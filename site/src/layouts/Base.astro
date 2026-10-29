@@ -1,0 +1,58 @@
+---
+import '../styles/global.css';
+import { allDocs, docUrl } from '../lib/docs';
+
+interface Props {
+  title: string;
+  description: string;
+  current: string;
+}
+
+const { title, description, current } = Astro.props;
+const docs = await allDocs();
+const pages = docs.filter((d) => d.id !== 'index' && !d.id.startsWith('decisions'));
+const adrs = docs.filter((d) => d.id.startsWith('decisions/'));
+const pageTitle = current === 'index' ? title : `${title} - paneld`;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{pageTitle}</title>
+    <meta name="description" content={description} />
+    <meta property="og:title" content={pageTitle} />
+    <meta property="og:description" content={description} />
+  </head>
+  <body>
+    <header class="top">
+      <a class="brand" href={docUrl('index')}>paneld</a>
+      <span class="tagline">design notes</span>
+    </header>
+    <div class="shell">
+      <nav class="side" aria-label="Pages">
+        <details open>
+          <summary>Pages</summary>
+          <ul>
+            {pages.map((d) => (
+              <li><a href={docUrl(d.id)} aria-current={d.id === current ? 'page' : undefined}>{d.data.title}</a></li>
+            ))}
+          </ul>
+          <p class="group"><a href={docUrl('decisions')} aria-current={current === 'decisions' ? 'page' : undefined}>Decisions</a></p>
+          <ul>
+            {adrs.map((d) => (
+              <li><a href={docUrl(d.id)} aria-current={d.id === current ? 'page' : undefined}>{d.data.title.replace(/^ADR /, '')}</a></li>
+            ))}
+          </ul>
+        </details>
+      </nav>
+      <script is:inline>
+        if (matchMedia('(max-width: 860px)').matches) document.querySelector('.side details')?.removeAttribute('open');
+      </script>
+      <main>
+        <slot />
+      </main>
+    </div>
+  </body>
+</html>

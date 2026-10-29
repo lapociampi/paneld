@@ -1,0 +1,15 @@
+{
+  "name": "paneld-site",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/markdown-satteri": "0.3.7",
+    "astro": "7.2.4"
+  }
+}

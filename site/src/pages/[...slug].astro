@@ -1,0 +1,41 @@
+---
+import Base from '../layouts/Base.astro';
+import { allDocs, docUrl, formatDate, rewriteLinks, type Doc } from '../lib/docs';
+
+export async function getStaticPaths() {
+  const docs = await allDocs();
+  return docs.map((doc, i) => ({
+    params: { slug: doc.id === 'index' ? undefined : doc.id },
+    props: { doc, prev: docs[i - 1], next: docs[i + 1] },
+  }));
+}
+
+interface Props {
+  doc: Doc;
+  prev?: Doc;
+  next?: Doc;
+}
+
+const { doc, prev, next } = Astro.props;
+const { title, description, date, updated, tags } = doc.data;
+const html = rewriteLinks(doc.rendered?.html ?? '', doc);
+---
+
+<Base title={title} description={description} current={doc.id}>
+  <article>
+    <header class="post-head">
+      <h1>{title}</h1>
+      <p class="lede">{description}</p>
+      <p class="meta">
+        <time datetime={formatDate(date)}>{formatDate(date)}</time>
+        {updated && <span>updated <time datetime={formatDate(updated)}>{formatDate(updated)}</time></span>}
+        {tags.filter((t) => t !== 'paneld').map((t) => <span class="tag">{t}</span>)}
+      </p>
+    </header>
+    <div class="prose" set:html={html} />
+    <footer class="pager">
+      {prev ? <a class="prev" href={docUrl(prev.id)}><small>Previous</small>{prev.data.title}</a> : <span />}
+      {next && <a class="next" href={docUrl(next.id)}><small>Next</small>{next.data.title}</a>}
+    </footer>
+  </article>
+</Base>
