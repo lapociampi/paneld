@@ -1,0 +1,4805 @@
+//! Schema check.
+//!
+//! Four passes, run in order:
+//!
+//! - **Structural** (Phase 4): top-level items are one of the known
+//!   kinds; named vs. category correctness; duplicate named items;
+//!   `include` form; stray `param` / `repeat` outside their contexts.
+//! - **Per-key** (Phase 5-6): inside blocks whose kind has a rule
+//!   table below, every assignment's key is known and its raw value
+//!   parses as the declared type (via the parsers in [`crate::value`]).
+//!   Phase 6 extended this to UI building blocks (section 8), alert
+//!   and reminder (sections 9-10), and page / component bodies. A
+//!   `{{ ... }}` expression is accepted wherever an `expr_ok` rule
+//!   allows it; CEL type-checking of the expression body itself is
+//!   deferred to a later phase.
+//! - **Cross-reference** (Phase 7): a second AST walk resolves name
+//!   references — `on_tap`/`on_hold`/`on_change`/`on_submit`/`button.action`/
+//!   `alert.action`/`action.then`/`action.else` against the collected
+//!   `action` names; `action.refresh`/`alert.from` against `source`
+//!   names; `screen.theme`/`night.theme` against `theme` names;
+//!   `app.start_page`/`goto` against `page` names (with `back` as a
+//!   special value); `security.pin` against `secret` names. Values
+//!   wrapped in `{{ }}` are skipped; CEL will handle them.
+//! - **Arg type-check** (Phase 8): a [`Params`] table is built from
+//!   every top-level `component` and `action` body (`param <name>:
+//!   <type> [= <default>]`). User-component call blocks
+//!   (`stat_tile { label = CPU; value = ... }`) and named
+//!   action-call shortcuts (`on_tap vm_stop { vm = ... }`) are then
+//!   validated: unknown arg keys are flagged, each value's raw type
+//!   is checked against the param's declared type, missing required
+//!   args are reported, and `action` / `source`-typed args that are
+//!   bare identifiers are cross-referenced against the collected
+//!   `Names`.
+//!
+//! What is still deferred (future phases):
+//!
+//! - Theme body validation (section 11: tokens, styles, overrides).
+//! - CEL parsing + type checking of `{{ }}` expression bodies.
+//!
+//! Diagnostics include file:line:col thanks to the [`SourceMap`].
+
+use std::collections::HashMap;
+
+use crate::parse::{Assign, AssignTarget, Block, Diagnostic, Document, Item, OptionsBlock, Param};
+use crate::value::{
+    classify, parse_bool, parse_bytes, parse_color, parse_duration, parse_int, parse_number,
+    parse_size, ValueShape,
+};
+use crate::{SourceMap, Span};
+
+// ---------------------------------------------------------------------------
+// Structural tables
+// ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum KindKind {
+    Named,
+    Category,
+}
+
+fn classify_kind(kind: &str) -> Option<KindKind> {
+    match kind {
+        "secret" | "source" | "action" | "component" | "page" | "alert" | "reminder" | "theme" => {
+            Some(KindKind::Named)
+        }
+        "screen" | "display" | "security" | "app" | "alerts" => Some(KindKind::Category),
+        _ => None,
+    }
+}
+
+fn is_legal_top_assign(key: &str) -> bool {
+    matches!(key, "include")
+}
+
+// ---------------------------------------------------------------------------
+// Per-key rules
+// ---------------------------------------------------------------------------
+
+/// Expected shape of a value's raw text, before `{{ }}` consideration.
+#[derive(Clone, Copy, Debug)]
+enum ExpectedType {
+    Bool,
+    Int,
+    Number,
+    Str,
+    Dur,
+    Size,
+    Bytes,
+    Color,
+    /// A path (currently a free string; no fs checks).
+    Path,
+    /// A command: raw text run as argv or `sh -c '...'`. Validated as
+    /// non-empty text.
+    Command,
+    /// A bare identifier reference (page name, source name, etc.).
+    Ident,
+    /// A list literal.
+    List,
+    /// Identifier or list of identifiers (`refresh = vms` or
+    /// `refresh = [vms, cpu_temp]`).
+    IdentOrList,
+    /// Exactly one of the given keyword strings.
+    OneOf(&'static [&'static str]),
+    /// Any text accepted; no shape check.
+    Any,
+}
+
+#[derive(Clone, Copy)]
+struct KeyRule {
+    name: &'static str,
+    ty: ExpectedType,
+    required: bool,
+    /// Allow `{{ expr }}` or interpolated text.
+    expr_ok: bool,
+}
+
+/// What's permitted inside a block body.
+#[derive(Clone, Copy)]
+enum BodyMode {
+    /// Only keys in `keys` are allowed; any sub-block kind must appear
+    /// in `nested`.
+    Keyed,
+    /// Any key is allowed; every value is validated as `ty`. Nested
+    /// blocks are not permitted.
+    AnyKey(ExpectedType),
+}
+
+#[derive(Clone, Copy)]
+struct NestedBlock {
+    kind: &'static str,
+    name_mode: NameMode,
+    schema: &'static BlockSchema,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameMode {
+    /// A `kind name { ... }` named sub-block; the name is required.
+    /// Reserved for schemas that will need it (chart series with ids,
+    /// future named sub-blocks); kept here so adding one does not
+    /// churn the enum.
+    #[allow(dead_code)]
+    Required,
+    /// A `kind { ... }` sub-block; a name is forbidden.
+    Forbidden,
+    /// Either form is accepted (`then` / `else`: name is an optional
+    /// called-action reference).
+    Optional,
+}
+
+#[derive(Clone, Copy)]
+struct BlockSchema {
+    keys: &'static [KeyRule],
+    nested: &'static [NestedBlock],
+    body_mode: BodyMode,
+}
+
+// --- generic small blocks ---
+
+const ENV_BLOCK: &BlockSchema = &BlockSchema {
+    keys: &[],
+    nested: &[],
+    body_mode: BodyMode::AnyKey(ExpectedType::Str),
+};
+
+const SET_BLOCK: &BlockSchema = &BlockSchema {
+    keys: &[],
+    nested: &[],
+    body_mode: BodyMode::AnyKey(ExpectedType::Any),
+};
+
+/// Body of a `then <action> { arg = val }` / `else <action> { ... }`
+/// block inside an `action`. Keys are the called action's parameter
+/// names, which the caller cannot cross-check without the action's
+/// param table (deferred). Keep lenient for now.
+const THEN_ELSE_BLOCK: &BlockSchema = &BlockSchema {
+    keys: &[],
+    nested: &[],
+    body_mode: BodyMode::AnyKey(ExpectedType::Any),
+};
+
+const NIGHT_BLOCK: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "from",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "to",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "theme",
+            ty: ExpectedType::Ident,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "idle",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "brightness",
+            ty: ExpectedType::Int,
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[],
+    body_mode: BodyMode::Keyed,
+};
+
+// --- top-level item schemas ---
+
+const SECRET_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "env",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "file",
+            ty: ExpectedType::Path,
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[],
+    body_mode: BodyMode::Keyed,
+};
+
+const SOURCE_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "run",
+            ty: ExpectedType::Command,
+            required: true,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "poll",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "stream",
+            ty: ExpectedType::Bool,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "parse",
+            ty: ExpectedType::OneOf(&["text", "number", "json", "lines"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "value",
+            ty: ExpectedType::Any,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "timeout",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "history",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "active",
+            ty: ExpectedType::OneOf(&["always", "visible"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "cwd",
+            ty: ExpectedType::Path,
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[NestedBlock {
+        kind: "env",
+        name_mode: NameMode::Forbidden,
+        schema: ENV_BLOCK,
+    }],
+    body_mode: BodyMode::Keyed,
+};
+
+const ACTION_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "pin",
+            ty: ExpectedType::Bool,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "confirm",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "run",
+            ty: ExpectedType::Command,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "timeout",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "cwd",
+            ty: ExpectedType::Path,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "goto",
+            ty: ExpectedType::Ident,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "refresh",
+            ty: ExpectedType::IdentOrList,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "then",
+            ty: ExpectedType::Ident,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "else",
+            ty: ExpectedType::Ident,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "busy",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "done",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "failed",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+    ],
+    nested: &[
+        NestedBlock {
+            kind: "env",
+            name_mode: NameMode::Forbidden,
+            schema: ENV_BLOCK,
+        },
+        NestedBlock {
+            kind: "set",
+            name_mode: NameMode::Forbidden,
+            schema: SET_BLOCK,
+        },
+        NestedBlock {
+            kind: "then",
+            name_mode: NameMode::Optional,
+            schema: THEN_ELSE_BLOCK,
+        },
+        NestedBlock {
+            kind: "else",
+            name_mode: NameMode::Optional,
+            schema: THEN_ELSE_BLOCK,
+        },
+    ],
+    body_mode: BodyMode::Keyed,
+};
+
+const SCREEN_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "theme",
+            ty: ExpectedType::Ident,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "idle",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "brightness",
+            ty: ExpectedType::Int,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "on",
+            ty: ExpectedType::Command,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "off",
+            ty: ExpectedType::Command,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "dim",
+            ty: ExpectedType::Command,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "wake_on",
+            ty: ExpectedType::List,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "first_tap",
+            ty: ExpectedType::OneOf(&["wake", "act"]),
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[NestedBlock {
+        kind: "night",
+        name_mode: NameMode::Forbidden,
+        schema: NIGHT_BLOCK,
+    }],
+    body_mode: BodyMode::Keyed,
+};
+
+const DISPLAY_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "backend",
+            ty: ExpectedType::OneOf(&["drm", "fbdev", "sdl"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "device",
+            ty: ExpectedType::Path,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "touch",
+            ty: ExpectedType::Path,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "width",
+            ty: ExpectedType::Int,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "height",
+            ty: ExpectedType::Int,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "rotation",
+            ty: ExpectedType::OneOf(&["0", "90", "180", "270"]),
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[],
+    body_mode: BodyMode::Keyed,
+};
+
+const SECURITY_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "pin",
+            ty: ExpectedType::Ident,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "unlock_for",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "attempts",
+            ty: ExpectedType::Int,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "lockout",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[],
+    body_mode: BodyMode::Keyed,
+};
+
+const APP_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "start_page",
+            ty: ExpectedType::Ident,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "timeout",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "max_output",
+            ty: ExpectedType::Bytes,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "max_running",
+            ty: ExpectedType::Int,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "state",
+            ty: ExpectedType::Path,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "log",
+            ty: ExpectedType::OneOf(&["error", "warn", "info", "debug"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "action_log",
+            ty: ExpectedType::Path,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "socket",
+            ty: ExpectedType::Path,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "shell",
+            ty: ExpectedType::Path,
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[],
+    body_mode: BodyMode::Keyed,
+};
+
+const ALERT_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "from",
+            ty: ExpectedType::Ident,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "when",
+            ty: ExpectedType::Bool,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "for",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "id",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "state",
+            ty: ExpectedType::OneOf(&["firing", "resolved"]),
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "severity",
+            ty: ExpectedType::OneOf(&["critical", "warning", "info"]),
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "title",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "text",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "link",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "action",
+            ty: ExpectedType::Ident,
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[],
+    body_mode: BodyMode::Keyed,
+};
+
+const REMINDER_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "every",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "start",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "once",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "title",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "text",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "link",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "severity",
+            ty: ExpectedType::OneOf(&["critical", "warning", "info"]),
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[],
+    body_mode: BodyMode::Keyed,
+};
+
+const ALERTS_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "history",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "snooze",
+            ty: ExpectedType::List,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "source_down",
+            ty: ExpectedType::Dur,
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    nested: &[],
+    body_mode: BodyMode::Keyed,
+};
+
+/// Return the Phase-5 rule table for a top-level block kind, or `None`
+/// to indicate "pass through without validating body" (component /
+/// page / theme / alert / reminder — they have their own non-trivial
+/// semantics the UI phase will cover).
+fn top_schema_for(kind: &str) -> Option<&'static BlockSchema> {
+    match kind {
+        "secret" => Some(SECRET_SCHEMA),
+        "source" => Some(SOURCE_SCHEMA),
+        "action" => Some(ACTION_SCHEMA),
+        "screen" => Some(SCREEN_SCHEMA),
+        "display" => Some(DISPLAY_SCHEMA),
+        "security" => Some(SECURITY_SCHEMA),
+        "app" => Some(APP_SCHEMA),
+        "alerts" => Some(ALERTS_SCHEMA),
+        "alert" => Some(ALERT_SCHEMA),
+        "reminder" => Some(REMINDER_SCHEMA),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Page / component keys and UI building blocks (schema section 7-8).
+// ---------------------------------------------------------------------------
+
+const PAGE_KEYS: &[KeyRule] = &[
+    KeyRule { name: "title", ty: ExpectedType::Str, required: false, expr_ok: true },
+    KeyRule { name: "icon", ty: ExpectedType::Ident, required: false, expr_ok: false },
+    KeyRule { name: "nav", ty: ExpectedType::Int, required: false, expr_ok: false },
+];
+
+/// Properties every UI building block accepts (schema section 8.1).
+const COMMON_UI_KEYS: &[KeyRule] = &[
+    KeyRule { name: "width", ty: ExpectedType::Size, required: false, expr_ok: true },
+    KeyRule { name: "height", ty: ExpectedType::Size, required: false, expr_ok: true },
+    KeyRule { name: "min_width", ty: ExpectedType::Size, required: false, expr_ok: false },
+    KeyRule { name: "max_width", ty: ExpectedType::Size, required: false, expr_ok: false },
+    KeyRule { name: "min_height", ty: ExpectedType::Size, required: false, expr_ok: false },
+    KeyRule { name: "max_height", ty: ExpectedType::Size, required: false, expr_ok: false },
+    KeyRule { name: "grow", ty: ExpectedType::Number, required: false, expr_ok: false },
+    KeyRule {
+        name: "align_self",
+        ty: ExpectedType::OneOf(&["start", "center", "end", "stretch"]),
+        required: false,
+        expr_ok: false,
+    },
+    // cell is "col row [colspan rowspan]" - a loose string literal.
+    KeyRule { name: "cell", ty: ExpectedType::Str, required: false, expr_ok: false },
+    KeyRule { name: "x", ty: ExpectedType::Size, required: false, expr_ok: false },
+    KeyRule { name: "y", ty: ExpectedType::Size, required: false, expr_ok: false },
+    KeyRule {
+        name: "anchor",
+        ty: ExpectedType::OneOf(&[
+            "top_left", "top_center", "top_right",
+            "left", "center", "right",
+            "bottom_left", "bottom_center", "bottom_right",
+        ]),
+        required: false,
+        expr_ok: false,
+    },
+    // padding is 1, 2 or 4 sizes - keep lenient.
+    KeyRule { name: "padding", ty: ExpectedType::Str, required: false, expr_ok: false },
+    KeyRule { name: "class", ty: ExpectedType::IdentOrList, required: false, expr_ok: false },
+    KeyRule { name: "background", ty: ExpectedType::Any, required: false, expr_ok: true },
+    KeyRule { name: "opacity", ty: ExpectedType::Number, required: false, expr_ok: true },
+    KeyRule { name: "radius", ty: ExpectedType::Size, required: false, expr_ok: false },
+    KeyRule { name: "border", ty: ExpectedType::Str, required: false, expr_ok: false },
+    KeyRule { name: "shadow", ty: ExpectedType::Str, required: false, expr_ok: false },
+    KeyRule { name: "color", ty: ExpectedType::Color, required: false, expr_ok: true },
+    KeyRule { name: "font", ty: ExpectedType::Str, required: false, expr_ok: true },
+    KeyRule { name: "visible", ty: ExpectedType::Bool, required: false, expr_ok: true },
+    KeyRule { name: "enabled", ty: ExpectedType::Bool, required: false, expr_ok: true },
+    // `on_tap = action` / `on_hold = action` as the plain-assign form.
+    // The block form `on_tap action { arg = val }` is handled by
+    // the UI walker separately. `expr_ok` is true because a component
+    // can thread an action through a param: `on_tap = {{ tap }}` where
+    // `tap: action` (schema.md section 7 example).
+    KeyRule { name: "on_tap", ty: ExpectedType::Ident, required: false, expr_ok: true },
+    KeyRule { name: "on_hold", ty: ExpectedType::Ident, required: false, expr_ok: true },
+];
+
+/// Event-handler keys whose block form (`on_tap action { ... }`) is a
+/// shortcut for calling an action with arguments.
+const EVENT_HANDLER_KINDS: &[&str] = &["on_tap", "on_hold", "on_change", "on_submit"];
+
+/// Inline-action keys accepted inside an action-call shortcut body
+/// (e.g. `on_tap { goto = home; refresh = foo }`).
+const INLINE_ACTION_KEYS: &[&str] =
+    &["goto", "refresh", "set", "then", "else", "run", "confirm", "pin"];
+
+/// A chart `series { }` sub-block.
+const CHART_SERIES_SCHEMA: &BlockSchema = &BlockSchema {
+    keys: &[
+        KeyRule {
+            name: "values",
+            ty: ExpectedType::Any,
+            required: false,
+            expr_ok: true,
+        },
+        KeyRule {
+            name: "color",
+            ty: ExpectedType::Any,
+            required: false,
+            expr_ok: true,
+        },
+    ],
+    nested: &[],
+    body_mode: BodyMode::Keyed,
+};
+
+struct UiNode {
+    kind: &'static str,
+    keys: &'static [KeyRule],
+    accepts_children: bool,
+    nested_subblocks: &'static [NestedBlock],
+    slot_only: bool,
+}
+
+const UI_ROW: &UiNode = &UiNode {
+    kind: "row",
+    keys: &[
+        KeyRule { name: "gap", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule {
+            name: "justify",
+            ty: ExpectedType::OneOf(&["start", "center", "end", "between", "around", "evenly"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "align",
+            ty: ExpectedType::OneOf(&["start", "center", "end", "stretch"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule { name: "wrap", ty: ExpectedType::Bool, required: false, expr_ok: false },
+    ],
+    accepts_children: true,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_COLUMN: &UiNode = &UiNode {
+    kind: "column",
+    keys: UI_ROW.keys,
+    accepts_children: true,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_GRID: &UiNode = &UiNode {
+    kind: "grid",
+    keys: &[
+        KeyRule { name: "columns", ty: ExpectedType::Any, required: false, expr_ok: false },
+        KeyRule { name: "rows", ty: ExpectedType::Any, required: false, expr_ok: false },
+        KeyRule { name: "gap", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "row_gap", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "column_gap", ty: ExpectedType::Size, required: false, expr_ok: false },
+    ],
+    accepts_children: true,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_STACK: &UiNode = &UiNode {
+    kind: "stack",
+    keys: &[],
+    accepts_children: true,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_SCROLL: &UiNode = &UiNode {
+    kind: "scroll",
+    keys: &[
+        KeyRule {
+            name: "direction",
+            ty: ExpectedType::OneOf(&["vertical", "horizontal"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "snap",
+            ty: ExpectedType::OneOf(&["none", "start", "center"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule { name: "gap", ty: ExpectedType::Size, required: false, expr_ok: false },
+    ],
+    accepts_children: true,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_SLOT: &UiNode = &UiNode {
+    kind: "slot",
+    keys: &[],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: true,
+};
+
+const UI_TEXT: &UiNode = &UiNode {
+    kind: "text",
+    keys: &[
+        KeyRule { name: "value", ty: ExpectedType::Str, required: false, expr_ok: true },
+        KeyRule {
+            name: "align",
+            ty: ExpectedType::OneOf(&["left", "center", "right"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "overflow",
+            ty: ExpectedType::OneOf(&["wrap", "clip", "dots", "scroll"]),
+            required: false,
+            expr_ok: false,
+        },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_ICON: &UiNode = &UiNode {
+    kind: "icon",
+    keys: &[
+        KeyRule { name: "name", ty: ExpectedType::Any, required: false, expr_ok: true },
+        KeyRule { name: "size", ty: ExpectedType::Size, required: false, expr_ok: false },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_IMAGE: &UiNode = &UiNode {
+    kind: "image",
+    keys: &[
+        KeyRule { name: "src", ty: ExpectedType::Str, required: false, expr_ok: true },
+        KeyRule {
+            name: "fit",
+            ty: ExpectedType::OneOf(&["contain", "cover", "fill", "none"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule { name: "recolor", ty: ExpectedType::Color, required: false, expr_ok: true },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_RECT: &UiNode = &UiNode {
+    kind: "rect",
+    keys: &[],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_ARC: &UiNode = &UiNode {
+    kind: "arc",
+    keys: &[
+        KeyRule { name: "value", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "min", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "max", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "start", ty: ExpectedType::Number, required: false, expr_ok: false },
+        KeyRule { name: "end", ty: ExpectedType::Number, required: false, expr_ok: false },
+        KeyRule { name: "thickness", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "track", ty: ExpectedType::Color, required: false, expr_ok: true },
+        KeyRule { name: "rounded", ty: ExpectedType::Bool, required: false, expr_ok: false },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_BAR: &UiNode = &UiNode {
+    kind: "bar",
+    keys: &[
+        KeyRule { name: "value", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "min", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "max", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule {
+            name: "direction",
+            ty: ExpectedType::OneOf(&["horizontal", "vertical"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule { name: "track", ty: ExpectedType::Color, required: false, expr_ok: true },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_LINE: &UiNode = &UiNode {
+    kind: "line",
+    keys: &[
+        KeyRule { name: "points", ty: ExpectedType::Any, required: false, expr_ok: true },
+        KeyRule { name: "thickness", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "rounded", ty: ExpectedType::Bool, required: false, expr_ok: false },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_CHART: &UiNode = &UiNode {
+    kind: "chart",
+    keys: &[
+        KeyRule {
+            name: "type",
+            ty: ExpectedType::OneOf(&["line", "bar", "area"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule { name: "min", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "max", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "points", ty: ExpectedType::Int, required: false, expr_ok: false },
+        KeyRule { name: "divisions", ty: ExpectedType::Str, required: false, expr_ok: false },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[NestedBlock {
+        kind: "series",
+        name_mode: NameMode::Forbidden,
+        schema: CHART_SERIES_SCHEMA,
+    }],
+    slot_only: false,
+};
+
+const UI_QR: &UiNode = &UiNode {
+    kind: "qr",
+    keys: &[
+        KeyRule { name: "data", ty: ExpectedType::Str, required: false, expr_ok: true },
+        KeyRule { name: "size", ty: ExpectedType::Size, required: false, expr_ok: false },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_SPINNER: &UiNode = &UiNode {
+    kind: "spinner",
+    keys: &[KeyRule {
+        name: "size",
+        ty: ExpectedType::Size,
+        required: false,
+        expr_ok: false,
+    }],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_BUTTON: &UiNode = &UiNode {
+    kind: "button",
+    keys: &[
+        KeyRule { name: "action", ty: ExpectedType::Ident, required: false, expr_ok: false },
+        KeyRule { name: "label", ty: ExpectedType::Str, required: false, expr_ok: true },
+        KeyRule { name: "icon", ty: ExpectedType::Any, required: false, expr_ok: true },
+    ],
+    accepts_children: true,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_TOGGLE: &UiNode = &UiNode {
+    kind: "toggle",
+    keys: &[
+        KeyRule { name: "value", ty: ExpectedType::Bool, required: false, expr_ok: true },
+        KeyRule { name: "on_change", ty: ExpectedType::Ident, required: false, expr_ok: true },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_SLIDER: &UiNode = &UiNode {
+    kind: "slider",
+    keys: &[
+        KeyRule { name: "value", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "min", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "max", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "step", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule {
+            name: "direction",
+            ty: ExpectedType::OneOf(&["horizontal", "vertical"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule { name: "on_change", ty: ExpectedType::Ident, required: false, expr_ok: true },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_SELECT: &UiNode = &UiNode {
+    kind: "select",
+    keys: &[
+        KeyRule { name: "options", ty: ExpectedType::Any, required: false, expr_ok: true },
+        KeyRule { name: "value", ty: ExpectedType::Any, required: false, expr_ok: true },
+        KeyRule {
+            name: "style",
+            ty: ExpectedType::OneOf(&["dropdown", "roller", "buttons"]),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule { name: "on_change", ty: ExpectedType::Ident, required: false, expr_ok: true },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+const UI_KEYPAD: &UiNode = &UiNode {
+    kind: "keypad",
+    keys: &[
+        KeyRule { name: "length", ty: ExpectedType::Int, required: false, expr_ok: false },
+        KeyRule { name: "masked", ty: ExpectedType::Bool, required: false, expr_ok: false },
+        KeyRule { name: "on_submit", ty: ExpectedType::Ident, required: false, expr_ok: true },
+    ],
+    accepts_children: false,
+    nested_subblocks: &[],
+    slot_only: false,
+};
+
+fn ui_node_schema(kind: &str) -> Option<&'static UiNode> {
+    Some(match kind {
+        "row" => UI_ROW,
+        "column" => UI_COLUMN,
+        "grid" => UI_GRID,
+        "stack" => UI_STACK,
+        "scroll" => UI_SCROLL,
+        "slot" => UI_SLOT,
+        "text" => UI_TEXT,
+        "icon" => UI_ICON,
+        "image" => UI_IMAGE,
+        "rect" => UI_RECT,
+        "arc" => UI_ARC,
+        "bar" => UI_BAR,
+        "line" => UI_LINE,
+        "chart" => UI_CHART,
+        "qr" => UI_QR,
+        "spinner" => UI_SPINNER,
+        "button" => UI_BUTTON,
+        "toggle" => UI_TOGGLE,
+        "slider" => UI_SLIDER,
+        "select" => UI_SELECT,
+        "keypad" => UI_KEYPAD,
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let mut seen: HashMap<(String, String), Span> = HashMap::new();
+
+    // Pre-passes: collect the names of user-defined `component`s so that
+    // calls to them inside UI trees can be recognized, the name tables
+    // used by the Phase 7 cross-reference resolver, and the per-kind
+    // param tables used by the Phase 8 arg type-checker.
+    let user_components = collect_user_components(doc);
+    let names = collect_names(doc);
+    let params = collect_params(doc, source, &mut diags);
+
+    let ctx = UiContext {
+        user_components: &user_components,
+        names: &names,
+        params: &params,
+        source,
+    };
+
+    for item in &doc.items {
+        check_top_item(item, source, &ctx, &mut seen, &mut diags);
+    }
+
+    resolve_refs(doc, &names, &mut diags);
+
+    // Phase 10: parse every `{{ ... }}` fragment as CEL, surface parse
+    // errors, and cross-reference `sources.<name>` against the collected
+    // source names.
+    check_cel_in_doc(doc, &names, &mut diags);
+
+    diags
+}
+
+fn collect_user_components(doc: &Document) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for item in &doc.items {
+        if let Item::Block(b) = item {
+            if b.kind.text == "component" {
+                if let Some(name) = &b.name {
+                    set.insert(name.text.clone());
+                }
+            }
+        }
+    }
+    set
+}
+
+struct UiContext<'a> {
+    user_components: &'a std::collections::HashSet<String>,
+    names: &'a Names,
+    params: &'a Params,
+    source: &'a SourceMap,
+}
+
+fn check_top_item(
+    item: &Item,
+    source: &SourceMap,
+    ctx: &UiContext,
+    seen: &mut HashMap<(String, String), Span>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match item {
+        Item::Block(b) => check_top_block(b, source, ctx, seen, diags),
+        Item::Assign(a) => check_top_assign(a, diags),
+        Item::Var(_) => {
+            // Top-level `var name: type = default`: name/type/default
+            // all live inside the AST node. Default-type agreement is
+            // Phase 5+ work (needs the type-dispatch table).
+        }
+        Item::Param(p) => diags.push(Diagnostic::new(
+            p.span,
+            "`param` is only allowed inside `action` or `component` bodies",
+        )),
+        Item::Repeat(r) => diags.push(Diagnostic::new(
+            r.span,
+            "`repeat` is only allowed inside a page or component body",
+        )),
+    }
+}
+
+fn check_top_block(
+    b: &Block,
+    source: &SourceMap,
+    ctx: &UiContext,
+    seen: &mut HashMap<(String, String), Span>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match classify_kind(&b.kind.text) {
+        Some(KindKind::Named) => {
+            let Some(name) = &b.name else {
+                diags.push(Diagnostic::new(
+                    b.kind.span,
+                    format!("`{}` needs a name", b.kind.text),
+                ));
+                return;
+            };
+            let key = (b.kind.text.clone(), name.text.clone());
+            if let Some(prev_span) = seen.get(&key) {
+                diags.push(Diagnostic::new(
+                    name.span,
+                    format!(
+                        "`{} {}` is already defined (first at {})",
+                        b.kind.text,
+                        name.text,
+                        source.location(*prev_span)
+                    ),
+                ));
+            } else {
+                seen.insert(key, name.span);
+            }
+        }
+        Some(KindKind::Category) => {
+            if let Some(name) = &b.name {
+                diags.push(Diagnostic::new(
+                    name.span,
+                    format!(
+                        "`{}` is a settings block and does not take a name",
+                        b.kind.text
+                    ),
+                ));
+            }
+        }
+        None => {
+            diags.push(Diagnostic::new(
+                b.kind.span,
+                format!("unknown top-level item `{}`", b.kind.text),
+            ));
+            return;
+        }
+    }
+
+    // Per-key validation of the body, if we have a schema for this kind.
+    if let Some(schema) = top_schema_for(&b.kind.text) {
+        validate_block_body(b, schema, source, diags);
+    } else if b.kind.text == "page" {
+        validate_page_body(b, ctx, diags);
+    } else if b.kind.text == "component" {
+        validate_component_body(b, ctx, diags);
+    } else if b.kind.text == "theme" {
+        validate_theme_body(b, ctx, diags);
+    }
+}
+
+fn check_top_assign(a: &Assign, diags: &mut Vec<Diagnostic>) {
+    match &a.target {
+        AssignTarget::Simple { key } => {
+            if !is_legal_top_assign(&key.text) {
+                diags.push(Diagnostic::new(
+                    key.span,
+                    format!(
+                        "unknown top-level option `{}`; expected `include`, a named item, or a settings block",
+                        key.text
+                    ),
+                ));
+            }
+        }
+        AssignTarget::Var { .. } => {}
+        AssignTarget::Qualified { category, key } => {
+            // `category:key = value` means "set `key` inside `category`'s
+            // block". Validate it against the category's schema, same as
+            // the opened form.
+            if classify_kind(&category.text).is_none() {
+                diags.push(Diagnostic::new(
+                    category.span,
+                    format!("unknown settings category `{}`", category.text),
+                ));
+                return;
+            }
+            check_qualified_key(
+                top_schema_for(&category.text),
+                &category.text,
+                key,
+                &a.value.text,
+                a.value.span,
+                diags,
+            );
+        }
+        AssignTarget::Indexed { kind, key, .. } => {
+            match classify_kind(&kind.text) {
+                Some(KindKind::Named) => {
+                    // `kind[name]:key = value` targets the named item's body.
+                    check_qualified_key(
+                        top_schema_for(&kind.text),
+                        &kind.text,
+                        key,
+                        &a.value.text,
+                        a.value.span,
+                        diags,
+                    );
+                }
+                Some(KindKind::Category) => diags.push(Diagnostic::new(
+                    kind.span,
+                    format!(
+                        "`{0}` is a settings block, not a named item; use `{0}:key = ...`",
+                        kind.text
+                    ),
+                )),
+                None => diags.push(Diagnostic::new(
+                    kind.span,
+                    format!("unknown item kind `{}` in indexed assignment", kind.text),
+                )),
+            }
+        }
+    }
+}
+
+/// Validate one `category:key = v` or `kind[name]:key = v` shorthand
+/// as if it were an assignment inside the block's body. Does nothing
+/// if the kind has no rule table (component / page / theme / alert /
+/// reminder — same silent pass-through as full-block form).
+fn check_qualified_key(
+    schema: Option<&'static BlockSchema>,
+    kind_name: &str,
+    key: &crate::parse::Ident,
+    value_text: &str,
+    value_span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(schema) = schema else { return };
+    match schema.body_mode {
+        BodyMode::AnyKey(ty) => {
+            check_value_type(value_text, value_span, ty, true, diags);
+        }
+        BodyMode::Keyed => {
+            if let Some(rule) = schema.keys.iter().find(|r| r.name == key.text) {
+                check_value_type(value_text, value_span, rule.ty, rule.expr_ok, diags);
+            } else {
+                diags.push(Diagnostic::new(
+                    key.span,
+                    format!(
+                        "unknown key `{}` for `{kind_name}`; valid keys: {}",
+                        key.text,
+                        format_key_list(schema.keys)
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-key body validation
+// ---------------------------------------------------------------------------
+
+fn validate_block_body(
+    block: &Block,
+    schema: &BlockSchema,
+    source: &SourceMap,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut seen_keys: HashMap<&str, Span> = HashMap::new();
+
+    for item in &block.items {
+        match item {
+            Item::Assign(a) => validate_assign_in_body(a, schema, &mut seen_keys, diags),
+            Item::Block(child) => validate_nested_block(child, schema, source, diags),
+            Item::Param(p) => validate_param_in_body(p, &block.kind.text, diags),
+            Item::Var(v) => diags.push(Diagnostic::new(
+                v.span,
+                format!("`var` is only allowed at the top level, not inside `{}`", block.kind.text),
+            )),
+            Item::Repeat(r) => diags.push(Diagnostic::new(
+                r.span,
+                format!("`repeat` is not allowed inside `{}`", block.kind.text),
+            )),
+        }
+    }
+
+    // Required keys that never appeared.
+    for rule in schema.keys.iter().filter(|r| r.required) {
+        if !seen_keys.contains_key(rule.name) {
+            diags.push(Diagnostic::new(
+                block.kind.span,
+                format!(
+                    "`{}` block is missing required key `{}`",
+                    block.kind.text, rule.name
+                ),
+            ));
+        }
+    }
+
+    // Blocks like `secret` where exactly one of `env`/`file` must be
+    // present. Special-cased by kind to avoid a bigger schema model.
+    if block.kind.text == "secret" {
+        let env_present = seen_keys.contains_key("env");
+        let file_present = seen_keys.contains_key("file");
+        if !env_present && !file_present {
+            diags.push(Diagnostic::new(
+                block.kind.span,
+                "`secret` must set exactly one of `env` or `file`",
+            ));
+        } else if env_present && file_present {
+            diags.push(Diagnostic::new(
+                block.kind.span,
+                "`secret` must set only one of `env` or `file`",
+            ));
+        }
+    }
+}
+
+fn validate_assign_in_body(
+    a: &Assign,
+    schema: &BlockSchema,
+    seen_keys: &mut HashMap<&'static str, Span>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let key = match &a.target {
+        AssignTarget::Simple { key } => key,
+        AssignTarget::Var { .. } => {
+            diags.push(Diagnostic::new(
+                a.span,
+                "`$var` definitions are only allowed at the top level",
+            ));
+            return;
+        }
+        AssignTarget::Qualified { .. } => {
+            diags.push(Diagnostic::new(
+                a.span,
+                "`category:key` shorthand is only allowed at the top level",
+            ));
+            return;
+        }
+        AssignTarget::Indexed { .. } => {
+            diags.push(Diagnostic::new(
+                a.span,
+                "`kind[name]:key` shorthand is only allowed at the top level",
+            ));
+            return;
+        }
+    };
+
+    match schema.body_mode {
+        BodyMode::AnyKey(ty) => {
+            check_value_type(&a.value.text, a.value.span, ty, true, diags);
+        }
+        BodyMode::Keyed => {
+            if let Some(rule) = schema.keys.iter().find(|r| r.name == key.text) {
+                seen_keys.insert(rule.name, key.span);
+                check_value_type(&a.value.text, a.value.span, rule.ty, rule.expr_ok, diags);
+            } else {
+                diags.push(Diagnostic::new(
+                    key.span,
+                    format!(
+                        "unknown key `{}`; valid keys: {}",
+                        key.text,
+                        format_key_list(schema.keys)
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn validate_nested_block(
+    child: &Block,
+    parent: &BlockSchema,
+    source: &SourceMap,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let nb = match parent.nested.iter().find(|n| n.kind == child.kind.text) {
+        Some(n) => n,
+        None => {
+            if matches!(parent.body_mode, BodyMode::AnyKey(_)) {
+                diags.push(Diagnostic::new(
+                    child.kind.span,
+                    "nested blocks are not allowed here",
+                ));
+                return;
+            }
+            diags.push(Diagnostic::new(
+                child.kind.span,
+                format!(
+                    "unknown nested block `{}`; allowed: {}",
+                    child.kind.text,
+                    format_nested_list(parent.nested)
+                ),
+            ));
+            return;
+        }
+    };
+    match nb.name_mode {
+        NameMode::Required => {
+            if child.name.is_none() {
+                diags.push(Diagnostic::new(
+                    child.kind.span,
+                    format!("`{}` block needs a name", child.kind.text),
+                ));
+                return;
+            }
+        }
+        NameMode::Forbidden => {
+            if let Some(name) = &child.name {
+                diags.push(Diagnostic::new(
+                    name.span,
+                    format!("`{}` does not take a name here", child.kind.text),
+                ));
+            }
+        }
+        NameMode::Optional => {}
+    }
+    validate_block_body(child, nb.schema, source, diags);
+}
+
+fn validate_param_in_body(p: &Param, parent_kind: &str, diags: &mut Vec<Diagnostic>) {
+    if !matches!(parent_kind, "action" | "component") {
+        diags.push(Diagnostic::new(
+            p.span,
+            format!(
+                "`param` is only allowed inside `action` or `component`, not `{parent_kind}`"
+            ),
+        ));
+    }
+    if let Some(opts) = &p.options {
+        validate_param_options(opts, diags);
+    }
+}
+
+/// Validate the options block of a `param`. Keys are per
+/// `docs/schema.md` section 6.
+fn validate_param_options(opts: &OptionsBlock, diags: &mut Vec<Diagnostic>) {
+    for item in &opts.items {
+        let Item::Assign(a) = item else {
+            diags.push(Diagnostic::new(
+                item.span(),
+                "`param` options block only accepts `key = value` entries",
+            ));
+            continue;
+        };
+        let AssignTarget::Simple { key } = &a.target else {
+            diags.push(Diagnostic::new(
+                a.span,
+                "`param` options block entries must be simple `key = value`",
+            ));
+            continue;
+        };
+        match key.text.as_str() {
+            "min" | "max" => {
+                check_value_type(&a.value.text, a.value.span, ExpectedType::Number, false, diags);
+            }
+            "pattern" => {
+                check_value_type(&a.value.text, a.value.span, ExpectedType::Str, false, diags);
+            }
+            "options" => {
+                check_value_type(&a.value.text, a.value.span, ExpectedType::List, true, diags);
+            }
+            "ask" => {
+                check_value_type(
+                    &a.value.text,
+                    a.value.span,
+                    ExpectedType::OneOf(&["select", "slider", "keypad", "toggle"]),
+                    false,
+                    diags,
+                );
+            }
+            "label" => {
+                check_value_type(&a.value.text, a.value.span, ExpectedType::Str, true, diags);
+            }
+            _ => diags.push(Diagnostic::new(
+                key.span,
+                format!(
+                    "unknown `param` option `{}`; valid: min, max, pattern, options, ask, label",
+                    key.text
+                ),
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Value type checking
+// ---------------------------------------------------------------------------
+
+fn check_value_type(
+    raw: &str,
+    span: Span,
+    ty: ExpectedType,
+    expr_ok: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // Commands and free-text strings commonly interpolate `{{ ... }}`
+    // (`run = curl /{{ vm }}/stop`, `dim = sh -c 'echo {{ level }} > ...'`).
+    // Treat those as implicitly expression-tolerant.
+    let implicit_expr_ok = matches!(ty, ExpectedType::Command | ExpectedType::Str);
+    match classify(raw) {
+        ValueShape::Expression(_) | ValueShape::Interp(_) => {
+            if !expr_ok && !implicit_expr_ok {
+                diags.push(Diagnostic::new(
+                    span,
+                    format!(
+                        "expected {} here; `{{{{ ... }}}}` expressions are not accepted for this key",
+                        type_name(ty)
+                    ),
+                ));
+            }
+        }
+        ValueShape::Literal(text) => {
+            if let Err(msg) = check_literal(text, ty) {
+                diags.push(Diagnostic::new(span, msg));
+            }
+        }
+    }
+}
+
+fn check_literal(text: &str, ty: ExpectedType) -> Result<(), String> {
+    match ty {
+        ExpectedType::Any => Ok(()),
+        ExpectedType::Bool => parse_bool(text)
+            .map(|_| ())
+            .ok_or_else(|| format!("expected a bool (`true` or `false`), got `{text}`")),
+        ExpectedType::Int => parse_int(text)
+            .map(|_| ())
+            .ok_or_else(|| format!("expected an integer, got `{text}`")),
+        ExpectedType::Number => parse_number(text)
+            .map(|_| ())
+            .ok_or_else(|| format!("expected a number, got `{text}`")),
+        ExpectedType::Str | ExpectedType::Path | ExpectedType::Command => {
+            if text.is_empty() {
+                let noun = match ty {
+                    ExpectedType::Str => "string",
+                    ExpectedType::Path => "path",
+                    ExpectedType::Command => "command",
+                    _ => unreachable!(),
+                };
+                Err(format!("expected a non-empty {noun}"))
+            } else {
+                Ok(())
+            }
+        }
+        ExpectedType::Dur => parse_duration(text)
+            .map(|_| ())
+            .ok_or_else(|| format!("expected a duration (`30s`, `2m`, `1h`, ...), got `{text}`")),
+        ExpectedType::Size => parse_size(text)
+            .map(|_| ())
+            .ok_or_else(|| format!("expected a size (`120`, `50%`, `grow`, `content`), got `{text}`")),
+        ExpectedType::Bytes => parse_bytes(text)
+            .map(|_| ())
+            .ok_or_else(|| format!("expected a byte count (`64KiB`, `1MiB`, ...), got `{text}`")),
+        ExpectedType::Color => parse_color(text)
+            .map(|_| ())
+            .ok_or_else(|| {
+                format!("expected a hex color (`#rgb`, `#rrggbb`, `#rrggbbaa`), got `{text}`")
+            }),
+        ExpectedType::Ident => {
+            if is_bare_ident(text) {
+                Ok(())
+            } else {
+                Err(format!("expected an identifier, got `{text}`"))
+            }
+        }
+        ExpectedType::List => {
+            if text.starts_with('[') && text.ends_with(']') {
+                Ok(())
+            } else {
+                Err(format!("expected a list `[...]`, got `{text}`"))
+            }
+        }
+        ExpectedType::IdentOrList => {
+            if is_bare_ident(text) || (text.starts_with('[') && text.ends_with(']')) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected an identifier or a list of identifiers, got `{text}`"
+                ))
+            }
+        }
+        ExpectedType::OneOf(allowed) => {
+            if allowed.contains(&text) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected one of {}, got `{text}`",
+                    allowed
+                        .iter()
+                        .map(|a| format!("`{a}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
+        }
+    }
+}
+
+fn is_bare_ident(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    if !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
+        return false;
+    }
+    b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+fn type_name(ty: ExpectedType) -> &'static str {
+    match ty {
+        ExpectedType::Bool => "a bool",
+        ExpectedType::Int => "an integer",
+        ExpectedType::Number => "a number",
+        ExpectedType::Str => "a string",
+        ExpectedType::Path => "a path",
+        ExpectedType::Command => "a command",
+        ExpectedType::Dur => "a duration",
+        ExpectedType::Size => "a size",
+        ExpectedType::Bytes => "a byte count",
+        ExpectedType::Color => "a color",
+        ExpectedType::Ident => "an identifier",
+        ExpectedType::List => "a list",
+        ExpectedType::IdentOrList => "an identifier or list of identifiers",
+        ExpectedType::OneOf(_) => "a keyword",
+        ExpectedType::Any => "a value",
+    }
+}
+
+fn format_key_list(keys: &[KeyRule]) -> String {
+    if keys.is_empty() {
+        return "(none)".to_string();
+    }
+    keys.iter()
+        .map(|r| format!("`{}`", r.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_nested_list(nested: &[NestedBlock]) -> String {
+    if nested.is_empty() {
+        return "(none)".to_string();
+    }
+    nested
+        .iter()
+        .map(|n| format!("`{}`", n.kind))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Page / component / UI tree walker
+// ---------------------------------------------------------------------------
+
+/// Validate the body of a `page home { ... }` block. The body is a mix
+/// of page-level keys (`title`, `icon`, `nav`) and UI nodes.
+fn validate_page_body(b: &Block, ctx: &UiContext, diags: &mut Vec<Diagnostic>) {
+    for item in &b.items {
+        match item {
+            Item::Assign(a) => validate_page_key(a, diags),
+            Item::Block(child) => validate_ui_block(child, ctx, false, diags),
+            Item::Repeat(r) => validate_ui_repeat(r, ctx, false, diags),
+            Item::Param(p) => diags.push(Diagnostic::new(
+                p.span,
+                "`param` is not allowed in a `page` body (use a `component`)",
+            )),
+            Item::Var(v) => diags.push(Diagnostic::new(
+                v.span,
+                "`var` declarations are only allowed at the top level",
+            )),
+        }
+    }
+}
+
+fn validate_page_key(a: &Assign, diags: &mut Vec<Diagnostic>) {
+    let AssignTarget::Simple { key } = &a.target else {
+        diags.push(Diagnostic::new(
+            a.span,
+            "qualified assignments are only allowed at the top level",
+        ));
+        return;
+    };
+    // Event-handler assigns are legal on a page too.
+    if EVENT_HANDLER_KINDS.contains(&key.text.as_str()) {
+        check_value_type(&a.value.text, a.value.span, ExpectedType::Ident, false, diags);
+        return;
+    }
+    if let Some(rule) = PAGE_KEYS.iter().find(|r| r.name == key.text) {
+        check_value_type(&a.value.text, a.value.span, rule.ty, rule.expr_ok, diags);
+    } else {
+        diags.push(Diagnostic::new(
+            key.span,
+            format!(
+                "unknown page key `{}`; valid: {}",
+                key.text,
+                format_key_list(PAGE_KEYS)
+            ),
+        ));
+    }
+}
+
+/// Validate the body of a `component foo { ... }` block. Body = params
+/// (zero or more) + exactly one root UI node.
+fn validate_component_body(b: &Block, ctx: &UiContext, diags: &mut Vec<Diagnostic>) {
+    let mut root_count = 0;
+    for item in &b.items {
+        match item {
+            Item::Param(p) => {
+                validate_param_in_body(p, "component", diags);
+            }
+            Item::Block(child) => {
+                root_count += 1;
+                validate_ui_block(child, ctx, true, diags);
+            }
+            Item::Repeat(r) => {
+                root_count += 1;
+                validate_ui_repeat(r, ctx, true, diags);
+            }
+            Item::Assign(a) => diags.push(Diagnostic::new(
+                a.span,
+                "a `component` body only accepts `param` and a single UI root node",
+            )),
+            Item::Var(v) => diags.push(Diagnostic::new(
+                v.span,
+                "`var` declarations are only allowed at the top level",
+            )),
+        }
+    }
+    if root_count == 0 {
+        diags.push(Diagnostic::new(
+            b.kind.span,
+            format!("`component {}` is missing its UI root node", b.name.as_ref().map(|n| n.text.as_str()).unwrap_or("?")),
+        ));
+    } else if root_count > 1 {
+        diags.push(Diagnostic::new(
+            b.kind.span,
+            "a `component` has exactly one UI root node; wrap siblings in a `column` or `row`",
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9: theme body
+// ---------------------------------------------------------------------------
+//
+// A `theme <name> { }` body (schema.md section 11 and themes.md):
+//
+// - Known tokens, typed: colors, fonts, sizes, `motion`, `shadow`,
+//   `extends` (theme ref), `background_image`, `icons`.
+// - Free extra tokens: a theme may add any token; they are read as
+//   `theme.<name>` in expressions. These are accepted with no shape
+//   check (expression-tolerant).
+// - `style <selector> { ... }` sub-blocks: the selector shape is
+//   validated (`.<class>`, `<node>[:state]`, `*`); body is any key
+//   = value, expression-tolerant.
+// - `component <name> { ... }` sub-blocks: a theme-local replacement
+//   component. Reuses the same body shape as a top-level component
+//   (params + exactly one UI root node). The replacement name is
+//   NOT required to match an existing component -- a theme may ship
+//   its own layout for a new slot too.
+// - A `param` or `repeat` outside a component sub-block is an error.
+
+/// Required theme tokens that must appear (directly or via a parent
+/// theme reached through `extends`). We only enforce "exists at some
+/// point in this theme or via `extends`" at a later phase; here we
+/// just type-check whatever is present. The list is used to drive
+/// shape checks and informative diagnostics.
+// Note: `background` is intentionally missing here. It's handled by
+// the explicit arm below with `ExpectedType::Any` because the
+// themes.md example lets a theme override `background` with either a
+// hex color (the Colors-group default) or a path to an image. Keeping
+// it only in the explicit arm avoids the two lists disagreeing when
+// one is edited and the other isn't.
+const THEME_COLOR_TOKENS: &[&str] = &[
+    "surface",
+    "text",
+    "muted",
+    "accent",
+    "ok",
+    "info",
+    "warning",
+    "critical",
+];
+
+const THEME_FONT_TOKENS: &[&str] = &["font_small", "font", "font_big", "font_huge"];
+
+const THEME_SIZE_TOKENS: &[&str] = &["gap", "padding", "radius", "tap_min"];
+
+fn theme_token_type(key: &str) -> Option<ExpectedType> {
+    match key {
+        "extends" => Some(ExpectedType::Ident),
+        "motion" => Some(ExpectedType::OneOf(&["full", "reduced", "none"])),
+        "shadow" => Some(ExpectedType::Str),
+        // schema.md calls `background_image` an optional path. The
+        // themes.md example also writes `background = images/bg.jpg`
+        // which overrides the Color token with a path; we accept
+        // either shape by typing both as Any.
+        "background" => Some(ExpectedType::Any),
+        "background_image" => Some(ExpectedType::Path),
+        "icons" => Some(ExpectedType::Path),
+        _ => {
+            if THEME_COLOR_TOKENS.contains(&key) {
+                Some(ExpectedType::Color)
+            } else if THEME_FONT_TOKENS.contains(&key) {
+                Some(ExpectedType::Str)
+            } else if THEME_SIZE_TOKENS.contains(&key) {
+                Some(ExpectedType::Size)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Validate the body of a `theme name { ... }`. Items are theme
+/// tokens (assigns), `style <selector> { }` sub-blocks, and theme-
+/// local replacement `component <name> { }` sub-blocks.
+fn validate_theme_body(b: &Block, ctx: &UiContext, diags: &mut Vec<Diagnostic>) {
+    for item in &b.items {
+        match item {
+            Item::Assign(a) => validate_theme_assign(a, diags),
+            Item::Block(child) => validate_theme_sub_block(child, ctx, diags),
+            Item::Param(p) => diags.push(Diagnostic::new(
+                p.span,
+                "`param` is only allowed inside a `component` body",
+            )),
+            Item::Repeat(r) => diags.push(Diagnostic::new(
+                r.span,
+                "`repeat` is not allowed inside a `theme` body",
+            )),
+            Item::Var(v) => diags.push(Diagnostic::new(
+                v.span,
+                "`var` declarations are only allowed at the top level",
+            )),
+        }
+    }
+}
+
+fn validate_theme_assign(a: &Assign, diags: &mut Vec<Diagnostic>) {
+    let AssignTarget::Simple { key } = &a.target else {
+        diags.push(Diagnostic::new(
+            a.span,
+            "qualified assignments are only allowed at the top level",
+        ));
+        return;
+    };
+    // Known token: type-check against its declared shape, with
+    // expression tolerance (a theme may interpolate another token).
+    if let Some(ty) = theme_token_type(&key.text) {
+        check_value_type(&a.value.text, a.value.span, ty, true, diags);
+        return;
+    }
+    // Unknown token name: accepted as a free extra token (schema.md
+    // section 11: "A theme may add any other token"). We still
+    // sanity-check that the key is a bare ident (the parser already
+    // ensured this) and that the value is non-empty.
+    check_value_type(&a.value.text, a.value.span, ExpectedType::Any, true, diags);
+}
+
+fn validate_theme_sub_block(child: &Block, ctx: &UiContext, diags: &mut Vec<Diagnostic>) {
+    match child.kind.text.as_str() {
+        "style" => validate_theme_style_block(child, diags),
+        "component" => validate_theme_component_block(child, ctx, diags),
+        _ => diags.push(Diagnostic::new(
+            child.kind.span,
+            format!(
+                "unknown theme sub-block `{}`; allowed: `style`, `component`",
+                child.kind.text
+            ),
+        )),
+    }
+}
+
+/// A `style <selector> { ... }` sub-block. The selector token was
+/// captured as a raw string by the lexer; validate its shape here,
+/// then accept any key = value entry in the body.
+fn validate_theme_style_block(b: &Block, diags: &mut Vec<Diagnostic>) {
+    let Some(selector) = &b.name else {
+        diags.push(Diagnostic::new(
+            b.kind.span,
+            "`style` needs a selector (`.card`, `button:pressed`, `*`, ...)",
+        ));
+        return;
+    };
+    if let Err(msg) = validate_style_selector(&selector.text) {
+        diags.push(Diagnostic::new(selector.span, msg));
+    }
+    // Each entry is key = value (expression-tolerant). Nested blocks
+    // are not permitted inside a style body.
+    for item in &b.items {
+        match item {
+            Item::Assign(a) => {
+                let AssignTarget::Simple { .. } = &a.target else {
+                    diags.push(Diagnostic::new(
+                        a.span,
+                        "a `style` body only contains simple `key = value`",
+                    ));
+                    continue;
+                };
+                check_value_type(&a.value.text, a.value.span, ExpectedType::Any, true, diags);
+            }
+            Item::Block(child) => diags.push(Diagnostic::new(
+                child.kind.span,
+                "a `style` body does not contain nested blocks",
+            )),
+            Item::Param(p) => diags.push(Diagnostic::new(
+                p.span,
+                "`param` is not allowed in a `style` body",
+            )),
+            Item::Repeat(r) => diags.push(Diagnostic::new(
+                r.span,
+                "`repeat` is not allowed in a `style` body",
+            )),
+            Item::Var(v) => diags.push(Diagnostic::new(
+                v.span,
+                "`var` declarations are only allowed at the top level",
+            )),
+        }
+    }
+}
+
+/// Shape check for a style selector. Accepts `*` (every node), `.ident`
+/// (class selector), and `ident[:state]` (node kind, with an optional
+/// pseudo-state). Multi-selector lists like `button, link` are not
+/// supported in v1 and left to a later phase; a tolerant diagnostic
+/// says so.
+fn validate_style_selector(sel: &str) -> Result<(), String> {
+    let s = sel.trim();
+    if s.is_empty() {
+        return Err("empty `style` selector".to_string());
+    }
+    if s == "*" {
+        return Ok(());
+    }
+    if s.contains(',') {
+        return Err(format!(
+            "selector lists are not supported yet; split `{s}` into separate `style` blocks"
+        ));
+    }
+    // `.class` form.
+    if let Some(rest) = s.strip_prefix('.') {
+        if !is_bare_ident(rest) {
+            return Err(format!(
+                "expected a class name after `.` (identifier), got `{s}`"
+            ));
+        }
+        return Ok(());
+    }
+    // `node[:state]` form.
+    if let Some((node, state)) = s.split_once(':') {
+        if !is_bare_ident(node) {
+            return Err(format!(
+                "expected a node kind before `:` (identifier), got `{s}`"
+            ));
+        }
+        if !matches!(state, "pressed" | "checked" | "disabled" | "focused" | "hover") {
+            return Err(format!(
+                "unknown pseudo-state `:{state}`; valid: `:pressed`, `:checked`, `:disabled`, `:focused`, `:hover`"
+            ));
+        }
+        return Ok(());
+    }
+    if !is_bare_ident(s) {
+        return Err(format!("invalid style selector `{s}`"));
+    }
+    Ok(())
+}
+
+/// A theme-local replacement `component <name> { ... }`. Same body shape
+/// as a top-level component.
+fn validate_theme_component_block(b: &Block, ctx: &UiContext, diags: &mut Vec<Diagnostic>) {
+    if b.name.is_none() {
+        diags.push(Diagnostic::new(
+            b.kind.span,
+            "a theme `component` sub-block needs a name",
+        ));
+        return;
+    }
+    validate_component_body(b, ctx, diags);
+}
+
+/// Validate one UI block. `inside_component` controls whether `slot`
+/// may appear.
+fn validate_ui_block(
+    b: &Block,
+    ctx: &UiContext,
+    inside_component: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // Action-call shortcut (block form of `on_tap`, `on_hold`, ...).
+    if EVENT_HANDLER_KINDS.contains(&b.kind.text.as_str()) {
+        validate_event_handler_block(b, ctx, diags);
+        return;
+    }
+
+    // User-defined component call.
+    if ctx.user_components.contains(&b.kind.text) {
+        validate_component_call(b, ctx, inside_component, diags);
+        return;
+    }
+
+    // Built-in UI building block.
+    let node = match ui_node_schema(&b.kind.text) {
+        Some(n) => n,
+        None => {
+            diags.push(Diagnostic::new(
+                b.kind.span,
+                format!(
+                    "unknown UI node or component `{}`",
+                    b.kind.text
+                ),
+            ));
+            return;
+        }
+    };
+
+    if node.slot_only && !inside_component {
+        diags.push(Diagnostic::new(
+            b.kind.span,
+            "`slot` is only allowed inside a `component` body",
+        ));
+    }
+    if let Some(name) = &b.name {
+        diags.push(Diagnostic::new(
+            name.span,
+            format!("`{}` does not take a name", b.kind.text),
+        ));
+    }
+
+    for item in &b.items {
+        validate_ui_item_in_body(item, node, ctx, inside_component, diags);
+    }
+}
+
+fn validate_ui_item_in_body(
+    item: &Item,
+    node: &UiNode,
+    ctx: &UiContext,
+    inside_component: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match item {
+        Item::Assign(a) => validate_ui_assign(a, node, diags),
+        Item::Block(child) => {
+            // Allowed as nested sub-block (`chart.series`)?
+            if let Some(nb) = node
+                .nested_subblocks
+                .iter()
+                .find(|n| n.kind == child.kind.text)
+            {
+                match nb.name_mode {
+                    NameMode::Required if child.name.is_none() => {
+                        diags.push(Diagnostic::new(
+                            child.kind.span,
+                            format!("`{}` block needs a name", child.kind.text),
+                        ));
+                    }
+                    NameMode::Forbidden if child.name.is_some() => {
+                        diags.push(Diagnostic::new(
+                            child.name.as_ref().unwrap().span,
+                            format!("`{}` does not take a name here", child.kind.text),
+                        ));
+                    }
+                    _ => {}
+                }
+                validate_block_body(child, nb.schema, ctx.source, diags);
+                return;
+            }
+            // Event-handler shortcut even in a terminal node? Yes, every
+            // UI node accepts `on_tap { ... }` etc.
+            if EVENT_HANDLER_KINDS.contains(&child.kind.text.as_str()) {
+                validate_event_handler_block(child, ctx, diags);
+                return;
+            }
+            // Otherwise, it's a child UI node.
+            if !node.accepts_children && !ctx.user_components.contains(&child.kind.text) {
+                diags.push(Diagnostic::new(
+                    child.kind.span,
+                    format!(
+                        "`{}` does not accept child UI nodes",
+                        node.kind
+                    ),
+                ));
+                return;
+            }
+            validate_ui_block(child, ctx, inside_component, diags);
+        }
+        Item::Repeat(r) => {
+            // `repeat` expands into child UI nodes, so a terminal node
+            // (text, icon, etc.) cannot host one.
+            if !node.accepts_children {
+                diags.push(Diagnostic::new(
+                    r.span,
+                    format!(
+                        "`{}` does not accept child UI nodes (`repeat` would produce them)",
+                        node.kind
+                    ),
+                ));
+                return;
+            }
+            validate_ui_repeat(r, ctx, inside_component, diags);
+        }
+        Item::Param(p) => diags.push(Diagnostic::new(
+            p.span,
+            "`param` is only allowed at the start of a `component` body",
+        )),
+        Item::Var(v) => diags.push(Diagnostic::new(
+            v.span,
+            "`var` declarations are only allowed at the top level",
+        )),
+    }
+}
+
+fn validate_ui_assign(a: &Assign, node: &UiNode, diags: &mut Vec<Diagnostic>) {
+    let AssignTarget::Simple { key } = &a.target else {
+        diags.push(Diagnostic::new(
+            a.span,
+            "qualified assignments are only allowed at the top level",
+        ));
+        return;
+    };
+
+    // Node-specific keys win over common keys.
+    if let Some(rule) = node.keys.iter().find(|r| r.name == key.text) {
+        check_value_type(&a.value.text, a.value.span, rule.ty, rule.expr_ok, diags);
+        return;
+    }
+    if let Some(rule) = COMMON_UI_KEYS.iter().find(|r| r.name == key.text) {
+        check_value_type(&a.value.text, a.value.span, rule.ty, rule.expr_ok, diags);
+        return;
+    }
+    // Event-handler simple-assign form is covered by COMMON_UI_KEYS
+    // (`on_tap`, `on_hold`). `on_change` / `on_submit` are node-specific
+    // and already handled above when the node declares them.
+    diags.push(Diagnostic::new(
+        key.span,
+        format!(
+            "unknown property `{}` on `{}`",
+            key.text, node.kind
+        ),
+    ));
+}
+
+fn validate_ui_repeat(
+    r: &crate::parse::Repeat,
+    ctx: &UiContext,
+    inside_component: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for item in &r.items {
+        match item {
+            Item::Block(child) => validate_ui_block(child, ctx, inside_component, diags),
+            Item::Repeat(inner) => validate_ui_repeat(inner, ctx, inside_component, diags),
+            Item::Assign(a) => diags.push(Diagnostic::new(
+                a.span,
+                "`repeat` body only contains UI nodes, not property assignments",
+            )),
+            Item::Param(p) => diags.push(Diagnostic::new(
+                p.span,
+                "`param` is not allowed inside a `repeat` body",
+            )),
+            Item::Var(v) => diags.push(Diagnostic::new(
+                v.span,
+                "`var` declarations are only allowed at the top level",
+            )),
+        }
+    }
+}
+
+/// Validate the body of an `on_tap action { ... }` or inline
+/// `on_tap { goto = home }` shortcut. For a named shortcut, keys are
+/// cross-checked against the referenced action's `param` table; for an
+/// inline (nameless) shortcut, only the `INLINE_ACTION_KEYS` subset is
+/// accepted.
+fn validate_event_handler_block(b: &Block, ctx: &UiContext, diags: &mut Vec<Diagnostic>) {
+    // Named action-call: validate args against that action's params.
+    if let Some(action_name) = &b.name {
+        // Only validate if the action exists; otherwise the Phase 7
+        // cross-ref resolver will already have flagged the unknown
+        // action name on the block header.
+        if let Some(specs) = ctx.params.actions.get(action_name.text.as_str()) {
+            validate_arg_body(b, specs, &b.kind.text, &action_name.text, ctx, diags);
+        }
+        return;
+    }
+
+    // Nameless inline shortcut.
+    for item in &b.items {
+        match item {
+            Item::Assign(a) => {
+                let AssignTarget::Simple { key } = &a.target else {
+                    diags.push(Diagnostic::new(
+                        a.span,
+                        "an action-call body only contains simple `key = value`",
+                    ));
+                    continue;
+                };
+                if !INLINE_ACTION_KEYS.contains(&key.text.as_str()) {
+                    diags.push(Diagnostic::new(
+                        key.span,
+                        format!(
+                            "unknown inline action key `{}`; valid: {}",
+                            key.text,
+                            INLINE_ACTION_KEYS
+                                .iter()
+                                .map(|k| format!("`{k}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ));
+                }
+            }
+            Item::Block(child) => {
+                // Inline actions can hold `set { var = val }` or
+                // `env { KEY = val }` sub-blocks, matching the full
+                // action grammar.
+                match child.kind.text.as_str() {
+                    "set" => validate_block_body(child, SET_BLOCK, ctx.source, diags),
+                    "env" => validate_block_body(child, ENV_BLOCK, ctx.source, diags),
+                    _ => diags.push(Diagnostic::new(
+                        child.kind.span,
+                        format!(
+                            "`{}` is not valid inside an inline action; use `set` or `env`",
+                            child.kind.text
+                        ),
+                    )),
+                }
+            }
+            _ => diags.push(Diagnostic::new(
+                item.span(),
+                "an action-call body only contains `key = value` entries",
+            )),
+        }
+    }
+}
+
+/// Validate a user-component call block (`stat_tile { label = CPU; ... }`).
+/// Items are a mix of param args (simple assigns matching a param name),
+/// common UI properties applied to the component's root (section 7),
+/// event-handler assigns, nested event-handler blocks, and child UI
+/// nodes going into the component's `slot`.
+fn validate_component_call(
+    b: &Block,
+    ctx: &UiContext,
+    inside_component: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    if let Some(name) = &b.name {
+        diags.push(Diagnostic::new(
+            name.span,
+            format!("`{}` does not take a name", b.kind.text),
+        ));
+    }
+
+    let specs = ctx
+        .params
+        .components
+        .get(b.kind.text.as_str())
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    validate_arg_body(b, specs, "component", &b.kind.text, ctx, diags);
+    // Still walk child UI nodes so misuses inside them surface (and
+    // event-handler blocks get their own typed arg check).
+    for item in &b.items {
+        match item {
+            Item::Block(child) => {
+                if EVENT_HANDLER_KINDS.contains(&child.kind.text.as_str()) {
+                    // Already validated via validate_arg_body's arg
+                    // walk (block args are not arg values); fall through
+                    // to the event-handler validator for its body.
+                    validate_event_handler_block(child, ctx, diags);
+                } else {
+                    // A child UI node going into the component's slot.
+                    validate_ui_block(child, ctx, inside_component, diags);
+                }
+            }
+            Item::Repeat(r) => validate_ui_repeat(r, ctx, inside_component, diags),
+            _ => {}
+        }
+    }
+}
+
+/// Shared validator for the arg body of a user-component call or a named
+/// action-call shortcut. `kind_label` is "component" or an event-handler
+/// name (`on_tap`, ...); `call_name` is the component / action name.
+fn validate_arg_body(
+    b: &Block,
+    specs: &[ParamSpec],
+    kind_label: &str,
+    call_name: &str,
+    ctx: &UiContext,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let is_component = kind_label == "component";
+    let mut seen: HashMap<String, Span> = HashMap::new();
+    for item in &b.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key } = &a.target else {
+            diags.push(Diagnostic::new(
+                a.span,
+                "an action/component call only contains simple `key = value` args",
+            ));
+            continue;
+        };
+        if seen.contains_key(&key.text) {
+            diags.push(Diagnostic::new(
+                key.span,
+                format!("arg `{}` is already set", key.text),
+            ));
+            continue;
+        }
+
+        // On a component call, common UI properties and event handlers
+        // apply to the root node (section 7). A simple event-handler
+        // assign is validated as an action-ref literal.
+        if is_component {
+            if let Some(rule) = COMMON_UI_KEYS.iter().find(|r| r.name == key.text) {
+                seen.insert(key.text.clone(), key.span);
+                check_value_type(&a.value.text, a.value.span, rule.ty, rule.expr_ok, diags);
+                continue;
+            }
+            if EVENT_HANDLER_KINDS.contains(&key.text.as_str()) {
+                seen.insert(key.text.clone(), key.span);
+                check_value_type(&a.value.text, a.value.span, ExpectedType::Ident, true, diags);
+                continue;
+            }
+        }
+
+        let Some(spec) = specs.iter().find(|s| s.name == key.text) else {
+            diags.push(Diagnostic::new(
+                key.span,
+                format!(
+                    "unknown arg `{}` for {}; valid args: {}",
+                    key.text,
+                    call_label(kind_label, call_name),
+                    format_param_list(specs)
+                ),
+            ));
+            continue;
+        };
+        seen.insert(spec.name.clone(), key.span);
+        check_param_arg(&a.value.text, a.value.span, spec, ctx.names, diags);
+    }
+
+    // Report missing required args (no default, no `ask`).
+    for spec in specs.iter() {
+        if spec.has_default || spec.asked {
+            continue;
+        }
+        if !seen.contains_key(&spec.name) {
+            diags.push(Diagnostic::new(
+                b.kind.span,
+                format!(
+                    "{} is missing required arg `{}` ({})",
+                    call_label(kind_label, call_name),
+                    spec.name,
+                    param_type_name(spec.ty)
+                ),
+            ));
+        }
+    }
+}
+
+fn call_label(kind_label: &str, call_name: &str) -> String {
+    if kind_label == "component" {
+        format!("component `{call_name}`")
+    } else {
+        format!("action `{call_name}` (called from `{kind_label}`)")
+    }
+}
+
+fn format_param_list(specs: &[ParamSpec]) -> String {
+    if specs.is_empty() {
+        return "(none)".to_string();
+    }
+    specs
+        .iter()
+        .map(|s| format!("`{}`", s.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: cross-reference resolution
+// ---------------------------------------------------------------------------
+//
+// After the structural + per-key checks, walk the AST once more to
+// resolve name references:
+//
+// - `on_tap` / `on_hold` / `on_change` / `on_submit` / `button.action`
+//   / `alert.action` / `action.then` / `action.else` = action name (or
+//   `none`).
+// - `action.refresh` = source name, or a list of them.
+// - `alert.from` = source name.
+// - `screen.theme`, `screen.night.theme` = theme name.
+// - `app.start_page` and any `goto = ...` = page name (or `back`).
+// - `security.pin` = secret name.
+//
+// Values that are `{{ ... }}` expressions are skipped; CEL will type
+// them later. The identifier `none` short-circuits action refs,
+// `back` short-circuits page refs. If a name is written literally and
+// isn't in the collected table, we emit a diagnostic.
+
+#[derive(Default)]
+struct Names {
+    sources: std::collections::HashSet<String>,
+    actions: std::collections::HashSet<String>,
+    pages: std::collections::HashSet<String>,
+    themes: std::collections::HashSet<String>,
+    secrets: std::collections::HashSet<String>,
+}
+
+fn collect_names(doc: &Document) -> Names {
+    let mut n = Names::default();
+    for item in &doc.items {
+        let Item::Block(b) = item else { continue };
+        let Some(name) = &b.name else { continue };
+        match b.kind.text.as_str() {
+            "source" => {
+                n.sources.insert(name.text.clone());
+            }
+            "action" => {
+                n.actions.insert(name.text.clone());
+            }
+            "page" => {
+                n.pages.insert(name.text.clone());
+            }
+            "theme" => {
+                n.themes.insert(name.text.clone());
+            }
+            "secret" => {
+                n.secrets.insert(name.text.clone());
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
+#[derive(Copy, Clone)]
+enum RefKind {
+    Action,
+    Source,
+    SourceList,
+    Page,
+    Theme,
+    Secret,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8: param tables for component and action calls
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum ParamType {
+    /// A regular typed value (string, int, number, bool, duration, color,
+    /// size, list, any).
+    Expected(ExpectedType),
+    /// `param foo: action` -- the arg is an action reference (bare
+    /// identifier or `{{ expr }}`); bare identifiers are cross-referenced
+    /// against the collected action names, with `none` as a short-circuit.
+    ActionRef,
+    /// `param foo: source` -- source reference, same shape as above
+    /// without the `none` short-circuit.
+    SourceRef,
+}
+
+#[derive(Clone, Debug)]
+struct ParamSpec {
+    name: String,
+    ty: ParamType,
+    /// The param has a `= default`, so it is optional at the call site.
+    has_default: bool,
+    /// The param has an `ask = ...` option; the runtime prompts for it
+    /// when the caller omits the arg (actions only, per schema.md
+    /// section 6), so it is treated as optional too.
+    asked: bool,
+    /// Span of the `param` keyword, for "declared at" cross-references.
+    #[allow(dead_code)]
+    span: Span,
+}
+
+#[derive(Default)]
+struct Params {
+    components: HashMap<String, Vec<ParamSpec>>,
+    actions: HashMap<String, Vec<ParamSpec>>,
+}
+
+/// Map the identifier after `:` in `param foo: TYPE` to a [`ParamType`].
+/// Returns `None` for an unknown type (the caller reports it).
+fn param_type_from_ident(s: &str) -> Option<ParamType> {
+    use ExpectedType as E;
+    Some(match s {
+        "string" => ParamType::Expected(E::Str),
+        "int" => ParamType::Expected(E::Int),
+        "number" => ParamType::Expected(E::Number),
+        "bool" => ParamType::Expected(E::Bool),
+        "duration" => ParamType::Expected(E::Dur),
+        "color" => ParamType::Expected(E::Color),
+        "size" => ParamType::Expected(E::Size),
+        "list" => ParamType::Expected(E::List),
+        "any" => ParamType::Expected(E::Any),
+        "action" => ParamType::ActionRef,
+        "source" => ParamType::SourceRef,
+        _ => return None,
+    })
+}
+
+/// Describe a [`ParamType`] in human words for diagnostics. The
+/// article-less `action name` / `source name` match the shape of
+/// `type_name`'s "an integer" / "a number" so the caller can inline
+/// either directly without stacking two articles.
+fn param_type_name(ty: ParamType) -> &'static str {
+    match ty {
+        ParamType::Expected(e) => type_name(e),
+        ParamType::ActionRef => "action name",
+        ParamType::SourceRef => "source name",
+    }
+}
+
+/// Collect `param` declarations from every top-level `component` and
+/// `action` body. Unknown type names and duplicate param names in a
+/// single declaration list are flagged here; a param without `: type`
+/// (parser-level error) is skipped.
+fn collect_params(doc: &Document, source: &SourceMap, diags: &mut Vec<Diagnostic>) -> Params {
+    let mut params = Params::default();
+    for item in &doc.items {
+        let Item::Block(b) = item else { continue };
+        let (bucket, parent) = match b.kind.text.as_str() {
+            "component" => (&mut params.components, "component"),
+            "action" => (&mut params.actions, "action"),
+            _ => continue,
+        };
+        let Some(name) = &b.name else { continue };
+        let specs = collect_params_in_body(b, parent, source, diags);
+        bucket.insert(name.text.clone(), specs);
+    }
+    params
+}
+
+fn collect_params_in_body(
+    b: &Block,
+    parent: &str,
+    source: &SourceMap,
+    diags: &mut Vec<Diagnostic>,
+) -> Vec<ParamSpec> {
+    let mut specs: Vec<ParamSpec> = Vec::new();
+    let mut seen: HashMap<String, Span> = HashMap::new();
+    for item in &b.items {
+        let Item::Param(p) = item else { continue };
+        if let Some(prev) = seen.get(&p.name.text) {
+            diags.push(Diagnostic::new(
+                p.name.span,
+                format!(
+                    "`param {}` is already declared (first at {})",
+                    p.name.text,
+                    source.location(*prev)
+                ),
+            ));
+            continue;
+        }
+        // Reject component params whose name collides with a common UI
+        // property or an event-handler key: on a component call the
+        // common-key lookup wins, so the param would be unreachable
+        // and silently return a type-mismatch for a value the user
+        // typed against the param's declared type (schema.md section
+        // 7 says common props on a call apply to the component's
+        // root).
+        if parent == "component" {
+            if COMMON_UI_KEYS.iter().any(|r| r.name == p.name.text) {
+                diags.push(Diagnostic::new(
+                    p.name.span,
+                    format!(
+                        "`param {}` conflicts with the common UI property `{0}`; pick a different name",
+                        p.name.text
+                    ),
+                ));
+                continue;
+            }
+            if EVENT_HANDLER_KINDS.contains(&p.name.text.as_str()) {
+                diags.push(Diagnostic::new(
+                    p.name.span,
+                    format!(
+                        "`param {}` conflicts with the event-handler key `{0}`; pick a different name",
+                        p.name.text
+                    ),
+                ));
+                continue;
+            }
+        }
+        let ty = match param_type_from_ident(&p.ty.text) {
+            Some(t) => t,
+            None => {
+                diags.push(Diagnostic::new(
+                    p.ty.span,
+                    format!(
+                        "unknown param type `{}`; valid: string, int, number, bool, duration, color, size, list, action, source, any",
+                        p.ty.text
+                    ),
+                ));
+                // Fall back to `any` so later checks don't double-fire.
+                ParamType::Expected(ExpectedType::Any)
+            }
+        };
+        let asked = p
+            .options
+            .as_ref()
+            .map(options_has_ask)
+            .unwrap_or(false);
+        seen.insert(p.name.text.clone(), p.name.span);
+        specs.push(ParamSpec {
+            name: p.name.text.clone(),
+            ty,
+            has_default: p.default.is_some(),
+            asked,
+            span: p.span,
+        });
+    }
+    specs
+}
+
+fn options_has_ask(opts: &OptionsBlock) -> bool {
+    for item in &opts.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key } = &a.target else {
+            continue;
+        };
+        if key.text == "ask" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validate a call-site arg value against the declared param type. For
+/// `action` / `source` params, cross-references bare identifiers against
+/// the collected names; `{{ expr }}` is accepted as opaque.
+fn check_param_arg(
+    value_text: &str,
+    value_span: Span,
+    spec: &ParamSpec,
+    names: &Names,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match spec.ty {
+        ParamType::Expected(ty) => {
+            check_value_type(value_text, value_span, ty, true, diags);
+        }
+        ParamType::ActionRef => {
+            // Bare ident is a reference. `{{ expr }}` is accepted
+            // opaquely (CEL phase will type it).
+            match classify(value_text) {
+                ValueShape::Expression(_) | ValueShape::Interp(_) => {}
+                ValueShape::Literal(text) => {
+                    let t = text.trim();
+                    if t == "none" {
+                        return;
+                    }
+                    if !is_bare_ident(t) {
+                        diags.push(Diagnostic::new(
+                            value_span,
+                            format!(
+                                "expected an action name for `{}` (bare identifier or `{{{{ expr }}}}`), got `{text}`",
+                                spec.name
+                            ),
+                        ));
+                        return;
+                    }
+                    if !names.actions.contains(t) {
+                        diags.push(Diagnostic::new(
+                            value_span,
+                            format!("unknown action `{t}`"),
+                        ));
+                    }
+                }
+            }
+        }
+        ParamType::SourceRef => {
+            match classify(value_text) {
+                ValueShape::Expression(_) | ValueShape::Interp(_) => {}
+                ValueShape::Literal(text) => {
+                    let t = text.trim();
+                    if !is_bare_ident(t) {
+                        diags.push(Diagnostic::new(
+                            value_span,
+                            format!(
+                                "expected a source name for `{}` (bare identifier or `{{{{ expr }}}}`), got `{text}`",
+                                spec.name
+                            ),
+                        ));
+                        return;
+                    }
+                    if !names.sources.contains(t) {
+                        diags.push(Diagnostic::new(
+                            value_span,
+                            format!("unknown source `{t}`"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn resolve_refs(doc: &Document, names: &Names, diags: &mut Vec<Diagnostic>) {
+    for item in &doc.items {
+        match item {
+            Item::Block(b) => resolve_refs_in_block(b, &b.kind.text, names, diags),
+            // Top-level qualified / indexed shorthand carries the same
+            // ref-containing keys as the opened form, so route them
+            // through the shared dispatcher.
+            Item::Assign(a) => match &a.target {
+                AssignTarget::Qualified { category, key } => {
+                    resolve_ref_shorthand(&category.text, key, &a.value, names, diags);
+                }
+                AssignTarget::Indexed { kind, key, .. } => {
+                    resolve_ref_shorthand(&kind.text, key, &a.value, names, diags);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn resolve_ref_shorthand(
+    parent_kind: &str,
+    key: &crate::parse::Ident,
+    value: &crate::parse::RawValue,
+    names: &Names,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(kind) = assign_ref_kind(parent_kind, &key.text) else {
+        return;
+    };
+    if matches!(
+        crate::value::classify(&value.text),
+        crate::value::ValueShape::Expression(_) | crate::value::ValueShape::Interp(_)
+    ) {
+        return;
+    }
+    match kind {
+        RefKind::SourceList => check_source_list(&value.text, value.span, names, diags),
+        _ => check_ref_name(&value.text, value.span, kind, names, diags),
+    }
+}
+
+fn resolve_refs_in_block(
+    b: &Block,
+    parent_kind: &str,
+    names: &Names,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // Block-header refs: `on_tap action_name { ... }`, `then foo { ... }`,
+    // etc. The `name` identifier (when present) is a ref.
+    if let Some(name) = &b.name {
+        if let Some(kind) = block_name_ref_kind(parent_kind, &b.kind.text) {
+            check_ref_name(&name.text, name.span, kind, names, diags);
+        }
+    }
+
+    for item in &b.items {
+        resolve_refs_in_item(item, &b.kind.text, names, diags);
+    }
+}
+
+fn resolve_refs_in_item(
+    item: &Item,
+    parent_kind: &str,
+    names: &Names,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match item {
+        Item::Assign(a) => resolve_refs_in_assign(a, parent_kind, names, diags),
+        Item::Block(child) => resolve_refs_in_block(child, parent_kind, names, diags),
+        Item::Repeat(r) => {
+            for inner in &r.items {
+                resolve_refs_in_item(inner, parent_kind, names, diags);
+            }
+        }
+        Item::Param(p) => {
+            if let Some(opts) = &p.options {
+                for inner in &opts.items {
+                    resolve_refs_in_item(inner, "param", names, diags);
+                }
+            }
+        }
+        Item::Var(_) => {}
+    }
+}
+
+fn resolve_refs_in_assign(
+    a: &Assign,
+    parent_kind: &str,
+    names: &Names,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let AssignTarget::Simple { key } = &a.target else {
+        return;
+    };
+    let kind = match assign_ref_kind(parent_kind, &key.text) {
+        Some(k) => k,
+        None => return,
+    };
+    // Expressions and interpolated text are opaque at this layer.
+    if matches!(
+        crate::value::classify(&a.value.text),
+        crate::value::ValueShape::Expression(_) | crate::value::ValueShape::Interp(_)
+    ) {
+        return;
+    }
+    match kind {
+        RefKind::SourceList => check_source_list(&a.value.text, a.value.span, names, diags),
+        _ => check_ref_name(&a.value.text, a.value.span, kind, names, diags),
+    }
+}
+
+/// Keys whose assigned value is a reference, by parent block kind.
+fn assign_ref_kind(parent_kind: &str, key: &str) -> Option<RefKind> {
+    // UI-tree event handlers and `goto` are context-independent.
+    match key {
+        "on_tap" | "on_hold" | "on_change" | "on_submit" => return Some(RefKind::Action),
+        "goto" => return Some(RefKind::Page),
+        _ => {}
+    }
+    match (parent_kind, key) {
+        ("action", "then") | ("action", "else") => Some(RefKind::Action),
+        ("action", "refresh") => Some(RefKind::SourceList),
+        ("alert", "from") => Some(RefKind::Source),
+        ("alert", "action") => Some(RefKind::Action),
+        ("screen", "theme") => Some(RefKind::Theme),
+        ("night", "theme") => Some(RefKind::Theme),
+        ("app", "start_page") => Some(RefKind::Page),
+        ("security", "pin") => Some(RefKind::Secret),
+        ("button", "action") => Some(RefKind::Action),
+        _ => None,
+    }
+}
+
+/// Block-header refs: for `kind name { ... }` inside a parent, what
+/// kind of name is `name`?
+fn block_name_ref_kind(parent_kind: &str, child_kind: &str) -> Option<RefKind> {
+    match child_kind {
+        "on_tap" | "on_hold" | "on_change" | "on_submit" => return Some(RefKind::Action),
+        _ => {}
+    }
+    match (parent_kind, child_kind) {
+        ("action", "then") | ("action", "else") => Some(RefKind::Action),
+        _ => None,
+    }
+}
+
+fn check_ref_name(
+    text: &str,
+    span: Span,
+    kind: RefKind,
+    names: &Names,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let t = text.trim();
+    // Short-circuits defined by the spec.
+    match kind {
+        RefKind::Action if t == "none" => return,
+        RefKind::Page if t == "back" => return,
+        _ => {}
+    }
+    if t.is_empty() {
+        return;
+    }
+    if !is_bare_ident(t) {
+        // The per-key validator already flagged shape issues; don't
+        // double-report.
+        return;
+    }
+    let (table, label) = match kind {
+        RefKind::Action => (&names.actions, "action"),
+        RefKind::Source => (&names.sources, "source"),
+        RefKind::SourceList => unreachable!("handled in check_source_list"),
+        RefKind::Page => (&names.pages, "page"),
+        RefKind::Theme => (&names.themes, "theme"),
+        RefKind::Secret => (&names.secrets, "secret"),
+    };
+    if !table.contains(t) {
+        diags.push(Diagnostic::new(
+            span,
+            format!("unknown {label} `{t}`"),
+        ));
+    }
+}
+
+fn check_source_list(
+    text: &str,
+    span: Span,
+    names: &Names,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let t = text.trim();
+    if t.is_empty() {
+        return;
+    }
+    // Either a single ident or a `[a, b, c]` literal.
+    let items = match crate::value::split_list(t) {
+        Some(items) => items,
+        None => vec![t.to_string()],
+    };
+    // Collect missing names, dedup while preserving order so one
+    // diagnostic lists them all at the value's span.
+    let mut missing: Vec<String> = Vec::new();
+    for item in items {
+        let item = item.trim();
+        if item.is_empty() || !is_bare_ident(item) {
+            continue;
+        }
+        if !names.sources.contains(item) && !missing.iter().any(|m| m == item) {
+            missing.push(item.to_string());
+        }
+    }
+    if missing.is_empty() {
+        return;
+    }
+    let msg = if missing.len() == 1 {
+        format!("unknown source `{}` in `refresh`", missing[0])
+    } else {
+        let list = missing
+            .iter()
+            .map(|m| format!("`{m}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("unknown sources in `refresh`: {list}")
+    };
+    diags.push(Diagnostic::new(span, msg));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10: CEL parse + source cross-reference
+// ---------------------------------------------------------------------------
+//
+// Walk the whole AST and, for every raw-value text or `{{ ... }}`
+// expression on a `repeat`, parse the embedded CEL. Surface parse
+// errors with file:line:col, and cross-reference `sources.<name>`
+// against the collected source names.
+
+fn check_cel_in_doc(doc: &Document, names: &Names, diags: &mut Vec<Diagnostic>) {
+    for item in &doc.items {
+        check_cel_in_item(item, names, diags);
+    }
+}
+
+fn check_cel_in_item(item: &Item, names: &Names, diags: &mut Vec<Diagnostic>) {
+    match item {
+        Item::Assign(a) => check_cel_in_raw_value(&a.value, names, diags),
+        Item::Block(b) => {
+            for child in &b.items {
+                check_cel_in_item(child, names, diags);
+            }
+        }
+        Item::Repeat(r) => {
+            // The repeat source is already a parsed Expr (body + full span).
+            let body_offset = r.source.span.start + 2; // past `{{`
+            let (expr, mut ds) =
+                crate::cel::parse_fragment(&r.source.body, r.source.span.file, body_offset);
+            diags.append(&mut ds);
+            if let Some(e) = &expr {
+                crate::cel::walk_source_refs(e, &names.sources, diags);
+            }
+            for inner in &r.items {
+                check_cel_in_item(inner, names, diags);
+            }
+        }
+        Item::Param(p) => {
+            if let Some(default) = &p.default {
+                check_cel_in_raw_value(default, names, diags);
+            }
+            if let Some(opts) = &p.options {
+                for inner in &opts.items {
+                    check_cel_in_item(inner, names, diags);
+                }
+            }
+        }
+        Item::Var(v) => check_cel_in_raw_value(&v.default, names, diags),
+    }
+}
+
+fn check_cel_in_raw_value(
+    v: &crate::parse::RawValue,
+    names: &Names,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match classify(&v.text) {
+        ValueShape::Literal(_) => {}
+        ValueShape::Expression(body) => {
+            // Translate the body's byte offset back to the enclosing
+            // file. The lexer trims only ` ` and `\t` off the value
+            // span, but `classify` runs `.trim()` which also strips
+            // `\r` and other whitespace from the text before matching
+            // `{{...}}`. Re-locating `{{` in the un-further-trimmed
+            // `v.text` and adding 2 (for the `{{`) therefore maps to
+            // the first byte of the body in the file regardless of
+            // which flavor of leading whitespace classify's trim
+            // dropped. If the shape is Expression, `find("{{")` is
+            // guaranteed to succeed; the `.unwrap_or(0)` is defensive.
+            let open_idx = v.text.find("{{").unwrap_or(0);
+            let body_offset = v.span.start + open_idx as u32 + 2;
+            let (expr, mut ds) =
+                crate::cel::parse_fragment(body, v.span.file, body_offset);
+            diags.append(&mut ds);
+            if let Some(e) = expr {
+                crate::cel::walk_source_refs(&e, &names.sources, diags);
+            }
+        }
+        ValueShape::Interp(_) => {
+            // Multi-fragment: walk each `{{ ... }}` in the trimmed text.
+            // The trimmed text begins at `v.span.start` (the lexer
+            // already trimmed leading / trailing whitespace from the
+            // span), so each fragment's local offset maps directly.
+            let (exprs, mut ds) =
+                crate::cel::parse_interp(&v.text, v.span.file, v.span.start);
+            diags.append(&mut ds);
+            for e in &exprs {
+                crate::cel::walk_source_refs(e, &names.sources, diags);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::load;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static N: AtomicUsize = AtomicUsize::new(0);
+
+    fn tmp_file(label: &str, text: &str) -> PathBuf {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("testdata");
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let dir = base.join(format!("paneld-sch-{label}-{pid}-{n}"));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("root.conf");
+        fs::write(&p, text).unwrap();
+        p
+    }
+
+    fn check_text(text: &str) -> Vec<String> {
+        let p = tmp_file("one", text);
+        let (map, doc, mut diags) = load(&p).unwrap();
+        diags.extend(check(&doc, &map));
+        let out: Vec<_> = diags
+            .iter()
+            .map(|d| format!("{}: {}", map.location(d.span), d.message))
+            .collect();
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+        out
+    }
+
+    fn assert_msg(diags: &[String], needle: &str) {
+        assert!(
+            diags.iter().any(|m| m.contains(needle)),
+            "no diagnostic contained `{needle}`; diags: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn clean_doc_has_no_diagnostics() {
+        let text = r#"
+secret adguard { env = ADGUARD_AUTH }
+source cpu_temp {
+    poll  = 30s
+    run   = cat /sys/x
+    parse = number
+    value = {{ out / 1000.0 }}
+}
+screen { idle = 2m }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn unknown_top_level_item_is_flagged() {
+        let diags = check_text("wat home { }\n");
+        assert_msg(&diags, "unknown top-level item `wat`");
+    }
+
+    #[test]
+    fn named_kind_without_name_is_flagged() {
+        let diags = check_text("source { run = cat /x }\n");
+        assert_msg(&diags, "`source` needs a name");
+    }
+
+    #[test]
+    fn category_kind_with_name_is_flagged() {
+        let diags = check_text("screen home { idle = 2m }\n");
+        assert_msg(&diags, "settings block");
+    }
+
+    #[test]
+    fn duplicate_named_item_is_flagged() {
+        let diags = check_text("source cpu { run = a }\nsource cpu { run = b }\n");
+        assert_msg(&diags, "`source cpu` is already defined");
+    }
+
+    #[test]
+    fn unknown_top_level_option_is_flagged() {
+        let diags = check_text("whatever = 3\n");
+        assert_msg(&diags, "unknown top-level option `whatever`");
+    }
+
+    #[test]
+    fn param_at_top_level_is_flagged() {
+        let diags = check_text("param x: int = 1\n");
+        assert_msg(&diags, "`param` is only allowed");
+    }
+
+    #[test]
+    fn repeat_at_top_level_is_flagged() {
+        let diags = check_text("repeat x in {{ 1 }} { }\n");
+        assert_msg(&diags, "`repeat` is only allowed");
+    }
+
+    #[test]
+    fn category_qualifier_with_unknown_category_is_flagged() {
+        let diags = check_text("foo:bar = 1\n");
+        assert_msg(&diags, "unknown settings category `foo`");
+    }
+
+    #[test]
+    fn indexed_qualifier_on_category_suggests_colon_form() {
+        let diags = check_text("screen[home]:idle = 2m\n");
+        assert_msg(&diags, "settings block");
+        assert_msg(&diags, "screen:key");
+    }
+
+    #[test]
+    fn indexed_qualifier_with_unknown_kind_is_flagged() {
+        let diags = check_text("widget[foo]:x = 1\n");
+        assert_msg(&diags, "unknown item kind `widget`");
+    }
+
+    #[test]
+    fn top_level_var_declaration_is_accepted() {
+        let diags = check_text("var tab: int = 0\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    // --- Phase 5: per-key validation ---
+
+    #[test]
+    fn source_without_run_is_flagged() {
+        let diags = check_text("source cpu { poll = 30s }\n");
+        assert_msg(&diags, "missing required key `run`");
+    }
+
+    #[test]
+    fn source_unknown_key_is_flagged() {
+        let diags = check_text("source cpu { run = cat; nope = 1 }\n");
+        assert_msg(&diags, "unknown key `nope`");
+    }
+
+    #[test]
+    fn source_bad_parse_mode_is_flagged() {
+        let diags = check_text("source cpu { run = cat; parse = xml }\n");
+        assert_msg(&diags, "expected one of");
+        assert_msg(&diags, "got `xml`");
+    }
+
+    #[test]
+    fn source_bad_duration_is_flagged() {
+        let diags = check_text("source cpu { run = cat; poll = soon }\n");
+        assert_msg(&diags, "expected a duration");
+    }
+
+    #[test]
+    fn source_bool_valid() {
+        let diags = check_text("source cpu { run = cat; stream = true }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn source_bool_invalid() {
+        let diags = check_text("source cpu { run = cat; stream = yes }\n");
+        assert_msg(&diags, "expected a bool");
+    }
+
+    #[test]
+    fn source_env_subblock_accepted() {
+        let diags = check_text("source cpu { run = cat; env { KEY = value } }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn source_unknown_subblock_flagged() {
+        let diags = check_text("source cpu { run = cat; wat { x = 1 } }\n");
+        assert_msg(&diags, "unknown nested block `wat`");
+    }
+
+    #[test]
+    fn screen_night_subblock_accepted() {
+        let diags = check_text(
+            "theme dim { }\nscreen { idle = 2m; night { from = 22:00; to = 07:00; theme = dim } }\n",
+        );
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn screen_night_unknown_key_flagged() {
+        let diags = check_text("screen { night { nope = 1 } }\n");
+        assert_msg(&diags, "unknown key `nope`");
+    }
+
+    #[test]
+    fn screen_bad_first_tap_flagged() {
+        let diags = check_text("screen { first_tap = never }\n");
+        assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
+    fn display_rotation_valid_values() {
+        let diags = check_text("display { rotation = 90 }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn display_bad_backend_flagged() {
+        let diags = check_text("display { backend = qt }\n");
+        assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
+    fn app_log_level_valid() {
+        let diags = check_text("app { log = debug }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn app_bad_log_level_flagged() {
+        let diags = check_text("app { log = verbose }\n");
+        assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
+    fn app_max_output_bytes_valid() {
+        let diags = check_text("app { max_output = 2MiB }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn app_bad_bytes_flagged() {
+        let diags = check_text("app { max_output = 2gigs }\n");
+        assert_msg(&diags, "expected a byte count");
+    }
+
+    #[test]
+    fn secret_env_only_valid() {
+        let diags = check_text("secret s { env = X }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn secret_both_env_and_file_flagged() {
+        let diags = check_text("secret s { env = X; file = /r }\n");
+        assert_msg(&diags, "must set only one of `env` or `file`");
+    }
+
+    #[test]
+    fn secret_neither_env_nor_file_flagged() {
+        let diags = check_text("secret s { }\n");
+        assert_msg(&diags, "must set exactly one of `env` or `file`");
+    }
+
+    #[test]
+    fn action_param_options_accepted() {
+        let text = r#"
+action pause {
+    param minutes: int { ask = select; options = [5, 30]; label = Minutes }
+    run = sh -c 'echo'
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn action_param_bad_ask_flagged() {
+        let text = r#"
+action a {
+    param x: int { ask = nope }
+    run = sh -c 'echo'
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
+    fn action_param_unknown_option_flagged() {
+        let text = r#"
+action a {
+    param x: int { squiggle = yes }
+    run = sh -c 'echo'
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown `param` option `squiggle`");
+    }
+
+    #[test]
+    fn expression_value_ok_where_allowed() {
+        let text = r#"
+source cpu {
+    run = cat
+    value = {{ out / 1000.0 }}
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn expression_not_ok_for_duration() {
+        let diags = check_text("source cpu { run = cat; poll = {{ x }} }\n");
+        assert_msg(&diags, "expressions are not accepted");
+    }
+
+    #[test]
+    fn qualified_top_level_assignment_is_validated() {
+        let diags = check_text("screen:idle = soon\n");
+        assert_msg(&diags, "expected a duration");
+    }
+
+    #[test]
+    fn qualified_top_level_unknown_key_is_flagged() {
+        let diags = check_text("screen:bogus = 1\n");
+        assert_msg(&diags, "unknown key `bogus` for `screen`");
+    }
+
+    #[test]
+    fn qualified_top_level_valid_passes() {
+        let diags = check_text("screen:idle = 2m\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn indexed_top_level_assignment_is_validated() {
+        let diags = check_text("source[cpu]:parse = xml\n");
+        assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
+    fn indexed_top_level_unknown_key_is_flagged() {
+        let diags = check_text("source[cpu]:nope = 1\n");
+        assert_msg(&diags, "unknown key `nope` for `source`");
+    }
+
+    #[test]
+    fn qualified_bypass_on_unknown_category_still_flags_the_category() {
+        let diags = check_text("wat:idle = 2m\n");
+        assert_msg(&diags, "unknown settings category `wat`");
+    }
+
+    #[test]
+    fn empty_command_value_error_has_correct_grammar() {
+        let diags = check_text("source cpu { run = \"\" }\n");
+        // Should NOT say "a non-empty a command"; must read naturally.
+        assert!(
+            diags.iter().all(|m| !m.contains("non-empty a ")),
+            "double-article grammar bug returned: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn component_and_page_bodies_are_not_validated_yet() {
+        // Phase 6 added page/component body validation. Theme bodies
+        // remain deferred to a later phase.
+        let text = r#"
+component foo {
+    param label: string
+    row { text { value = Y } }
+}
+page home {
+    grid { columns = 3 }
+}
+theme light {
+    accent = #44aaff
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    // --- Phase 6: alert + reminder ---
+
+    #[test]
+    fn alert_valid_condition_mode() {
+        let text = r#"
+source cpu_temp { run = cat; parse = number }
+alert pi_hot {
+    when     = {{ sources.cpu_temp.value > 70 }}
+    for      = 2m
+    severity = warning
+    title    = Pi hot
+    text     = {{ round(sources.cpu_temp.value, 1) }} C
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn alert_bad_severity_flagged() {
+        let diags = check_text("alert a { severity = catastrophic }\n");
+        assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
+    fn alert_bad_duration_flagged() {
+        let diags = check_text("alert a { for = soon }\n");
+        assert_msg(&diags, "expected a duration");
+    }
+
+    #[test]
+    fn alert_unknown_key_flagged() {
+        let diags = check_text("alert a { squiggle = yes }\n");
+        assert_msg(&diags, "unknown key `squiggle`");
+    }
+
+    #[test]
+    fn reminder_valid() {
+        let text = r#"
+reminder restore_test {
+    every = 1 month
+    title = Test a restore
+    link  = https://example.org/x
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn reminder_bad_duration_flagged() {
+        let diags = check_text("reminder r { every = soon }\n");
+        assert_msg(&diags, "expected a duration");
+    }
+
+    // --- Phase 6: page body ---
+
+    #[test]
+    fn page_valid_keys_and_ui_tree() {
+        let text = r#"
+page home {
+    title = Home
+    icon  = home
+    nav   = 1
+    grid { columns = 3; text { value = Hello } }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn page_unknown_key_flagged() {
+        let diags = check_text("page home { wat = 1 }\n");
+        assert_msg(&diags, "unknown page key `wat`");
+    }
+
+    #[test]
+    fn page_bad_nav_type_flagged() {
+        let diags = check_text("page home { nav = many }\n");
+        assert_msg(&diags, "expected an integer");
+    }
+
+    // --- Phase 6: UI building blocks ---
+
+    #[test]
+    fn ui_text_valid_properties() {
+        let text = r#"
+page home {
+    text { value = Hi; align = center; overflow = dots; color = #44aaff }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn ui_text_unknown_property_flagged() {
+        let diags = check_text("page home { text { value = Hi; wibble = 1 } }\n");
+        assert_msg(&diags, "unknown property `wibble` on `text`");
+    }
+
+    #[test]
+    fn ui_text_bad_align_flagged() {
+        let diags = check_text("page home { text { align = sideways } }\n");
+        assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
+    fn ui_grid_accepts_children() {
+        let text = r#"
+page home {
+    grid {
+        columns = 3
+        text { value = A }
+        text { value = B }
+    }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn ui_text_rejects_children() {
+        let diags = check_text("page home { text { value = Hi; column { } } }\n");
+        assert_msg(&diags, "does not accept child UI nodes");
+    }
+
+    #[test]
+    fn ui_chart_series_accepted() {
+        let text = r#"
+source cpu_temp { run = cat; parse = number }
+page home {
+    chart {
+        type = line
+        series { values = {{ sources.cpu_temp.history }}; color = #44aaff }
+    }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn unknown_ui_node_flagged() {
+        let diags = check_text("page home { wobble { } }\n");
+        assert_msg(&diags, "unknown UI node or component `wobble`");
+    }
+
+    #[test]
+    fn user_component_call_is_recognized() {
+        let text = r#"
+component stat_tile {
+    param label: string
+    text { value = {{ label }} }
+}
+page home {
+    stat_tile { label = CPU }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn slot_outside_component_is_flagged() {
+        let diags = check_text("page home { slot { } }\n");
+        assert_msg(&diags, "`slot` is only allowed inside a `component`");
+    }
+
+    #[test]
+    fn slot_inside_component_is_accepted() {
+        let text = r#"
+component card {
+    column { slot { } }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn component_missing_root_is_flagged() {
+        let diags = check_text("component foo { param x: int }\n");
+        assert_msg(&diags, "missing its UI root node");
+    }
+
+    #[test]
+    fn component_multiple_roots_is_flagged() {
+        let text = r#"
+component foo {
+    text { value = A }
+    text { value = B }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "exactly one UI root node");
+    }
+
+    // --- Phase 6: event handlers ---
+
+    #[test]
+    fn on_tap_simple_assign_is_accepted() {
+        let text = r#"
+action refresh_all { run = cat }
+page home {
+    text { value = Hi; on_tap = refresh_all }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn on_tap_named_action_call_is_accepted() {
+        let text = r#"
+action vm_stop { param vm: string; run = cat }
+page home {
+    text { value = Hi; on_tap vm_stop { vm = {{ item.id }} } }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn on_tap_inline_action_valid_keys() {
+        let text = r#"
+page settings { }
+page home {
+    text { value = Hi; on_tap { goto = settings } }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn on_tap_inline_action_unknown_key_flagged() {
+        let diags = check_text("page home { text { on_tap { wobble = 1 } } }\n");
+        assert_msg(&diags, "unknown inline action key `wobble`");
+    }
+
+    // --- Phase 6: repeat ---
+
+    #[test]
+    fn on_tap_action_param_expression_is_accepted() {
+        // From schema.md section 7: a component takes `tap: action` and
+        // forwards it with `on_tap = {{ tap }}`.
+        let text = r#"
+component stat_tile {
+    param tap: action = none
+    column { on_tap = {{ tap }} }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn on_change_expression_on_toggle_is_accepted() {
+        let text = r#"
+component my_toggle {
+    param flip: action = none
+    toggle { value = true; on_change = {{ flip }} }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn repeat_in_terminal_ui_node_is_flagged() {
+        let diags = check_text(
+            "page home { text { value = Hi; repeat x in {{ xs }} { text { value = {{ x }} } } } }\n",
+        );
+        assert_msg(&diags, "`text` does not accept child UI nodes");
+    }
+
+    #[test]
+    fn invalid_hex_color_literal_is_flagged() {
+        let diags = check_text("page home { text { color = banana } }\n");
+        assert_msg(&diags, "expected a hex color");
+    }
+
+    #[test]
+    fn theme_token_color_expression_still_accepted() {
+        let text = r#"
+page home {
+    text { value = Hi; color = {{ theme.critical }} }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn repeat_in_page_body_accepted() {
+        let text = r#"
+source vms { run = cat; parse = json }
+page home {
+    grid {
+        repeat item in {{ sources.vms.value }} {
+            text { value = {{ item.name }} }
+        }
+    }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    // --- Phase 7: cross-reference resolution ---
+
+    #[test]
+    fn unknown_action_in_on_tap_is_flagged() {
+        let diags = check_text("page home { text { on_tap = ghost } }\n");
+        assert_msg(&diags, "unknown action `ghost`");
+    }
+
+    #[test]
+    fn on_tap_none_is_accepted() {
+        let diags = check_text("page home { text { on_tap = none } }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn goto_back_is_accepted() {
+        let diags = check_text("page home { text { on_tap { goto = back } } }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn goto_unknown_page_is_flagged() {
+        let diags = check_text("page home { text { on_tap { goto = somewhere } } }\n");
+        assert_msg(&diags, "unknown page `somewhere`");
+    }
+
+    #[test]
+    fn start_page_known_is_accepted() {
+        let diags = check_text("page home { }\napp { start_page = home }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn start_page_unknown_is_flagged() {
+        let diags = check_text("app { start_page = ghost }\n");
+        assert_msg(&diags, "unknown page `ghost`");
+    }
+
+    #[test]
+    fn screen_theme_known_is_accepted() {
+        let diags = check_text("theme dark { }\nscreen { theme = dark }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn screen_theme_unknown_is_flagged() {
+        let diags = check_text("screen { theme = ghost }\n");
+        assert_msg(&diags, "unknown theme `ghost`");
+    }
+
+    #[test]
+    fn alert_from_known_source_is_accepted() {
+        let text = r#"
+source ntfy { run = cat; stream = true }
+alert a { from = ntfy; severity = warning; title = Up }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn alert_from_unknown_source_is_flagged() {
+        let diags = check_text("alert a { from = ghost; severity = info; title = x }\n");
+        assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn action_refresh_single_source_resolved() {
+        let text = r#"
+source vms { run = cat }
+action pause { run = cat; refresh = vms }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn action_refresh_source_list_each_resolved() {
+        let text = r#"
+source vms { run = cat }
+source cpu { run = cat }
+action pause { run = cat; refresh = [vms, cpu] }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn action_refresh_unknown_source_in_list_flagged() {
+        let text = r#"
+source vms { run = cat }
+action pause { run = cat; refresh = [vms, ghost] }
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn action_then_simple_action_resolved() {
+        let text = r#"
+action a { run = cat }
+action b { run = cat; then = a }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn action_then_block_form_accepted() {
+        let text = r#"
+action vm_stop { param vm: string; run = cat }
+action pause { run = cat; then vm_stop { vm = foo } }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn action_then_unknown_action_flagged() {
+        let diags = check_text("action a { run = cat; then = ghost }\n");
+        assert_msg(&diags, "unknown action `ghost`");
+    }
+
+    #[test]
+    fn alert_action_known_resolved() {
+        let text = r#"
+action restart { run = cat }
+alert a { severity = info; title = x; action = restart }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn security_pin_unknown_secret_flagged() {
+        let diags = check_text("security { pin = ghost }\n");
+        assert_msg(&diags, "unknown secret `ghost`");
+    }
+
+    #[test]
+    fn security_pin_known_secret_resolved() {
+        let diags = check_text(
+            "secret pin_hash { env = PIN_HASH }\nsecurity { pin = pin_hash }\n",
+        );
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn on_change_unknown_action_flagged() {
+        let diags = check_text(
+            "page home { toggle { value = true; on_change = ghost } }\n",
+        );
+        assert_msg(&diags, "unknown action `ghost`");
+    }
+
+    #[test]
+    fn button_action_unknown_flagged() {
+        let diags = check_text("page home { button { action = ghost } }\n");
+        assert_msg(&diags, "unknown action `ghost`");
+    }
+
+    #[test]
+    fn on_tap_named_action_unknown_name_flagged() {
+        let diags = check_text("page home { text { on_tap ghost { } } }\n");
+        assert_msg(&diags, "unknown action `ghost`");
+    }
+
+    #[test]
+    fn expression_reference_is_not_checked_against_names() {
+        // `{{ ... }}` is opaque at this layer; CEL will check it.
+        let text = r#"
+page home { text { on_tap = {{ some_expr }} } }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn inline_action_set_block_accepted() {
+        let diags = check_text(
+            "page home { text { on_tap { set { tab = home } } } }\n",
+        );
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn qualified_top_level_ref_is_resolved() {
+        let diags = check_text("screen:theme = ghost\n");
+        assert_msg(&diags, "unknown theme `ghost`");
+    }
+
+    #[test]
+    fn qualified_top_level_known_ref_passes() {
+        let diags = check_text("theme dark { }\nscreen:theme = dark\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn qualified_top_level_app_start_page_ref_is_resolved() {
+        let diags = check_text("app:start_page = ghost\n");
+        assert_msg(&diags, "unknown page `ghost`");
+    }
+
+    #[test]
+    fn qualified_top_level_security_pin_ref_is_resolved() {
+        let diags = check_text("security:pin = ghost\n");
+        assert_msg(&diags, "unknown secret `ghost`");
+    }
+
+    #[test]
+    fn indexed_top_level_alert_action_ref_is_resolved() {
+        let diags = check_text("alert[a]:action = ghost\n");
+        assert_msg(&diags, "unknown action `ghost`");
+    }
+
+    #[test]
+    fn indexed_top_level_alert_from_ref_is_resolved() {
+        let diags = check_text("alert[a]:from = ghost\n");
+        assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn night_theme_known_passes() {
+        let diags = check_text(
+            "theme dim { }\nscreen { night { from = 22:00; theme = dim } }\n",
+        );
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn night_theme_unknown_is_flagged() {
+        let diags = check_text("screen { night { theme = ghost } }\n");
+        assert_msg(&diags, "unknown theme `ghost`");
+    }
+
+    #[test]
+    fn refresh_list_collapses_duplicates_into_one_diagnostic() {
+        let text = r#"
+source vms { run = cat }
+action pause { run = cat; refresh = [vms, ghost1, ghost2, ghost1] }
+"#;
+        let diags = check_text(text);
+        // One diagnostic lists both ghost1 and ghost2, no duplicates.
+        let refresh_diags: Vec<_> = diags
+            .iter()
+            .filter(|m| m.contains("refresh"))
+            .collect();
+        assert_eq!(refresh_diags.len(), 1, "diags: {diags:?}");
+        assert!(refresh_diags[0].contains("ghost1"));
+        assert!(refresh_diags[0].contains("ghost2"));
+    }
+
+    // --- Phase 8: component / action arg type-checking ---
+
+    #[test]
+    fn component_call_with_matching_args_is_accepted() {
+        let text = r#"
+component stat_tile {
+    param label: string
+    param value: number
+    text { value = {{ label }} }
+}
+page home {
+    stat_tile { label = CPU; value = 42 }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn component_call_unknown_arg_is_flagged() {
+        let text = r#"
+component stat_tile {
+    param label: string
+    text { value = {{ label }} }
+}
+page home {
+    stat_tile { label = CPU; bogus = 1 }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown arg `bogus` for component `stat_tile`");
+    }
+
+    #[test]
+    fn component_call_missing_required_arg_is_flagged() {
+        let text = r#"
+component stat_tile {
+    param label: string
+    param value: number
+    text { value = {{ label }} }
+}
+page home {
+    stat_tile { label = CPU }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(
+            &diags,
+            "component `stat_tile` is missing required arg `value`",
+        );
+    }
+
+    #[test]
+    fn component_call_param_with_default_is_optional() {
+        let text = r#"
+component stat_tile {
+    param label: string
+    param warn: number = 1e9
+    text { value = {{ label }} }
+}
+page home {
+    stat_tile { label = CPU }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn component_call_wrong_arg_type_is_flagged() {
+        let text = r#"
+component stat_tile {
+    param value: number
+    text { value = {{ value }} }
+}
+page home {
+    stat_tile { value = banana }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "expected a number, got `banana`");
+    }
+
+    #[test]
+    fn component_call_arg_expression_is_accepted() {
+        let text = r#"
+source cpu_temp { run = cat; parse = number }
+component stat_tile {
+    param value: number
+    text { value = {{ value }} }
+}
+page home {
+    stat_tile { value = {{ sources.cpu_temp.value }} }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn component_call_common_ui_property_on_root_is_accepted() {
+        // schema.md section 7: common node properties set on the call
+        // apply to the component's root node.
+        let text = r#"
+component stat_tile {
+    param label: string
+    text { value = {{ label }} }
+}
+page home {
+    stat_tile { label = CPU; width = 120; class = card }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn component_call_action_ref_arg_resolved() {
+        let text = r#"
+action refresh_all { run = cat }
+component button_x {
+    param tap: action
+    text { value = Go; on_tap = {{ tap }} }
+}
+page home {
+    button_x { tap = refresh_all }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn component_call_unknown_action_ref_arg_is_flagged() {
+        let text = r#"
+component button_x {
+    param tap: action
+    text { value = Go; on_tap = {{ tap }} }
+}
+page home {
+    button_x { tap = refresh_all }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown action `refresh_all`");
+    }
+
+    #[test]
+    fn component_call_action_ref_none_is_accepted() {
+        let text = r#"
+component button_x {
+    param tap: action = none
+    text { value = Go; on_tap = {{ tap }} }
+}
+page home {
+    button_x { tap = none }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn component_call_source_ref_arg_resolved() {
+        let text = r#"
+source cpu_temp { run = cat; parse = number }
+component gauge {
+    param src: source
+    text { value = {{ src.value }} }
+}
+page home {
+    gauge { src = cpu_temp }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn component_call_unknown_source_ref_arg_is_flagged() {
+        let text = r#"
+component gauge {
+    param src: source
+    text { value = {{ src.value }} }
+}
+page home {
+    gauge { src = ghost }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn unknown_param_type_is_flagged() {
+        let text = r#"
+component stat_tile {
+    param label: banana
+    text { value = {{ label }} }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown param type `banana`");
+    }
+
+    #[test]
+    fn named_action_call_arg_type_mismatch_is_flagged() {
+        let text = r#"
+action vm_stop { param vm: int; run = cat }
+page home {
+    text { value = Hi; on_tap vm_stop { vm = banana } }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "expected an integer, got `banana`");
+    }
+
+    #[test]
+    fn named_action_call_unknown_arg_is_flagged() {
+        let text = r#"
+action vm_stop { param vm: string; run = cat }
+page home {
+    text { value = Hi; on_tap vm_stop { bogus = 1 } }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown arg `bogus` for action `vm_stop`");
+    }
+
+    #[test]
+    fn named_action_call_missing_required_arg_is_flagged() {
+        let text = r#"
+action vm_stop { param vm: string; run = cat }
+page home {
+    text { value = Hi; on_tap vm_stop { } }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "is missing required arg `vm`");
+    }
+
+    #[test]
+    fn named_action_call_asked_param_is_optional() {
+        // schema.md section 6: a param with `ask = ...` is prompted at
+        // runtime when not passed, so it's optional at the call site.
+        let text = r#"
+action restart { param delay: int { ask = keypad }; run = cat }
+page home {
+    text { value = Hi; on_tap restart { } }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn duplicate_param_in_component_is_flagged() {
+        let text = r#"
+component stat_tile {
+    param label: string
+    param label: int
+    text { value = {{ label }} }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "`param label` is already declared");
+    }
+
+    #[test]
+    fn component_call_duplicate_arg_is_flagged() {
+        let text = r#"
+component stat_tile {
+    param label: string
+    text { value = {{ label }} }
+}
+page home {
+    stat_tile { label = CPU; label = GPU }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "arg `label` is already set");
+    }
+
+    #[test]
+    fn component_call_child_ui_node_still_walked() {
+        // Children inside a user-component call go into the component's
+        // slot. The arg check must not swallow typos inside them.
+        let text = r#"
+component card {
+    column { slot { } }
+}
+page home {
+    card { text { bad_prop = 1 } }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown property `bad_prop`");
+    }
+
+    #[test]
+    fn component_call_event_handler_arg_applies_to_root() {
+        // on_tap on a component call applies to its root node.
+        let text = r#"
+action refresh_all { run = cat }
+component card {
+    param label: string
+    text { value = {{ label }} }
+}
+page home {
+    card { label = CPU; on_tap = refresh_all }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    // --- Phase 9: theme body ---
+
+    #[test]
+    fn theme_with_known_tokens_is_accepted() {
+        let text = r#"
+theme dark {
+    background = #202020
+    accent     = #44aaff
+    text       = #e8e8e8
+    font       = roboto 16
+    gap        = 8
+    motion     = reduced
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn theme_color_token_bad_value_is_flagged() {
+        let diags = check_text("theme dark { accent = banana }\n");
+        assert_msg(&diags, "expected a hex color");
+    }
+
+    #[test]
+    fn theme_motion_bad_keyword_is_flagged() {
+        let diags = check_text("theme dark { motion = sometimes }\n");
+        assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
+    fn theme_extra_token_is_accepted() {
+        // schema.md section 11: "A theme may add any other token".
+        let text = r#"
+theme dark {
+    my_token = 42
+    other    = whatever
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn theme_style_with_class_selector_is_accepted() {
+        let text = r#"
+theme dark {
+    style .card { radius = 16; shadow = 12 }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn theme_style_with_pseudostate_selector_is_accepted() {
+        let text = r#"
+theme dark {
+    style button:pressed { scale = 0.96; background = {{ theme.accent }} }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn theme_style_with_bare_node_selector_is_accepted() {
+        let diags = check_text("theme dark { style button { radius = 8 } }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn theme_style_with_wildcard_selector_is_accepted() {
+        let diags = check_text("theme dark { style * { padding = 4 } }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn theme_style_unknown_pseudostate_is_flagged() {
+        let diags = check_text("theme dark { style button:wobble { radius = 8 } }\n");
+        assert_msg(&diags, "unknown pseudo-state");
+    }
+
+    #[test]
+    fn theme_style_selector_list_is_flagged() {
+        let diags = check_text("theme dark { style button, link { radius = 8 } }\n");
+        assert_msg(&diags, "selector lists are not supported yet");
+    }
+
+    #[test]
+    fn theme_style_body_rejects_nested_block() {
+        let diags = check_text("theme dark { style .card { foo { } } }\n");
+        assert_msg(&diags, "does not contain nested blocks");
+    }
+
+    #[test]
+    fn theme_replacement_component_is_accepted() {
+        let text = r#"
+theme glass {
+    extends = dark
+    component stat_tile {
+        param label: string
+        param value: number
+        column {
+            text { value = {{ label }} }
+            text { value = {{ string(round(value, 1)) }} }
+        }
+    }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn theme_replacement_component_without_name_is_flagged() {
+        let diags = check_text("theme dark { component { column { text { value = Hi } } } }\n");
+        assert_msg(&diags, "needs a name");
+    }
+
+    #[test]
+    fn theme_unknown_sub_block_is_flagged() {
+        let diags = check_text("theme dark { wobble { } }\n");
+        assert_msg(&diags, "unknown theme sub-block `wobble`");
+    }
+
+    #[test]
+    fn theme_param_outside_component_is_flagged() {
+        let diags = check_text("theme dark { param x: int }\n");
+        assert_msg(&diags, "`param` is only allowed inside a `component` body");
+    }
+
+    #[test]
+    fn theme_extends_simple_assign_is_accepted() {
+        let text = r#"
+theme dark { }
+theme glass { extends = dark }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn style_outside_theme_still_parses_but_flags() {
+        // `style` at top level isn't recognized as a top-level item
+        // kind. The parser handles `style <selector> { ... }`
+        // identically everywhere; the schema check flags it.
+        let diags = check_text("style .card { radius = 8 }\n");
+        assert_msg(&diags, "unknown top-level item `style`");
+    }
+
+    #[test]
+    fn style_as_an_assignment_key_still_works() {
+        // The contextual lexer must not break `style = foo` or
+        // `style:x = ...` (unlikely syntax, but we want robustness).
+        let diags = check_text("page home { text { value = Hi } }\nstyle = ignore_me\n");
+        // The second line is a top-level simple assign with an
+        // unknown key; the schema flags that, but it's not a lex
+        // error -- the selector mode was correctly suppressed.
+        assert_msg(&diags, "unknown top-level option `style`");
+    }
+
+    // --- Phase 10: CEL parse + source cross-reference ---
+
+    #[test]
+    fn cel_expression_parses_cleanly() {
+        let text = r#"
+source cpu_temp { run = cat; parse = number }
+page home {
+    text { value = {{ sources.cpu_temp.value * 1.8 + 32 }} }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn cel_unknown_source_ref_is_flagged() {
+        let text = r#"
+page home {
+    text { value = {{ sources.ghost.value }} }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn cel_parse_error_is_flagged() {
+        let diags = check_text("page home { text { value = {{ 1 + + 2 }} } }\n");
+        let has_cel = diags.iter().any(|d| d.contains("expression"));
+        assert!(has_cel, "expected a CEL diagnostic, got: {diags:?}");
+    }
+
+    #[test]
+    fn cel_in_interpolation_is_parsed() {
+        let text = r#"
+source cpu_temp { run = cat; parse = number }
+page home {
+    text { value = Temp is {{ sources.cpu_temp.value }} C }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn cel_unknown_source_in_interpolation_is_flagged() {
+        let diags = check_text(
+            "page home { text { value = Temp is {{ sources.ghost.value }} C } }\n",
+        );
+        assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn cel_in_repeat_source_is_checked() {
+        let text = r#"
+page home {
+    grid {
+        repeat item in {{ sources.ghost.value }} {
+            text { value = {{ item.name }} }
+        }
+    }
+}
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn cel_ternary_and_call_combined() {
+        let text = r#"
+source cpu_temp { run = cat; parse = number }
+component stat_tile {
+    param warn: number
+    text { value = {{ sources.cpu_temp.value > warn ? "hot" : "ok" }} }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn cel_bare_identifier_not_flagged() {
+        // CEL cross-ref only flags `sources.<name>`. Bare roots like
+        // `item`, `theme`, a component param -- all legal and left
+        // to a later type-check phase.
+        let text = r#"
+component stat_tile {
+    param label: string
+    text { value = {{ label }} }
+}
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    // --- Review follow-ups ---
+
+    #[test]
+    fn component_param_shadowing_common_ui_key_is_flagged() {
+        // schema.md section 7: common UI properties on a component call
+        // apply to the root node. A param whose name collides with one
+        // of those keys would be unreachable, so flag it at decl time.
+        let diags = check_text(
+            "component t { param width: string = \"\"\n text { value = Hi } }\n",
+        );
+        assert_msg(
+            &diags,
+            "`param width` conflicts with the common UI property `width`",
+        );
+    }
+
+    #[test]
+    fn component_param_shadowing_event_handler_is_flagged() {
+        // `on_change` is in EVENT_HANDLER_KINDS but not in COMMON_UI_KEYS,
+        // so the event-handler-specific branch fires here. (`on_tap`
+        // and `on_hold` also appear in COMMON_UI_KEYS, so they'd be
+        // reported as common-UI-property shadowing instead.)
+        let diags = check_text(
+            "component t { param on_change: action = none\n text { value = Hi } }\n",
+        );
+        assert_msg(
+            &diags,
+            "`param on_change` conflicts with the event-handler key `on_change`",
+        );
+    }
+
+    #[test]
+    fn action_param_shadowing_common_ui_key_is_accepted() {
+        // Actions aren't called with common UI props, so the shadow
+        // trap doesn't apply there.
+        let diags = check_text(
+            "action a { param width: int; run = cat }\n",
+        );
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn cel_sources_index_string_cross_ref() {
+        let text = r#"
+page home { text { value = {{ sources["ghost"].value }} } }
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn cel_sources_index_known_source_is_accepted() {
+        let text = r#"
+source cpu_temp { run = cat; parse = number }
+page home { text { value = {{ sources["cpu_temp"].value }} } }
+"#;
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn interp_double_backslash_before_opener_is_literal_backslash() {
+        // `\\{{ ... }}` is a literal `\` followed by an expression,
+        // NOT an escaped `{{`. The CEL walk must parse the `{{...}}`.
+        let text = r#"
+page home { text { value = \\{{ sources.ghost.value }} } }
+"#;
+        let diags = check_text(text);
+        // The expression inside should be parsed; the ghost ref flagged.
+        assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn interp_single_backslash_escapes_opener() {
+        // `\{{ x }}` is a literal `{{ x }}`, no CEL parse.
+        let text = r#"
+page home { text { value = \{{ sources.ghost.value }} } }
+"#;
+        let diags = check_text(text);
+        // ghost ref must NOT fire -- the whole thing is literal.
+        assert!(
+            !diags.iter().any(|d| d.contains("unknown source")),
+            "unexpected ghost diagnostic: {diags:?}"
+        );
+    }
+}

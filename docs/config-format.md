@@ -112,6 +112,7 @@ page home {
 - A value that is only one expression keeps the expression's type (number, bool, color, list): `value = {{ sources.cpu_temp.value }}`.
 - An expression mixed with text makes a string: `label = CPU {{ round(x, 1) }} C`.
 - `\{{` is a literal `{{`.
+- `\\` is a literal backslash, so `\\{{ ... }}` is a backslash followed by a real expression (not an escaped opener). To write a literal backslash directly before an expression without the opener firing, use `\\\{{` (literal backslash, then an escaped `{{`).
 - Expressions are compiled and type-checked at load.
 
 ## Value types

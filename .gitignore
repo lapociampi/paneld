@@ -1,6 +1,15 @@
-/target/
+/target
+
 *.log
 .env
-/site/node_modules/
-/site/dist/
-/site/.astro/
+
+# site build output
+site/dist
+site/.astro
+site/node_modules
+
+# editor
+.vscode
+.idea
+*.swp
+*.swo

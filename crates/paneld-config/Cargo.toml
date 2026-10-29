@@ -1,0 +1,13 @@
+[package]
+name = "paneld-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Config parser and schema check for paneld"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
