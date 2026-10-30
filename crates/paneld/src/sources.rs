@@ -64,15 +64,6 @@ pub fn resolve_all(doc: &Document) -> BTreeMap<String, Value> {
     out
 }
 
-/// Build an [`paneld_ui::Context`] whose only top-level key is
-/// `sources`, mapping to the resolved per-source value map. Future
-/// phases will layer `theme`, `now`, `alerts` on top.
-pub fn into_context(sources: BTreeMap<String, Value>) -> Context {
-    let mut ctx = Context::new();
-    ctx.insert("sources".to_string(), Value::Map(sources));
-    ctx
-}
-
 /// Spawn a background worker for each source that declares a
 /// `poll = DURATION`. Each worker sleeps for that interval, re-runs
 /// the source's command, and emits a [`SourceUpdate`] on the shared

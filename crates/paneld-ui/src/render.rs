@@ -20,23 +20,39 @@
 //! Properties supported today: `width`, `height`, `padding`, `gap`,
 //! `background` (literal hex), `color` (literal hex, on text).
 
+use std::sync::mpsc::Sender;
+
 use paneld_config::cel;
 use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
-use crate::expr::{eval, Context};
-use crate::ui::{Obj, Size};
+use crate::expr::{eval, Context, Value};
+use crate::ui::{ActionTrigger, Obj, Size};
+
+/// Children of a component call plus the outer context they should
+/// resolve against. Threaded through [`render_node`] so a `slot { }`
+/// inside the component's body expands to the caller's children.
+struct SlotCtx<'a> {
+    children: &'a [Item],
+    outer_ctx: &'a Context,
+}
 
 /// Render the page named `page_name` from `doc` into `screen`. If no
 /// such page exists, draws a plain "page not found" label as a
 /// diagnostic.
-pub fn render_page(doc: &Document, page_name: &str, ctx: &Context, screen: &Obj<'_>) {
+pub fn render_page(
+    doc: &Document,
+    page_name: &str,
+    ctx: &Context,
+    sink: &Sender<ActionTrigger>,
+    screen: &Obj<'_>,
+) {
     for item in &doc.items {
         if let Item::Block(b) = item {
             if b.kind.text == "page"
                 && b.name.as_ref().is_some_and(|n| n.text == page_name)
             {
-                render_page_body(b, ctx, screen);
+                render_page_body(b, doc, ctx, sink, screen);
                 return;
             }
         }
@@ -44,83 +60,335 @@ pub fn render_page(doc: &Document, page_name: &str, ctx: &Context, screen: &Obj<
     screen.new_label(&format!("page `{page_name}` not found"));
 }
 
-fn render_page_body(page: &Block, ctx: &Context, screen: &Obj<'_>) {
+fn render_page_body(
+    page: &Block,
+    doc: &Document,
+    ctx: &Context,
+    sink: &Sender<ActionTrigger>,
+    screen: &Obj<'_>,
+) {
     let page_root = screen.new_container();
     page_root.set_size(Size::Percent(100), Size::Percent(100));
     page_root.set_flex_column();
     page_root.set_padding(16);
     page_root.set_gap(8);
 
-    for item in &page.items {
+    render_item_list(&page.items, doc, ctx, None, sink, &page_root);
+}
+
+/// Walk a slice of `Item`s inside a UI container, dispatching each
+/// one to the right path: `Block` -> `render_node`, `Repeat` ->
+/// iterate the source list and render per-item.
+fn render_item_list(
+    items: &[Item],
+    doc: &Document,
+    ctx: &Context,
+    slot: Option<&SlotCtx<'_>>,
+    sink: &Sender<ActionTrigger>,
+    parent: &Obj<'_>,
+) {
+    for item in items {
         match item {
-            Item::Block(child) => render_node(child, ctx, &page_root),
-            Item::Assign(_a) => {
-                // Page-level keys (`title`, `icon`, `nav`) don't
-                // affect the current single-page view. Skip them.
-            }
+            Item::Block(child) => render_node(child, doc, ctx, slot, sink, parent),
+            Item::Repeat(r) => expand_repeat(r, doc, ctx, slot, sink, parent),
             _ => {}
         }
     }
 }
 
-fn render_node(node: &Block, ctx: &Context, parent: &Obj<'_>) {
+/// Expand a `repeat BIND in {{ EXPR }} { ... }`: evaluate the
+/// source expression, iterate the resulting list, and render the
+/// contained items for each element with `BIND` bound to the item.
+fn expand_repeat(
+    r: &paneld_config::parse::Repeat,
+    doc: &Document,
+    ctx: &Context,
+    slot: Option<&SlotCtx<'_>>,
+    sink: &Sender<ActionTrigger>,
+    parent: &Obj<'_>,
+) {
+    let body_offset = r.source.span.start + 2;
+    let (expr, diags) =
+        cel::parse_fragment(&r.source.body, r.source.span.file, body_offset);
+    if !diags.is_empty() {
+        parent.new_label(&format!("[repeat parse: {}]", diags[0].message));
+        return;
+    }
+    let Some(expr) = expr else {
+        return;
+    };
+    let items = match eval(&expr, ctx) {
+        Ok(Value::List(xs)) => xs,
+        Ok(other) => {
+            parent.new_label(&format!(
+                "[repeat: expected a list, got {}]",
+                display_type(&other)
+            ));
+            return;
+        }
+        Err(e) => {
+            parent.new_label(&format!("[repeat eval: {}]", e.message));
+            return;
+        }
+    };
+    for item in items {
+        let mut inner = ctx.clone();
+        inner.insert(r.binding.text.clone(), item);
+        render_item_list(&r.items, doc, &inner, slot, sink, parent);
+    }
+}
+
+fn display_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Int(_) => "int",
+        Value::Double(_) => "number",
+        Value::String(_) => "string",
+        Value::List(_) => "list",
+        Value::Map(_) => "map",
+    }
+}
+
+fn render_node(
+    node: &Block,
+    doc: &Document,
+    ctx: &Context,
+    slot: Option<&SlotCtx<'_>>,
+    sink: &Sender<ActionTrigger>,
+    parent: &Obj<'_>,
+) {
     match node.kind.text.as_str() {
         "column" => {
             let obj = parent.new_container();
             obj.set_size(Size::Content, Size::Content);
             obj.set_flex_column();
-            apply_props(node, ctx, &obj);
-            for item in &node.items {
-                if let Item::Block(child) = item {
-                    render_node(child, ctx, &obj);
-                }
-            }
+            apply_props(node, ctx, sink, &obj);
+            render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "row" => {
             let obj = parent.new_container();
             obj.set_size(Size::Content, Size::Content);
             obj.set_flex_row();
-            apply_props(node, ctx, &obj);
-            for item in &node.items {
-                if let Item::Block(child) = item {
-                    render_node(child, ctx, &obj);
-                }
-            }
+            apply_props(node, ctx, sink, &obj);
+            render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "stack" => {
             let obj = parent.new_container();
             obj.set_size(Size::Content, Size::Content);
-            apply_props(node, ctx, &obj);
-            for item in &node.items {
-                if let Item::Block(child) = item {
-                    render_node(child, ctx, &obj);
-                }
-            }
+            apply_props(node, ctx, sink, &obj);
+            render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "text" => {
             let text = resolve_text(node, "value", ctx).unwrap_or_default();
             let obj = parent.new_label(&text);
-            apply_props(node, ctx, &obj);
+            apply_props(node, ctx, sink, &obj);
         }
         "button" => {
             let obj = parent.new_button();
-            apply_props(node, ctx, &obj);
-            for item in &node.items {
-                if let Item::Block(child) = item {
-                    render_node(child, ctx, &obj);
-                }
-            }
+            apply_props(node, ctx, sink, &obj);
+            render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "rect" => {
             let obj = parent.new_container();
             obj.set_size(Size::Content, Size::Content);
-            apply_props(node, ctx, &obj);
+            apply_props(node, ctx, sink, &obj);
+        }
+        "bar" => {
+            let obj = parent.new_bar();
+            let min = resolve_num(node, "min", ctx).unwrap_or(0.0) as i32;
+            let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
+            obj.set_bar_range(min, max);
+            if let Some(v) = resolve_num(node, "value", ctx) {
+                obj.set_bar_value(v as i32);
+            }
+            apply_props(node, ctx, sink, &obj);
+        }
+        "arc" => {
+            let obj = parent.new_arc();
+            let min = resolve_num(node, "min", ctx).unwrap_or(0.0) as i32;
+            let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
+            obj.set_arc_range(min, max);
+            if let Some(v) = resolve_num(node, "value", ctx) {
+                obj.set_arc_value(v as i32);
+            }
+            apply_props(node, ctx, sink, &obj);
+        }
+        "spinner" => {
+            let obj = parent.new_spinner();
+            apply_props(node, ctx, sink, &obj);
+        }
+        "slot" => {
+            // Expand the caller's child-items here, resolving them
+            // against the OUTER context (not the component's inner
+            // scope). If there's no enclosing component call, the
+            // slot renders nothing.
+            if let Some(s) = slot {
+                render_item_list(s.children, doc, s.outer_ctx, None, sink, parent);
+            }
         }
         other => {
-            // Unknown or not-yet-supported widget: draw a stub so
-            // the user sees something and knows which node is
-            // missing instead of silently ignoring it.
+            // Try to resolve as a user-defined component. If found,
+            // expand its body in place with each arg bound in a
+            // fresh scope.
+            if let Some(comp) = find_component(doc, other) {
+                expand_component(node, comp, doc, ctx, sink, parent);
+                return;
+            }
+            // Not a built-in widget and not a known component.
             parent.new_label(&format!("[{other}: not implemented yet]"));
+        }
+    }
+}
+
+/// Find a top-level `component NAME { ... }` block by name.
+fn find_component<'a>(doc: &'a Document, name: &str) -> Option<&'a Block> {
+    for item in &doc.items {
+        if let Item::Block(b) = item {
+            if b.kind.text == "component"
+                && b.name.as_ref().is_some_and(|n| n.text == name)
+            {
+                return Some(b);
+            }
+        }
+    }
+    None
+}
+
+/// Expand a user-component call: evaluate each `arg = value` from
+/// the call site against the outer context, fill in defaults for
+/// omitted args, bind them as top-level identifiers in a fresh
+/// Context, and render the component's single UI root into
+/// `parent`.
+///
+/// Scope today: no `slot`, no `repeat`. Nested calls to other user
+/// components work (they re-enter this expander with their own
+/// scope).
+fn expand_component(
+    call: &Block,
+    comp: &Block,
+    doc: &Document,
+    outer_ctx: &Context,
+    sink: &Sender<ActionTrigger>,
+    parent: &Obj<'_>,
+) {
+    let mut inner_ctx = outer_ctx.clone();
+    for item in &comp.items {
+        let Item::Param(p) = item else { continue };
+        let bound = if let Some((raw, span)) = find_raw(call, &p.name.text) {
+            resolve_expr_value(raw, span, outer_ctx).unwrap_or(Value::Null)
+        } else if let Some(default) = &p.default {
+            resolve_expr_value(&default.text, default.span, outer_ctx).unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        inner_ctx.insert(p.name.text.clone(), bound);
+    }
+    // Children of the call that aren't args become the slot's
+    // content. The schema check already enforced "exactly one slot"
+    // and "no children unless a slot exists".
+    let child_items: Vec<Item> = call
+        .items
+        .iter()
+        .filter(|it| matches!(it, Item::Block(_) | Item::Repeat(_)))
+        .cloned()
+        .collect();
+    let slot = SlotCtx { children: &child_items, outer_ctx };
+    render_item_list(&comp.items, doc, &inner_ctx, Some(&slot), sink, parent);
+}
+
+/// Evaluate a `key = <raw>` as either a literal string (for a
+/// non-expression value) or a CEL expression resolved against `ctx`,
+/// returning a [`Value`]. Interpolated-string values become a
+/// [`Value::String`].
+fn resolve_expr_value(
+    raw: &str,
+    span: paneld_config::source::Span,
+    ctx: &Context,
+) -> Option<Value> {
+    match classify(raw) {
+        ValueShape::Literal(text) => Some(Value::String(text.to_string())),
+        ValueShape::Expression(body) => {
+            let (expr, diags) = cel::parse_fragment(body, span.file, span.start + 2);
+            if !diags.is_empty() {
+                return None;
+            }
+            expr.and_then(|e| eval(&e, ctx).ok())
+        }
+        ValueShape::Interp(_) => {
+            let (fragments, diags) = cel::parse_interp(raw, span.file, span.start);
+            if !diags.is_empty() {
+                return None;
+            }
+            let mut out = String::new();
+            let bytes = raw.as_bytes();
+            let mut i = 0;
+            let mut frag_idx = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\\') {
+                    out.push_str("\\\\");
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'\\'
+                    && bytes.get(i + 1) == Some(&b'{')
+                    && bytes.get(i + 2) == Some(&b'{')
+                {
+                    out.push_str("{{");
+                    i += 3;
+                    continue;
+                }
+                if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
+                    let mut j = i + 2;
+                    let mut depth: u32 = 0;
+                    while j < bytes.len() {
+                        match bytes[j] {
+                            b'"' | b'\'' => {
+                                let q = bytes[j];
+                                j += 1;
+                                while j < bytes.len() {
+                                    if bytes[j] == b'\\' {
+                                        j += 2;
+                                        continue;
+                                    }
+                                    if bytes[j] == q {
+                                        j += 1;
+                                        break;
+                                    }
+                                    j += 1;
+                                }
+                            }
+                            b'{' => {
+                                depth = depth.saturating_add(1);
+                                j += 1;
+                            }
+                            b'}' => {
+                                if depth > 0 {
+                                    depth -= 1;
+                                    j += 1;
+                                } else if bytes.get(j + 1) == Some(&b'}') {
+                                    j += 2;
+                                    break;
+                                } else {
+                                    j += 1;
+                                }
+                            }
+                            _ => j += 1,
+                        }
+                    }
+                    if let Some(frag) = fragments.get(frag_idx) {
+                        if let Ok(v) = eval(frag, ctx) {
+                            out.push_str(&v.to_display_string());
+                        }
+                    }
+                    frag_idx += 1;
+                    i = j;
+                    continue;
+                }
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            Some(Value::String(out))
         }
     }
 }
@@ -242,7 +510,7 @@ fn interpolate_text(raw: &str, fragments: &[cel::Expr], ctx: &Context) -> String
     out
 }
 
-fn apply_props(node: &Block, _ctx: &Context, obj: &Obj<'_>) {
+fn apply_props(node: &Block, ctx: &Context, sink: &Sender<ActionTrigger>, obj: &Obj<'_>) {
     for item in &node.items {
         let Item::Assign(a) = item else { continue };
         let AssignTarget::Simple { key } = &a.target else {
@@ -271,23 +539,58 @@ fn apply_props(node: &Block, _ctx: &Context, obj: &Obj<'_>) {
                 }
             }
             "background" => {
-                if let Some(rgb) = parse_hex_color(value) {
+                if let Some(rgb) = resolve_color(value, a.value.span, ctx) {
                     obj.set_background_hex(rgb);
                 }
             }
             "color" => {
-                if let Some(rgb) = parse_hex_color(value) {
+                if let Some(rgb) = resolve_color(value, a.value.span, ctx) {
                     obj.set_text_color_hex(rgb);
+                }
+            }
+            "on_tap" => {
+                // Simple-assign form only: `on_tap = <action-name>`.
+                // The `on_tap action { ... }` block form (named
+                // action with args) and the inline `on_tap { ... }`
+                // form come in a later phase.
+                let name = value;
+                if name == "none" || name.is_empty() {
+                    continue;
+                }
+                if is_bare_ident(name) {
+                    obj.set_clickable();
+                    obj.on_tap(sink.clone(), name);
                 }
             }
             _ => {
                 // Not yet wired; silently ignore so the daemon
                 // doesn't crash on properties that are legal
                 // schema-wise but need engine work (theme resolution,
-                // event bindings).
+                // event bindings beyond `on_tap`).
             }
         }
     }
+}
+
+/// Resolve a `key = ...` on `node` as an f64. Handles literal
+/// numbers and `{{ expr }}` evaluating to Int/Double. Returns None
+/// if the key is absent or doesn't produce a number.
+fn resolve_num(node: &Block, key: &str, ctx: &Context) -> Option<f64> {
+    let (raw, span) = find_raw(node, key)?;
+    let v = resolve_expr_value(raw, span, ctx)?;
+    match v {
+        Value::Int(n) => Some(n as f64),
+        Value::Double(d) => Some(d),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn is_bare_ident(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// Find a simple `key = value` on `node`, returning the raw text and
@@ -318,6 +621,34 @@ fn parse_size(s: &str) -> Option<Size> {
         return p.trim().parse::<u16>().ok().map(Size::Percent);
     }
     s.parse::<i32>().ok().map(Size::Px)
+}
+
+/// Resolve a color value's raw text. Accepts a literal hex (`#rgb`,
+/// `#rrggbb`, `#rrggbbaa`), a `{{ expr }}` whose evaluated string
+/// is a hex, or an interpolated value whose rendered string is a
+/// hex. Returns the 24-bit RGB (alpha dropped for now).
+fn resolve_color(
+    value: &str,
+    span: paneld_config::source::Span,
+    ctx: &Context,
+) -> Option<u32> {
+    match classify(value) {
+        ValueShape::Literal(text) => parse_hex_color(text),
+        ValueShape::Expression(body) => {
+            let (expr, diags) = cel::parse_fragment(body, span.file, span.start + 2);
+            if !diags.is_empty() {
+                return None;
+            }
+            let v = expr.and_then(|e| eval(&e, ctx).ok())?;
+            parse_hex_color(&v.to_display_string())
+        }
+        ValueShape::Interp(_) => {
+            // Rarely useful for colors; evaluate the whole thing
+            // and hope the result is a hex.
+            resolve_expr_value(value, span, ctx)
+                .and_then(|v| parse_hex_color(&v.to_display_string()))
+        }
+    }
 }
 
 /// Accept `#rgb`, `#rrggbb`, `#rrggbbaa` (alpha ignored for now).

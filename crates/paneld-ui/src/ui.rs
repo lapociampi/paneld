@@ -8,9 +8,54 @@
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lvgl_sys as sys;
+
+/// A tap on a UI node bound to a top-level action. Sent to the
+/// consumer (`main.rs`) by the LVGL click callback registered in
+/// [`Obj::on_tap`].
+#[derive(Debug, Clone)]
+pub struct ActionTrigger {
+    pub action_name: String,
+}
+
+#[derive(Clone)]
+struct ActionBinding {
+    name: String,
+    sink: Sender<ActionTrigger>,
+}
+
+/// Global registry of per-widget action bindings. [`Obj::on_tap`]
+/// appends a binding and uses the returned index as the LVGL event
+/// user_data; the static trampoline reads that index when the event
+/// fires. The main loop calls [`reset_action_bindings`] before each
+/// re-render so freshly-cleared LVGL objects cannot fire against
+/// stale indices.
+fn bindings() -> &'static Mutex<Vec<ActionBinding>> {
+    static B: OnceLock<Mutex<Vec<ActionBinding>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Drop every registered action binding. Call this on the UI thread
+/// AFTER [`Obj::clear_children`] on the screen (which destroys the
+/// LVGL objects whose callbacks reference these indices).
+pub fn reset_action_bindings() {
+    bindings().lock().unwrap().clear();
+}
+
+unsafe extern "C" fn on_tap_trampoline(e: *mut sys::lv_event_t) {
+    let idx = unsafe { sys::lv_event_get_user_data(e) } as usize;
+    let bind = {
+        let guard = bindings().lock().unwrap();
+        guard.get(idx).cloned()
+    };
+    if let Some(bind) = bind {
+        let _ = bind.sink.send(ActionTrigger { action_name: bind.name });
+    }
+}
 
 // LVGL's `LV_SIZE_CONTENT` and `LV_PCT(x)` are C macros that bindgen
 // doesn't translate; mirror the exact bit layout from
@@ -176,6 +221,48 @@ impl<'ui> Obj<'ui> {
         Obj { raw, _ui: PhantomData }
     }
 
+    /// A horizontal / vertical fill-bar widget. Driver sets range and
+    /// value through [`Self::set_bar_value`] and [`Self::set_range`].
+    pub fn new_bar(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_bar_create(self.raw) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// A circular arc gauge (dial).
+    pub fn new_arc(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_arc_create(self.raw) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// A built-in spinning indicator; no value, just animates.
+    pub fn new_spinner(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_spinner_create(self.raw) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// Set a bar's current fill value (no animation).
+    pub fn set_bar_value(&self, v: i32) {
+        unsafe { sys::lv_bar_set_value(self.raw, v, false) };
+    }
+
+    /// Set a bar's min / max range.
+    pub fn set_bar_range(&self, min: i32, max: i32) {
+        unsafe { sys::lv_bar_set_range(self.raw, min, max) };
+    }
+
+    /// Set an arc's current value.
+    pub fn set_arc_value(&self, v: i32) {
+        unsafe { sys::lv_arc_set_value(self.raw, v) };
+    }
+
+    /// Set an arc's min / max range.
+    pub fn set_arc_range(&self, min: i32, max: i32) {
+        unsafe { sys::lv_arc_set_range(self.raw, min, max) };
+    }
+
     pub fn set_size(&self, w: Size, h: Size) {
         unsafe { sys::lv_obj_set_size(self.raw, w.to_lvgl(), h.to_lvgl()) };
     }
@@ -215,6 +302,30 @@ impl<'ui> Obj<'ui> {
     /// re-render path when a source value changes.
     pub fn clear_children(&self) {
         unsafe { sys::lv_obj_clean(self.raw) };
+    }
+
+    /// Mark this object clickable (plain `obj` and `label` need this;
+    /// `button` has it on by default).
+    pub fn set_clickable(&self) {
+        unsafe { sys::lv_obj_add_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_CLICKABLE) };
+    }
+
+    /// Register an LVGL CLICKED callback that pushes an
+    /// [`ActionTrigger`] on `sink` when the object is tapped.
+    pub fn on_tap(&self, sink: Sender<ActionTrigger>, action_name: &str) {
+        let idx = {
+            let mut g = bindings().lock().unwrap();
+            g.push(ActionBinding { name: action_name.to_string(), sink });
+            g.len() - 1
+        };
+        unsafe {
+            sys::lv_obj_add_event_cb(
+                self.raw,
+                Some(on_tap_trampoline),
+                sys::lv_event_code_t_LV_EVENT_CLICKED,
+                idx as *mut std::ffi::c_void,
+            );
+        }
     }
 }
 

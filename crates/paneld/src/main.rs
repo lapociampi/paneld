@@ -7,8 +7,11 @@
 //!
 //! See `docs/architecture.md` and ADR 0007.
 
+mod actions;
+mod ctl;
 mod runner;
 mod sources;
+mod themes;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -124,15 +127,99 @@ Flags:
 }
 
 fn run_daemon(config: PathBuf) -> ExitCode {
-    use paneld_config::{check, load};
+    let ui = match paneld_ui::Ui::init() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("paneld: {e}");
+            return ExitCode::from(70);
+        }
+    };
 
-    // Load and validate the config up front; a broken config
-    // shouldn't open an empty window.
-    let (source, doc, mut diags) = match load(&config) {
+    // Start the ctl listener early so `paneld ctl exit` works even
+    // if the first config fails to load.
+    let (control_tx, control_rx) = std::sync::mpsc::channel::<ctl::ControlMsg>();
+    let sock_path = ctl::default_socket_path();
+    if let Err(e) = ctl::serve(&sock_path, control_tx.clone()) {
+        eprintln!(
+            "paneld: cannot bind ctl socket {}: {e}; `paneld ctl` will not work",
+            sock_path.display()
+        );
+    }
+
+    // Also watch the config file: an editor save fires Reload the
+    // same way `paneld ctl reload` does.
+    ctl::watch_config(
+        &config,
+        std::time::Duration::from_millis(500),
+        control_tx,
+    );
+
+    let _window = ui.open_window(800, 480, "paneld");
+    let screen = ui.screen();
+
+    // Initial live state. `reload` wipes and rebuilds this.
+    let mut live = match setup_live_state(&config, &screen) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let mut pump = ui.pump();
+    'main: loop {
+        // Drain the ctl channel.
+        while let Ok(msg) = control_rx.try_recv() {
+            match msg {
+                ctl::ControlMsg::Exit => break 'main,
+                ctl::ControlMsg::Reload => match setup_live_state(&config, &screen) {
+                    Ok(fresh) => {
+                        live = fresh;
+                        eprintln!("paneld: reloaded config");
+                    }
+                    Err(_code) => {
+                        eprintln!("paneld: reload failed; keeping previous config");
+                    }
+                },
+            }
+        }
+
+        // Drain source updates and re-render if anything changed.
+        let mut dirty = false;
+        while let Ok(update) = live.source_rx.try_recv() {
+            live.source_values.insert(update.name, update.value);
+            dirty = true;
+        }
+        if dirty {
+            let ctx = build_ctx(&live.source_values, &live.theme);
+            screen.clear_children();
+            paneld_ui::reset_action_bindings();
+            paneld_ui::render_page(&live.doc, "home", &ctx, &live.action_tx, &screen);
+        }
+
+        pump.step();
+    }
+
+    let _ = std::fs::remove_file(&sock_path);
+    ExitCode::SUCCESS
+}
+
+/// Everything the main loop re-creates on a `reload`.
+struct LiveState {
+    doc: paneld_config::parse::Document,
+    source_values: std::collections::BTreeMap<String, paneld_ui::Value>,
+    source_rx: std::sync::mpsc::Receiver<sources::SourceUpdate>,
+    theme: std::collections::BTreeMap<String, paneld_ui::Value>,
+    action_tx: std::sync::mpsc::Sender<paneld_ui::ActionTrigger>,
+}
+
+fn setup_live_state(
+    config: &std::path::Path,
+    screen: &paneld_ui::ui::Obj<'_>,
+) -> Result<LiveState, ExitCode> {
+    use paneld_config::{check, load};
+    let (source, doc, mut diags) = match load(config) {
         Ok(parts) => parts,
         Err(e) => {
             eprintln!("paneld: {e}");
-            return ExitCode::from(1);
+            return Err(ExitCode::from(1));
         }
     };
     diags.extend(check(&doc, &source));
@@ -142,49 +229,26 @@ fn run_daemon(config: PathBuf) -> ExitCode {
             eprintln!("{loc}: {}", d.message);
         }
         eprintln!(
-            "paneld: {} config issue{} found; refusing to start",
+            "paneld: {} config issue{} found; refusing to apply",
             diags.len(),
             if diags.len() == 1 { "" } else { "s" }
         );
-        return ExitCode::from(1);
+        return Err(ExitCode::from(1));
     }
 
-    let ui = match paneld_ui::Ui::init() {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("paneld: {e}");
-            return ExitCode::from(70);
-        }
-    };
-    // Resolve every top-level `source` block once at startup and
-    // feed the result into the renderer's eval context. Sources
-    // with a `poll = ...` are then polled in background threads;
-    // updates land on `rx` and trigger a re-render.
-    let mut source_values = sources::resolve_all(&doc);
-    let rx = sources::spawn_pollers(&doc);
-    let mut ctx = sources::into_context(source_values.clone());
+    let source_values = sources::resolve_all(&doc);
+    let source_rx = sources::spawn_pollers(&doc);
+    let theme = themes::resolve(&doc);
+    let action_table = actions::collect(&doc);
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    actions::spawn_worker(action_table, action_rx);
 
-    let _window = ui.open_window(800, 480, "paneld");
-    let screen = ui.screen();
-    // First-pass renderer: hard-code the page name until `screen`,
-    // `app.start_page` and theme resolution are wired through the
-    // engine. `home` is the convention in every example config.
-    paneld_ui::render_page(&doc, "home", &ctx, &screen);
+    let ctx = build_ctx(&source_values, &theme);
+    screen.clear_children();
+    paneld_ui::reset_action_bindings();
+    paneld_ui::render_page(&doc, "home", &ctx, &action_tx, screen);
 
-    let mut pump = ui.pump();
-    loop {
-        let mut dirty = false;
-        while let Ok(update) = rx.try_recv() {
-            source_values.insert(update.name, update.value);
-            dirty = true;
-        }
-        if dirty {
-            ctx = sources::into_context(source_values.clone());
-            screen.clear_children();
-            paneld_ui::render_page(&doc, "home", &ctx, &screen);
-        }
-        pump.step();
-    }
+    Ok(LiveState { doc, source_values, source_rx, theme, action_tx })
 }
 
 fn run_check(config: PathBuf) -> ExitCode {
@@ -216,9 +280,24 @@ fn run_check(config: PathBuf) -> ExitCode {
     ExitCode::from(1)
 }
 
-fn run_ctl(_args: &[String]) -> ExitCode {
-    eprintln!("paneld ctl: not implemented yet");
-    ExitCode::from(70)
+fn run_ctl(args: &[String]) -> ExitCode {
+    let Some(cmd) = args.first() else {
+        eprintln!("paneld ctl: missing subcommand (try `ping`, `reload`, `exit`)");
+        return ExitCode::from(2);
+    };
+    let path = ctl::default_socket_path();
+    let code = ctl::call(&path, cmd);
+    ExitCode::from(code as u8)
+}
+
+fn build_ctx(
+    source_values: &std::collections::BTreeMap<String, paneld_ui::Value>,
+    theme: &std::collections::BTreeMap<String, paneld_ui::Value>,
+) -> paneld_ui::Context {
+    let mut ctx = paneld_ui::Context::new();
+    ctx.insert("sources".into(), paneld_ui::Value::Map(source_values.clone()));
+    ctx.insert("theme".into(), paneld_ui::Value::Map(theme.clone()));
+    ctx
 }
 
 #[cfg(test)]

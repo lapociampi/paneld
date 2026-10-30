@@ -22,4 +22,4 @@ pub mod ui;
 
 pub use expr::{eval, Context, EvalError, Value};
 pub use render::render_page;
-pub use ui::{Ui, Window};
+pub use ui::{reset_action_bindings, ActionTrigger, Ui, Window};
