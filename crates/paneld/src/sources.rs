@@ -44,7 +44,7 @@ pub struct SourceUpdate {
 /// Writes a one-line warning to stderr for each source that failed to
 /// run; the UI still renders, with that source missing from the
 /// context.
-pub fn resolve_all(doc: &Document) -> BTreeMap<String, Value> {
+pub fn resolve_all(doc: &Document, ctx: &Context) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     for item in &doc.items {
         let Item::Block(b) = item else { continue };
@@ -52,7 +52,7 @@ pub fn resolve_all(doc: &Document) -> BTreeMap<String, Value> {
             continue;
         }
         let Some(name) = &b.name else { continue };
-        match resolve_one(b) {
+        match resolve_one(b, ctx) {
             Ok(v) => {
                 out.insert(name.text.clone(), v);
             }
@@ -72,7 +72,7 @@ pub fn resolve_all(doc: &Document) -> BTreeMap<String, Value> {
 ///
 /// Returns the [`Receiver`] end of the channel. The main thread
 /// drains it on every pump of the LVGL loop.
-pub fn spawn_pollers(doc: &Document) -> Receiver<SourceUpdate> {
+pub fn spawn_pollers(doc: &Document, ctx: &Context) -> Receiver<SourceUpdate> {
     let (tx, rx) = mpsc::channel::<SourceUpdate>();
     for item in &doc.items {
         let Item::Block(b) = item else { continue };
@@ -91,19 +91,28 @@ pub fn spawn_pollers(doc: &Document) -> Receiver<SourceUpdate> {
             continue;
         };
         // Clone the source block owned so the worker thread can read
-        // it without holding a borrow of the document.
+        // it without holding a borrow of the document. Secrets and
+        // theme tokens live in the cloned ctx; they don't change at
+        // runtime in v1.
         let block_clone = b.clone();
         let name_clone = name.text.clone();
         let tx_clone: Sender<SourceUpdate> = tx.clone();
-        thread::spawn(move || poll_loop(block_clone, name_clone, poll, tx_clone));
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || poll_loop(block_clone, name_clone, poll, tx_clone, ctx_clone));
     }
     rx
 }
 
-fn poll_loop(block: Block, name: String, interval: Duration, tx: Sender<SourceUpdate>) {
+fn poll_loop(
+    block: Block,
+    name: String,
+    interval: Duration,
+    tx: Sender<SourceUpdate>,
+    ctx: Context,
+) {
     loop {
         thread::sleep(interval);
-        match resolve_one(&block) {
+        match resolve_one(&block, &ctx) {
             Ok(v) => {
                 if tx.send(SourceUpdate { name: name.clone(), value: v }).is_err() {
                     // Receiver dropped; the daemon is shutting down.
@@ -121,11 +130,15 @@ fn poll_loop(block: Block, name: String, interval: Duration, tx: Sender<SourceUp
 /// under its name in the sources map; `.value` is set so the
 /// idiomatic `sources.X.value` works. `.ok` reflects the command's
 /// exit code (missing today -> `false`).
-fn resolve_one(b: &Block) -> Result<Value, String> {
-    let run = find_simple(b, "run").ok_or_else(|| "missing `run`".to_string())?;
+fn resolve_one(b: &Block, ctx: &Context) -> Result<Value, String> {
+    let (run_raw, run_span) =
+        find_raw(b, "run").ok_or_else(|| "missing `run`".to_string())?;
     let parse_mode = find_simple(b, "parse").unwrap_or("text").trim().to_string();
 
-    let r = runner::exec(run, DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)
+    // Interpolate secrets, theme tokens and other context values into
+    // the shell command before executing.
+    let run = paneld_ui::interpolate(run_raw, run_span.file, run_span.start, ctx);
+    let r = runner::exec(&run, DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)
         .map_err(|e| format!("run: {e}"))?;
     if r.timed_out {
         return Err("timed out".into());

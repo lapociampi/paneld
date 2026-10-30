@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 ///
 /// The inner value is only writable from this module, so a `FileId`
 /// handed to a `SourceMap` method is always one the map produced.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+/// `Default` returns a sentinel id for diagnostics that don't need
+/// a real source location (e.g. an interpolation at runtime).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FileId(pub(crate) u32);
 
 /// A byte range inside a specific source file.

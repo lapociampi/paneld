@@ -127,6 +127,7 @@ fn generate_bindings(manifest_dir: &Path, lvgl_dir: &Path) {
         .allowlist_type("_lv_.*")
         .allowlist_var("LV_.*")
         .allowlist_var("_LV_.*")
+        .allowlist_var("lv_font_.*")
         .size_t_is_usize(true)
         .derive_default(true)
         .layout_tests(false)

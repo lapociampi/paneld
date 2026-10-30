@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use paneld_config::parse::{AssignTarget, Document, Item};
-use paneld_ui::ActionTrigger;
+use paneld_ui::Context;
 
 use crate::runner;
 
@@ -39,17 +39,25 @@ pub fn collect(doc: &Document) -> HashMap<String, String> {
 /// action's `run` command in `actions` and executes it in its own
 /// short-lived thread so a slow action never blocks the UI event
 /// stream.
-pub fn spawn_worker(actions: HashMap<String, String>, rx: Receiver<ActionTrigger>) {
+pub fn spawn_worker(
+    actions: HashMap<String, String>,
+    ctx: Context,
+    rx: Receiver<String>,
+) {
     thread::spawn(move || {
-        for trigger in rx {
-            let Some(cmd) = actions.get(&trigger.action_name).cloned() else {
-                eprintln!(
-                    "paneld: action `{}`: unknown action",
-                    trigger.action_name
-                );
+        for action_name in rx {
+            let Some(raw) = actions.get(&action_name).cloned() else {
+                eprintln!("paneld: action `{action_name}`: unknown action");
                 continue;
             };
-            let name = trigger.action_name;
+            // Interpolate secrets and other context into the shell
+            // command before executing. The file/base lookup is a
+            // stub here -- actions are collected without their
+            // original spans; a later phase threads the real span
+            // for better diagnostics on CEL parse errors.
+            let file = paneld_config::source::FileId::default();
+            let cmd = paneld_ui::interpolate(&raw, file, 0, &ctx);
+            let name = action_name;
             thread::spawn(move || match runner::exec(&cmd, DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES) {
                 Ok(r) => {
                     eprintln!(

@@ -10,6 +10,7 @@
 mod actions;
 mod ctl;
 mod runner;
+mod secrets;
 mod sources;
 mod themes;
 
@@ -181,17 +182,39 @@ fn run_daemon(config: PathBuf) -> ExitCode {
             }
         }
 
-        // Drain source updates and re-render if anything changed.
+        // Drain UI events: actions forward to the action worker,
+        // gotos update the current page.
         let mut dirty = false;
+        while let Ok(ev) = live.event_rx.try_recv() {
+            match ev {
+                paneld_ui::UiEvent::Action { name } => {
+                    let _ = live.action_tx.send(name);
+                }
+                paneld_ui::UiEvent::Goto { page } => {
+                    if page != live.current_page {
+                        live.current_page = page;
+                        dirty = true;
+                    }
+                }
+            }
+        }
+
+        // Drain source updates and re-render if anything changed.
         while let Ok(update) = live.source_rx.try_recv() {
             live.source_values.insert(update.name, update.value);
             dirty = true;
         }
         if dirty {
-            let ctx = build_ctx(&live.source_values, &live.theme);
+            let ctx = build_ctx(&live.source_values, &live.theme, &live.secrets);
             screen.clear_children();
             paneld_ui::reset_action_bindings();
-            paneld_ui::render_page(&live.doc, "home", &ctx, &live.action_tx, &screen);
+            paneld_ui::render_page(
+                &live.doc,
+                &live.current_page,
+                &ctx,
+                &live.event_tx,
+                &screen,
+            );
         }
 
         pump.step();
@@ -207,7 +230,11 @@ struct LiveState {
     source_values: std::collections::BTreeMap<String, paneld_ui::Value>,
     source_rx: std::sync::mpsc::Receiver<sources::SourceUpdate>,
     theme: std::collections::BTreeMap<String, paneld_ui::Value>,
-    action_tx: std::sync::mpsc::Sender<paneld_ui::ActionTrigger>,
+    secrets: std::collections::BTreeMap<String, paneld_ui::Value>,
+    event_tx: std::sync::mpsc::Sender<paneld_ui::UiEvent>,
+    event_rx: std::sync::mpsc::Receiver<paneld_ui::UiEvent>,
+    action_tx: std::sync::mpsc::Sender<String>,
+    current_page: String,
 }
 
 fn setup_live_state(
@@ -236,19 +263,67 @@ fn setup_live_state(
         return Err(ExitCode::from(1));
     }
 
-    let source_values = sources::resolve_all(&doc);
-    let source_rx = sources::spawn_pollers(&doc);
+    // Resolve secrets first so they're available for the first
+    // source-run's interpolation. (Secrets never change at runtime
+    // in v1; a reload re-reads them.)
+    let secret_values = secrets::resolve(&doc);
     let theme = themes::resolve(&doc);
+    let base_ctx = build_ctx(&Default::default(), &theme, &secret_values);
+    let source_values = sources::resolve_all(&doc, &base_ctx);
+    let source_rx = sources::spawn_pollers(&doc, &base_ctx);
     let action_table = actions::collect(&doc);
-    let (action_tx, action_rx) = std::sync::mpsc::channel();
-    actions::spawn_worker(action_table, action_rx);
+    let (action_tx, action_rx) = std::sync::mpsc::channel::<String>();
+    actions::spawn_worker(action_table, base_ctx.clone(), action_rx);
 
-    let ctx = build_ctx(&source_values, &theme);
+    // One channel carries both actions and goto navs from the UI.
+    // The main loop demuxes: `Action` forwards to the action worker,
+    // `Goto` updates current_page and marks dirty.
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<paneld_ui::UiEvent>();
+
+    let current_page = find_start_page(&doc).unwrap_or_else(|| "home".to_string());
+    let ctx = build_ctx(&source_values, &theme, &secret_values);
     screen.clear_children();
     paneld_ui::reset_action_bindings();
-    paneld_ui::render_page(&doc, "home", &ctx, &action_tx, screen);
+    paneld_ui::render_page(&doc, &current_page, &ctx, &event_tx, screen);
 
-    Ok(LiveState { doc, source_values, source_rx, theme, action_tx })
+    Ok(LiveState {
+        doc,
+        source_values,
+        source_rx,
+        theme,
+        secrets: secret_values,
+        event_tx,
+        event_rx,
+        action_tx,
+        current_page,
+    })
+}
+
+fn find_start_page(doc: &paneld_config::parse::Document) -> Option<String> {
+    use paneld_config::parse::{AssignTarget, Item};
+    for item in &doc.items {
+        if let Item::Block(b) = item {
+            if b.kind.text == "app" {
+                for inner in &b.items {
+                    if let Item::Assign(a) = inner {
+                        if let AssignTarget::Simple { key } = &a.target {
+                            if key.text == "start_page" {
+                                return Some(a.value.text.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Item::Assign(a) = item {
+            if let AssignTarget::Qualified { category, key } = &a.target {
+                if category.text == "app" && key.text == "start_page" {
+                    return Some(a.value.text.trim().to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn run_check(config: PathBuf) -> ExitCode {
@@ -293,10 +368,12 @@ fn run_ctl(args: &[String]) -> ExitCode {
 fn build_ctx(
     source_values: &std::collections::BTreeMap<String, paneld_ui::Value>,
     theme: &std::collections::BTreeMap<String, paneld_ui::Value>,
+    secret_values: &std::collections::BTreeMap<String, paneld_ui::Value>,
 ) -> paneld_ui::Context {
     let mut ctx = paneld_ui::Context::new();
     ctx.insert("sources".into(), paneld_ui::Value::Map(source_values.clone()));
     ctx.insert("theme".into(), paneld_ui::Value::Map(theme.clone()));
+    ctx.insert("secrets".into(), paneld_ui::Value::Map(secret_values.clone()));
     ctx
 }
 

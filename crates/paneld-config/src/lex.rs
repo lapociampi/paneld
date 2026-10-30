@@ -412,12 +412,24 @@ impl<'src> Lexer<'src> {
 
         let start = self.pos;
         let mut end = start;
+        // Depth of unmatched `{` inside the value. A `}` at depth 0
+        // terminates the value (closing the enclosing block); a `}`
+        // at depth > 0 just decrements. This lets a value hold an
+        // awk / jq script with its own braces (`run = awk '{print}'`)
+        // without needing to double-quote the whole value.
+        let mut brace_depth: u32 = 0;
         loop {
             match self.peek() {
                 None => break,
                 Some(b'\n') => break,
                 Some(b'\r') if self.peek_at(1) == Some(b'\n') => break,
-                Some(b';') | Some(b'}') => break,
+                Some(b';') if brace_depth == 0 => break,
+                Some(b'}') if brace_depth == 0 => break,
+                Some(b'}') => {
+                    brace_depth -= 1;
+                    self.pos += 1;
+                    end = self.pos;
+                }
                 Some(b'#') => {
                     // `##` is a literal `#`.
                     if self.peek_at(1) == Some(b'#') {
@@ -496,6 +508,38 @@ impl<'src> Lexer<'src> {
                 }
                 Some(b'{') if self.peek_at(1) == Some(b'{') => {
                     self.scan_expression()?;
+                    end = self.pos;
+                }
+                Some(b'{') => {
+                    brace_depth = brace_depth.saturating_add(1);
+                    self.pos += 1;
+                    end = self.pos;
+                }
+                Some(b'\'') => {
+                    // A `'...'` single-quoted string inside the value
+                    // keeps literal `{` / `}` / `;` from affecting
+                    // termination. Shell-style single quotes have no
+                    // escape sequence; the next `'` ends the span.
+                    let quote_start = self.pos;
+                    self.pos += 1;
+                    loop {
+                        match self.peek() {
+                            None => {
+                                return Err(LexError {
+                                    span: self.make_span(quote_start, self.pos),
+                                    message: "unterminated single-quoted string in value"
+                                        .to_string(),
+                                });
+                            }
+                            Some(b'\'') => {
+                                self.pos += 1;
+                                break;
+                            }
+                            _ => {
+                                self.pos += 1;
+                            }
+                        }
+                    }
                     end = self.pos;
                 }
                 _ => {
@@ -1120,6 +1164,39 @@ mod tests {
                 (Ident, "include".into()),
                 (Equals, "=".into()),
                 (RawValue, "pages/*.conf".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn balanced_braces_in_value() {
+        // `}` at depth 0 still terminates the value, so the outer
+        // block closes correctly; `}` inside an open `{...}` just
+        // decrements depth.
+        assert_eq!(
+            lex("source s { run = awk /x/ {print 1} /tmp/f\n}"),
+            vec![
+                (Ident, "source".into()),
+                (Ident, "s".into()),
+                (LBrace, "{".into()),
+                (Ident, "run".into()),
+                (Equals, "=".into()),
+                (RawValue, "awk /x/ {print 1} /tmp/f".into()),
+                (Newline, "\n".into()),
+                (RBrace, "}".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_quoted_string_in_value_protects_braces_and_semicolons() {
+        assert_eq!(
+            lex("run = awk '/x/ {print; next}' /tmp/f\n"),
+            vec![
+                (Ident, "run".into()),
+                (Equals, "=".into()),
+                (RawValue, "awk '/x/ {print; next}' /tmp/f".into()),
+                (Newline, "\n".into()),
             ]
         );
     }

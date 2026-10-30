@@ -27,7 +27,7 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
 use crate::expr::{eval, Context, Value};
-use crate::ui::{ActionTrigger, Obj, Size};
+use crate::ui::{Obj, Size, UiEvent};
 
 /// Children of a component call plus the outer context they should
 /// resolve against. Threaded through [`render_node`] so a `slot { }`
@@ -44,7 +44,7 @@ pub fn render_page(
     doc: &Document,
     page_name: &str,
     ctx: &Context,
-    sink: &Sender<ActionTrigger>,
+    sink: &Sender<UiEvent>,
     screen: &Obj<'_>,
 ) {
     for item in &doc.items {
@@ -64,7 +64,7 @@ fn render_page_body(
     page: &Block,
     doc: &Document,
     ctx: &Context,
-    sink: &Sender<ActionTrigger>,
+    sink: &Sender<UiEvent>,
     screen: &Obj<'_>,
 ) {
     let page_root = screen.new_container();
@@ -84,16 +84,27 @@ fn render_item_list(
     doc: &Document,
     ctx: &Context,
     slot: Option<&SlotCtx<'_>>,
-    sink: &Sender<ActionTrigger>,
+    sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
 ) {
     for item in items {
         match item {
-            Item::Block(child) => render_node(child, doc, ctx, slot, sink, parent),
+            Item::Block(child) => {
+                if is_event_handler_block(&child.kind.text) {
+                    // Handled by apply_props on the parent; don't
+                    // render as a child UI node.
+                    continue;
+                }
+                render_node(child, doc, ctx, slot, sink, parent);
+            }
             Item::Repeat(r) => expand_repeat(r, doc, ctx, slot, sink, parent),
             _ => {}
         }
     }
+}
+
+fn is_event_handler_block(kind: &str) -> bool {
+    matches!(kind, "on_tap" | "on_hold" | "on_change" | "on_submit")
 }
 
 /// Expand a `repeat BIND in {{ EXPR }} { ... }`: evaluate the
@@ -104,7 +115,7 @@ fn expand_repeat(
     doc: &Document,
     ctx: &Context,
     slot: Option<&SlotCtx<'_>>,
-    sink: &Sender<ActionTrigger>,
+    sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
 ) {
     let body_offset = r.source.span.start + 2;
@@ -155,7 +166,7 @@ fn render_node(
     doc: &Document,
     ctx: &Context,
     slot: Option<&SlotCtx<'_>>,
-    sink: &Sender<ActionTrigger>,
+    sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
 ) {
     match node.kind.text.as_str() {
@@ -176,6 +187,25 @@ fn render_node(
         "stack" => {
             let obj = parent.new_container();
             obj.set_size(Size::Content, Size::Content);
+            apply_props(node, ctx, sink, &obj);
+            render_item_list(&node.items, doc, ctx, slot, sink, &obj);
+        }
+        "grid" => {
+            let obj = parent.new_container();
+            obj.set_size(Size::Content, Size::Content);
+            // Count the direct UI children up front so a sensible
+            // `rows` default (ceil(children / columns)) is applied
+            // when the user doesn't say.
+            let child_count = node
+                .items
+                .iter()
+                .filter(|it| matches!(it, Item::Block(_) | Item::Repeat(_)))
+                .count() as i32;
+            let cols = resolve_num(node, "columns", ctx).unwrap_or(2.0) as i32;
+            let rows = resolve_num(node, "rows", ctx).unwrap_or_else(|| {
+                (child_count.max(1) + cols.max(1) - 1) as f64 / cols.max(1) as f64
+            }) as i32;
+            obj.set_grid(cols.max(1), rows.max(1));
             apply_props(node, ctx, sink, &obj);
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
@@ -269,7 +299,7 @@ fn expand_component(
     comp: &Block,
     doc: &Document,
     outer_ctx: &Context,
-    sink: &Sender<ActionTrigger>,
+    sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
 ) {
     let mut inner_ctx = outer_ctx.clone();
@@ -295,6 +325,28 @@ fn expand_component(
         .collect();
     let slot = SlotCtx { children: &child_items, outer_ctx };
     render_item_list(&comp.items, doc, &inner_ctx, Some(&slot), sink, parent);
+}
+
+/// Interpolate every `{{ ... }}` fragment in `raw` against `ctx`,
+/// returning the rendered string. Literal text is kept verbatim.
+/// Used by sources / actions to splice secrets, sources and theme
+/// tokens into their shell commands before `runner::exec`.
+///
+/// `file` and `base` identify where `raw` lives in the enclosing
+/// source so CEL parse errors can point back at it; a caller
+/// without good coordinates can pass a dummy FileId and 0 base.
+pub fn interpolate(
+    raw: &str,
+    file: paneld_config::source::FileId,
+    base: u32,
+    ctx: &Context,
+) -> String {
+    let span = paneld_config::source::Span { file, start: base, end: base };
+    match resolve_expr_value(raw, span, ctx) {
+        Some(Value::String(s)) => s,
+        Some(v) => v.to_display_string(),
+        None => raw.to_string(),
+    }
 }
 
 /// Evaluate a `key = <raw>` as either a literal string (for a
@@ -510,7 +562,21 @@ fn interpolate_text(raw: &str, fragments: &[cel::Expr], ctx: &Context) -> String
     out
 }
 
-fn apply_props(node: &Block, ctx: &Context, sink: &Sender<ActionTrigger>, obj: &Obj<'_>) {
+fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_>) {
+    // Inline-action block form: `on_tap { goto = settings }`.
+    for item in &node.items {
+        let Item::Block(child) = item else { continue };
+        if child.kind.text != "on_tap" || child.name.is_some() {
+            continue;
+        }
+        if let Some(page) = find_simple(child, "goto") {
+            let page = page.trim();
+            if is_bare_ident(page) {
+                obj.set_clickable();
+                obj.on_tap_goto(sink.clone(), page);
+            }
+        }
+    }
     for item in &node.items {
         let Item::Assign(a) = item else { continue };
         let AssignTarget::Simple { key } = &a.target else {
@@ -548,6 +614,39 @@ fn apply_props(node: &Block, ctx: &Context, sink: &Sender<ActionTrigger>, obj: &
                     obj.set_text_color_hex(rgb);
                 }
             }
+            "font" => {
+                // Accept `<family> <size> [bold]` and pick the
+                // compiled Montserrat at that size, ignoring the
+                // family token for now (TinyTTF-loaded fonts come
+                // in a later phase). Falls back silently if the
+                // size isn't compiled in.
+                let resolved = resolve_expr_value(value, a.value.span, ctx)
+                    .map(|v| v.to_display_string())
+                    .unwrap_or_else(|| value.to_string());
+                if let Some(size) = extract_font_size(&resolved) {
+                    obj.set_font_size(size);
+                }
+            }
+            "align" => {
+                match value {
+                    "left" => obj.set_text_align_left(),
+                    "center" => obj.set_text_align_center(),
+                    "right" => obj.set_text_align_right(),
+                    _ => {}
+                }
+            }
+            "visible" => {
+                let flag = resolve_expr_value(value, a.value.span, ctx)
+                    .map(|v| value_truthy(&v))
+                    .unwrap_or(true);
+                obj.set_hidden(!flag);
+            }
+            "enabled" => {
+                let flag = resolve_expr_value(value, a.value.span, ctx)
+                    .map(|v| value_truthy(&v))
+                    .unwrap_or(true);
+                obj.set_enabled(flag);
+            }
             "on_tap" => {
                 // Simple-assign form only: `on_tap = <action-name>`.
                 // The `on_tap action { ... }` block form (named
@@ -583,6 +682,42 @@ fn resolve_num(node: &Block, key: &str, ctx: &Context) -> Option<f64> {
         Value::Double(d) => Some(d),
         Value::String(s) => s.trim().parse::<f64>().ok(),
         _ => None,
+    }
+}
+
+/// Pull the size integer out of a `font` value such as
+/// `roboto 20`, `montserrat 16 bold`, `fonts/Inter.ttf 24`.
+fn extract_font_size(s: &str) -> Option<u16> {
+    for tok in s.split_whitespace() {
+        if let Ok(n) = tok.parse::<u16>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn find_simple<'a>(node: &'a Block, key: &str) -> Option<&'a str> {
+    for item in &node.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key: k } = &a.target else {
+            continue;
+        };
+        if k.text == key {
+            return Some(a.value.text.as_str());
+        }
+    }
+    None
+}
+
+fn value_truthy(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Null => false,
+        Value::Int(n) => *n != 0,
+        Value::Double(d) => *d != 0.0,
+        Value::String(s) => !s.is_empty(),
+        Value::List(items) => !items.is_empty(),
+        Value::Map(m) => !m.is_empty(),
     }
 }
 

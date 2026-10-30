@@ -14,34 +14,41 @@ use std::time::{Duration, Instant};
 
 use lvgl_sys as sys;
 
-/// A tap on a UI node bound to a top-level action. Sent to the
-/// consumer (`main.rs`) by the LVGL click callback registered in
-/// [`Obj::on_tap`].
+/// A tap on a UI node bound to either a named top-level action or
+/// a `goto = <page>` inline navigation. Sent to the consumer
+/// (`main.rs`) by the LVGL click callback registered in
+/// [`Obj::on_tap`] / [`Obj::on_tap_goto`].
 #[derive(Debug, Clone)]
-pub struct ActionTrigger {
-    pub action_name: String,
+pub enum UiEvent {
+    /// `on_tap = action_name` -- run that action's `run` command.
+    Action { name: String },
+    /// `on_tap { goto = page_name }` -- switch to that page.
+    Goto { page: String },
 }
+
+/// Back-compat alias for the pre-nav payload.
+#[allow(dead_code)]
+pub type ActionTrigger = UiEvent;
 
 #[derive(Clone)]
-struct ActionBinding {
-    name: String,
-    sink: Sender<ActionTrigger>,
+enum Binding {
+    Action { name: String, sink: Sender<UiEvent> },
+    Goto { page: String, sink: Sender<UiEvent> },
 }
 
-/// Global registry of per-widget action bindings. [`Obj::on_tap`]
-/// appends a binding and uses the returned index as the LVGL event
-/// user_data; the static trampoline reads that index when the event
-/// fires. The main loop calls [`reset_action_bindings`] before each
-/// re-render so freshly-cleared LVGL objects cannot fire against
-/// stale indices.
-fn bindings() -> &'static Mutex<Vec<ActionBinding>> {
-    static B: OnceLock<Mutex<Vec<ActionBinding>>> = OnceLock::new();
+/// Global registry of per-widget bindings. [`Obj::on_tap`] /
+/// [`Obj::on_tap_goto`] append a binding and use the returned index
+/// as the LVGL event user_data; the static trampoline reads that
+/// index when the event fires. The main loop calls
+/// [`reset_action_bindings`] before each re-render so freshly-
+/// cleared LVGL objects cannot fire against stale indices.
+fn bindings() -> &'static Mutex<Vec<Binding>> {
+    static B: OnceLock<Mutex<Vec<Binding>>> = OnceLock::new();
     B.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Drop every registered action binding. Call this on the UI thread
-/// AFTER [`Obj::clear_children`] on the screen (which destroys the
-/// LVGL objects whose callbacks reference these indices).
+/// Drop every registered action / goto binding. Call this on the UI
+/// thread AFTER [`Obj::clear_children`] on the screen.
 pub fn reset_action_bindings() {
     bindings().lock().unwrap().clear();
 }
@@ -52,17 +59,30 @@ unsafe extern "C" fn on_tap_trampoline(e: *mut sys::lv_event_t) {
         let guard = bindings().lock().unwrap();
         guard.get(idx).cloned()
     };
-    if let Some(bind) = bind {
-        let _ = bind.sink.send(ActionTrigger { action_name: bind.name });
+    match bind {
+        Some(Binding::Action { name, sink }) => {
+            let _ = sink.send(UiEvent::Action { name });
+        }
+        Some(Binding::Goto { page, sink }) => {
+            let _ = sink.send(UiEvent::Goto { page });
+        }
+        None => {}
     }
 }
 
-// LVGL's `LV_SIZE_CONTENT` and `LV_PCT(x)` are C macros that bindgen
-// doesn't translate; mirror the exact bit layout from
-// `vendor/lvgl/include/lvgl/core/lv_area.h` here.
+// LVGL's `LV_SIZE_CONTENT`, `LV_PCT(x)` and the grid sentinels are C
+// macros that bindgen doesn't translate; mirror the exact bit layout
+// from `vendor/lvgl/include/lvgl/core/lv_area.h` and
+// `include/lvgl/layouts/lv_grid.h` here.
 const LV_COORD_TYPE_SPEC: i32 = 1 << 29;
 const LV_COORD_MAX_LOCAL: i32 = (1 << 29) - 1;
 const LV_SIZE_CONTENT_LOCAL: i32 = LV_COORD_MAX_LOCAL | LV_COORD_TYPE_SPEC;
+/// Mirrors `#define LV_GRID_FR(x) (LV_COORD_MAX - 100 + x)`.
+pub(crate) fn grid_fr(x: i32) -> i32 {
+    LV_COORD_MAX_LOCAL - 100 + x
+}
+/// Sentinel ending a grid dsc array; matches `LV_GRID_TEMPLATE_LAST`.
+pub(crate) const GRID_TEMPLATE_LAST: i32 = sys::LV_GRID_TEMPLATE_LAST as i32;
 
 /// Guards the global `lv_init` / `lv_deinit` so a second `Ui` can't
 /// be built in the same process. Dropping [`Ui`] releases the guard.
@@ -293,6 +313,49 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_style_text_color(self.raw, color, 0) };
     }
 
+    /// Pick one of the compiled Montserrat font sizes for this
+    /// object. Returns `false` if the requested size isn't compiled
+    /// into our LVGL build (see `lv_conf.h`).
+    pub fn set_font_size(&self, size: u16) -> bool {
+        let font: *const sys::lv_font_t = unsafe {
+            match size {
+                12 => &sys::lv_font_montserrat_12,
+                14 => &sys::lv_font_montserrat_14,
+                16 => &sys::lv_font_montserrat_16,
+                20 => &sys::lv_font_montserrat_20,
+                24 => &sys::lv_font_montserrat_24,
+                32 => &sys::lv_font_montserrat_32,
+                _ => return false,
+            }
+        };
+        unsafe { sys::lv_obj_set_style_text_font(self.raw, font, 0) };
+        true
+    }
+
+    pub fn set_text_align_left(&self) {
+        unsafe {
+            sys::lv_obj_set_style_text_align(self.raw, sys::lv_text_align_t_LV_TEXT_ALIGN_LEFT, 0)
+        };
+    }
+    pub fn set_text_align_center(&self) {
+        unsafe {
+            sys::lv_obj_set_style_text_align(
+                self.raw,
+                sys::lv_text_align_t_LV_TEXT_ALIGN_CENTER,
+                0,
+            )
+        };
+    }
+    pub fn set_text_align_right(&self) {
+        unsafe {
+            sys::lv_obj_set_style_text_align(
+                self.raw,
+                sys::lv_text_align_t_LV_TEXT_ALIGN_RIGHT,
+                0,
+            )
+        };
+    }
+
     pub fn align_center(&self) {
         unsafe { sys::lv_obj_align(self.raw, sys::lv_align_t_LV_ALIGN_CENTER, 0, 0) };
     }
@@ -304,18 +367,73 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_clean(self.raw) };
     }
 
+    /// Make this object a grid container with `cols` equal fractional
+    /// columns and `rows` equal fractional rows. The row and column
+    /// descriptor arrays leak intentionally (they must outlive the
+    /// LVGL object) -- children on a reload re-create the arrays and
+    /// the old ones are collected by the OS at exit. The descriptor
+    /// stays stable across the object's lifetime.
+    pub fn set_grid(&self, cols: i32, rows: i32) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let mut col_dsc: Vec<i32> = (0..cols).map(|_| grid_fr(1)).collect();
+        col_dsc.push(GRID_TEMPLATE_LAST);
+        let mut row_dsc: Vec<i32> = (0..rows).map(|_| grid_fr(1)).collect();
+        row_dsc.push(GRID_TEMPLATE_LAST);
+        // Leak so the pointers stay valid for the LVGL object's
+        // lifetime; see doc comment above.
+        let col_ptr = Box::leak(col_dsc.into_boxed_slice()).as_ptr();
+        let row_ptr = Box::leak(row_dsc.into_boxed_slice()).as_ptr();
+        unsafe {
+            sys::lv_obj_set_layout(self.raw, sys::lv_layout_t_LV_LAYOUT_GRID);
+            sys::lv_obj_set_grid_dsc_array(self.raw, col_ptr, row_ptr);
+        }
+    }
+
     /// Mark this object clickable (plain `obj` and `label` need this;
     /// `button` has it on by default).
     pub fn set_clickable(&self) {
         unsafe { sys::lv_obj_add_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_CLICKABLE) };
     }
 
-    /// Register an LVGL CLICKED callback that pushes an
-    /// [`ActionTrigger`] on `sink` when the object is tapped.
-    pub fn on_tap(&self, sink: Sender<ActionTrigger>, action_name: &str) {
+    /// Hide / show the object.
+    pub fn set_hidden(&self, hidden: bool) {
+        if hidden {
+            unsafe { sys::lv_obj_add_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_HIDDEN) };
+        } else {
+            unsafe {
+                sys::lv_obj_remove_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_HIDDEN)
+            };
+        }
+    }
+
+    /// Enable / disable click handling.
+    pub fn set_enabled(&self, enabled: bool) {
+        if enabled {
+            unsafe { sys::lv_obj_add_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_CLICKABLE) };
+        } else {
+            unsafe {
+                sys::lv_obj_remove_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_CLICKABLE)
+            };
+        }
+    }
+
+    /// Register an LVGL CLICKED callback that pushes a
+    /// [`UiEvent::Action`] on `sink` when the object is tapped.
+    pub fn on_tap(&self, sink: Sender<UiEvent>, action_name: &str) {
+        self.register_binding(Binding::Action { name: action_name.to_string(), sink });
+    }
+
+    /// Register an LVGL CLICKED callback that pushes a
+    /// [`UiEvent::Goto`] on `sink` when the object is tapped.
+    pub fn on_tap_goto(&self, sink: Sender<UiEvent>, page: &str) {
+        self.register_binding(Binding::Goto { page: page.to_string(), sink });
+    }
+
+    fn register_binding(&self, binding: Binding) {
         let idx = {
             let mut g = bindings().lock().unwrap();
-            g.push(ActionBinding { name: action_name.to_string(), sink });
+            g.push(binding);
             g.len() - 1
         };
         unsafe {
