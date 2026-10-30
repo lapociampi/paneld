@@ -32,18 +32,20 @@ fn main() {
     println!("cargo:rerun-if-changed=include/lv_conf.h");
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=build.rs");
-    // Submodule rev changes: let `.gitmodules` act as a signal.
     println!(
         "cargo:rerun-if-changed={}",
         workspace_root.join(".gitmodules").display()
     );
 
-    compile_lvgl(&manifest_dir, &lvgl_dir);
-    generate_bindings(&manifest_dir, &lvgl_dir);
-    link_sdl2();
+    let sdl = env::var_os("CARGO_FEATURE_SDL").is_some();
+    let drm = env::var_os("CARGO_FEATURE_DRM").is_some();
+
+    compile_lvgl(&manifest_dir, &lvgl_dir, sdl, drm);
+    generate_bindings(&manifest_dir, &lvgl_dir, sdl, drm);
+    link_runtime_libs(sdl, drm);
 }
 
-fn compile_lvgl(manifest_dir: &Path, lvgl_dir: &Path) {
+fn compile_lvgl(manifest_dir: &Path, lvgl_dir: &Path, sdl: bool, drm: bool) {
     let mut build = cc::Build::new();
     build
         .flag_if_supported("-std=c11")
@@ -57,30 +59,47 @@ fn compile_lvgl(manifest_dir: &Path, lvgl_dir: &Path) {
         .flag_if_supported("-fvisibility=hidden")
         .define("LV_CONF_INCLUDE_SIMPLE", None)
         .define("LV_LVGL_H_INCLUDE_SIMPLE", None)
-        // Required for `strnlen` and friends in the clib stdlib shim.
         .define("_GNU_SOURCE", None)
         .include(manifest_dir.join("include"))
         .include(lvgl_dir)
         .include(lvgl_dir.join("src"))
         .include(lvgl_dir.join("include"));
 
-    // SDL2 headers (for the drivers/sdl sources).
-    for inc in sdl2_include_paths() {
-        build.include(inc);
+    // Flip the backend defines to match our Cargo features. These
+    // override the matching #defines in lv_conf.h so a feature-less
+    // build drops the whole subsystem's code.
+    build.define("PANELD_USE_SDL", if sdl { "1" } else { "0" });
+    build.define("PANELD_USE_DRM", if drm { "1" } else { "0" });
+    // `lv_conf.h` honors these overrides below.
+
+    if sdl {
+        for inc in sdl2_include_paths() {
+            build.include(inc);
+        }
+    }
+    if drm {
+        for inc in libdrm_include_paths() {
+            build.include(inc);
+        }
     }
 
-    // Walk every C file under src/, filtering only files we know
-    // shouldn't be compiled (optional backends gated by features we
-    // don't enable).
     let srcs = collect_c_sources(&lvgl_dir.join("src"));
     for src in &srcs {
+        // Skip whole-backend driver TUs when their feature is off,
+        // so a missing SDL2 header on a device build never blocks
+        // compilation.
+        let path = src.to_string_lossy();
+        if !sdl && path.contains("/drivers/sdl/") {
+            continue;
+        }
+        if !drm && path.contains("lv_linux_drm.c") {
+            continue;
+        }
         build.file(src);
     }
 
     build.compile("lvgl");
 
-    // Make the include paths available for consumers (the `ui` crate
-    // needs them for bindgen-generated types to type-check).
     println!("cargo:include={}", lvgl_dir.display());
     println!("cargo:lvgl_dir={}", lvgl_dir.display());
 }
@@ -103,25 +122,21 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn generate_bindings(manifest_dir: &Path, lvgl_dir: &Path) {
+fn generate_bindings(manifest_dir: &Path, lvgl_dir: &Path, sdl: bool, drm: bool) {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bindings_path = out_dir.join("bindings.rs");
 
+    let wrapper = if sdl { "wrapper.h" } else { "wrapper_nosdl.h" };
     let mut builder = bindgen::Builder::default()
-        .header(
-            manifest_dir
-                .join("wrapper.h")
-                .to_string_lossy()
-                .into_owned(),
-        )
+        .header(manifest_dir.join(wrapper).to_string_lossy().into_owned())
         .clang_arg(format!("-I{}", manifest_dir.join("include").display()))
         .clang_arg(format!("-I{}", lvgl_dir.display()))
         .clang_arg(format!("-I{}", lvgl_dir.join("src").display()))
         .clang_arg(format!("-I{}", lvgl_dir.join("include").display()))
         .clang_arg("-DLV_CONF_INCLUDE_SIMPLE")
         .clang_arg("-DLV_LVGL_H_INCLUDE_SIMPLE")
-        // Narrow the generated surface to the LVGL public API; keep
-        // our bindings small (ADR 0011).
+        .clang_arg(format!("-DPANELD_USE_SDL={}", if sdl { 1 } else { 0 }))
+        .clang_arg(format!("-DPANELD_USE_DRM={}", if drm { 1 } else { 0 }))
         .allowlist_function("lv_.*")
         .allowlist_type("lv_.*")
         .allowlist_type("_lv_.*")
@@ -133,8 +148,10 @@ fn generate_bindings(manifest_dir: &Path, lvgl_dir: &Path) {
         .layout_tests(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
 
-    for inc in sdl2_include_paths() {
-        builder = builder.clang_arg(format!("-I{}", inc.display()));
+    if sdl {
+        for inc in sdl2_include_paths() {
+            builder = builder.clang_arg(format!("-I{}", inc.display()));
+        }
     }
 
     let bindings = builder
@@ -146,17 +163,22 @@ fn generate_bindings(manifest_dir: &Path, lvgl_dir: &Path) {
 }
 
 fn sdl2_include_paths() -> Vec<PathBuf> {
-    // Try pkg-config first.
-    if let Ok(lib) = pkg_config_sdl2() {
+    if let Ok(lib) = pkg_config_cflags("sdl2") {
         return lib;
     }
-    // Fall back to the common Linux path.
     vec![PathBuf::from("/usr/include/SDL2"), PathBuf::from("/usr/include")]
 }
 
-fn pkg_config_sdl2() -> Result<Vec<PathBuf>, ()> {
+fn libdrm_include_paths() -> Vec<PathBuf> {
+    if let Ok(lib) = pkg_config_cflags("libdrm") {
+        return lib;
+    }
+    vec![PathBuf::from("/usr/include/libdrm"), PathBuf::from("/usr/include/drm")]
+}
+
+fn pkg_config_cflags(pkg: &str) -> Result<Vec<PathBuf>, ()> {
     let out = std::process::Command::new("pkg-config")
-        .args(["--cflags-only-I", "sdl2"])
+        .args(["--cflags-only-I", pkg])
         .output()
         .map_err(|_| ())?;
     if !out.status.success() {
@@ -174,11 +196,11 @@ fn pkg_config_sdl2() -> Result<Vec<PathBuf>, ()> {
     }
 }
 
-fn link_sdl2() {
-    // On a PC build we always link SDL2. The device targets will add
-    // libdrm / libinput here instead (ADR 0012); for now we only
-    // speak PC.
-    if pkg_config::Config::new().probe("sdl2").is_err() {
+fn link_runtime_libs(sdl: bool, drm: bool) {
+    if sdl && pkg_config::Config::new().probe("sdl2").is_err() {
         println!("cargo:rustc-link-lib=SDL2");
+    }
+    if drm && pkg_config::Config::new().probe("libdrm").is_err() {
+        println!("cargo:rustc-link-lib=drm");
     }
 }

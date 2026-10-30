@@ -9,6 +9,7 @@
 
 mod actions;
 mod ctl;
+mod display;
 mod runner;
 mod secrets;
 mod sources;
@@ -155,7 +156,22 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         control_tx,
     );
 
-    let _window = ui.open_window(800, 480, "paneld");
+    // Peek at the config just to pick the display backend. The
+    // live state will reload the full config a moment later.
+    let display_cfg = match paneld_config::load(&config) {
+        Ok((_, doc, _)) => display::DisplayConfig::from_doc(&doc),
+        Err(_) => display::DisplayConfig::default(),
+    };
+    let _window = match display_cfg.open(&ui) {
+        Some(w) => w,
+        None => {
+            eprintln!(
+                "paneld: display backend {:?} failed to open; try `backend = sdl` or check the device path",
+                display_cfg.backend
+            );
+            return ExitCode::from(70);
+        }
+    };
     let screen = ui.screen();
 
     // Initial live state. `reload` wipes and rebuilds this.

@@ -108,18 +108,74 @@ impl Ui {
     }
 
     pub fn open_window(&self, width: i32, height: i32, title: &str) -> Window {
-        // SAFETY: `lv_sdl_window_create` is safe to call after
-        // `lv_init`. The returned display is owned by LVGL's global
-        // registry; we store the raw pointer for identification. SDL
-        // only supports setting the window title via its own call --
-        // LVGL 9.6 exposes `lv_sdl_window_set_title`.
+        #[cfg(feature = "sdl")]
+        {
+            self.open_sdl_window(width, height, title)
+        }
+        #[cfg(not(feature = "sdl"))]
+        {
+            let _ = (width, height, title);
+            panic!("paneld-ui built without the `sdl` feature; use open_drm_display or open_fbdev_display")
+        }
+    }
+
+    /// Open an SDL2 window with a mouse input device attached (PC
+    /// build). WSLg surfaces this as an X11 window.
+    #[cfg(feature = "sdl")]
+    pub fn open_sdl_window(&self, width: i32, height: i32, title: &str) -> Window {
         let display = unsafe { sys::lv_sdl_window_create(width, height) };
         assert!(!display.is_null(), "lv_sdl_window_create returned null");
         let c_title = CString::new(title).expect("window title contains a NUL byte");
         unsafe { sys::lv_sdl_window_set_title(display, c_title.as_ptr()) };
         let mouse = unsafe { sys::lv_sdl_mouse_create() };
         assert!(!mouse.is_null(), "lv_sdl_mouse_create returned null");
-        Window { display, _mouse: mouse }
+        Window { display, _input: Some(mouse) }
+    }
+
+    /// Open a DRM/KMS display (device build; ADR 0012). `device` is
+    /// the DRM card path (`/dev/dri/card1` on the Pi 4). Returns
+    /// `None` if the device can't be opened.
+    #[cfg(feature = "drm")]
+    pub fn open_drm_display(&self, device: &str) -> Option<Window> {
+        let display = unsafe { sys::lv_linux_drm_create() };
+        if display.is_null() {
+            return None;
+        }
+        let c_dev = CString::new(device).ok()?;
+        let r = unsafe { sys::lv_linux_drm_set_file(display, c_dev.as_ptr(), -1) };
+        if r != sys::lv_result_t_LV_RESULT_OK {
+            return None;
+        }
+        Some(Window { display, _input: None })
+    }
+
+    /// Open a Linux fbdev display (fallback for boards without a
+    /// usable DRM/KMS path). `device` is e.g. `/dev/fb0`.
+    pub fn open_fbdev_display(&self, device: &str) -> Option<Window> {
+        let display = unsafe { sys::lv_linux_fbdev_create() };
+        if display.is_null() {
+            return None;
+        }
+        let c_dev = CString::new(device).ok()?;
+        let r = unsafe { sys::lv_linux_fbdev_set_file(display, c_dev.as_ptr()) };
+        if r != sys::lv_result_t_LV_RESULT_OK {
+            return None;
+        }
+        Some(Window { display, _input: None })
+    }
+
+    /// Attach an evdev touch / mouse pointer at `device` (e.g.
+    /// `/dev/input/event0`). Returns `false` if the device can't be
+    /// opened.
+    pub fn add_evdev_pointer(&self, device: &str) -> bool {
+        let c_dev = match CString::new(device) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let indev = unsafe {
+            sys::lv_evdev_create(sys::lv_indev_type_t_LV_INDEV_TYPE_POINTER, c_dev.as_ptr())
+        };
+        !indev.is_null()
     }
 
     /// Return a handle to the active screen's root `lv_obj`. Children
@@ -189,13 +245,12 @@ impl Drop for Ui {
     }
 }
 
-/// An SDL2 window plus its mouse input device. Attached to the
-/// [`Ui`]; dropped before `lv_deinit` runs.
+/// A display plus (optionally) one attached pointer input device.
+/// Attached to the [`Ui`]; dropped before `lv_deinit` runs. LVGL
+/// owns the underlying objects through its global registries.
 pub struct Window {
     display: *mut sys::lv_display_t,
-    // Kept so the input device isn't considered unused; LVGL owns
-    // its lifetime through its global indev list.
-    _mouse: *mut sys::lv_indev_t,
+    _input: Option<*mut sys::lv_indev_t>,
 }
 
 impl Window {

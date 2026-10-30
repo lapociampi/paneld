@@ -12,7 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 paneld-config.workspace = true
-paneld-ui = { path = "../paneld-ui" }
+paneld-ui = { path = "../paneld-ui", default-features = false }
+
+[features]
+default = ["sdl"]
+sdl = ["paneld-ui/sdl"]
+drm = ["paneld-ui/drm"]
+device = ["drm"]
 
 [lints]
 workspace = true

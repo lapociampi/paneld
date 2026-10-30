@@ -9,6 +9,15 @@ description = "Raw FFI bindings to LVGL 9, built from vendored source."
 links = "lvgl"
 build = "build.rs"
 
+[features]
+default = ["sdl"]
+# PC build: SDL2 window driver. Needs libSDL2-dev / SDL2 headers.
+sdl = []
+# Linux device build: DRM/KMS + fbdev + evdev. Needs libdrm headers.
+drm = []
+# Default device profile: DRM + fbdev + evdev, no SDL.
+device = ["drm"]
+
 [build-dependencies]
 bindgen = "0.72"
 cc = "1.2"

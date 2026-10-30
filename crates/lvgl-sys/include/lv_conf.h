@@ -20,8 +20,12 @@
 #define LV_USE_STDLIB_STRING    LV_STDLIB_CLIB
 #define LV_USE_STDLIB_SPRINTF   LV_STDLIB_CLIB
 
-/* OS: SDL2 drives us on a PC. Reconfigure for the device build later. */
+/* OS: SDL2 drives us on a PC build; pthread on a device build. */
+#if PANELD_USE_SDL
 #define LV_USE_OS               LV_OS_SDL2
+#else
+#define LV_USE_OS               LV_OS_PTHREAD
+#endif
 
 /* ---------------------------------------------------------------------
  * Rendering
@@ -103,10 +107,9 @@
  * Platform drivers
  * --------------------------------------------------------------------- */
 
-/* SDL2 window on a PC (WSLg). Device backends (DRM/KMS, fbdev, evdev)
- * will be enabled by their own cfg(target_os) feature in a later
- * phase. */
-#define LV_USE_SDL              1
+/* SDL2 window on a PC (WSLg). Controlled by the `sdl` Cargo
+ * feature: build.rs defines PANELD_USE_SDL to 0 or 1. */
+#define LV_USE_SDL              PANELD_USE_SDL
 #define LV_SDL_INCLUDE_PATH     "SDL2/SDL.h"
 #define LV_SDL_BACKEND          LV_SDL_BACKEND_SW
 #define LV_SDL_RENDER_MODE      LV_DISPLAY_RENDER_MODE_DIRECT
@@ -114,5 +117,21 @@
 #define LV_SDL_ACCELERATED      1
 #define LV_SDL_FULLSCREEN       0
 #define LV_SDL_DIRECT_EXIT      1
+
+/* Device backends (ADR 0012): DRM/KMS primary, fbdev as fallback,
+ * evdev for touch. DRM is controlled by the `drm` Cargo feature;
+ * fbdev + evdev have no external dependency so stay on. */
+#define LV_USE_LINUX_DRM        PANELD_USE_DRM
+#define LV_LINUX_DRM_GPU_PLANE  0
+#define LV_LINUX_DRM_HOR_RES    800
+#define LV_LINUX_DRM_VER_RES    480
+
+#define LV_USE_LINUX_FBDEV      1
+#define LV_LINUX_FBDEV_BSD      0
+#define LV_LINUX_FBDEV_RENDER_MODE  LV_DISPLAY_RENDER_MODE_PARTIAL
+#define LV_LINUX_FBDEV_BUFFER_COUNT 0
+#define LV_LINUX_FBDEV_BUFFER_SIZE  60
+
+#define LV_USE_EVDEV            1
 
 #endif /*LV_CONF_H*/
