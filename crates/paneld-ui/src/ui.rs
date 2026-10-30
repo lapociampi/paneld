@@ -17,13 +17,63 @@ use lvgl_sys as sys;
 /// A tap on a UI node bound to either a named top-level action or
 /// a `goto = <page>` inline navigation. Sent to the consumer
 /// (`main.rs`) by the LVGL click callback registered in
-/// [`Obj::on_tap`] / [`Obj::on_tap_goto`].
+/// [`Obj::on_tap`] / [`Obj::on_tap_goto`]. The action worker also
+/// sends [`UiEvent::VarsChanged`] after it applies a `set` block,
+/// so the main loop knows to rebuild the context and re-render.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    /// `on_tap = action_name` -- run that action's `run` command.
-    Action { name: String },
+    /// `on_tap = action_name` or `on_tap action_name { arg = val }` --
+    /// run that action's `run` command, with the already-evaluated
+    /// `args` overlaid on the eval context as named bindings.
+    Action { name: String, args: Vec<ActionArg> },
     /// `on_tap { goto = page_name }` -- switch to that page.
     Goto { page: String },
+    /// `on_tap { set { k = v; ... } }` -- apply these writes to the
+    /// shared vars map. Each item carries the key and the raw value
+    /// text; the main loop evaluates each RHS against the current
+    /// context, like a named action's `set` block.
+    InlineSet { assigns: Vec<InlineSetItem> },
+    /// `on_change { set { k = v; ... } }` on an input widget whose
+    /// new value should be visible in the set-RHS expressions as the
+    /// `event.value` identifier. Carries the live value snapshot
+    /// (bool for a toggle, int for a slider, ...).
+    ChangeInlineSet {
+        assigns: Vec<InlineSetItem>,
+        event_value: EventValue,
+    },
+    /// Some `var` was written (by a named action's `set` or by an
+    /// [`UiEvent::InlineSet`] on tap). The main loop treats this like
+    /// a source update: rebuild ctx, re-render.
+    VarsChanged,
+}
+
+/// The scalar an input widget's `on_change` handler sees as
+/// `event.value`. Kept primitive so the UI thread can snapshot it
+/// without allocating; the main loop lifts it into a
+/// [`crate::Value`] when building the eval context.
+#[derive(Clone, Copy, Debug)]
+pub enum EventValue {
+    Bool(bool),
+    Int(i64),
+    Double(f64),
+}
+
+/// One `k = v` entry inside an inline `on_tap { set { ... } }`.
+#[derive(Debug, Clone)]
+pub struct InlineSetItem {
+    pub key: String,
+    pub value_raw: String,
+}
+
+/// A single already-evaluated `name = value` arg from an action-call
+/// shortcut (`on_tap vm_stop { vm = {{ item.id }} }`). Captured at
+/// render time so the value reflects the scope the user tapped in --
+/// after a repeat has advanced or a var has changed, the stored
+/// value still matches what the row showed.
+#[derive(Debug, Clone)]
+pub struct ActionArg {
+    pub name: String,
+    pub value: crate::expr::Value,
 }
 
 /// Back-compat alias for the pre-nav payload.
@@ -32,8 +82,28 @@ pub type ActionTrigger = UiEvent;
 
 #[derive(Clone)]
 enum Binding {
-    Action { name: String, sink: Sender<UiEvent> },
+    Action {
+        name: String,
+        args: Vec<ActionArg>,
+        sink: Sender<UiEvent>,
+    },
     Goto { page: String, sink: Sender<UiEvent> },
+    InlineSet { assigns: Vec<InlineSetItem>, sink: Sender<UiEvent> },
+    /// On an LVGL VALUE_CHANGED / RELEASED event, the trampoline
+    /// reads the widget's current state, builds an
+    /// [`EventValue`] of the right flavor, and sends an
+    /// [`UiEvent::ChangeInlineSet`].
+    Change {
+        kind: ChangeKind,
+        assigns: Vec<InlineSetItem>,
+        sink: Sender<UiEvent>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ChangeKind {
+    Toggle,
+    Slider,
 }
 
 /// Global registry of per-widget bindings. [`Obj::on_tap`] /
@@ -60,13 +130,40 @@ unsafe extern "C" fn on_tap_trampoline(e: *mut sys::lv_event_t) {
         guard.get(idx).cloned()
     };
     match bind {
-        Some(Binding::Action { name, sink }) => {
-            let _ = sink.send(UiEvent::Action { name });
+        Some(Binding::Action { name, args, sink }) => {
+            let _ = sink.send(UiEvent::Action { name, args });
         }
         Some(Binding::Goto { page, sink }) => {
             let _ = sink.send(UiEvent::Goto { page });
         }
-        None => {}
+        Some(Binding::InlineSet { assigns, sink }) => {
+            let _ = sink.send(UiEvent::InlineSet { assigns });
+        }
+        _ => {}
+    }
+}
+
+unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
+    let idx = unsafe { sys::lv_event_get_user_data(e) } as usize;
+    let target = unsafe { sys::lv_event_get_target(e) } as *mut sys::lv_obj_t;
+    let bind = {
+        let guard = bindings().lock().unwrap();
+        guard.get(idx).cloned()
+    };
+    if let Some(Binding::Change { kind, assigns, sink }) = bind {
+        let event_value = match kind {
+            ChangeKind::Toggle => {
+                let on = unsafe {
+                    sys::lv_obj_has_state(target, sys::lv_state_t_LV_STATE_CHECKED)
+                };
+                EventValue::Bool(on)
+            }
+            ChangeKind::Slider => {
+                let v = unsafe { sys::lv_slider_get_value(target) };
+                EventValue::Int(v as i64)
+            }
+        };
+        let _ = sink.send(UiEvent::ChangeInlineSet { assigns, event_value });
     }
 }
 
@@ -318,6 +415,65 @@ impl<'ui> Obj<'ui> {
         Obj { raw, _ui: PhantomData }
     }
 
+    /// A two-state toggle switch (schema `toggle`). State is driven
+    /// through [`Self::set_toggle_state`] and read back by the
+    /// change-event trampoline.
+    pub fn new_toggle(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_switch_create(self.raw) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// Add or remove `LV_STATE_CHECKED` so the switch displays `on`.
+    pub fn set_toggle_state(&self, on: bool) {
+        unsafe {
+            if on {
+                sys::lv_obj_add_state(self.raw, sys::lv_state_t_LV_STATE_CHECKED);
+            } else {
+                sys::lv_obj_remove_state(self.raw, sys::lv_state_t_LV_STATE_CHECKED);
+            }
+        }
+    }
+
+    /// A QR code widget (schema `qr`). Size is in pixels (square);
+    /// data is set via [`Self::set_qrcode_data`].
+    pub fn new_qrcode(&self, size: i32) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_qrcode_create(self.raw) };
+        assert!(!raw.is_null());
+        unsafe { sys::lv_qrcode_set_size(raw, size) };
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// Encode `data` into the QR code. LVGL copies the bytes.
+    pub fn set_qrcode_data(&self, data: &str) {
+        let c = CString::new(data).unwrap_or_else(|_| CString::new("").unwrap());
+        unsafe { sys::lv_qrcode_set_data(self.raw, c.as_ptr()) };
+        // `set_data` only stashes the string; `render` turns it into
+        // a bitmap. In immediate update mode this would be automatic;
+        // in deferred it is not. Force a render either way so the
+        // widget shows a valid code before the next LVGL tick.
+        unsafe {
+            let _ = sys::lv_qrcode_render(self.raw);
+        }
+    }
+
+    /// A horizontal slider (schema `slider`). Range and value set
+    /// through [`Self::set_slider_range`] / [`Self::set_slider_value`].
+    pub fn new_slider(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_slider_create(self.raw) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    pub fn set_slider_range(&self, min: i32, max: i32) {
+        unsafe { sys::lv_slider_set_range(self.raw, min, max) };
+    }
+
+    pub fn set_slider_value(&self, v: i32) {
+        unsafe { sys::lv_slider_set_value(self.raw, v, false) };
+    }
+
+
     /// Set a bar's current fill value (no animation).
     pub fn set_bar_value(&self, v: i32) {
         unsafe { sys::lv_bar_set_value(self.raw, v, false) };
@@ -474,15 +630,95 @@ impl<'ui> Obj<'ui> {
     }
 
     /// Register an LVGL CLICKED callback that pushes a
-    /// [`UiEvent::Action`] on `sink` when the object is tapped.
+    /// [`UiEvent::Action`] with no args on `sink` when tapped.
     pub fn on_tap(&self, sink: Sender<UiEvent>, action_name: &str) {
-        self.register_binding(Binding::Action { name: action_name.to_string(), sink });
+        self.on_tap_with_args(sink, action_name, Vec::new());
+    }
+
+    /// Same as [`Self::on_tap`] but carries already-evaluated args
+    /// for an action-call shortcut (`on_tap vm_stop { vm = ... }`).
+    pub fn on_tap_with_args(
+        &self,
+        sink: Sender<UiEvent>,
+        action_name: &str,
+        args: Vec<ActionArg>,
+    ) {
+        self.register_binding(Binding::Action {
+            name: action_name.to_string(),
+            args,
+            sink,
+        });
     }
 
     /// Register an LVGL CLICKED callback that pushes a
     /// [`UiEvent::Goto`] on `sink` when the object is tapped.
     pub fn on_tap_goto(&self, sink: Sender<UiEvent>, page: &str) {
         self.register_binding(Binding::Goto { page: page.to_string(), sink });
+    }
+
+    /// Register an LVGL CLICKED callback that pushes a
+    /// [`UiEvent::InlineSet`] on `sink` when the object is tapped.
+    /// The `assigns` are evaluated and applied by the main loop so
+    /// the UI thread stays free of CEL work on tap.
+    pub fn on_tap_inline_set(&self, sink: Sender<UiEvent>, assigns: Vec<InlineSetItem>) {
+        self.register_binding(Binding::InlineSet { assigns, sink });
+    }
+
+    /// Register an LVGL VALUE_CHANGED callback on a toggle (switch)
+    /// widget. On change the trampoline reads the switch's new state
+    /// and pushes [`UiEvent::ChangeInlineSet`] on `sink`, with the
+    /// state carried as `event.value`.
+    pub fn on_change_toggle_inline_set(
+        &self,
+        sink: Sender<UiEvent>,
+        assigns: Vec<InlineSetItem>,
+    ) {
+        self.register_change_binding(
+            ChangeKind::Toggle,
+            assigns,
+            sink,
+            sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED,
+        );
+    }
+
+    /// Register an LVGL RELEASED callback on a slider; on release the
+    /// trampoline reads the slider's value and pushes an
+    /// [`UiEvent::ChangeInlineSet`] with `event.value` as an int.
+    /// RELEASED (not VALUE_CHANGED) matches the schema: on_change
+    /// fires only when the user lets go of the knob.
+    pub fn on_change_slider_inline_set(
+        &self,
+        sink: Sender<UiEvent>,
+        assigns: Vec<InlineSetItem>,
+    ) {
+        self.register_change_binding(
+            ChangeKind::Slider,
+            assigns,
+            sink,
+            sys::lv_event_code_t_LV_EVENT_RELEASED,
+        );
+    }
+
+    fn register_change_binding(
+        &self,
+        kind: ChangeKind,
+        assigns: Vec<InlineSetItem>,
+        sink: Sender<UiEvent>,
+        event_code: sys::lv_event_code_t,
+    ) {
+        let idx = {
+            let mut g = bindings().lock().unwrap();
+            g.push(Binding::Change { kind, assigns, sink });
+            g.len() - 1
+        };
+        unsafe {
+            sys::lv_obj_add_event_cb(
+                self.raw,
+                Some(on_change_trampoline),
+                event_code,
+                idx as *mut std::ffi::c_void,
+            );
+        }
     }
 
     fn register_binding(&self, binding: Binding) {

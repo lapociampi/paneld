@@ -27,7 +27,7 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
 use crate::expr::{eval, Context, Value};
-use crate::ui::{Obj, Size, UiEvent};
+use crate::ui::{ActionArg, InlineSetItem, Obj, Size, UiEvent};
 
 /// Children of a component call plus the outer context they should
 /// resolve against. Threaded through [`render_node`] so a `slot { }`
@@ -217,6 +217,13 @@ fn render_node(
         "button" => {
             let obj = parent.new_button();
             apply_props(node, ctx, sink, &obj);
+            // Shortcut: `button { label = "Save" }` renders a label
+            // child so the simplest button only takes one line. If
+            // the button also has child nodes, those render after
+            // the shortcut label.
+            if let Some(label) = resolve_assign_value(node, "label", ctx) {
+                obj.new_label(&label.to_display_string());
+            }
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "rect" => {
@@ -247,6 +254,40 @@ fn render_node(
         "spinner" => {
             let obj = parent.new_spinner();
             apply_props(node, ctx, sink, &obj);
+        }
+        "qr" => {
+            let size = find_simple(node, "size")
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(128);
+            let obj = parent.new_qrcode(size);
+            if let Some(data) = resolve_assign_value(node, "data", ctx) {
+                obj.set_qrcode_data(&data.to_display_string());
+            }
+            apply_props(node, ctx, sink, &obj);
+        }
+        "toggle" => {
+            let obj = parent.new_toggle();
+            let value_on = resolve_assign_value(node, "value", ctx)
+                .map(|v| value_truthy(&v))
+                .unwrap_or(false);
+            obj.set_toggle_state(value_on);
+            apply_props(node, ctx, sink, &obj);
+            if let Some(assigns) = inline_on_change_set(node) {
+                obj.on_change_toggle_inline_set(sink.clone(), assigns);
+            }
+        }
+        "slider" => {
+            let obj = parent.new_slider();
+            let min = resolve_num(node, "min", ctx).unwrap_or(0.0) as i32;
+            let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
+            obj.set_slider_range(min, max);
+            if let Some(v) = resolve_num(node, "value", ctx) {
+                obj.set_slider_value(v as i32);
+            }
+            apply_props(node, ctx, sink, &obj);
+            if let Some(assigns) = inline_on_change_set(node) {
+                obj.on_change_slider_inline_set(sink.clone(), assigns);
+            }
         }
         "slot" => {
             // Expand the caller's child-items here, resolving them
@@ -347,6 +388,18 @@ pub fn interpolate(
         Some(v) => v.to_display_string(),
         None => raw.to_string(),
     }
+}
+
+/// Public re-export of [`resolve_expr_value`] for callers that have a
+/// raw value text and need its evaluated [`Value`] against `ctx`.
+/// Used by the action worker to resolve each `set { k = <raw> }` RHS
+/// through the same path as a UI node's `value =`.
+pub fn resolve_value(
+    raw: &str,
+    span: paneld_config::source::Span,
+    ctx: &Context,
+) -> Option<Value> {
+    resolve_expr_value(raw, span, ctx)
 }
 
 /// Evaluate a `key = <raw>` as either a literal string (for a
@@ -563,17 +616,40 @@ fn interpolate_text(raw: &str, fragments: &[cel::Expr], ctx: &Context) -> String
 }
 
 fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_>) {
-    // Inline-action block form: `on_tap { goto = settings }`.
+    // Inline-action block form, with or without a name:
+    //   `on_tap { goto = settings }`
+    //   `on_tap { set { k = v; ... } }`
+    //   `on_tap vm_stop { vm = {{ item.id }} }`
+    // Only one gets wired per tap: the first form found wins,
+    // matching schema semantics (one action per handler).
     for item in &node.items {
         let Item::Block(child) = item else { continue };
-        if child.kind.text != "on_tap" || child.name.is_some() {
+        if child.kind.text != "on_tap" {
             continue;
+        }
+        // Named action-call shortcut: eval args NOW against the
+        // current render ctx so the stored binding captures the row
+        // (`item`, `vars.*`, ...) the user is tapping on.
+        if let Some(name) = &child.name {
+            let args = collect_action_args(child, ctx);
+            obj.set_clickable();
+            obj.on_tap_with_args(sink.clone(), &name.text, args);
+            break;
         }
         if let Some(page) = find_simple(child, "goto") {
             let page = page.trim();
             if is_bare_ident(page) {
                 obj.set_clickable();
                 obj.on_tap_goto(sink.clone(), page);
+                break;
+            }
+        }
+        if let Some(set_block) = find_block(child, "set") {
+            let assigns = collect_inline_set(set_block);
+            if !assigns.is_empty() {
+                obj.set_clickable();
+                obj.on_tap_inline_set(sink.clone(), assigns);
+                break;
             }
         }
     }
@@ -707,6 +783,83 @@ fn find_simple<'a>(node: &'a Block, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Resolve `key = <raw>` in `node` through [`resolve_expr_value`],
+/// using the real value span so a CEL error points at the right place.
+fn resolve_assign_value(node: &Block, key: &str, ctx: &Context) -> Option<Value> {
+    for item in &node.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key: k } = &a.target else {
+            continue;
+        };
+        if k.text == key {
+            return resolve_expr_value(&a.value.text, a.value.span, ctx);
+        }
+    }
+    None
+}
+
+fn find_block<'a>(node: &'a Block, kind: &str) -> Option<&'a Block> {
+    for item in &node.items {
+        if let Item::Block(b) = item {
+            if b.kind.text == kind {
+                return Some(b);
+            }
+        }
+    }
+    None
+}
+
+/// Scan a widget node for `on_change { set { ... } }` and return the
+/// inline set payload. Returns `None` if no such handler is present.
+fn inline_on_change_set(node: &Block) -> Option<Vec<InlineSetItem>> {
+    for item in &node.items {
+        let Item::Block(child) = item else { continue };
+        if child.kind.text != "on_change" || child.name.is_some() {
+            continue;
+        }
+        if let Some(set_block) = find_block(child, "set") {
+            let assigns = collect_inline_set(set_block);
+            if !assigns.is_empty() {
+                return Some(assigns);
+            }
+        }
+    }
+    None
+}
+
+/// Evaluate every `arg = <raw>` in an action-call shortcut body
+/// against `ctx`, returning the already-resolved [`ActionArg`]s. An
+/// arg whose expression fails to evaluate is dropped so a bad arg
+/// does not make the whole tap no-op.
+fn collect_action_args(call: &Block, ctx: &Context) -> Vec<ActionArg> {
+    let mut out = Vec::new();
+    for item in &call.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key } = &a.target else {
+            continue;
+        };
+        if let Some(v) = resolve_expr_value(&a.value.text, a.value.span, ctx) {
+            out.push(ActionArg { name: key.text.clone(), value: v });
+        }
+    }
+    out
+}
+
+fn collect_inline_set(set_block: &Block) -> Vec<InlineSetItem> {
+    let mut out = Vec::new();
+    for item in &set_block.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key } = &a.target else {
+            continue;
+        };
+        out.push(InlineSetItem {
+            key: key.text.clone(),
+            value_raw: a.value.text.clone(),
+        });
+    }
+    out
 }
 
 fn value_truthy(v: &Value) -> bool {

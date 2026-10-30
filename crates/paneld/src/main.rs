@@ -14,6 +14,7 @@ mod runner;
 mod secrets;
 mod sources;
 mod themes;
+mod vars;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -199,18 +200,62 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         }
 
         // Drain UI events: actions forward to the action worker,
-        // gotos update the current page.
+        // gotos update the current page, vars changes trigger a
+        // re-render (the worker already wrote the new values).
         let mut dirty = false;
         while let Ok(ev) = live.event_rx.try_recv() {
             match ev {
-                paneld_ui::UiEvent::Action { name } => {
-                    let _ = live.action_tx.send(name);
+                paneld_ui::UiEvent::Action { name, args } => {
+                    let _ = live.action_tx.send(actions::Call { name, args });
                 }
                 paneld_ui::UiEvent::Goto { page } => {
                     if page != live.current_page {
                         live.current_page = page;
                         dirty = true;
                     }
+                }
+                paneld_ui::UiEvent::InlineSet { assigns } => {
+                    let ctx = build_ctx(
+                        &live.source_values,
+                        &live.theme,
+                        &live.secrets,
+                        &live.vars,
+                    );
+                    if actions::apply_inline_set(
+                        &assigns,
+                        &ctx,
+                        &live.var_types,
+                        &live.vars,
+                    ) {
+                        dirty = true;
+                    }
+                }
+                paneld_ui::UiEvent::ChangeInlineSet { assigns, event_value } => {
+                    let mut ctx = build_ctx(
+                        &live.source_values,
+                        &live.theme,
+                        &live.secrets,
+                        &live.vars,
+                    );
+                    let v = match event_value {
+                        paneld_ui::EventValue::Bool(b) => paneld_ui::Value::Bool(b),
+                        paneld_ui::EventValue::Int(n) => paneld_ui::Value::Int(n),
+                        paneld_ui::EventValue::Double(d) => paneld_ui::Value::Double(d),
+                    };
+                    let mut event = std::collections::BTreeMap::new();
+                    event.insert("value".to_string(), v);
+                    ctx.insert("event".into(), paneld_ui::Value::Map(event));
+                    if actions::apply_inline_set(
+                        &assigns,
+                        &ctx,
+                        &live.var_types,
+                        &live.vars,
+                    ) {
+                        dirty = true;
+                    }
+                }
+                paneld_ui::UiEvent::VarsChanged => {
+                    dirty = true;
                 }
             }
         }
@@ -221,7 +266,12 @@ fn run_daemon(config: PathBuf) -> ExitCode {
             dirty = true;
         }
         if dirty {
-            let ctx = build_ctx(&live.source_values, &live.theme, &live.secrets);
+            let ctx = build_ctx(
+                &live.source_values,
+                &live.theme,
+                &live.secrets,
+                &live.vars,
+            );
             screen.clear_children();
             paneld_ui::reset_action_bindings();
             paneld_ui::render_page(
@@ -247,9 +297,11 @@ struct LiveState {
     source_rx: std::sync::mpsc::Receiver<sources::SourceUpdate>,
     theme: std::collections::BTreeMap<String, paneld_ui::Value>,
     secrets: std::collections::BTreeMap<String, paneld_ui::Value>,
+    vars: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
+    var_types: std::collections::BTreeMap<String, String>,
     event_tx: std::sync::mpsc::Sender<paneld_ui::UiEvent>,
     event_rx: std::sync::mpsc::Receiver<paneld_ui::UiEvent>,
-    action_tx: std::sync::mpsc::Sender<String>,
+    action_tx: std::sync::mpsc::Sender<actions::Call>,
     current_page: String,
 }
 
@@ -284,20 +336,37 @@ fn setup_live_state(
     // in v1; a reload re-reads them.)
     let secret_values = secrets::resolve(&doc);
     let theme = themes::resolve(&doc);
-    let base_ctx = build_ctx(&Default::default(), &theme, &secret_values);
+    let vars_map = vars::initial_values(&doc);
+    let var_types = vars::types(&doc);
+    let vars_shared = std::sync::Arc::new(std::sync::Mutex::new(vars_map));
+    let base_ctx = build_ctx(&Default::default(), &theme, &secret_values, &vars_shared);
     let source_values = sources::resolve_all(&doc, &base_ctx);
-    let source_rx = sources::spawn_pollers(&doc, &base_ctx);
+    let (source_tx, source_rx) =
+        std::sync::mpsc::channel::<sources::SourceUpdate>();
+    sources::spawn_pollers(&doc, &base_ctx, source_tx.clone());
     let action_table = actions::collect(&doc);
-    let (action_tx, action_rx) = std::sync::mpsc::channel::<String>();
-    actions::spawn_worker(action_table, base_ctx.clone(), action_rx);
+    let source_blocks = sources::collect_blocks(&doc);
 
-    // One channel carries both actions and goto navs from the UI.
-    // The main loop demuxes: `Action` forwards to the action worker,
-    // `Goto` updates current_page and marks dirty.
+    // One channel carries actions, goto navs and vars-changed events.
+    // The main loop demuxes.
     let (event_tx, event_rx) = std::sync::mpsc::channel::<paneld_ui::UiEvent>();
+    let (action_tx, action_rx) = std::sync::mpsc::channel::<actions::Call>();
+    actions::spawn_worker(
+        actions::WorkerCtx {
+            actions: action_table,
+            base_ctx: base_ctx.clone(),
+            vars: vars_shared.clone(),
+            var_types: var_types.clone(),
+            event_tx: event_tx.clone(),
+            source_blocks,
+            source_tx,
+            self_tx: action_tx.clone(),
+        },
+        action_rx,
+    );
 
     let current_page = find_start_page(&doc).unwrap_or_else(|| "home".to_string());
-    let ctx = build_ctx(&source_values, &theme, &secret_values);
+    let ctx = build_ctx(&source_values, &theme, &secret_values, &vars_shared);
     screen.clear_children();
     paneld_ui::reset_action_bindings();
     paneld_ui::render_page(&doc, &current_page, &ctx, &event_tx, screen);
@@ -308,6 +377,8 @@ fn setup_live_state(
         source_rx,
         theme,
         secrets: secret_values,
+        vars: vars_shared,
+        var_types,
         event_tx,
         event_rx,
         action_tx,
@@ -385,11 +456,14 @@ fn build_ctx(
     source_values: &std::collections::BTreeMap<String, paneld_ui::Value>,
     theme: &std::collections::BTreeMap<String, paneld_ui::Value>,
     secret_values: &std::collections::BTreeMap<String, paneld_ui::Value>,
+    vars: &std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
 ) -> paneld_ui::Context {
     let mut ctx = paneld_ui::Context::new();
     ctx.insert("sources".into(), paneld_ui::Value::Map(source_values.clone()));
     ctx.insert("theme".into(), paneld_ui::Value::Map(theme.clone()));
     ctx.insert("secrets".into(), paneld_ui::Value::Map(secret_values.clone()));
+    let snapshot = vars.lock().unwrap().clone();
+    ctx.insert("vars".into(), paneld_ui::Value::Map(snapshot));
     ctx
 }
 

@@ -21,5 +21,7 @@ pub mod render;
 pub mod ui;
 
 pub use expr::{eval, Context, EvalError, Value};
-pub use render::{interpolate, render_page};
-pub use ui::{reset_action_bindings, ActionTrigger, Ui, UiEvent, Window};
+pub use render::{interpolate, render_page, resolve_value};
+pub use ui::{
+    reset_action_bindings, ActionArg, ActionTrigger, EventValue, InlineSetItem, Ui, UiEvent, Window,
+};

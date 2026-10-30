@@ -17,7 +17,7 @@
 //! substitution come in later phases.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 
@@ -66,14 +66,12 @@ pub fn resolve_all(doc: &Document, ctx: &Context) -> BTreeMap<String, Value> {
 
 /// Spawn a background worker for each source that declares a
 /// `poll = DURATION`. Each worker sleeps for that interval, re-runs
-/// the source's command, and emits a [`SourceUpdate`] on the shared
-/// channel. Sources without a `poll` key never re-emit; they stay
-/// at whatever value [`resolve_all`] produced.
-///
-/// Returns the [`Receiver`] end of the channel. The main thread
-/// drains it on every pump of the LVGL loop.
-pub fn spawn_pollers(doc: &Document, ctx: &Context) -> Receiver<SourceUpdate> {
-    let (tx, rx) = mpsc::channel::<SourceUpdate>();
+/// the source's command, and emits a [`SourceUpdate`] on `tx`.
+/// Sources without a `poll` key never re-emit; they stay at whatever
+/// value [`resolve_all`] produced. The sender is cloned per worker,
+/// so the caller can keep its own clone to hand to other producers
+/// (the action `refresh` step reuses it).
+pub fn spawn_pollers(doc: &Document, ctx: &Context, tx: Sender<SourceUpdate>) {
     for item in &doc.items {
         let Item::Block(b) = item else { continue };
         if b.kind.text != "source" {
@@ -100,7 +98,6 @@ pub fn spawn_pollers(doc: &Document, ctx: &Context) -> Receiver<SourceUpdate> {
         let ctx_clone = ctx.clone();
         thread::spawn(move || poll_loop(block_clone, name_clone, poll, tx_clone, ctx_clone));
     }
-    rx
 }
 
 fn poll_loop(
@@ -126,11 +123,28 @@ fn poll_loop(
     }
 }
 
+/// Collect all top-level `source` blocks keyed by name, so the
+/// action worker can look up a block by its name when applying a
+/// `refresh = NAME` step without re-walking the document.
+pub fn collect_blocks(doc: &Document) -> BTreeMap<String, Block> {
+    let mut out = BTreeMap::new();
+    for item in &doc.items {
+        let Item::Block(b) = item else { continue };
+        if b.kind.text != "source" {
+            continue;
+        }
+        if let Some(name) = &b.name {
+            out.insert(name.text.clone(), b.clone());
+        }
+    }
+    out
+}
+
 /// Resolve one `source` block. Returns the [`Value::Map`] stored
 /// under its name in the sources map; `.value` is set so the
 /// idiomatic `sources.X.value` works. `.ok` reflects the command's
 /// exit code (missing today -> `false`).
-fn resolve_one(b: &Block, ctx: &Context) -> Result<Value, String> {
+pub fn resolve_one(b: &Block, ctx: &Context) -> Result<Value, String> {
     let (run_raw, run_span) =
         find_raw(b, "run").ok_or_else(|| "missing `run`".to_string())?;
     let parse_mode = find_simple(b, "parse").unwrap_or("text").trim().to_string();
