@@ -120,9 +120,47 @@ Flags:
     );
 }
 
-fn run_daemon(_config: PathBuf) -> ExitCode {
-    eprintln!("paneld: daemon not implemented yet");
-    ExitCode::from(70)
+fn run_daemon(config: PathBuf) -> ExitCode {
+    use paneld_config::{check, load};
+
+    // Load and validate the config up front; a broken config
+    // shouldn't open an empty window.
+    let (source, doc, mut diags) = match load(&config) {
+        Ok(parts) => parts,
+        Err(e) => {
+            eprintln!("paneld: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    diags.extend(check(&doc, &source));
+    if !diags.is_empty() {
+        for d in &diags {
+            let loc = source.location(d.span);
+            eprintln!("{loc}: {}", d.message);
+        }
+        eprintln!(
+            "paneld: {} config issue{} found; refusing to start",
+            diags.len(),
+            if diags.len() == 1 { "" } else { "s" }
+        );
+        return ExitCode::from(1);
+    }
+
+    let ui = match paneld_ui::Ui::init() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("paneld: {e}");
+            return ExitCode::from(70);
+        }
+    };
+    let _window = ui.open_window(800, 480, "paneld");
+    let screen = ui.screen();
+    // First-pass renderer: hard-code the page name until `screen`,
+    // `app.start_page` and theme resolution are wired through the
+    // engine. `home` is the convention in every example config.
+    paneld_ui::render_page(&doc, "home", &screen);
+    ui.run(|| false);
+    ExitCode::SUCCESS
 }
 
 fn run_check(config: PathBuf) -> ExitCode {

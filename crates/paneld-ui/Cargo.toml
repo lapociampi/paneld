@@ -1,0 +1,17 @@
+[package]
+name = "paneld-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Safe LVGL wrapper and UI tree builder for paneld."
+
+[dependencies]
+lvgl-sys = { path = "../lvgl-sys" }
+paneld-config.workspace = true
+
+# Per ADR 0001 the `ui` module is where paneld's unsafe code lives.
+# Reasserting the workspace defaults for the rest.
+[lints.rust]
+unsafe_code = "allow"

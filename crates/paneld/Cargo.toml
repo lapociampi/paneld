@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 paneld-config.workspace = true
+paneld-ui = { path = "../paneld-ui" }
 
 [lints]
 workspace = true
