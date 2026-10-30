@@ -16,8 +16,10 @@
 //! `button`, `rect`. The schema accepts many more; adding one is a
 //! few lines in [`render::render_node`].
 
+pub mod expr;
 pub mod render;
 pub mod ui;
 
+pub use expr::{eval, Context, EvalError, Value};
 pub use render::render_page;
 pub use ui::{Ui, Window};

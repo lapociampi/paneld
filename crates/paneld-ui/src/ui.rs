@@ -70,22 +70,49 @@ impl Ui {
     /// LV_SDL_DIRECT_EXIT; we also hand out `done` so callers can
     /// stop on `paneld ctl exit` later.
     pub fn run<F: FnMut() -> bool>(&self, mut done: F) {
-        let mut last = Instant::now();
+        let mut pump = Pump::new();
         loop {
             if done() {
                 break;
             }
-            let now = Instant::now();
-            let elapsed = now.duration_since(last).as_millis() as u32;
-            if elapsed > 0 {
-                unsafe { sys::lv_tick_inc(elapsed) };
-                last = now;
-            }
-            // Returns the time (ms) until it wants to be called again.
-            let sleep_ms = unsafe { sys::lv_timer_handler() };
-            let sleep = Duration::from_millis(sleep_ms.min(100) as u64);
-            std::thread::sleep(sleep);
+            pump.step();
         }
+    }
+
+    /// Return a [`Pump`] a caller can drive manually. The caller is
+    /// responsible for calling `pump.step()` on every iteration of
+    /// its own loop; between steps it can drain inter-thread channels
+    /// and tweak the UI tree.
+    pub fn pump(&self) -> Pump<'_> {
+        Pump::new()
+    }
+}
+
+/// One iteration of the LVGL tick loop. See [`Ui::pump`].
+pub struct Pump<'ui> {
+    last: Instant,
+    _ui: PhantomData<&'ui Ui>,
+}
+
+impl<'ui> Pump<'ui> {
+    fn new() -> Self {
+        Self { last: Instant::now(), _ui: PhantomData }
+    }
+
+    /// Advance LVGL's internal clock, run its timers, and block for
+    /// the hint it returned (capped at 100ms). Returns the hint so
+    /// the caller can use it as its own idle timeout.
+    pub fn step(&mut self) -> Duration {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_millis() as u32;
+        if elapsed > 0 {
+            unsafe { sys::lv_tick_inc(elapsed) };
+            self.last = now;
+        }
+        let sleep_ms = unsafe { sys::lv_timer_handler() };
+        let sleep = Duration::from_millis(sleep_ms.min(100) as u64);
+        std::thread::sleep(sleep);
+        sleep
     }
 }
 
@@ -181,6 +208,13 @@ impl<'ui> Obj<'ui> {
 
     pub fn align_center(&self) {
         unsafe { sys::lv_obj_align(self.raw, sys::lv_align_t_LV_ALIGN_CENTER, 0, 0) };
+    }
+
+    /// Remove every child of this object but keep the object itself,
+    /// so a caller can rebuild the tree in place. Used by the live
+    /// re-render path when a source value changes.
+    pub fn clear_children(&self) {
+        unsafe { sys::lv_obj_clean(self.raw) };
     }
 }
 

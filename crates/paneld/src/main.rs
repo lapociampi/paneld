@@ -7,6 +7,9 @@
 //!
 //! See `docs/architecture.md` and ADR 0007.
 
+mod runner;
+mod sources;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -153,14 +156,35 @@ fn run_daemon(config: PathBuf) -> ExitCode {
             return ExitCode::from(70);
         }
     };
+    // Resolve every top-level `source` block once at startup and
+    // feed the result into the renderer's eval context. Sources
+    // with a `poll = ...` are then polled in background threads;
+    // updates land on `rx` and trigger a re-render.
+    let mut source_values = sources::resolve_all(&doc);
+    let rx = sources::spawn_pollers(&doc);
+    let mut ctx = sources::into_context(source_values.clone());
+
     let _window = ui.open_window(800, 480, "paneld");
     let screen = ui.screen();
     // First-pass renderer: hard-code the page name until `screen`,
     // `app.start_page` and theme resolution are wired through the
     // engine. `home` is the convention in every example config.
-    paneld_ui::render_page(&doc, "home", &screen);
-    ui.run(|| false);
-    ExitCode::SUCCESS
+    paneld_ui::render_page(&doc, "home", &ctx, &screen);
+
+    let mut pump = ui.pump();
+    loop {
+        let mut dirty = false;
+        while let Ok(update) = rx.try_recv() {
+            source_values.insert(update.name, update.value);
+            dirty = true;
+        }
+        if dirty {
+            ctx = sources::into_context(source_values.clone());
+            screen.clear_children();
+            paneld_ui::render_page(&doc, "home", &ctx, &screen);
+        }
+        pump.step();
+    }
 }
 
 fn run_check(config: PathBuf) -> ExitCode {
