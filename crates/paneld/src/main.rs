@@ -13,11 +13,14 @@ mod ctl;
 mod display;
 mod pin;
 mod png;
+mod reminders;
 mod runner;
+mod screen;
 mod secrets;
 mod sources;
 mod state;
 mod themes;
+mod tz;
 mod vars;
 
 use std::path::PathBuf;
@@ -60,6 +63,14 @@ enum Cmd {
     Shot(ShotOpts),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ShotStep {
+    /// Press at (x, y) for `press_ms`, release, then `--settle`.
+    Touch { x: i32, y: i32, press_ms: u32 },
+    /// Run the UI this long without touching it.
+    Wait(u32),
+}
+
 /// `paneld shot`: render the config headless to a PNG.
 #[derive(Debug, PartialEq, Eq)]
 struct ShotOpts {
@@ -67,8 +78,8 @@ struct ShotOpts {
     out: PathBuf,
     page: Option<String>,
     size: (i32, i32),
-    /// (x, y, how long the press lasts in ms), in order.
-    taps: Vec<(i32, i32, u32)>,
+    /// Touches and pauses, in order.
+    taps: Vec<ShotStep>,
     settle_ms: u32,
 }
 
@@ -106,11 +117,15 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
             "--tap" | "--hold" => {
                 let v = val(&mut i, a)?;
                 let (x, y) = v.split_once(',').ok_or(format!("`{a}` is X,Y"))?;
-                o.taps.push((
-                    x.trim().parse().map_err(|_| format!("bad `{a}` x"))?,
-                    y.trim().parse().map_err(|_| format!("bad `{a}` y"))?,
-                    if a == "--hold" { 1000 } else { 100 },
-                ));
+                o.taps.push(ShotStep::Touch {
+                    x: x.trim().parse().map_err(|_| format!("bad `{a}` x"))?,
+                    y: y.trim().parse().map_err(|_| format!("bad `{a}` y"))?,
+                    press_ms: if a == "--hold" { 1000 } else { 100 },
+                });
+            }
+            "--wait" => {
+                let ms = val(&mut i, a)?.parse().map_err(|_| "bad `--wait` ms")?;
+                o.taps.push(ShotStep::Wait(ms));
             }
             "--settle" => {
                 o.settle_ms = val(&mut i, a)?.parse().map_err(|_| "bad `--settle` ms")?;
@@ -209,11 +224,11 @@ Usage:
       alert ack <id> | alert snooze <id> [duration]
   paneld hash-pin                     Read a PIN on stdin, print its
                                       argon2 hash for security.pin
-  paneld shot -o FILE.png [--page P] [--size WxH] [--tap X,Y]...
-              [--hold X,Y]... [--settle MS]
+  paneld shot -o FILE.png [--page P] [--size WxH] [--settle MS]
+              [--tap X,Y | --hold X,Y | --wait MS]...
                                       Render the config headless to a PNG,
-                                      after the given taps and holds (runs
-                                      sources and touched actions for real)
+                                      after the given steps (runs sources
+                                      and touched actions for real)
 
 Flags:
   -c, --config PATH   Config file (default: {DEFAULT_CONFIG})
@@ -406,6 +421,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                     dirty = true;
                 }
             }
+            paneld_ui::UiEvent::Wake => live.touched = true,
             paneld_ui::UiEvent::ActionDone { name, ok, result } => {
                 live.running.remove(&name);
                 if action_done(live, screen, &name, ok, result) {
@@ -504,22 +520,32 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         None,
     );
     let now_instant = std::time::Instant::now();
-    if live.alerts.tick(
-        &alerts_ctx,
-        now_instant,
-        std::time::SystemTime::now(),
-    ) {
+    let now_wall = std::time::SystemTime::now();
+    if live.alerts.tick(&alerts_ctx, now_instant, now_wall) {
+        dirty = true;
+    }
+    if live.reminders.tick(&mut live.alerts, &alerts_ctx, now_wall) {
         dirty = true;
     }
     // Keep the state file (ADR 0014) in sync. `note` is cheap:
     // it only flags a pending write when the set actually
     // changed. `flush_if_due` writes at most once per 10s.
-    live.state.note(live.alerts.active_alerts());
+    live.state.note(live.alerts.active_alerts(), live.reminders.dates());
     live.state.flush_if_due(now_instant);
 
     if live.toast_until.is_some_and(|t| std::time::Instant::now() >= t) {
         screen.top_layer().clear_children();
         live.toast_until = None;
+    }
+
+    if screen_step(live) {
+        dirty = true;
+    }
+    // Asleep: no redraws (ADR 0001, idle means asleep); render once
+    // on wake instead.
+    if dirty && live.screen.asleep() {
+        live.redraw = true;
+        dirty = false;
     }
 
     if dirty && live.pending.is_none() {
@@ -571,6 +597,8 @@ struct LiveState {
     /// so nothing carries across one.)
     rendered_page: String,
     alerts: alerts::Engine,
+    /// Schema 10; due reminders are alerts in `alerts`.
+    reminders: reminders::Book,
     state: state::Store,
     sources_shutdown: sources::ShutdownHandle,
     /// Clone of the action table the worker holds. Lets the main
@@ -590,6 +618,10 @@ struct LiveState {
     /// Set by ctl requests that change what is shown; consumed by the
     /// next `process`.
     redraw: bool,
+    /// Screen power and night hours (schema 12).
+    screen: screen::Screen,
+    /// The sleep cover was touched since the last step.
+    touched: bool,
     pin_gate: pin::Gate,
 }
 
@@ -736,6 +768,7 @@ fn setup_live_state(
     alerts_engine.restore(
         state_store
             .snapshot()
+            .alerts
             .iter()
             .map(|(k, v)| {
                 let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
@@ -750,7 +783,7 @@ fn setup_live_state(
     );
     // Alerts raised over ctl have no rule to raise them again: bring
     // them back from the state file as they were.
-    for saved in state_store.snapshot().values().filter(|a| a.rule == alerts::CTL_RULE) {
+    for saved in state_store.snapshot().alerts.values().filter(|a| a.rule == alerts::CTL_RULE) {
         alerts_engine.fire_external(
             &saved.instance,
             &saved.severity,
@@ -767,6 +800,13 @@ fn setup_live_state(
         std::time::Instant::now(),
         std::time::SystemTime::now(),
     );
+    let reminder_book = reminders::Book::new(
+        &doc,
+        tz::Zone::local(),
+        &state_store.snapshot().reminders,
+        std::time::SystemTime::now(),
+    );
+    reminder_book.tick(&mut alerts_engine, &ctx_no_alerts, std::time::SystemTime::now());
     let ctx = build_ctx(
         &source_values,
         &theme,
@@ -779,6 +819,8 @@ fn setup_live_state(
     paneld_ui::reset_action_bindings();
     paneld_ui::render_page(&doc, &current_page, &ctx, &event_tx, screen);
 
+    let screen_state =
+        screen::Screen::new(screen::Config::from_doc(&doc), tz::Zone::local(), config_dir.clone());
     Ok(LiveState {
         doc,
         source_values,
@@ -792,6 +834,7 @@ fn setup_live_state(
         rendered_page: current_page.clone(),
         current_page,
         alerts: alerts_engine,
+        reminders: reminder_book,
         state: state_store,
         sources_shutdown,
         actions: action_table_for_main,
@@ -801,6 +844,8 @@ fn setup_live_state(
         previous_page: None,
         toast_until: None,
         redraw: false,
+        screen: screen_state,
+        touched: false,
         pin_gate,
     })
 }
@@ -902,6 +947,15 @@ fn run_builtin(live: &mut LiveState, call: &actions::Call) -> Result<(), ctl::Ct
     };
     let id = arg("id").ok_or_else(|| ctl::CtlError::msg("needs `id`"))?;
     let found = match call.name.as_str() {
+        "reminder_done" => {
+            let now = std::time::SystemTime::now();
+            if !live.reminders.done(&id, now) {
+                return Err(ctl::CtlError::msg(format!("no due reminder `{id}`")));
+            }
+            let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, None);
+            live.reminders.tick(&mut live.alerts, &ctx, now);
+            true
+        }
         "alert_ack" => live.alerts.ack(&id),
         "alert_snooze" => {
             let d = match arg("for") {
@@ -918,6 +972,76 @@ fn run_builtin(live: &mut LiveState, call: &actions::Call) -> Result<(), ctl::Ct
     }
     live.redraw = true;
     Ok(())
+}
+
+/// Run the screen rules (schema 12) for this pass and apply what they
+/// ask for. Returns true if the page must be redrawn.
+fn screen_step(live: &mut LiveState) -> bool {
+    let now = std::time::SystemTime::now();
+    let shown = live.alerts.shown(now);
+    let inputs = screen::Inputs {
+        now,
+        inactive: std::time::Duration::from_millis(paneld_ui::inactive_ms().into()),
+        touched: std::mem::take(&mut live.touched),
+        shown: &shown,
+    };
+    let mut redraw = false;
+    for effect in live.screen.step(&inputs) {
+        match effect {
+            screen::Effect::Sleep { absorb } => {
+                screen_command(&live.screen, live.screen.cfg.off.clone(), None);
+                paneld_ui::show_sleep_cover(absorb, live.event_tx.clone());
+            }
+            screen::Effect::Wake => {
+                paneld_ui::hide_sleep_cover();
+                // An alert wake has no touch: restart the idle clock.
+                paneld_ui::trigger_activity();
+                screen_command(&live.screen, live.screen.cfg.on.clone(), None);
+                redraw = true;
+            }
+            screen::Effect::Dim(level) => {
+                screen_command(&live.screen, live.screen.cfg.dim.clone(), Some(level));
+            }
+            screen::Effect::Theme(name) => {
+                live.theme = themes::resolve_with(&live.doc, name.as_deref());
+                redraw = true;
+            }
+        }
+    }
+    redraw
+}
+
+/// Run a screen command (`on`, `off`, `dim` with `level`) in the
+/// background: a slow backlight must not stall the UI.
+fn screen_command(s: &screen::Screen, template: Option<String>, level: Option<u8>) {
+    let Some(template) = template else { return };
+    let cwd = s.cwd.clone();
+    std::thread::spawn(move || {
+        let mut ctx = paneld_ui::Context::new();
+        if let Some(l) = level {
+            ctx.insert("level".into(), paneld_ui::Value::Int(l.into()));
+        }
+        let file = paneld_config::source::FileId::default();
+        let result = runner::command_argv(&template, |t| paneld_ui::interpolate(t, file, 0, &ctx))
+            .and_then(|argv| {
+                runner::exec(
+                    &argv,
+                    runner::Opts {
+                        timeout: std::time::Duration::from_secs(10),
+                        max_bytes: 64 * 1024,
+                        kind: runner::Kind::Other,
+                        name: "screen",
+                        cwd: Some(&cwd),
+                        env: &[],
+                    },
+                )
+            });
+        match result {
+            Ok(r) if r.succeeded() => {}
+            Ok(r) => eprintln!("paneld: screen command failed: exit {:?} {}", r.exit_code, r.stderr.trim()),
+            Err(e) => eprintln!("paneld: screen command: {e}"),
+        }
+    });
 }
 
 /// Hand a call that passed its gates to the worker and mark the
@@ -1192,11 +1316,16 @@ fn run_shot(o: ShotOpts) -> ExitCode {
         let _ = live.event_tx.send(paneld_ui::UiEvent::Goto { page: page.clone() });
     }
     settle(&mut live, o.settle_ms);
-    for &(x, y, press_ms) in &o.taps {
-        mem.set_pointer(x, y, true);
-        settle(&mut live, press_ms);
-        mem.set_pointer(x, y, false);
-        settle(&mut live, o.settle_ms);
+    for step in &o.taps {
+        match *step {
+            ShotStep::Touch { x, y, press_ms } => {
+                mem.set_pointer(x, y, true);
+                settle(&mut live, press_ms);
+                mem.set_pointer(x, y, false);
+                settle(&mut live, o.settle_ms);
+            }
+            ShotStep::Wait(ms) => settle(&mut live, ms),
+        }
     }
 
     let (w, h) = mem.size();
@@ -1257,12 +1386,14 @@ fn reload(
     config: &std::path::Path,
     screen: &paneld_ui::ui::Obj<'_>,
 ) -> Result<(), Vec<ctl::CtlError>> {
-    match setup_live_state(config, screen, None) {
+    // Write pending alert and reminder state first: the new state
+    // reads the file, and an ack from a moment ago must be in it.
+    live.state.force_flush();
+    let state_path = live.state.path().to_path_buf();
+    match setup_live_state(config, screen, Some(&state_path)) {
         Ok(mut fresh) => {
             fresh.pin_gate.carry_from(&live.pin_gate);
-            // Flush pending alert state before the old store goes, so
-            // a reload mid-incident keeps timestamps not yet written.
-            live.state.force_flush();
+            fresh.screen.carry_from(&live.screen);
             // Stop the old poll / stream workers; the new state runs
             // its own.
             live.sources_shutdown.stop();
@@ -1390,6 +1521,13 @@ fn handle_request(
             let call = actions::Call::new(
                 req.cmd.clone(),
                 args.into_iter().map(|(name, value)| paneld_ui::ActionArg { name, value }).collect(),
+            );
+            run_builtin(live, &call).map(|()| Value::String("ok".into()))
+        }
+        "reminder_done" => {
+            let call = actions::Call::new(
+                req.cmd.clone(),
+                vec![paneld_ui::ActionArg { name: "id".into(), value: Value::String(req.arg("id")?) }],
             );
             run_builtin(live, &call).map(|()| Value::String("ok".into()))
         }
@@ -1588,8 +1726,16 @@ mod tests {
         assert_eq!(o.out, PathBuf::from("x.png"));
         assert_eq!(o.page.as_deref(), Some("p"));
         assert_eq!(o.size, (320, 240));
-        assert_eq!(o.taps, vec![(10, 20, 100), (30, 40, 1000)]);
+        assert_eq!(
+            o.taps,
+            vec![
+                ShotStep::Touch { x: 10, y: 20, press_ms: 100 },
+                ShotStep::Touch { x: 30, y: 40, press_ms: 1000 },
+            ]
+        );
         assert_eq!(o.settle_ms, 50);
+        let Ok(Cmd::Shot(o)) = parse(&["shot", "-o", "x.png", "--wait", "500"]) else { panic!() };
+        assert_eq!(o.taps, vec![ShotStep::Wait(500)]);
         assert!(parse(&["shot"]).unwrap_err().contains("-o"));
         assert!(parse(&["shot", "-o", "x.png", "--size", "0x10"]).is_err());
     }

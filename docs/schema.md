@@ -343,13 +343,15 @@ reminder restore_test {
 
 | Key | Type | Notes |
 | --- | --- | --- |
-| `every` | duration | |
-| `start` | date | First due date; default: one interval after first load |
+| `every` | duration | Months and years step the calendar (Jan 31 + 1 month is Feb 28); the rest rounds up to whole days |
+| `start` | date (`YYYY-MM-DD`) | First due date; default: one `every` after the reminder is first seen |
 | `once` | date | Instead of `every`: a one-time reminder |
-| `title`, `text`, `link` | string | |
+| `title`, `text`, `link` | string | `title` default: the name |
 | `severity` | | default `info` |
 
-Due reminders appear as alerts; Done records the date and schedules the next.
+Exactly one of `every` and `once`. A reminder is due from local midnight of its date and shows as the alert `reminder:<name>` (rule `reminder`), so the banner, ack and snooze work as for any alert. The built-in action `reminder_done { id }` (the name or the alert id) records today and resolves it; the next one is due one `every` after that day, or never for `once`. The shipped `alerts` page shows Done instead of Acknowledge for reminders; `paneld ctl reminder done <name>` does the same. First-seen and done dates live in the state file.
+
+The alert names `ctl`, `reminder` and `source_down` are reserved for the panel's own alerts.
 
 ## 11. Themes
 

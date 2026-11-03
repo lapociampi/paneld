@@ -151,9 +151,7 @@ fn apply(out: &mut AppDefaults, key: &str, raw: &str) {
 pub enum Kind {
     Source,
     Action,
-    /// A caller that doesn't set either env var (today only the
-    /// runner's own tests).
-    #[allow(dead_code)]
+    /// Neither (the screen's `on` / `off` / `dim`).
     Other,
 }
 

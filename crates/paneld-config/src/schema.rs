@@ -90,6 +90,8 @@ enum ExpectedType {
     Number,
     Str,
     Dur,
+    /// A calendar date, `YYYY-MM-DD`.
+    Date,
     Size,
     Bytes,
     Color,
@@ -678,13 +680,13 @@ const REMINDER_SCHEMA: &BlockSchema = &BlockSchema {
         },
         KeyRule {
             name: "start",
-            ty: ExpectedType::Str,
+            ty: ExpectedType::Date,
             required: false,
             expr_ok: false,
         },
         KeyRule {
             name: "once",
-            ty: ExpectedType::Str,
+            ty: ExpectedType::Date,
             required: false,
             expr_ok: false,
         },
@@ -1224,6 +1226,7 @@ pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
 
     resolve_refs(doc, &names, &mut diags);
     check_override_targets(doc, &mut diags);
+    check_reminder_schedules(doc, &mut diags);
 
     // Phase 10: parse every `{{ ... }}` fragment as CEL, surface parse
     // errors, and cross-reference `sources.<name>` against the collected
@@ -1264,6 +1267,44 @@ fn check_override_targets(doc: &Document, diags: &mut Vec<Diagnostic>) {
                 ),
             ));
         }
+    }
+}
+
+/// Alert rule names the daemon uses for its own alerts: ctl, reminders
+/// and the source watchdog. A config alert with one of them would
+/// share their ids.
+const RESERVED_ALERT_NAMES: &[&str] = &["ctl", "reminder", "source_down"];
+
+/// A reminder needs exactly one of `every` and `once` (schema 10);
+/// `start` only makes sense with `every`.
+fn check_reminder_schedules(doc: &Document, diags: &mut Vec<Diagnostic>) {
+    for item in &doc.items {
+        let Item::Block(b) = item else { continue };
+        if b.kind.text == "alert" {
+            if let Some(name) = b.name.as_ref().filter(|n| RESERVED_ALERT_NAMES.contains(&n.text.as_str())) {
+                diags.push(Diagnostic::new(
+                    name.span,
+                    format!("alert name `{}` is reserved for the panel's own alerts", name.text),
+                ));
+            }
+            continue;
+        }
+        if b.kind.text != "reminder" {
+            continue;
+        }
+        let Some(name) = &b.name else { continue };
+        let has = |k: &str| {
+            b.items.iter().any(|i| {
+                matches!(i, Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == k))
+            })
+        };
+        let msg = match (has("every"), has("once")) {
+            (true, true) => "has both `every` and `once`; keep one",
+            (false, false) => "needs `every` (repeating) or `once` (a date)",
+            (false, true) if has("start") => "`start` only applies with `every`",
+            _ => continue,
+        };
+        diags.push(Diagnostic::new(name.span, format!("reminder `{}` {msg}", name.text)));
     }
 }
 
@@ -1765,6 +1806,9 @@ fn check_literal(text: &str, ty: ExpectedType) -> Result<(), String> {
         ExpectedType::Dur => parse_duration(text)
             .map(|_| ())
             .ok_or_else(|| format!("expected a duration (`30s`, `2m`, `1h`, ...), got `{text}`")),
+        ExpectedType::Date => crate::value::parse_date(text)
+            .map(|_| ())
+            .ok_or_else(|| format!("expected a date (`YYYY-MM-DD`), got `{text}`")),
         ExpectedType::Size => parse_size(text)
             .map(|_| ())
             .ok_or_else(|| format!("expected a size (`120`, `50%`, `grow`, `content`), got `{text}`")),
@@ -1836,6 +1880,7 @@ fn type_name(ty: ExpectedType) -> &'static str {
         ExpectedType::Path => "a path",
         ExpectedType::Command => "a command",
         ExpectedType::Dur => "a duration",
+        ExpectedType::Date => "a date",
         ExpectedType::Size => "a size",
         ExpectedType::Bytes => "a byte count",
         ExpectedType::Color => "a color",
@@ -3691,6 +3736,17 @@ reminder restore_test {
 "#;
         let diags = check_text(text);
         assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn reminder_schedule_and_dates_checked() {
+        assert!(check_text("reminder r { once = 2026-12-01 }\n").is_empty());
+        assert!(check_text("reminder r { every = 1w\n start = 2026-12-01 }\n").is_empty());
+        assert_msg(&check_text("reminder r { once = 2026-02-30 }\n"), "expected a date");
+        assert_msg(&check_text("reminder r { title = x }\n"), "needs `every`");
+        assert_msg(&check_text("reminder r { every = 1d\n once = 2026-12-01 }\n"), "both `every` and `once`");
+        assert_msg(&check_text("reminder r { once = 2026-12-01\n start = 2026-11-01 }\n"), "`start` only applies");
+        assert_msg(&check_text("alert reminder { when = {{ true }} }\n"), "is reserved");
     }
 
     #[test]

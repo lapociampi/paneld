@@ -17,7 +17,7 @@ use crate::source::SourceMap;
 const LIBRARY: &str = include_str!("library.conf");
 
 /// Built-in actions (ADR 0016), handled by the daemon itself.
-pub const BUILTIN_ACTIONS: &[&str] = &["alert_ack", "alert_snooze"];
+pub const BUILTIN_ACTIONS: &[&str] = &["alert_ack", "alert_snooze", "reminder_done"];
 
 /// How many top-level items the library adds to a config that
 /// replaces none of them (for tests that count items).

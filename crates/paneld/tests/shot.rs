@@ -313,3 +313,51 @@ fn acknowledging_takes_an_alert_off_the_banner() {
     assert!(close(before.px(700, 72), [0xd3, 0x2f, 0x2f], 16), "no banner before the ack");
     assert!(!close(after.px(700, 72), [0xd3, 0x2f, 0x2f], 16), "banner still shown after ack");
 }
+
+#[test]
+fn a_due_reminder_is_an_alert_until_done_and_snooze_1w_works() {
+    let d = tmp("reminder");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "reminder restore { once = 2020-01-01; title = Test a restore; severity = warning }\n\
+         page home { text { value = body } }\n",
+    )
+    .unwrap();
+    let warning = [0xef, 0x6c, 0x00];
+    let banner = |img: &Image| close(img.px(700, 72), warning, 16);
+    // Banner opens the alerts page: Done, Snooze 1d, Snooze 1w.
+    let before = shot(&conf, &["--tap", "400,72", "--settle", "100"]);
+    assert!(banner(&before), "no banner for a due reminder");
+    let done = shot(&conf, &["--tap", "400,72", "--tap", "67,163", "--settle", "100"]);
+    assert!(!done.any(|p| close(p, warning, 16)), "reminder still listed after Done");
+    let snoozed = shot(&conf, &["--tap", "400,72", "--tap", "307,163", "--settle", "100"]);
+    assert!(!banner(&snoozed), "banner still shown after Snooze 1w");
+    assert!(snoozed.any(|p| close(p, warning, 16)), "snoozed reminder must stay listed");
+}
+
+#[test]
+fn idle_screen_goes_black_and_the_waking_tap_does_nothing_else() {
+    let d = tmp("sleep");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var n: int = 0\n\
+         screen { idle = 1s }\n\
+         page home {\n\
+             button { width = 200; height = 80; label = add\n\
+                      on_tap { set { n = {{ vars.n + 1 }} } } }\n\
+             rect { width = 100; height = 40\n\
+                    background = {{ vars.n == 1 ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let black = |p| close(p, [0, 0, 0], 4);
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    let asleep = shot(&conf, &["--settle", "100", "--wait", "1500"]);
+    assert!((0..asleep.h).all(|y| black(asleep.px(400, y))), "screen not blacked out");
+    // First tap wakes only; the second counts once.
+    let woke = shot(&conf, &["--settle", "100", "--wait", "1500", "--tap", "100,100", "--tap", "100,100"]);
+    assert!(!black(woke.px(400, 240)), "did not wake");
+    assert!(woke.any(green), "the waking tap was not absorbed (or the second was lost)");
+}

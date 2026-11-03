@@ -320,6 +320,14 @@ pub fn parse_cli(args: &[String]) -> Result<(String, BTreeMap<String, Value>), S
                 other => return Err(format!("unknown alert verb `{other}` (fire, resolve, ack, snooze)")),
             }
         }
+        "reminder" => {
+            let [verb, id] = rest else { return Err("`reminder done <name>`".into()) };
+            if verb != "done" {
+                return Err(format!("unknown reminder verb `{verb}` (done)"));
+            }
+            a.insert("id".into(), s(id));
+            "reminder_done".into()
+        }
         other => return Err(format!("unknown command `{other}`")),
     };
     Ok((cmd, a))
@@ -461,6 +469,9 @@ mod tests {
         assert!(cli(&["alert", "fire", "x", "color=red"]).is_err());
         assert!(cli(&["goto"]).is_err());
         assert!(cli(&["frobnicate"]).is_err());
+        let (c, a) = cli(&["reminder", "done", "restore_test"]).unwrap();
+        assert_eq!((c.as_str(), &a["id"]), ("reminder_done", &Value::String("restore_test".into())));
+        assert!(cli(&["reminder", "skip", "x"]).is_err());
     }
 
     #[test]

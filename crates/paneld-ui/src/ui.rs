@@ -55,6 +55,8 @@ pub enum UiEvent {
     /// A `then` / `else` call from the worker. Unlike a tap it is
     /// kept, and run after any modal that is up closes.
     Chained { name: String, args: Vec<ActionArg> },
+    /// The sleeping screen was touched (schema 12, `first_tap = wake`).
+    Wake,
     /// The worker finished a call of action `name`; `result` is the
     /// schema's `{ok, code, stdout, stderr}`.
     ActionDone { name: String, ok: bool, result: crate::expr::Value },
@@ -151,6 +153,76 @@ fn bindings() -> &'static Mutex<Vec<Binding>> {
 pub fn reset_action_bindings() {
     bindings().lock().unwrap().clear();
     INPUTS.with(|v| v.borrow_mut().clear());
+}
+
+/// Milliseconds since the last touch on the default display.
+pub fn inactive_ms() -> u32 {
+    unsafe { sys::lv_display_get_inactive_time(std::ptr::null()) }
+}
+
+/// Count as a touch now (restarts the idle clock), e.g. when an alert
+/// wakes the screen.
+pub fn trigger_activity() {
+    unsafe { sys::lv_display_trigger_activity(sys::lv_display_get_default()) };
+}
+
+thread_local! {
+    /// The sleep cover on the system layer, while the screen sleeps.
+    static SLEEP_COVER: std::cell::Cell<*mut sys::lv_obj_t> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Where the sleep cover sends [`UiEvent::Wake`]. A static, not the
+/// binding table: page re-renders reset that table, not this.
+fn wake_sink() -> &'static Mutex<Option<Sender<UiEvent>>> {
+    static S: OnceLock<Mutex<Option<Sender<UiEvent>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+unsafe extern "C" fn on_cover_pressed(_e: *mut sys::lv_event_t) {
+    if let Some(tx) = wake_sink().lock().unwrap().as_ref() {
+        let _ = tx.send(UiEvent::Wake);
+    }
+}
+
+/// Black out the screen while it sleeps: a full-screen black object on
+/// LVGL's system layer, above pages, modals and toasts. With `absorb`
+/// it takes the touch that wakes the screen (`first_tap = wake`) and
+/// reports it as [`UiEvent::Wake`]; without, touches pass through to
+/// the page (`first_tap = act`). Idempotent.
+pub fn show_sleep_cover(absorb: bool, sink: Sender<UiEvent>) {
+    if !SLEEP_COVER.with(|c| c.get()).is_null() {
+        return;
+    }
+    unsafe {
+        let layer = sys::lv_layer_sys();
+        let cover = sys::lv_obj_create(layer);
+        sys::lv_obj_remove_style_all(cover);
+        sys::lv_obj_set_size(cover, Size::Percent(100).to_lvgl(), Size::Percent(100).to_lvgl());
+        sys::lv_obj_set_style_bg_color(cover, sys::lv_color_hex(0x000000), 0);
+        sys::lv_obj_set_style_bg_opa(cover, 255, 0);
+        sys::lv_obj_set_clickable(cover, absorb);
+        if absorb {
+            *wake_sink().lock().unwrap() = Some(sink);
+            sys::lv_obj_add_event_cb(
+                cover,
+                Some(on_cover_pressed),
+                sys::lv_event_code_t_LV_EVENT_PRESSED,
+                std::ptr::null_mut(),
+            );
+        }
+        SLEEP_COVER.with(|c| c.set(cover));
+    }
+}
+
+/// Remove the sleep cover, if any. Called from the main loop, never
+/// from inside the cover's own event callback.
+pub fn hide_sleep_cover() {
+    let cover = SLEEP_COVER.with(|c| c.replace(std::ptr::null_mut()));
+    if !cover.is_null() {
+        unsafe { sys::lv_obj_delete(cover) };
+        *wake_sink().lock().unwrap() = None;
+    }
 }
 
 thread_local! {

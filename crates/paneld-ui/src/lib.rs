@@ -23,6 +23,7 @@ pub mod ui;
 pub use expr::{eval, Context, EvalError, Value};
 pub use render::{interpolate, render_page, render_toast, resolve_value};
 pub use ui::{
-    reset_action_bindings, restore_inputs, snapshot_inputs, ActionArg, ActionTrigger, EventValue,
-    InlineSetItem, MemDisplay, Ui, UiEvent, Window,
+    hide_sleep_cover, inactive_ms, reset_action_bindings, restore_inputs, show_sleep_cover,
+    snapshot_inputs, trigger_activity, ActionArg, ActionTrigger, EventValue, InlineSetItem, MemDisplay, Ui, UiEvent,
+    Window,
 };

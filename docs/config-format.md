@@ -2,6 +2,7 @@
 title: "Config format"
 description: "The hypr-style syntax of paneld config files."
 date: 2026-10-29
+updated: 2026-11-03
 tags: [paneld, config]
 series: paneld
 order: 3
@@ -122,7 +123,7 @@ page home {
 | number | `12`, `0.5`, `1e9` |
 | bool | `true`, `false` |
 | string | text, or `"..."` |
-| duration | `500ms`, `30s`, `2m`, `1h`, `1d`, `1 month` |
+| duration | `500ms`, `30s`, `2m`, `1h`, `1d`, `1w`, `1 month`, `1y` (a month is 30 days, a year 365) |
 | size | `120` (px), `50%`, `grow` |
 | bytes | `512`, `64KiB`, `1MiB` |
 | color | `#rgb`, `#rrggbb`, `#rrggbbaa`, or a theme color by name |

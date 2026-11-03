@@ -56,6 +56,21 @@ impl SavedAlert {
     }
 }
 
+/// When a reminder was first seen (its default start) and last done,
+/// as Unix seconds.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SavedReminder {
+    pub first_seen: u64,
+    pub done: Option<u64>,
+}
+
+/// Everything the state file holds (ADR 0014).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct StateData {
+    pub alerts: BTreeMap<String, SavedAlert>,
+    pub reminders: BTreeMap<String, SavedReminder>,
+}
+
 /// Rate-limited state file writer. Owns the state path, remembers
 /// what was last on disk, and only writes when the running set
 /// actually diverges from it, at most every [`WRITE_INTERVAL`].
@@ -63,8 +78,8 @@ pub struct Store {
     path: PathBuf,
     tmp: PathBuf,
     last_write: Instant,
-    on_disk: BTreeMap<String, SavedAlert>,
-    pending: Option<BTreeMap<String, SavedAlert>>,
+    on_disk: StateData,
+    pending: Option<StateData>,
 }
 
 impl Store {
@@ -88,16 +103,16 @@ impl Store {
                     let mut bad = path.clone();
                     bad.set_extension("bad");
                     let _ = fs::rename(&path, &bad);
-                    BTreeMap::new()
+                    StateData::default()
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StateData::default(),
             Err(e) => {
                 eprintln!(
                     "paneld: cannot read state file {}: {e}; starting empty",
                     path.display()
                 );
-                BTreeMap::new()
+                StateData::default()
             }
         };
         Self {
@@ -118,18 +133,29 @@ impl Store {
     /// What the daemon loaded at startup. The alert engine replays
     /// these timestamps onto freshly fired alerts so `since` survives
     /// a restart.
-    pub fn snapshot(&self) -> &BTreeMap<String, SavedAlert> {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn snapshot(&self) -> &StateData {
         &self.on_disk
     }
 
-    /// Note the current alert set. Writes are deferred: nothing goes
-    /// to disk until [`Self::flush_if_due`] decides enough time has
-    /// passed.
-    pub fn note(&mut self, alerts: &BTreeMap<String, Alert>) {
-        let snapshot: BTreeMap<String, SavedAlert> = alerts
-            .iter()
-            .map(|(k, v)| (k.clone(), SavedAlert::from_alert(v)))
-            .collect();
+    /// Note the current alerts and reminder dates. Writes are
+    /// deferred: nothing goes to disk until [`Self::flush_if_due`]
+    /// decides enough time has passed.
+    pub fn note(
+        &mut self,
+        alerts: &BTreeMap<String, Alert>,
+        reminders: &BTreeMap<String, SavedReminder>,
+    ) {
+        let snapshot = StateData {
+            alerts: alerts
+                .iter()
+                .map(|(k, v)| (k.clone(), SavedAlert::from_alert(v)))
+                .collect(),
+            reminders: reminders.clone(),
+        };
         if snapshot != self.on_disk {
             self.pending = Some(snapshot);
         } else {
@@ -183,17 +209,13 @@ impl Store {
     }
 }
 
-fn write_atomic(
-    path: &Path,
-    tmp: &Path,
-    alerts: &BTreeMap<String, SavedAlert>,
-) -> std::io::Result<()> {
+fn write_atomic(path: &Path, tmp: &Path, data: &StateData) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    let serialised = render(alerts);
+    let serialised = render(data);
     {
         // Alert titles and text may carry secrets or source output,
         // so lock the file down to the owning user. ADR 0014.
@@ -217,7 +239,8 @@ fn to_unix(t: SystemTime) -> u64 {
 
 /// Build the serialised JSON. Hand-rolled rather than pull a JSON
 /// crate for one object.
-fn render(alerts: &BTreeMap<String, SavedAlert>) -> String {
+fn render(data: &StateData) -> String {
+    let alerts = &data.alerts;
     let mut out = String::new();
     out.push_str("{\n  \"version\": ");
     out.push_str(&VERSION.to_string());
@@ -252,6 +275,23 @@ fn render(alerts: &BTreeMap<String, SavedAlert>) -> String {
         out.push_str("\n    }");
     }
     if !alerts.is_empty() {
+        out.push_str("\n  ");
+    }
+    out.push_str("},\n  \"reminders\": {");
+    for (i, (name, r)) in data.reminders.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("\n    ");
+        out.push_str(&json_string(name));
+        out.push_str(&format!(": {{ \"first_seen\": {}, \"done\": ", r.first_seen));
+        match r.done {
+            Some(t) => out.push_str(&t.to_string()),
+            None => out.push_str("null"),
+        }
+        out.push_str(" }");
+    }
+    if !data.reminders.is_empty() {
         out.push_str("\n  ");
     }
     out.push_str("}\n}\n");
@@ -292,12 +332,13 @@ impl std::fmt::Display for ParseError {
 /// Minimal reader for the shape [`render`] produces. Not a general
 /// JSON parser: it accepts a top-level object with `version` and
 /// `alerts`, each alert a flat object of our known fields.
-fn parse(src: &str) -> Result<BTreeMap<String, SavedAlert>, ParseError> {
+fn parse(src: &str) -> Result<StateData, ParseError> {
     let mut p = Parser { src: src.as_bytes(), i: 0 };
     p.skip_ws();
     p.expect(b'{')?;
     let mut version: Option<u64> = None;
     let mut alerts: Option<BTreeMap<String, SavedAlert>> = None;
+    let mut reminders: BTreeMap<String, SavedReminder> = BTreeMap::new();
     loop {
         p.skip_ws();
         if p.peek() == Some(b'}') {
@@ -310,6 +351,7 @@ fn parse(src: &str) -> Result<BTreeMap<String, SavedAlert>, ParseError> {
         match key.as_str() {
             "version" => version = Some(p.unsigned()?),
             "alerts" => alerts = Some(parse_alerts_map(&mut p)?),
+            "reminders" => reminders = parse_reminders_map(&mut p)?,
             _ => p.skip_value()?,
         }
         p.skip_ws();
@@ -323,7 +365,51 @@ fn parse(src: &str) -> Result<BTreeMap<String, SavedAlert>, ParseError> {
             "unsupported state file version {version}"
         )));
     }
-    Ok(alerts.unwrap_or_default())
+    Ok(StateData { alerts: alerts.unwrap_or_default(), reminders })
+}
+
+fn parse_reminders_map(p: &mut Parser) -> Result<BTreeMap<String, SavedReminder>, ParseError> {
+    p.expect(b'{')?;
+    let mut out = BTreeMap::new();
+    loop {
+        p.skip_ws();
+        if p.peek() == Some(b'}') {
+            p.i += 1;
+            return Ok(out);
+        }
+        let name = p.string()?;
+        p.skip_ws();
+        p.expect(b':')?;
+        p.skip_ws();
+        p.expect(b'{')?;
+        let mut r = SavedReminder::default();
+        loop {
+            p.skip_ws();
+            if p.peek() == Some(b'}') {
+                p.i += 1;
+                break;
+            }
+            let key = p.string()?;
+            p.skip_ws();
+            p.expect(b':')?;
+            p.skip_ws();
+            match key.as_str() {
+                "first_seen" => r.first_seen = p.unsigned()?,
+                "done" if p.peek() == Some(b'n') => p.expect_kw("null")?,
+                "done" => r.done = Some(p.unsigned()?),
+                _ => p.skip_value()?,
+            }
+            p.skip_ws();
+            if p.peek() == Some(b',') {
+                p.i += 1;
+            }
+        }
+        out.insert(name, r);
+        p.skip_ws();
+        if p.peek() == Some(b',') {
+            p.i += 1;
+        }
+    }
 }
 
 fn parse_alerts_map(p: &mut Parser) -> Result<BTreeMap<String, SavedAlert>, ParseError> {
@@ -641,6 +727,18 @@ pub fn config_path(doc: &paneld_config::parse::Document) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn data(alerts: BTreeMap<String, SavedAlert>) -> StateData {
+        StateData { alerts, reminders: BTreeMap::new() }
+    }
+
+    #[test]
+    fn roundtrips_reminders() {
+        let mut d = StateData::default();
+        d.reminders.insert("a".into(), SavedReminder { first_seen: 100, done: None });
+        d.reminders.insert("b \"x\"".into(), SavedReminder { first_seen: 1, done: Some(2) });
+        assert_eq!(parse(&render(&d)).expect("parse"), d);
+    }
+
     fn sample_alert() -> Alert {
         Alert {
             rule: "pi_hot".into(),
@@ -661,17 +759,18 @@ mod tests {
         let a = sample_alert();
         let mut m = BTreeMap::new();
         m.insert("pi_hot:pi_hot".to_string(), SavedAlert::from_alert(&a));
-        let s = render(&m);
+        let s = render(&data(m.clone()));
         let parsed = parse(&s).expect("parse");
-        assert_eq!(parsed, m);
+        assert_eq!(parsed.alerts, m);
     }
 
     #[test]
     fn handles_empty_set() {
-        let s = render(&BTreeMap::new());
+        let s = render(&StateData::default());
         let parsed = parse(&s).expect("parse");
-        assert!(parsed.is_empty());
+        assert_eq!(parsed, StateData::default());
         assert!(s.contains("\"alerts\": {}"));
+        assert!(s.contains("\"reminders\": {}"));
     }
 
     #[test]
@@ -682,7 +781,7 @@ mod tests {
         };
         let mut m = BTreeMap::new();
         m.insert("pi_hot:pi_hot".into(), SavedAlert::from_alert(&a));
-        let parsed = parse(&render(&m)).expect("parse");
+        let parsed = parse(&render(&data(m))).expect("parse").alerts;
         assert_eq!(parsed["pi_hot:pi_hot"].text, "72\u{00b0} C \u{65e5}");
     }
 
@@ -694,7 +793,7 @@ mod tests {
         };
         let mut m = BTreeMap::new();
         m.insert("pi_hot:pi_hot".into(), SavedAlert::from_alert(&a));
-        let parsed = parse(&render(&m)).expect("parse");
+        let parsed = parse(&render(&data(m))).expect("parse").alerts;
         assert_eq!(parsed["pi_hot:pi_hot"].title, "quoth: \"nevermore\"\n");
     }
 
@@ -708,7 +807,7 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("a".into(), SavedAlert::from_alert(&a_null));
         m.insert("b".into(), SavedAlert::from_alert(&a_snoozed));
-        let parsed = parse(&render(&m)).expect("parse");
+        let parsed = parse(&render(&data(m))).expect("parse").alerts;
         assert_eq!(parsed["a"].snoozed_until, None);
         assert_eq!(parsed["b"].snoozed_until, Some(1_762_000_600));
     }
@@ -740,7 +839,8 @@ mod tests {
             }
         }"#;
         let m = parse(s).expect("parse");
-        assert_eq!(m["pi_hot:pi_hot"].since, 1000);
+        assert_eq!(m.alerts["pi_hot:pi_hot"].since, 1000);
+        assert!(m.reminders.is_empty(), "older files have no reminders");
     }
 
     #[test]
@@ -752,27 +852,35 @@ mod tests {
 
         let mut set = BTreeMap::new();
         set.insert("a".into(), sample_alert());
-        store.note(&set);
+        store.note(&set, &BTreeMap::new());
 
         // First flush: eligible (last_write was pushed back).
         assert!(store.flush_if_due(Instant::now()));
         assert!(path.exists());
 
         // Note the same set again: no diff, no pending, so no write.
-        store.note(&set);
+        store.note(&set, &BTreeMap::new());
         assert!(!store.flush_if_due(Instant::now()));
 
         // Change the set but try to flush immediately: suppressed by
         // the 10s interval.
         let mut set2 = set.clone();
         set2.get_mut("a").unwrap().text = "new".into();
-        store.note(&set2);
+        store.note(&set2, &BTreeMap::new());
         assert!(!store.flush_if_due(Instant::now()));
 
         // force_flush bypasses the interval.
         assert!(store.force_flush());
         let on_disk = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(on_disk["a"].text, "new");
+        assert_eq!(on_disk.alerts["a"].text, "new");
+
+        // A reminder date change is a change too.
+        let mut r = BTreeMap::new();
+        r.insert("restore".to_string(), SavedReminder { first_seen: 5, done: Some(9) });
+        store.note(&set2, &r);
+        assert!(store.force_flush());
+        let on_disk = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.reminders, r);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -795,7 +903,7 @@ mod tests {
 
         let mut set = BTreeMap::new();
         set.insert("a".into(), sample_alert());
-        store.note(&set);
+        store.note(&set, &BTreeMap::new());
 
         let t0 = Instant::now();
         assert!(!store.flush_if_due(t0), "write should fail");
@@ -817,7 +925,7 @@ mod tests {
         let path = dir.join("state");
         std::fs::write(&path, "{ this is not JSON").unwrap();
         let store = Store::open(path.clone());
-        assert!(store.snapshot().is_empty());
+        assert_eq!(store.snapshot(), &StateData::default());
         assert!(dir.join("state.bad").exists());
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);

@@ -22,11 +22,17 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_ui::Value;
 
 pub fn resolve(doc: &Document) -> BTreeMap<String, Value> {
+    resolve_with(doc, None)
+}
+
+/// Like [`resolve`], with `theme` (e.g. the night theme) in place of
+/// the configured one.
+pub fn resolve_with(doc: &Document, theme: Option<&str>) -> BTreeMap<String, Value> {
     // themes.md, "Precedence": built-in defaults first, then the
     // active theme chain on top. So every required token exists even
     // with no theme configured.
     let mut out = builtin_tokens();
-    if let Some(active) = active_theme_name(doc) {
+    if let Some(active) = theme.map(str::to_string).or_else(|| active_theme_name(doc)) {
         let mut seen = Vec::new();
         out.extend(merge_theme(doc, &active, &mut seen));
     }

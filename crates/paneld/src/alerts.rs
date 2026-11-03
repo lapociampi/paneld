@@ -255,6 +255,16 @@ impl Engine {
         }
     }
 
+    /// `(id, severity)` of the alerts not acknowledged or snoozed, for
+    /// the screen's wake-on-alert rule.
+    pub fn shown(&self, now: SystemTime) -> Vec<(String, String)> {
+        self.active
+            .iter()
+            .filter(|(_, a)| !a.acked && a.snoozed_until.map_or(true, |t| t <= now))
+            .map(|(k, a)| (k.clone(), a.severity.clone()))
+            .collect()
+    }
+
     /// The `alerts:snooze` choices; the first is `alert_snooze`'s
     /// default.
     pub fn snooze_choices(&self) -> &[(String, Duration)] {
@@ -280,10 +290,32 @@ impl Engine {
         link: &str,
         wall: SystemTime,
     ) -> bool {
-        let key = format!("{CTL_RULE}:{id}");
+        self.fire_rule(CTL_RULE, id, severity, title, text, link, wall)
+    }
+
+    /// `paneld ctl alert resolve <id>`. Returns true if it was active.
+    pub fn resolve_external(&mut self, id: &str) -> bool {
+        self.resolve_rule(CTL_RULE, id)
+    }
+
+    /// Raise `<rule>:<id>` from outside the rules (ctl, reminders).
+    /// `wall` is its `since` if it is new. Returns true if the active
+    /// set changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fire_rule(
+        &mut self,
+        rule: &str,
+        id: &str,
+        severity: &str,
+        title: &str,
+        text: &str,
+        link: &str,
+        wall: SystemTime,
+    ) -> bool {
+        let key = format!("{rule}:{id}");
         let (c, fired_at) = self.carry(&key, wall);
         let alert = Alert {
-            rule: CTL_RULE.to_string(),
+            rule: rule.to_string(),
             instance: id.to_string(),
             severity: severity.to_string(),
             title: title.to_string(),
@@ -297,9 +329,9 @@ impl Engine {
         self.active.insert(key, alert.clone()) != Some(alert)
     }
 
-    /// `paneld ctl alert resolve <id>`. Returns true if it was active.
-    pub fn resolve_external(&mut self, id: &str) -> bool {
-        self.active.remove(&format!("{CTL_RULE}:{id}")).is_some()
+    /// Resolve `<rule>:<id>`. Returns true if it was active.
+    pub fn resolve_rule(&mut self, rule: &str, id: &str) -> bool {
+        self.active.remove(&format!("{rule}:{id}")).is_some()
     }
 
     /// Feed one event (a source update's value) to every event-mode

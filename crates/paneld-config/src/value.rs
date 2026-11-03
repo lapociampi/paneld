@@ -156,6 +156,26 @@ pub fn parse_number(text: &str) -> Option<f64> {
 
 /// Parse a duration literal: `500ms`, `30s`, `2m`, `1h`, `1d`,
 /// `1 month`. A space before the unit is tolerated.
+/// `YYYY-MM-DD` as `(year, month, day)`, checked against the month's
+/// length.
+pub fn parse_date(text: &str) -> Option<(i64, u32, u32)> {
+    let mut it = text.trim().split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: u32 = it.next()?.parse().ok()?;
+    let d: u32 = it.next()?.parse().ok()?;
+    if it.next().is_some() || !(1..=12).contains(&m) || d == 0 {
+        return None;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let len = match m {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (d <= len).then_some((y, m, d))
+}
+
 pub fn parse_duration(text: &str) -> Option<Duration> {
     let t = text.trim();
     // Split on first non-numeric (and non-`.`, non-`-`) byte.
@@ -179,7 +199,8 @@ pub fn parse_duration(text: &str) -> Option<Duration> {
         "s" => num,
         "m" => num * 60.0,
         "h" => num * 3_600.0,
-        "d" => num * 86_400.0,
+        "d" | "day" | "days" => num * 86_400.0,
+        "w" | "week" | "weeks" => num * 7.0 * 86_400.0,
         "month" | "months" => num * 30.0 * 86_400.0,
         "y" | "year" | "years" => num * 365.0 * 86_400.0,
         _ => return None,
@@ -489,8 +510,20 @@ mod tests {
             Some(Duration::from_secs(30 * 86_400))
         );
         assert_eq!(parse_duration("1.5s"), Some(Duration::from_millis(1_500)));
+        assert_eq!(parse_duration("1w"), Some(Duration::from_secs(7 * 86_400)));
+        assert_eq!(parse_duration("2 weeks"), Some(Duration::from_secs(14 * 86_400)));
+        assert_eq!(parse_duration("3 days"), Some(Duration::from_secs(3 * 86_400)));
         assert_eq!(parse_duration("foo"), None);
         assert_eq!(parse_duration("5"), None); // missing unit
+    }
+
+    #[test]
+    fn date_cases() {
+        assert_eq!(parse_date("2026-11-01"), Some((2026, 11, 1)));
+        assert_eq!(parse_date("2028-02-29"), Some((2028, 2, 29)));
+        assert_eq!(parse_date("2026-02-29"), None);
+        assert_eq!(parse_date("2026-11"), None);
+        assert_eq!(parse_date("tomorrow"), None);
     }
 
     #[test]
