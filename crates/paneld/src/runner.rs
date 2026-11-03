@@ -185,90 +185,76 @@ pub struct Opts<'a> {
 /// even across spaces or quotes, so it can be interpolated per argv
 /// item afterwards (see [`command_argv`]).
 pub fn tokenize(cmd: &str) -> Result<Vec<String>, RunError> {
+    let err = |m: &str| RunError { message: m.into() };
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_tok = false;
-    let mut chars = cmd.chars().peekable();
-    // Copy a `{{ ... }}` (the first `{` already consumed) verbatim.
-    fn take_expr(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, cur: &mut String) {
-        cur.push('{');
-        let mut prev = '\0';
-        for c in chars.by_ref() {
-            cur.push(c);
-            if prev == '}' && c == '}' {
-                return;
-            }
-            prev = c;
-        }
-    }
-    while let Some(c) = chars.next() {
-        if c == '{' && chars.peek() == Some(&'{') {
+    let mut i = 0;
+    // Copy the `{{ ... }}` at `i` whole (the interpolator finds its
+    // end the same way) and return the index after it.
+    let take_expr = |i: usize, cur: &mut String| -> Result<usize, RunError> {
+        let end = paneld_config::cel::expr_end(cmd, i).ok_or_else(|| err("unterminated `{{`"))?;
+        cur.push_str(&cmd[i..end]);
+        Ok(end)
+    };
+    while let Some(c) = cmd[i..].chars().next() {
+        let rest = &cmd[i..];
+        if rest.starts_with("{{") {
             in_tok = true;
-            take_expr(&mut chars, &mut cur);
+            i = take_expr(i, &mut cur)?;
             continue;
         }
+        i += c.len_utf8();
         match c {
-            ' ' | '\t' | '\n' | '\r' if !in_tok => {}
             ' ' | '\t' | '\n' | '\r' => {
-                out.push(std::mem::take(&mut cur));
-                in_tok = false;
-            }
-            '\'' => {
-                in_tok = true;
-                let mut closed = false;
-                while let Some(c2) = chars.next() {
-                    if c2 == '{' && chars.peek() == Some(&'{') {
-                        take_expr(&mut chars, &mut cur);
-                        continue;
-                    }
-                    if c2 == '\'' {
-                        closed = true;
-                        break;
-                    }
-                    cur.push(c2);
-                }
-                if !closed {
-                    return Err(RunError {
-                        message: "unterminated single quote".into(),
-                    });
+                if in_tok {
+                    out.push(std::mem::take(&mut cur));
+                    in_tok = false;
                 }
             }
-            '"' => {
+            '\'' | '"' => {
                 in_tok = true;
-                let mut closed = false;
-                while let Some(c2) = chars.next() {
-                    if c2 == '{' && chars.peek() == Some(&'{') {
-                        take_expr(&mut chars, &mut cur);
+                loop {
+                    let Some(c2) = cmd[i..].chars().next() else {
+                        return Err(err(if c == '"' { "unterminated double quote" } else { "unterminated single quote" }));
+                    };
+                    if cmd[i..].starts_with("{{") {
+                        i = take_expr(i, &mut cur)?;
                         continue;
                     }
-                    if c2 == '"' {
-                        closed = true;
+                    i += c2.len_utf8();
+                    if c2 == c {
                         break;
                     }
-                    if c2 == '\\' {
-                        if let Some(&next) = chars.peek() {
-                            if matches!(next, '"' | '\\' | '$' | '`' | '\n') {
-                                cur.push(next);
-                                chars.next();
-                                continue;
-                            }
+                    // In double quotes `\` escapes `"`, `\`, `$`, a
+                    // backtick and a newline; anything else stays.
+                    if c == '"' && c2 == '\\' {
+                        if let Some(next) = cmd[i..].chars().next().filter(|n| matches!(n, '"' | '\\' | '$' | '`' | '\n')) {
+                            cur.push(next);
+                            i += next.len_utf8();
+                            continue;
                         }
                     }
                     cur.push(c2);
                 }
-                if !closed {
-                    return Err(RunError {
-                        message: "unterminated double quote".into(),
-                    });
-                }
             }
             '\\' => {
                 in_tok = true;
+                if cmd[i..].starts_with("{{") {
+                    // `\{{` stays as is: the interpolator turns it into
+                    // a literal `{{`.
+                    cur.push_str("\\{{");
+                    i += 2;
+                    continue;
+                }
                 // Backslash escapes the next character outside quotes.
                 // A trailing bare backslash is kept as a literal, same
                 // as most POSIX shells.
-                match chars.next() {
-                    Some(next) => cur.push(next),
+                match cmd[i..].chars().next() {
+                    Some(next) => {
+                        cur.push(next);
+                        i += next.len_utf8();
+                    }
                     None => cur.push('\\'),
                 }
             }
@@ -282,9 +268,7 @@ pub fn tokenize(cmd: &str) -> Result<Vec<String>, RunError> {
         out.push(cur);
     }
     if out.is_empty() {
-        return Err(RunError {
-            message: "empty command".into(),
-        });
+        return Err(err("empty command"));
     }
     Ok(out)
 }
@@ -487,6 +471,17 @@ mod tests {
             cwd: None,
             env: &[],
         }
+    }
+
+    #[test]
+    fn tokenize_cuts_expressions_where_the_interpolator_does() {
+        // Review round 6: a `}}` inside a string or a nested map ended
+        // the expression early.
+        assert_eq!(tokenize(r#"echo {{ x == "}}" ? 1 : 2 }}"#).unwrap(), ["echo", r#"{{ x == "}}" ? 1 : 2 }}"#]);
+        assert_eq!(tokenize("echo {{ {'a': {'b': 1}} }}").unwrap(), ["echo", "{{ {'a': {'b': 1}} }}"]);
+        assert_eq!(tokenize("echo {{ a").unwrap_err().message, "unterminated `{{`");
+        assert_eq!(tokenize(r"echo \{{ a }}").unwrap(), ["echo", r"\{{", "a", "}}"]);
+        assert_eq!(tokenize("echo caf\u{e9}{{ x }}\u{65e5}").unwrap(), ["echo", "caf\u{e9}{{ x }}\u{65e5}"]);
     }
 
     #[test]

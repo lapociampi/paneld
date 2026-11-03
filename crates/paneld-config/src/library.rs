@@ -4,11 +4,10 @@
 //! same config.
 //!
 //! A config component or page with a library name replaces the library
-//! one. Library actions are the built-in actions (ADR 0016): they are
-//! always added, so a config that defines one gets the usual "defined
-//! twice" error.
+//! one. Library actions are the built-in actions (ADR 0016): a config
+//! that defines one gets an error at its own definition.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::lex::tokenize;
 use crate::parse::{parse, Diagnostic, Document, Item};
@@ -28,11 +27,11 @@ pub fn item_count() -> usize {
 }
 
 pub fn merge(doc: &mut Document, source: &mut SourceMap, diags: &mut Vec<Diagnostic>) {
-    let defined: HashSet<(String, String)> = doc
+    let defined: HashMap<(String, String), crate::source::Span> = doc
         .items
         .iter()
         .filter_map(|it| match it {
-            Item::Block(b) => b.name.as_ref().map(|n| (b.kind.text.clone(), n.text.clone())),
+            Item::Block(b) => b.name.as_ref().map(|n| ((b.kind.text.clone(), n.text.clone()), n.span)),
             _ => None,
         })
         .collect();
@@ -43,12 +42,22 @@ pub fn merge(doc: &mut Document, source: &mut SourceMap, diags: &mut Vec<Diagnos
     diags.extend(parse_diags);
     for item in lib.items {
         if let Item::Block(b) = &item {
-            let replaced = b.kind.text != "action"
-                && b.name
-                    .as_ref()
-                    .is_some_and(|n| defined.contains(&(b.kind.text.clone(), n.text.clone())));
-            if replaced {
-                continue;
+            let name = b.name.as_ref().map_or("", |n| n.text.as_str());
+            if let Some(span) = defined.get(&(b.kind.text.clone(), name.to_string())) {
+                if b.kind.text != "action" {
+                    continue;
+                }
+                // A built-in action cannot be replaced: report it at
+                // the user's definition and drop that one, so calls
+                // are still checked against the built-in.
+                diags.push(Diagnostic::new(
+                    *span,
+                    format!("`{name}` is a built-in action (ADR 0016); give this action another name"),
+                ));
+                doc.items.retain(|it| {
+                    !matches!(it, Item::Block(u) if u.kind.text == "action"
+                        && u.name.as_ref().is_some_and(|n| n.span == *span))
+                });
             }
         }
         doc.items.push(item);
@@ -102,10 +111,9 @@ mod tests {
     fn a_config_cannot_redefine_a_builtin_action() {
         let (map, doc, mut diags) = load_text("action alert_ack { run = /bin/true }\n");
         diags.extend(crate::check(&doc, &map));
-        assert!(
-            diags.iter().any(|d| d.message.contains("alert_ack")),
-            "{:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
+        let msgs: Vec<_> = diags.iter().map(|d| (map.path(d.span.file).display().to_string(), d.message.clone())).collect();
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].0, "t.conf", "reported in the user's file");
+        assert!(msgs[0].1.contains("`alert_ack` is a built-in action"), "{msgs:?}");
     }
 }

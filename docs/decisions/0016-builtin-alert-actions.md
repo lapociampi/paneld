@@ -25,8 +25,8 @@ The panel must handle acknowledge (the alert stays listed, the banner goes) and 
   | `alert_snooze` | `id: string`, `for: duration` (default: the first of `alerts:snooze`) | Hides it from `alerts.shown` until `for` has passed |
   | `reminder_done` | `id: string` (reminder name or `reminder:<name>`) | Records today as done for a due reminder ([Schema](../schema.md), section 10) and resolves its alert |
 
-  `id` is the alert's full id (`alerts.active[i].id`). A config cannot define an action with these names.
-- An alert that resolves and fires again starts fresh. A repeat event for a firing alert keeps its ack and snooze.
+  `id` is the alert's full id (`alerts.active[i].id`). A config cannot define an action with these names, but can gate them like any action: `action[alert_ack]:pin = true`, `action[alert_snooze]:confirm = ...`.
+- An alert that resolves and fires again starts fresh, also when it resolved while the daemon was down: after the first check at startup, saved acks and snoozes of condition alerts that did not fire again are dropped (event alerts keep theirs until their source sends a `resolved` for them). A repeat event for a firing alert keeps its ack and snooze, unless it got worse (warning to critical): then it shows again.
 - Expressions gain `alerts.shown` (active, not acknowledged, not snoozed; worst first) and `alerts.snooze` (the `alerts:snooze` choices as written).
 - **Library items** written in the config language ship with the program and are merged at load, so `paneld check` sees them too: the built-in action declarations, the page `shell` component (banner from `alerts.shown`) and a page `alerts` listing every alert with Acknowledge and Snooze buttons. A config or theme replaces the component or the page by defining its own.
 - `paneld ctl alert ack <id>`, `alert snooze <id> [duration]` and `reminder done <name>` do the same from a script.

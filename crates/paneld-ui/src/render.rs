@@ -27,7 +27,7 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
 use crate::expr::{eval, Context, Value};
-use crate::ui::{ActionArg, FlexAlign, InlineSetItem, Obj, Size, Trigger, UiEvent};
+use crate::ui::{ActionArg, FlexAlign, InlineSetItem, Obj, Size, Trigger, UiEvent, ValueWidget};
 
 /// Children of a component call plus the outer context they should
 /// resolve against. Threaded through [`render_node`] so a `slot { }`
@@ -37,9 +37,6 @@ struct SlotCtx<'a> {
     outer_ctx: &'a Context,
 }
 
-/// Render the page named `page_name` from `doc` into `screen`. If no
-/// such page exists, draws a plain "page not found" label as a
-/// diagnostic.
 /// Show `text` as a toast on `layer` (the top layer), replacing any
 /// earlier one: a pill near the bottom in `background` (a hex color,
 /// e.g. a theme token) with white text. The caller removes it with
@@ -47,6 +44,8 @@ struct SlotCtx<'a> {
 pub fn render_toast(layer: &Obj<'_>, text: &str, background: &str) {
     layer.clear_children();
     let pill = layer.new_container();
+    // Taps go through to the page (or a modal) under it.
+    pill.set_enabled(false);
     pill.set_size(Size::Content, Size::Content);
     pill.set_padding(12);
     pill.set_radius(8);
@@ -60,6 +59,9 @@ pub fn render_toast(layer: &Obj<'_>, text: &str, background: &str) {
     pill.align_bottom_mid(-72);
 }
 
+/// Render the page named `page_name` from `doc` into `screen`. If no
+/// such page exists, draws a plain "page not found" label as a
+/// diagnostic.
 pub fn render_page(
     doc: &Document,
     page_name: &str,
@@ -349,7 +351,7 @@ fn render_node(
                 .unwrap_or(false);
             obj.set_toggle_state(value_on);
             apply_props(node, ctx, sink, &obj);
-            if let Some(assigns) = inline_on_change_set(node) {
+            if let Some(assigns) = bind_change_action(node, "on_change", ValueWidget::Toggle, ctx, sink, &obj) {
                 obj.on_change_toggle_inline_set(sink.clone(), assigns);
             }
         }
@@ -362,7 +364,7 @@ fn render_node(
                 obj.set_slider_value(v as i32);
             }
             apply_props(node, ctx, sink, &obj);
-            if let Some(assigns) = inline_on_change_set(node) {
+            if let Some(assigns) = bind_change_action(node, "on_change", ValueWidget::Slider, ctx, sink, &obj) {
                 obj.on_change_slider_inline_set(sink.clone(), assigns);
             }
         }
@@ -381,17 +383,9 @@ fn render_node(
             let kb = parent.new_number_keyboard();
             kb.attach_keyboard_to(&ta);
             apply_props(node, ctx, sink, &ta);
-            // Two forms: `on_submit = <action>` (the digits arrive as
-            // `value`) or `on_submit { set { ... } }` (`event.value`).
-            match find_simple(node, "on_submit").map(str::trim) {
-                Some(action) if is_bare_ident(action) => {
-                    kb.on_submit_action(sink.clone(), action.to_string());
-                }
-                _ => {
-                    if let Some(assigns) = inline_on_submit_set(node) {
-                        kb.on_submit_keyboard_inline_set(sink.clone(), assigns);
-                    }
-                }
+            // The digits arrive as `value` / `event.value`.
+            if let Some(assigns) = bind_change_action(node, "on_submit", ValueWidget::Keypad, ctx, sink, &kb) {
+                kb.on_submit_keyboard_inline_set(sink.clone(), assigns);
             }
         }
         "select" => {
@@ -423,7 +417,7 @@ fn render_node(
                 obj.set_dropdown_selected(idx);
             }
             apply_props(node, ctx, sink, &obj);
-            if let Some(assigns) = inline_on_change_set(node) {
+            if let Some(assigns) = bind_change_action(node, "on_change", ValueWidget::Dropdown, ctx, sink, &obj) {
                 obj.on_change_dropdown_inline_set(sink.clone(), assigns);
             }
         }
@@ -596,75 +590,7 @@ fn resolve_expr_value(
             if !diags.is_empty() {
                 return None;
             }
-            let mut out = String::new();
-            let bytes = raw.as_bytes();
-            let mut i = 0;
-            let mut frag_idx = 0;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\\') {
-                    out.push_str("\\\\");
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == b'\\'
-                    && bytes.get(i + 1) == Some(&b'{')
-                    && bytes.get(i + 2) == Some(&b'{')
-                {
-                    out.push_str("{{");
-                    i += 3;
-                    continue;
-                }
-                if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
-                    let mut j = i + 2;
-                    let mut depth: u32 = 0;
-                    while j < bytes.len() {
-                        match bytes[j] {
-                            b'"' | b'\'' => {
-                                let q = bytes[j];
-                                j += 1;
-                                while j < bytes.len() {
-                                    if bytes[j] == b'\\' {
-                                        j += 2;
-                                        continue;
-                                    }
-                                    if bytes[j] == q {
-                                        j += 1;
-                                        break;
-                                    }
-                                    j += 1;
-                                }
-                            }
-                            b'{' => {
-                                depth = depth.saturating_add(1);
-                                j += 1;
-                            }
-                            b'}' => {
-                                if depth > 0 {
-                                    depth -= 1;
-                                    j += 1;
-                                } else if bytes.get(j + 1) == Some(&b'}') {
-                                    j += 2;
-                                    break;
-                                } else {
-                                    j += 1;
-                                }
-                            }
-                            _ => j += 1,
-                        }
-                    }
-                    if let Some(frag) = fragments.get(frag_idx) {
-                        if let Ok(v) = eval(frag, ctx) {
-                            out.push_str(&v.to_display_string());
-                        }
-                    }
-                    frag_idx += 1;
-                    i = j;
-                    continue;
-                }
-                out.push(bytes[i] as char);
-                i += 1;
-            }
-            Some(Value::String(out))
+            Some(Value::String(splice(raw, &fragments, ctx, false)))
         }
     }
 }
@@ -711,78 +637,50 @@ fn resolve_text(node: &Block, key: &str, ctx: &Context) -> Option<String> {
 /// `fragments` is the ordered list of parsed CEL ASTs; we match them
 /// up to the openers encountered in `raw`.
 fn interpolate_text(raw: &str, fragments: &[cel::Expr], ctx: &Context) -> String {
+    splice(raw, fragments, ctx, true)
+}
+
+/// Put the values of `fragments` (parsed from `raw` by
+/// [`cel::parse_interp`]) in place of their `{{ ... }}` in `raw`.
+/// Mirrors the lexer's `\\` and `\{{` escapes. A failed fragment
+/// shows as `[message]` with `show_errors`, else as nothing.
+fn splice(raw: &str, fragments: &[cel::Expr], ctx: &Context, show_errors: bool) -> String {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
-    let mut i = 0;
-    let mut frag_idx = 0;
+    let (mut i, mut literal_from, mut frag_idx) = (0, 0, 0);
     while i < bytes.len() {
-        // Mirror the lexer's `\\{{` and `\{{` handling.
-        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\\') {
-            out.push_str("\\\\");
+        let rest = &bytes[i..];
+        if rest.starts_with(b"\\\\") {
             i += 2;
             continue;
         }
-        if bytes[i] == b'\\'
-            && bytes.get(i + 1) == Some(&b'{')
-            && bytes.get(i + 2) == Some(&b'{')
-        {
-            out.push_str("{{");
-            i += 3;
+        let escaped_open = rest.starts_with(b"\\{{");
+        let open = rest.starts_with(b"{{");
+        if !escaped_open && !open {
+            i += 1;
             continue;
         }
-        if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
-            // Advance past the matching `}}` using the same scan the
-            // CEL parser used.
-            let mut j = i + 2;
-            let mut depth: u32 = 0;
-            while j < bytes.len() {
-                match bytes[j] {
-                    b'"' | b'\'' => {
-                        let q = bytes[j];
-                        j += 1;
-                        while j < bytes.len() {
-                            if bytes[j] == b'\\' {
-                                j += 2;
-                                continue;
-                            }
-                            if bytes[j] == q {
-                                j += 1;
-                                break;
-                            }
-                            j += 1;
-                        }
-                    }
-                    b'{' => {
-                        depth = depth.saturating_add(1);
-                        j += 1;
-                    }
-                    b'}' => {
-                        if depth > 0 {
-                            depth -= 1;
-                            j += 1;
-                        } else if bytes.get(j + 1) == Some(&b'}') {
-                            j += 2;
-                            break;
-                        } else {
-                            j += 1;
-                        }
-                    }
-                    _ => j += 1,
-                }
-            }
+        // Text before here is literal; the special bytes are ASCII,
+        // so the slice ends on a char boundary.
+        out.push_str(&raw[literal_from..i]);
+        if escaped_open {
+            out.push_str("{{");
+            i += 3;
+        } else {
+            let end = cel::expr_end(raw, i).unwrap_or(bytes.len());
             if let Some(expr) = fragments.get(frag_idx) {
                 match eval(expr, ctx) {
                     Ok(v) => out.push_str(&v.to_display_string()),
-                    Err(e) => out.push_str(&format!("[{}]", e.message)),
+                    Err(e) if show_errors => out.push_str(&format!("[{}]", e.message)),
+                    Err(_) => {}
                 }
             }
             frag_idx += 1;
-            i = j;
-            continue;
+            i = end;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        literal_from = i;
     }
+    out.push_str(&raw[literal_from..]);
     out
 }
 
@@ -1044,22 +942,37 @@ fn find_block<'a>(node: &'a Block, kind: &str) -> Option<&'a Block> {
     None
 }
 
-/// Scan a widget node for `on_change { set { ... } }` and return the
-/// inline set payload. Returns `None` if no such handler is present.
-fn inline_on_change_set(node: &Block) -> Option<Vec<InlineSetItem>> {
-    inline_set_for_handler(node, "on_change")
-}
-
-/// Same shape, for a `keypad`'s `on_submit { set { ... } }`.
-fn inline_on_submit_set(node: &Block) -> Option<Vec<InlineSetItem>> {
-    inline_set_for_handler(node, "on_submit")
-}
-
-fn inline_set_for_handler(node: &Block, handler: &str) -> Option<Vec<InlineSetItem>> {
+/// Wire a value widget's `on_change` / `on_submit` when it calls an
+/// action: `= name`, `name { args }`, or an inline block with action
+/// keys (`run`, `pin`, `confirm`, ...), which is an anonymous action
+/// so its gates apply as for `on_tap`. Otherwise returns the payload
+/// of a plain `{ set { ... } }` for the caller to bind.
+fn bind_change_action(
+    node: &Block,
+    handler: &str,
+    widget: ValueWidget,
+    ctx: &Context,
+    sink: &Sender<UiEvent>,
+    obj: &Obj<'_>,
+) -> Option<Vec<InlineSetItem>> {
+    if let Some(action) = find_simple(node, handler).map(str::trim) {
+        if action != "none" && is_bare_ident(action) {
+            obj.on_change_action(widget, sink.clone(), action.to_string(), local_args(ctx));
+            return None;
+        }
+    }
     for item in &node.items {
         let Item::Block(child) = item else { continue };
-        if child.kind.text != handler || child.name.is_some() {
+        if child.kind.text != handler {
             continue;
+        }
+        if let Some(name) = &child.name {
+            obj.on_change_action(widget, sink.clone(), name.text.clone(), collect_action_args(child, ctx));
+            return None;
+        }
+        if child.is_inline_action() {
+            obj.on_change_action(widget, sink.clone(), child.inline_action_name(), local_args(ctx));
+            return None;
         }
         if let Some(set_block) = find_block(child, "set") {
             let assigns = collect_inline_set(set_block);
@@ -1256,5 +1169,18 @@ mod tests {
         // Not convertible: passed through unchanged.
         assert_eq!(typed_param("number", s("abc")), s("abc"));
         assert_eq!(typed_param("number", Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn interpolation_keeps_text_and_finds_the_real_end() {
+        let mut ctx = Context::new();
+        ctx.insert("x".into(), Value::String("42".into()));
+        let f = paneld_config::source::SourceMap::new().add("t".into(), String::new());
+        let i = |raw: &str| interpolate(raw, f, 0, &ctx);
+        // Review round 6: non-ASCII text next to `{{ }}` was mangled.
+        assert_eq!(i("Caf\u{e9} {{ x }} \u{65e5}"), "Caf\u{e9} 42 \u{65e5}");
+        assert_eq!(i("a {{ x == \"}}\" ? 1 : 2 }} b"), "a 2 b");
+        assert_eq!(i("{{ {'a': {'b': x}}['a']['b'] }}!"), "42!");
+        assert_eq!(i("\\{{ x }} {{ x }}"), "{{ x }} 42");
     }
 }

@@ -15,9 +15,11 @@
 //! - A handful of builtin functions: `string`, `int`, `number`,
 //!   `round`, `len`, `has`.
 //!
-//! What is deferred: method calls on complex types, map literals as
-//! context values, overload resolution, UTF-8 aware string functions,
-//! duration / timestamp arithmetic.
+//! - Map literals with string keys.
+//!
+//! What is deferred: method calls on complex types, overload
+//! resolution, UTF-8 aware string functions, duration / timestamp
+//! arithmetic.
 
 use std::collections::BTreeMap;
 
@@ -156,7 +158,16 @@ pub fn eval(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
             }
             Ok(Value::List(vals))
         }
-        ExprKind::Map(_) => Err(EvalError::new("map literals are not supported yet")),
+        ExprKind::Map(pairs) => {
+            let mut m = BTreeMap::new();
+            for (k, v) in pairs {
+                let Value::String(key) = eval(k, ctx)? else {
+                    return Err(EvalError::new("map keys must be strings"));
+                };
+                m.insert(key, eval(v, ctx)?);
+            }
+            Ok(Value::Map(m))
+        }
         ExprKind::Unary(op, inner) => {
             let v = eval(inner, ctx)?;
             match (op, v) {

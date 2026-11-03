@@ -776,6 +776,7 @@ fn setup_live_state(
                     since: at(v.since),
                     acked: v.acked,
                     snoozed_until: v.snoozed_until.map(at),
+                    rank: alerts::severity_rank(&v.severity),
                 };
                 (k.clone(), carry)
             })
@@ -807,6 +808,7 @@ fn setup_live_state(
         std::time::SystemTime::now(),
     );
     reminder_book.tick(&mut alerts_engine, &ctx_no_alerts, std::time::SystemTime::now());
+    alerts_engine.forget_unfired();
     let ctx = build_ctx(
         &source_values,
         &theme,
@@ -870,13 +872,6 @@ fn route_call(
     call: actions::Call,
     pin_done: bool,
 ) {
-    // ADR 0016: built-in actions act on the alert engine here.
-    if paneld_config::library::BUILTIN_ACTIONS.contains(&call.name.as_str()) {
-        if let Err(e) = run_builtin(live, &call) {
-            eprintln!("paneld: action `{}`: {}", call.name, e.message);
-        }
-        return;
-    }
     let Some(def) = live.actions.get(&call.name).cloned() else {
         // Unknown action: let the worker log it.
         let _ = live.action_tx.send(call);
@@ -963,7 +958,10 @@ fn run_builtin(live: &mut LiveState, call: &actions::Call) -> Result<(), ctl::Ct
                     .ok_or_else(|| ctl::CtlError::msg(format!("`for = {t}` is not a duration")))?,
                 None => live.alerts.snooze_choices()[0].1,
             };
-            live.alerts.snooze(&id, std::time::SystemTime::now() + d)
+            let until = std::time::SystemTime::now()
+                .checked_add(d)
+                .ok_or_else(|| ctl::CtlError::msg("snooze is too long"))?;
+            live.alerts.snooze(&id, until)
         }
         other => return Err(ctl::CtlError::msg(format!("no built-in `{other}`"))),
     };
@@ -1047,6 +1045,14 @@ fn screen_command(s: &screen::Screen, template: Option<String>, level: Option<u8
 /// Hand a call that passed its gates to the worker and mark the
 /// action running until its `ActionDone` arrives.
 fn dispatch(live: &mut LiveState, call: actions::Call) {
+    // ADR 0016: built-in actions act on the alert engine here, after
+    // the same gates as any action (`action[alert_ack]:pin = true`).
+    if paneld_config::library::BUILTIN_ACTIONS.contains(&call.name.as_str()) {
+        if let Err(e) = run_builtin(live, &call) {
+            eprintln!("paneld: action `{}`: {}", call.name, e.message);
+        }
+        return;
+    }
     if !live.running.insert(call.name.clone()) {
         eprintln!("paneld: action `{}` is still running; call ignored", call.name);
         return;

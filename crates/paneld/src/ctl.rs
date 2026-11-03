@@ -11,9 +11,10 @@
 //! to the main loop as a [`Request`] and is answered from there.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Duration;
@@ -113,15 +114,34 @@ pub fn serve(path: &Path, tx: Sender<ControlMsg>) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let listener = UnixListener::bind(path)?;
+    // Bind with no bits for others, so the socket is never open to
+    // them before the chmod below. Only "other" bits are masked: files
+    // other threads create meanwhile keep working modes.
+    use nix::sys::stat::{umask, Mode};
+    let old = umask(Mode::from_bits_truncate(0o007));
+    umask(old | Mode::from_bits_truncate(0o007));
+    let bound = UnixListener::bind(path);
+    umask(old);
+    let listener = bound?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
     let path = path.to_path_buf();
     thread::spawn(move || {
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
+                    // One thread per client, bounded: a script that
+                    // opens connections and never closes them must
+                    // not exhaust threads on a 1 GB Pi.
+                    if CLIENTS.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
+                        CLIENTS.fetch_sub(1, Ordering::SeqCst);
+                        let _ = writeln!(&stream, "{}", reply_line(&Value::Null, &Err(CtlError::msg("too many ctl clients"))));
+                        continue;
+                    }
                     let tx = tx.clone();
-                    thread::spawn(move || handle_client(stream, tx));
+                    thread::spawn(move || {
+                        handle_client(stream, tx);
+                        CLIENTS.fetch_sub(1, Ordering::SeqCst);
+                    });
                 }
                 Err(e) => eprintln!("paneld ctl: accept on {}: {e}", path.display()),
             }
@@ -130,7 +150,16 @@ pub fn serve(path: &Path, tx: Sender<ControlMsg>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Longest request line; a longer one ends the connection.
+const MAX_LINE: u64 = 64 * 1024;
+/// Clients served at once.
+const MAX_CLIENTS: usize = 16;
+/// A client silent this long is dropped.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+static CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
 fn handle_client(stream: UnixStream, tx: Sender<ControlMsg>) {
+    let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
     let greeting = format!(
         r#"{{"paneld":{},"protocol":{PROTOCOL}}}"#,
         json_string(env!("CARGO_PKG_VERSION"))
@@ -142,9 +171,13 @@ fn handle_client(stream: UnixStream, tx: Sender<ControlMsg>) {
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        match reader.by_ref().take(MAX_LINE + 1).read_line(&mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
+        }
+        if line.len() as u64 > MAX_LINE {
+            let _ = writeln!(&stream, "{}", reply_line(&Value::Null, &Err(CtlError::msg("request line too long"))));
+            return;
         }
         if line.trim().is_empty() {
             continue;
@@ -452,6 +485,42 @@ mod tests {
         let v = Value::Map(m);
         assert_eq!(crate::sources::parse_json(&to_json(&v)), Some(v));
         assert_eq!(to_json(&Value::Double(f64::NAN)), "null");
+    }
+
+    #[test]
+    fn socket_survives_hostile_clients() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("paneld-ctl-hostile-{}", std::process::id()));
+        let path = dir.join("s.sock");
+        let (tx, _rx) = mpsc::channel();
+        serve(&path, tx).expect("serve");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o660);
+        let talk = |line: &[u8]| {
+            let s = UnixStream::connect(&path).unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut greeting = String::new();
+            r.read_line(&mut greeting).unwrap();
+            // The server may hang up mid-write: write on the side.
+            let line = line.to_vec();
+            let mut w = s.try_clone().unwrap();
+            let writer = thread::spawn(move || {
+                let _ = w.write_all(&line);
+            });
+            let mut reply = String::new();
+            r.read_line(&mut reply).unwrap();
+            drop(s);
+            let _ = writer.join();
+            reply
+        };
+        let mut deep = "[".repeat(200_000).into_bytes();
+        deep.push(b'\n');
+        // Over the line cap: refused before parsing.
+        assert!(talk(&deep).contains("too long"), "long line");
+        let mut nested = "[".repeat(10_000).into_bytes();
+        nested.push(b'\n');
+        assert!(talk(&nested).contains("not a JSON object"), "deep JSON");
+        assert!(talk(b"{\"id\":1,\"cmd\":\"ping\"}\n").contains("pong"), "still serving");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1270,6 +1270,32 @@ fn check_override_targets(doc: &Document, diags: &mut Vec<Diagnostic>) {
     }
 }
 
+/// True if `cmd` runs a shell with `-c` and the script (the next word,
+/// quoted or not) holds a `{{ }}`. Values must reach commands as argv
+/// items or env vars, never as shell code (requirements, "Inputs").
+fn shell_script_interpolates(cmd: &str) -> bool {
+    const SHELLS: &[&str] = &["sh", "bash", "dash", "ash", "zsh", "ksh"];
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    if !SHELLS.contains(&first.rsplit('/').next().unwrap_or(first)) {
+        return false;
+    }
+    let mut rest = cmd;
+    while let Some(at) = rest.find("-c") {
+        let before_ok = at == 0 || rest[..at].ends_with(char::is_whitespace);
+        let after = &rest[at + 2..];
+        if before_ok && after.starts_with(char::is_whitespace) {
+            let script = after.trim_start();
+            let body = match script.chars().next() {
+                Some(q @ ('\'' | '"')) => script[1..].split(q).next().unwrap_or(""),
+                _ => script.split(char::is_whitespace).next().unwrap_or(""),
+            };
+            return body.contains("{{");
+        }
+        rest = after;
+    }
+    false
+}
+
 /// Alert rule names the daemon uses for its own alerts: ctl, reminders
 /// and the source watchdog. A config alert with one of them would
 /// share their ids.
@@ -1755,10 +1781,18 @@ fn check_value_type(
     diags: &mut Vec<Diagnostic>,
 ) {
     // Commands and free-text strings commonly interpolate `{{ ... }}`
-    // (`run = curl /{{ vm }}/stop`, `dim = sh -c 'echo {{ level }} > ...'`).
-    // Treat those as implicitly expression-tolerant.
+    // (`run = curl /{{ vm }}/stop`). Treat those as implicitly
+    // expression-tolerant, except inside a shell script.
     let implicit_expr_ok = matches!(ty, ExpectedType::Command | ExpectedType::Str);
     match classify(raw) {
+        ValueShape::Interp(_) if matches!(ty, ExpectedType::Command) && shell_script_interpolates(raw) => {
+            diags.push(Diagnostic::new(
+                span,
+                "`{{ }}` inside a `-c` shell script pastes the value into shell code; pass it as an \
+                 argument (`sh -c '... \"$$1\"' sh {{ x }}`) or in `env { }`"
+                    .to_string(),
+            ));
+        }
         ValueShape::Expression(_) | ValueShape::Interp(_) => {
             if !expr_ok && !implicit_expr_ok {
                 diags.push(Diagnostic::new(
@@ -3217,7 +3251,16 @@ fn check_cel_in_doc(doc: &Document, names: &Names, diags: &mut Vec<Diagnostic>) 
 fn check_cel_in_item(item: &Item, names: &Names, in_env: bool, diags: &mut Vec<Diagnostic>) {
     match item {
         Item::Assign(a) => {
-            let is_run = matches!(&a.target, AssignTarget::Simple { key } if key.text == "run");
+            // `run = ...`, or overridden as `action[x]:run` /
+            // `source[x]:run`: the one key besides `env` that may
+            // use secrets.
+            let is_run = match &a.target {
+                AssignTarget::Simple { key } => key.text == "run",
+                AssignTarget::Indexed { kind, key, .. } => {
+                    key.text == "run" && matches!(kind.text.as_str(), "action" | "source")
+                }
+                _ => false,
+            };
             check_cel_in_raw_value(&a.value, names, in_env || is_run, diags)
         }
         Item::Block(b) => {
@@ -3736,6 +3779,24 @@ reminder restore_test {
 "#;
         let diags = check_text(text);
         assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn secrets_allowed_in_an_overridden_run() {
+        let src = "secret tok { env = T }\naction a { run = /bin/true }\naction[a]:run = curl -H {{ secrets.tok }} x\n";
+        assert!(check_text(src).is_empty(), "{:?}", check_text(src));
+        let bad = "secret tok { env = T }\naction a { run = /bin/true }\naction[a]:done = {{ secrets.tok }}\n";
+        assert!(!check_text(bad).is_empty());
+    }
+
+    #[test]
+    fn interpolating_into_a_shell_script_is_flagged() {
+        assert_msg(&check_text("action a { run = sh -c 'echo {{ vars.x }} > /tmp/f' }\n"), "pastes the value into shell code");
+        assert_msg(&check_text("screen { dim = /bin/bash -c 'echo {{ level }}' }\n"), "pastes the value");
+        // As an argument after the script, or with no shell: fine.
+        assert!(check_text("action a { run = sh -c 'echo \"$$1\" > /tmp/f' sh {{ vars.x }} }\n").is_empty());
+        assert!(check_text("action a { run = ssh -c aes128-ctr {{ vars.x }} }\n").is_empty());
+        assert!(check_text("action a { run = curl -H {{ vars.x }} http://x }\n").is_empty());
     }
 
     #[test]

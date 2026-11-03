@@ -176,6 +176,8 @@ pub fn parse_date(text: &str) -> Option<(i64, u32, u32)> {
     (d <= len).then_some((y, m, d))
 }
 
+const MAX_DURATION_SECS: f64 = 100.0 * 365.0 * 86_400.0;
+
 pub fn parse_duration(text: &str) -> Option<Duration> {
     let t = text.trim();
     // Split on first non-numeric (and non-`.`, non-`-`) byte.
@@ -205,7 +207,9 @@ pub fn parse_duration(text: &str) -> Option<Duration> {
         "y" | "year" | "years" => num * 365.0 * 86_400.0,
         _ => return None,
     };
-    if seconds.is_nan() || seconds.is_infinite() || seconds < 0.0 {
+    // Over 100 years is a typo, and adding it to a clock would
+    // overflow (a panic in `Instant + Duration`).
+    if seconds.is_nan() || !(0.0..=MAX_DURATION_SECS).contains(&seconds) {
         return None;
     }
     let whole = seconds.trunc() as u64;
@@ -513,6 +517,10 @@ mod tests {
         assert_eq!(parse_duration("1w"), Some(Duration::from_secs(7 * 86_400)));
         assert_eq!(parse_duration("2 weeks"), Some(Duration::from_secs(14 * 86_400)));
         assert_eq!(parse_duration("3 days"), Some(Duration::from_secs(3 * 86_400)));
+        assert_eq!(parse_duration("100y"), Some(Duration::from_secs(100 * 365 * 86_400)));
+        assert_eq!(parse_duration("101y"), None);
+        assert_eq!(parse_duration("300000000000y"), None);
+        assert_eq!(parse_duration("1e30s"), None);
         assert_eq!(parse_duration("foo"), None);
         assert_eq!(parse_duration("5"), None); // missing unit
     }

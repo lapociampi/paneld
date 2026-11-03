@@ -111,7 +111,9 @@ fn collect_inline(items: &[Item], out: &mut HashMap<String, ActionDef>) {
     for item in items {
         match item {
             Item::Block(b) => {
-                if matches!(b.kind.text.as_str(), "on_tap" | "on_hold") && b.is_inline_action() {
+                if matches!(b.kind.text.as_str(), "on_tap" | "on_hold" | "on_change" | "on_submit")
+                    && b.is_inline_action()
+                {
                     out.insert(b.inline_action_name(), parse_def(b));
                 }
                 collect_inline(&b.items, out);
@@ -356,8 +358,13 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                     cwd: Some(&cwd),
                     env: &env_pairs,
                 };
+                // Nothing a command prints reaches the log, the screen
+                // or `result` with a secret in it.
+                let mask = crate::secrets::Mask::new(&wctx.secrets);
                 match argv.and_then(|argv| runner::exec(&argv, opts)) {
-                    Ok(r) => {
+                    Ok(mut r) => {
+                        r.stdout = mask.apply(&r.stdout);
+                        r.stderr = mask.apply(&r.stderr);
                         eprintln!(
                             "paneld: action `{name}`: exit {:?}, timed_out {}{}",
                             r.exit_code,
@@ -382,9 +389,10 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                         };
                     }
                     Err(e) => {
+                        let e = mask.apply(&e.to_string());
                         eprintln!("paneld: action `{name}`: {e}");
                         ok = false;
-                        stderr = e.to_string();
+                        stderr = e;
                     }
                 }
             }
@@ -734,6 +742,10 @@ mod tests {
     }
 
     fn worker_for(doc: &Document) -> (Sender<Call>, Receiver<UiEvent>) {
+        worker_with(doc, BTreeMap::new())
+    }
+
+    fn worker_with(doc: &Document, secrets: BTreeMap<String, Value>) -> (Sender<Call>, Receiver<UiEvent>) {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (source_tx, _source_rx) = std::sync::mpsc::channel();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -741,7 +753,7 @@ mod tests {
             WorkerCtx {
                 actions: collect(doc),
                 base_ctx: Context::new(),
-                secrets: BTreeMap::new(),
+                secrets,
                 vars: Arc::new(Mutex::new(BTreeMap::new())),
                 source_values: Arc::new(Mutex::new(BTreeMap::new())),
                 var_types: BTreeMap::new(),
@@ -754,6 +766,30 @@ mod tests {
             rx,
         );
         (tx, event_rx)
+    }
+
+    #[test]
+    fn command_output_has_secrets_masked() {
+        // Review round 6: a command echoing its argv put the token on
+        // the screen (failed toast, `result`) and in the journal.
+        let doc = parse_doc("action leak { run = /bin/sh -c 'echo \"$1\"; echo \"$1\" >&2; exit 1' x {{ secrets.tok }} }\n");
+        let mut secrets = BTreeMap::new();
+        secrets.insert("tok".to_string(), Value::String("hunter2-token".into()));
+        let (tx, events) = worker_with(&doc, secrets);
+        tx.send(Call { name: "leak".into(), args: Vec::new(), cleared: true }).unwrap();
+        loop {
+            match events.recv_timeout(Duration::from_secs(5)) {
+                Ok(UiEvent::ActionDone { ok, result, .. }) => {
+                    assert!(!ok);
+                    let Value::Map(m) = result else { panic!("result is a map") };
+                    assert_eq!(m["stdout"], Value::String("****\n".into()));
+                    assert_eq!(m["stderr"], Value::String("****\n".into()));
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("no ActionDone: {e}"),
+            }
+        }
     }
 
     #[test]

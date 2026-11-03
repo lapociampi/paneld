@@ -6,7 +6,8 @@
 //! context as `secrets.<name>`.
 //!
 //! Scope today: `env` and `file` sources, with the file contents
-//! trimmed. `cmd` and masked logging come in a later phase.
+//! trimmed; `cmd` comes later. [`Mask`] hides their values in what
+//! commands print, before it is logged, shown or stored.
 
 use std::collections::BTreeMap;
 
@@ -51,4 +52,65 @@ fn find_simple<'a>(node: &'a Block, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Values shorter than this are not masked: hiding every `1` or `ok`
+/// in command output would mangle it and hide nothing worth hiding.
+const MIN_MASKED_LEN: usize = 4;
+
+/// Replaces secret values with `****` in command output. A command
+/// that echoes its argv or env (usage text, a verbose error) would
+/// otherwise put a token on the screen and in the journal.
+#[derive(Clone, Debug, Default)]
+pub struct Mask(Vec<String>);
+
+impl Mask {
+    pub fn new(secrets: &BTreeMap<String, Value>) -> Self {
+        let mut values: Vec<String> = secrets
+            .values()
+            .filter_map(|v| match v {
+                Value::String(s) if s.len() >= MIN_MASKED_LEN => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        // Longest first, so a secret that contains another is hidden
+        // whole.
+        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        values.dedup();
+        Self(values)
+    }
+
+    /// From a command context's `secrets` map, if it has one.
+    pub fn from_ctx(ctx: &paneld_ui::Context) -> Self {
+        match ctx.get("secrets") {
+            Some(Value::Map(m)) => Self::new(m),
+            _ => Self::default(),
+        }
+    }
+
+    pub fn apply(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for v in &self.0 {
+            if out.contains(v.as_str()) {
+                out = out.replace(v.as_str(), "****");
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_hides_values_longest_first_and_skips_short_ones() {
+        let mut m = BTreeMap::new();
+        m.insert("a".to_string(), Value::String("s3cr3t-token".into()));
+        m.insert("b".to_string(), Value::String("s3cr3t".into()));
+        m.insert("c".to_string(), Value::String("ok".into()));
+        let mask = Mask::new(&m);
+        assert_eq!(mask.apply("auth s3cr3t-token / s3cr3t: ok"), "auth **** / ****: ok");
+        assert_eq!(Mask::default().apply("s3cr3t"), "s3cr3t");
+    }
 }

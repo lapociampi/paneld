@@ -113,11 +113,28 @@ fn carry_of(
     wall: SystemTime,
 ) -> (Carry, Instant) {
     if let Some(a) = active.get(key) {
-        let c = Carry { since: a.since, acked: a.acked, snoozed_until: a.snoozed_until };
+        let c = Carry {
+            since: a.since,
+            acked: a.acked,
+            snoozed_until: a.snoozed_until,
+            rank: severity_rank(&a.severity),
+        };
         return (c, a.fired_at);
     }
-    let c = restored.remove(key).unwrap_or(Carry { since: wall, acked: false, snoozed_until: None });
+    let c = restored.remove(key).unwrap_or(Carry { since: wall, acked: false, snoozed_until: None, rank: 0 });
     (c, Instant::now())
+}
+
+/// Put what `alert` carries over onto it. An alert that got worse
+/// (warning to critical) loses its ack and snooze: the new severity
+/// has not been seen yet.
+fn apply_carry(alert: &mut Alert, c: Carry, fired_at: Instant) {
+    alert.since = c.since;
+    alert.fired_at = fired_at;
+    if severity_rank(&alert.severity) <= c.rank {
+        alert.acked = c.acked;
+        alert.snoozed_until = c.snoozed_until;
+    }
 }
 
 /// `alerts:snooze = [1d, 1w]` (schema 9), default `1d`, `1w`.
@@ -164,6 +181,8 @@ pub struct Carry {
     pub since: SystemTime,
     pub acked: bool,
     pub snoozed_until: Option<SystemTime>,
+    /// [`severity_rank`] it had when acked or snoozed.
+    pub rank: u8,
 }
 
 /// Rule name for alerts raised over `paneld ctl`.
@@ -223,6 +242,21 @@ impl Engine {
     /// current one.
     pub fn restore(&mut self, saved: BTreeMap<String, Carry>) {
         self.restored = saved;
+    }
+
+    /// Call once after the first tick of a (re)start. A condition
+    /// rule, reminder or built-in alert that did not fire again has
+    /// resolved while the daemon was down, so its saved ack and
+    /// snooze are dropped: firing later starts fresh (ADR 0016).
+    /// Event rules keep theirs until the source's next event for that
+    /// alert, since their state only arrives with events.
+    pub fn forget_unfired(&mut self) {
+        let (rules, pending) = (&self.rules, &self.pending);
+        self.restored.retain(|k, _| {
+            let rule = k.split_once(':').map_or(k.as_str(), |(r, _)| r);
+            // Still waiting out its `for`: the same incident, maybe.
+            pending.contains_key(k) || rules.iter().any(|r| r.name == rule && r.from.is_some())
+        });
     }
 
     /// What `key` carries if it fires now: from the active alert, else
@@ -314,7 +348,7 @@ impl Engine {
     ) -> bool {
         let key = format!("{rule}:{id}");
         let (c, fired_at) = self.carry(&key, wall);
-        let alert = Alert {
+        let mut alert = Alert {
             rule: rule.to_string(),
             instance: id.to_string(),
             severity: severity.to_string(),
@@ -323,9 +357,10 @@ impl Engine {
             link: link.to_string(),
             since: c.since,
             fired_at,
-            acked: c.acked,
-            snoozed_until: c.snoozed_until,
+            acked: false,
+            snoozed_until: None,
         };
+        apply_carry(&mut alert, c, fired_at);
         self.active.insert(key, alert.clone()) != Some(alert)
     }
 
@@ -388,6 +423,7 @@ impl Engine {
 
             match state.as_str() {
                 "resolved" => {
+                    self.restored.remove(&key);
                     if self.active.remove(&key).is_some() {
                         changed = true;
                     }
@@ -398,9 +434,7 @@ impl Engine {
                     // them from the state file, else starts clean.
                     let (c, fired_at) = carry_of(&self.active, &mut self.restored, &key, wall);
                     let mut alert = evaluate(rule, &instance, &ctx, c.since);
-                    alert.fired_at = fired_at;
-                    alert.acked = c.acked;
-                    alert.snoozed_until = c.snoozed_until;
+                    apply_carry(&mut alert, c, fired_at);
                     // An event stream can carry updates to a firing
                     // alert (severity escalation, text change). Only
                     // mark the frame dirty when something a user can
@@ -460,13 +494,13 @@ impl Engine {
                     self.pending.remove(&key);
                     let (c, fired_at) = carry_of(&self.active, &mut self.restored, &key, wall);
                     let mut alert = evaluate(rule, &instance, ctx, c.since);
-                    alert.fired_at = fired_at;
-                    alert.acked = c.acked;
-                    alert.snoozed_until = c.snoozed_until;
+                    apply_carry(&mut alert, c, fired_at);
                     self.active.insert(key, alert);
                     changed = true;
                 }
             } else {
+                // Resolved: a later fire is a new incident.
+                self.restored.remove(&key);
                 if self.pending.remove(&key).is_some() {
                     // was pending, never fired: no visible change.
                 }
@@ -626,7 +660,7 @@ fn resolve_string(
 
 /// Rank for sorting: higher is worse. `"none"` is only used when the
 /// list is empty.
-fn severity_rank(s: &str) -> u8 {
+pub fn severity_rank(s: &str) -> u8 {
     match s {
         "critical" => 3,
         "warning" => 2,
@@ -1127,7 +1161,7 @@ mod tests {
         let mut saved = BTreeMap::new();
         saved.insert(
             "pi_hot:pi_hot".to_string(),
-            Carry { since: saved_since, acked: true, snoozed_until: None },
+            Carry { since: saved_since, acked: true, snoozed_until: None, rank: 2 },
         );
         eng.restore(saved);
 
@@ -1146,6 +1180,61 @@ mod tests {
         assert!(eng.active_alerts().is_empty());
         eng.tick(&ctx_with_temp(80.0), Instant::now(), wall);
         assert_eq!(eng.active_alerts()["pi_hot:pi_hot"].since, wall);
+    }
+
+    #[test]
+    fn an_ack_saved_for_an_alert_that_resolved_while_down_is_dropped() {
+        // Review round 6: acked, restart while the condition is false,
+        // fires again later still acked (no banner for a new incident).
+        let doc = parse_doc(
+            "alert pi_hot { when = {{ sources.cpu_temp.value > 70 }}; severity = critical; title = Hot }\n\
+             alert slow { when = {{ sources.cpu_temp.value > 70 }}; for = 1h; severity = critical; title = Slow }\n\
+             source ev { run = /bin/true }\n\
+             alert ev { from = ev; severity = critical; title = E; state = {{ event.state }} }\n",
+        );
+        let saved = |k: &str| (k.to_string(), Carry { since: SystemTime::UNIX_EPOCH, acked: true, snoozed_until: None, rank: 3 });
+        let mut eng = Engine::new(&doc);
+        eng.restore(["pi_hot:pi_hot", "slow:slow", "ev:ev", "reminder:x"].into_iter().map(saved).collect());
+        let wall = SystemTime::now();
+        // First tick after start: pi_hot is not firing.
+        eng.tick(&ctx_with_temp(60.0), Instant::now(), wall);
+        eng.forget_unfired();
+        let keys: Vec<&String> = eng.restored.keys().collect();
+        assert_eq!(keys, ["ev:ev"], "only event rules wait for their next event");
+        eng.tick(&ctx_with_temp(80.0), Instant::now(), wall);
+        assert!(!eng.active_alerts()["pi_hot:pi_hot"].acked, "a new incident must show");
+
+        // An alert still waiting out its `for` keeps its ack.
+        let mut eng = Engine::new(&doc);
+        eng.restore(["slow:slow"].into_iter().map(saved).collect());
+        eng.tick(&ctx_with_temp(80.0), Instant::now(), wall);
+        eng.forget_unfired();
+        assert!(eng.restored.contains_key("slow:slow"));
+
+        // A resolved event drops the event rule's saved ack.
+        let mut eng = Engine::new(&doc);
+        eng.restore(["ev:ev"].into_iter().map(saved).collect());
+        let mut m = BTreeMap::new();
+        m.insert("state".to_string(), Value::String("resolved".into()));
+        eng.ingest_event("ev", &Value::Map(m.clone()), &Context::new(), wall);
+        m.insert("state".to_string(), Value::String("firing".into()));
+        eng.ingest_event("ev", &Value::Map(m), &Context::new(), wall);
+        assert!(!eng.active_alerts()["ev:ev"].acked);
+    }
+
+    #[test]
+    fn getting_worse_clears_the_ack() {
+        let doc = parse_doc("alert a { when = {{ true }}; title = A }\n");
+        let mut eng = Engine::new(&doc);
+        let wall = SystemTime::now();
+        eng.fire_rule("ctl", "x", "warning", "X", "", "", wall);
+        assert!(eng.ack("ctl:x"));
+        eng.fire_rule("ctl", "x", "warning", "X again", "", "", wall);
+        assert!(eng.active_alerts()["ctl:x"].acked, "same severity keeps the ack");
+        eng.fire_rule("ctl", "x", "info", "X", "", "", wall);
+        assert!(eng.active_alerts()["ctl:x"].acked, "milder keeps the ack");
+        eng.fire_rule("ctl", "x", "critical", "X", "", "", wall);
+        assert!(!eng.active_alerts()["ctl:x"].acked, "worse must show again");
     }
 
     #[test]

@@ -267,6 +267,31 @@ fn action_goto_and_done_failed_toasts() {
 }
 
 #[test]
+fn a_toast_lets_taps_through() {
+    // Review round 6: the toast pill swallowed taps for 3 s.
+    let d = tmp("toast");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var hit: bool = false\n\
+         action bad { run = /bin/false }\n\
+         page one {\n\
+             rect { width = 100; height = 20; background = {{ vars.hit ? '#00ff00' : '#ff0000' }} }\n\
+             button { width = 200; height = 40; label = bad; on_tap = bad }\n\
+             button { width = 100%; height = 300; label = under; on_tap { set { hit = true } } }\n\
+         }\n",
+    )
+    .unwrap();
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    let failed_red = |p| close(p, [0xd3, 0x2f, 0x2f], 12);
+    let toast = shot(&conf, &["--tap", "100,113", "--settle", "300"]);
+    assert!(toast.any(failed_red), "no failure toast to tap through");
+    // The pill sits at the bottom middle, over the big button.
+    let through = shot(&conf, &["--tap", "100,113", "--settle", "300", "--tap", "400,386", "--settle", "150"]);
+    assert!(through.any(green), "the tap on the toast did not reach the button under it");
+}
+
+#[test]
 fn inline_handler_confirm_gates_its_set() {
     // Review round 5: `on_tap { set { ... }; confirm = ... }` ran the
     // set without asking.
@@ -290,6 +315,39 @@ fn inline_handler_confirm_gates_its_set() {
     // Tap, then OK (right footer button of the centered modal).
     let done = shot(&conf, &["--tap", "100,95", "--tap", "463,282", "--settle", "200"]);
     assert!(done.any(green), "set did not run after OK");
+}
+
+#[test]
+fn on_change_handlers_go_through_the_gates() {
+    // Review round 6: `on_change { set; pin }` set the var with no PIN.
+    let d = tmp("change");
+    let write = |handler: &str| {
+        let conf = d.join(format!("{}.conf", handler.len()));
+        std::fs::write(
+            &conf,
+            format!(
+                "var on: bool = false\n\
+                 page home {{\n\
+                     toggle {{ on_change {{ set {{ on = {{{{ event.value }}}} }}; {handler} }} }}\n\
+                     rect {{ width = 100; height = 40\n\
+                            background = {{{{ vars.on ? '#00ff00' : '#ff0000' }}}} }}\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+        conf
+    };
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    let red = |p| close(p, [0xff, 0, 0], 16);
+    // No PIN is configured, so a PIN-gated call is refused outright;
+    // dismiss the notice and look at the page.
+    let pinned = shot(&write("pin = true"), &["--tap", "38,77", "--tap", "399,269", "--settle", "150"]);
+    assert!(pinned.any(red) && !pinned.any(green), "set ran without the PIN");
+    let conf = write("confirm = Sure?");
+    let asked = shot(&conf, &["--tap", "38,77", "--settle", "150"]);
+    assert!(!asked.any(green), "set ran before the confirm");
+    let done = shot(&conf, &["--tap", "38,77", "--tap", "463,282", "--settle", "200"]);
+    assert!(done.any(green), "set did not run after OK, or event.value was lost");
 }
 
 #[test]
@@ -334,6 +392,26 @@ fn a_due_reminder_is_an_alert_until_done_and_snooze_1w_works() {
     let snoozed = shot(&conf, &["--tap", "400,72", "--tap", "307,163", "--settle", "100"]);
     assert!(!banner(&snoozed), "banner still shown after Snooze 1w");
     assert!(snoozed.any(|p| close(p, warning, 16)), "snoozed reminder must stay listed");
+}
+
+#[test]
+fn builtin_actions_take_the_gates_of_an_override() {
+    // Review round 6: `action[alert_ack]:pin|confirm` was ignored.
+    let d = tmp("ackgate");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "alert hot { when = {{ true }}; severity = critical; title = Hot }\n\
+         action[alert_ack]:confirm = Acknowledge?\n\
+         page home { text { value = body } }\n",
+    )
+    .unwrap();
+    let banner = |img: &Image| close(img.px(700, 72), [0xd3, 0x2f, 0x2f], 16);
+    // Acknowledge, then Cancel: still on the banner.
+    let cancelled = shot(&conf, &["--tap", "400,72", "--tap", "100,145", "--tap", "351,282", "--settle", "150"]);
+    assert!(banner(&cancelled), "ack ran without the confirm");
+    let ok = shot(&conf, &["--tap", "400,72", "--tap", "100,145", "--tap", "463,282", "--settle", "150"]);
+    assert!(!banner(&ok), "ack did not run after OK");
 }
 
 #[test]

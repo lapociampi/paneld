@@ -100,7 +100,15 @@ pub enum BinaryOp {
 /// are translated into the enclosing file's coordinates.
 pub fn parse_fragment(src: &str, file: FileId, base: u32) -> (Option<Expr>, Vec<Diagnostic>) {
     let mut parser = Parser::new(src, file, base);
-    let expr = parser.parse_expression();
+    let mut expr = parser.parse_expression();
+    // Evaluation recurses on the tree: refuse one too deep for it
+    // (`1+1+1+...` nests without the parser recursing).
+    if let Some(e) = &expr {
+        if depth_of(e) > MAX_TREE_DEPTH {
+            parser.diags.push(Diagnostic::new(e.span, "expression is nested too deeply".to_string()));
+            expr = None;
+        }
+    }
     // Any tokens left over after the top expression are a trailing
     // garbage error.
     if expr.is_some() && parser.peek().kind != Tk::Eof {
@@ -112,6 +120,38 @@ pub fn parse_fragment(src: &str, file: FileId, base: u32) -> (Option<Expr>, Vec<
         ));
     }
     (expr, parser.diags)
+}
+
+/// Limits that keep the parser, `eval` and dropping the tree within
+/// the stack whatever text arrives (`paneld ctl eval` takes it from
+/// any local client). Real expressions stay far below them.
+const MAX_TOKENS: u32 = 4096;
+const MAX_NESTING: u32 = 64;
+const MAX_TREE_DEPTH: usize = 128;
+
+/// Depth of `e`, computed without recursion.
+fn depth_of(e: &Expr) -> usize {
+    let mut max = 0;
+    let mut stack: Vec<(&Expr, usize)> = vec![(e, 1)];
+    while let Some((e, d)) = stack.pop() {
+        max = max.max(d);
+        let children: Vec<&Expr> = match &e.kind {
+            ExprKind::IntLit(_)
+            | ExprKind::DoubleLit(_)
+            | ExprKind::StringLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::Null
+            | ExprKind::Ident(_) => Vec::new(),
+            ExprKind::Field(a, _) | ExprKind::Unary(_, a) => vec![a],
+            ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) => vec![a, b],
+            ExprKind::Call(_, args) | ExprKind::List(args) => args.iter().collect(),
+            ExprKind::Method(a, _, args) => std::iter::once(&**a).chain(args).collect(),
+            ExprKind::Map(kv) => kv.iter().flat_map(|(k, v)| [k, v]).collect(),
+            ExprKind::Conditional(a, b, c) => vec![a, b, c],
+        };
+        stack.extend(children.into_iter().map(|c| (c, d + 1)));
+    }
+    max
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +507,10 @@ struct Parser<'a> {
     /// token, this holds that body (unescaped later during AST
     /// construction).
     cur_string_body: Option<String>,
+    /// Tokens consumed; past [`MAX_TOKENS`] the rest reads as the end.
+    tokens: u32,
+    /// Current recursion depth of `parse_ternary` / `parse_unary`.
+    nesting: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -487,6 +531,8 @@ impl<'a> Parser<'a> {
             src,
             diags,
             cur_string_body,
+            tokens: 0,
+            nesting: 0,
         }
     }
 
@@ -496,6 +542,17 @@ impl<'a> Parser<'a> {
 
     fn bump(&mut self) -> Token {
         let prev = self.cur;
+        if self.tokens >= MAX_TOKENS {
+            // Already cut off: stay at the end.
+            self.cur.kind = Tk::Eof;
+            return prev;
+        }
+        self.tokens += 1;
+        if self.tokens == MAX_TOKENS {
+            self.diags.push(Diagnostic::new(prev.span, "expression is too long".to_string()));
+            self.cur.kind = Tk::Eof;
+            return prev;
+        }
         self.cur = self.lx.next_token();
         self.cur_text = self.lx.last_slice_text.clone();
         self.cur_string_body = if self.cur.kind == Tk::StringLit {
@@ -534,7 +591,24 @@ impl<'a> Parser<'a> {
         self.parse_ternary()
     }
 
+    /// Run `f` one recursion level deeper, refusing past
+    /// [`MAX_NESTING`].
+    fn nested(&mut self, f: fn(&mut Self) -> Option<Expr>) -> Option<Expr> {
+        if self.nesting >= MAX_NESTING {
+            self.diags.push(Diagnostic::new(self.cur.span, "expression is nested too deeply".to_string()));
+            return None;
+        }
+        self.nesting += 1;
+        let e = f(self);
+        self.nesting -= 1;
+        e
+    }
+
     fn parse_ternary(&mut self) -> Option<Expr> {
+        self.nested(Self::parse_ternary_inner)
+    }
+
+    fn parse_ternary_inner(&mut self) -> Option<Expr> {
         let cond = self.parse_or()?;
         if self.cur.kind == Tk::Question {
             let qmark = self.bump();
@@ -643,6 +717,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Option<Expr> {
+        self.nested(Self::parse_unary_inner)
+    }
+
+    fn parse_unary_inner(&mut self) -> Option<Expr> {
         match self.cur.kind {
             Tk::Minus => {
                 let op_tok = self.bump();
@@ -940,11 +1018,6 @@ fn unescape(s: &str) -> String {
 // small, well-known set of bare roots.
 // ---------------------------------------------------------------------------
 
-/// Walk a parsed CEL expression and append diagnostics for any
-/// `sources.<name>` whose `<name>` is not in `known_sources`. Other
-/// identifier roots are left alone -- they may be component / action
-/// params, `item` from a `repeat`, or `theme` tokens that a theme
-/// adds freely.
 /// The span of the first bare identifier `name` in `expr`, if any.
 pub fn find_ident(expr: &Expr, name: &str) -> Option<Span> {
     match &expr.kind {
@@ -973,6 +1046,11 @@ pub fn find_ident(expr: &Expr, name: &str) -> Option<Span> {
     }
 }
 
+/// Walk a parsed CEL expression and append diagnostics for any
+/// `sources.<name>` whose `<name>` is not in `known_sources`. Other
+/// identifier roots are left alone -- they may be component / action
+/// params, `item` from a `repeat`, or `theme` tokens that a theme
+/// adds freely.
 pub fn walk_source_refs(
     expr: &Expr,
     known_sources: &std::collections::HashSet<String>,
@@ -1049,6 +1127,46 @@ pub fn walk_source_refs(
 // `curl /{{ vm }}/stop` validates its one expression body.
 // ---------------------------------------------------------------------------
 
+/// Where the `{{ ... }}` opening at byte `open` of `s` ends: the index
+/// just past its closing `}}`, or `None` if it is not closed. Quotes
+/// and nested braces inside are skipped, so `{{ x == "}}" }}` and
+/// `{{ {'a': {'b': 1}} }}` are one expression each. Every place that
+/// cuts expressions out of text uses this, so they all agree.
+pub fn expr_end(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut j = open + 2;
+    let mut depth: u32 = 0;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'"' | b'\'' => {
+                let q = bytes[j];
+                j += 1;
+                while j < bytes.len() {
+                    if bytes[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    if bytes[j - 1] == q {
+                        break;
+                    }
+                }
+            }
+            b'{' => {
+                depth += 1;
+                j += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                j += 1;
+            }
+            b'}' if bytes.get(j + 1) == Some(&b'}') => return Some(j + 2),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
 /// Scan `raw` for `{{ ... }}` fragments, parse each one, and return
 /// their ASTs plus any diagnostics. `base` is the byte offset of
 /// `raw` in the enclosing source file. `\{{` is treated as an
@@ -1079,69 +1197,21 @@ pub fn parse_interp(
         }
         if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
             let expr_start = i + 2;
-            let mut j = expr_start;
-            let mut depth: u32 = 0;
-            let mut closed = false;
-            while j < bytes.len() {
-                match bytes[j] {
-                    b'"' | b'\'' => {
-                        let q = bytes[j];
-                        j += 1;
-                        while j < bytes.len() {
-                            if bytes[j] == b'\\' {
-                                j += 2;
-                                continue;
-                            }
-                            if bytes[j] == q {
-                                j += 1;
-                                break;
-                            }
-                            j += 1;
-                        }
-                    }
-                    b'{' => {
-                        depth = depth.saturating_add(1);
-                        j += 1;
-                    }
-                    b'}' => {
-                        if depth > 0 {
-                            depth -= 1;
-                            j += 1;
-                        } else if bytes.get(j + 1) == Some(&b'}') {
-                            // Found closing `}}`.
-                            let body = &raw[expr_start..j];
-                            let (e, mut ds) =
-                                parse_fragment(body, file, base + expr_start as u32);
-                            if let Some(e) = e {
-                                out.push(e);
-                            }
-                            diags.append(&mut ds);
-                            j += 2;
-                            i = j;
-                            closed = true;
-                            break;
-                        } else {
-                            j += 1;
-                        }
-                    }
-                    _ => j += 1,
-                }
-            }
-            if !closed {
+            let Some(after) = expr_end(raw, i) else {
                 // Reached end without closing `}}`. The outer config
                 // lexer should have caught this; emit a soft error
                 // anyway.
-                let span = Span::new(
-                    file,
-                    base + i as u32,
-                    base + bytes.len() as u32,
-                );
-                diags.push(Diagnostic::new(
-                    span,
-                    "unterminated `{{` expression".to_string(),
-                ));
+                let span = Span::new(file, base + i as u32, base + bytes.len() as u32);
+                diags.push(Diagnostic::new(span, "unterminated `{{` expression".to_string()));
                 break;
+            };
+            let body = &raw[expr_start..after - 2];
+            let (e, mut ds) = parse_fragment(body, file, base + expr_start as u32);
+            if let Some(e) = e {
+                out.push(e);
             }
+            diags.append(&mut ds);
+            i = after;
         } else {
             i += 1;
         }
@@ -1198,6 +1268,22 @@ mod tests {
         let (e, d) = parse("string(round(value, 1))");
         assert!(d.is_empty(), "{d:?}");
         matches!(e.unwrap().kind, ExprKind::Call(_, _));
+    }
+
+    #[test]
+    fn hostile_input_is_refused_without_overflowing() {
+        let refused = |src: &str| {
+            let (e, d) = parse_fragment(src, FileId(0), 0);
+            assert!(e.is_none() && !d.is_empty(), "accepted {} bytes", src.len());
+        };
+        refused(&"(".repeat(300_000));
+        refused(&"!".repeat(300_000));
+        refused(&"a ? b : ".repeat(100_000));
+        refused(&"1+".repeat(300_000));
+        refused(&format!("{}1", "1+".repeat(200)));
+        // Ordinary nesting still parses.
+        let (e, d) = parse_fragment(&format!("{}1{}", "(".repeat(30), ")".repeat(30)), FileId(0), 0);
+        assert!(e.is_some() && d.is_empty(), "{d:?}");
     }
 
     #[test]

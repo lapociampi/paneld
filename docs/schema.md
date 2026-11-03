@@ -290,6 +290,8 @@ Value changes of `arc`, `bar` and `chart` animate when the theme's motion allows
 
 Inputs show the value from their `value` expression; a change runs `on_change` and the display follows the source of `value` (for example a `var` set by the action, or a refreshed source).
 
+`on_change` and `on_submit` take the same forms as `on_tap`: `= action`, `action { args }`, or an inline block. The new value arrives as `value` and `event.value`. An inline block with action keys (`run`, `pin`, `confirm`, `then`, ...) is an action of its own, gates included; one with only `set { }` just sets.
+
 ## 9. Alerts
 
 ```
@@ -375,7 +377,7 @@ screen {
     brightness = 80
     on         = sh -c 'echo 0 > /sys/class/backlight/*/bl_power'
     off        = sh -c 'echo 1 > /sys/class/backlight/*/bl_power'
-    dim        = sh -c 'echo {{ level }} > /sys/class/backlight/*/brightness'
+    dim        = sh -c 'echo "$$1" > /sys/class/backlight/*/brightness' sh {{ level }}
     night { from = 22:00; to = 07:00; theme = dim; idle = 30s; brightness = 20 }
 }
 ```
@@ -435,8 +437,10 @@ screen {
 | `<repeat name>` | inside `repeat` |
 | `out` | in a source's `value` |
 | `event` | in an alert with `from` |
-| `value` | in `on_change` / `on_submit` calls |
+| `value`, `event.value` | in `on_change` / `on_submit` calls |
 | `result` | in `then` / `else` |
 | `level` | in `screen:dim` |
+
+Secret values (4 characters or more) are replaced with `****` in everything commands print before it is logged, shown, or put in `result` or a source's value. Prefer `env { TOKEN = {{ secrets.token }} }` over putting a secret in `run`: argv items are visible to every local user in `/proc/<pid>/cmdline`, the environment is not.
 
 Extra functions on top of CEL: `round(x, n)`, `format(x, unit)`, `duration(x)` and `ago(t)` for display, `clamp(x, a, b)`, `color(token or hex)`, `mix(color, color, t)`.

@@ -118,9 +118,26 @@ enum Binding {
     },
     /// Modal OK / Cancel button; sends [`UiEvent::ConfirmReply`].
     Confirm { accept: bool, sink: Sender<UiEvent> },
-    /// Keypad `on_submit = <action>`; sends [`UiEvent::Action`] with
-    /// the digits as the `value` arg.
-    SubmitAction { action: String, sink: Sender<UiEvent> },
+    /// `on_change` / `on_submit` calling an action (named, or an
+    /// inline handler with action keys); sends [`UiEvent::Action`]
+    /// with `args` plus the widget's value as `value` and
+    /// `event.value`.
+    ChangeAction {
+        kind: ChangeKind,
+        action: String,
+        args: Vec<ActionArg>,
+        sink: Sender<UiEvent>,
+    },
+}
+
+/// A widget whose `on_change` / `on_submit` carries a value.
+#[derive(Clone, Copy, Debug)]
+pub enum ValueWidget {
+    Toggle,
+    Slider,
+    Dropdown,
+    /// A keypad's keyboard (`on_submit`).
+    Keypad,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -305,42 +322,46 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
         let guard = bindings().lock().unwrap();
         guard.get(idx).cloned()
     };
-    if let Some(Binding::SubmitAction { action, sink }) = &bind {
-        let digits = keyboard_text(target);
-        let _ = sink.send(UiEvent::Action {
-            name: action.clone(),
-            args: vec![ActionArg {
-                name: "value".into(),
-                value: crate::expr::Value::String(digits),
-            }],
-        });
-        return;
+    match bind {
+        Some(Binding::ChangeAction { kind, action, mut args, sink }) => {
+            use crate::expr::Value;
+            let value = match widget_value(kind, target) {
+                Some(EventValue::Bool(b)) => Value::Bool(b),
+                Some(EventValue::Int(n)) => Value::Int(n),
+                Some(EventValue::Double(d)) => Value::Double(d),
+                Some(EventValue::String(s)) => Value::String(s),
+                None => return,
+            };
+            let event = std::collections::BTreeMap::from([("value".to_string(), value.clone())]);
+            args.push(ActionArg { name: "value".into(), value });
+            args.push(ActionArg { name: "event".into(), value: Value::Map(event) });
+            let _ = sink.send(UiEvent::Action { name: action, args });
+        }
+        Some(Binding::Change { kind: ChangeKind::PinEntry, sink, .. }) => {
+            let digits = keyboard_text(target);
+            let _ = sink.send(UiEvent::PinEntered { digits });
+        }
+        Some(Binding::Change { kind, assigns, sink }) => {
+            if let Some(event_value) = widget_value(kind, target) {
+                let _ = sink.send(UiEvent::ChangeInlineSet { assigns, event_value });
+            }
+        }
+        _ => {}
     }
-    if let Some(Binding::Change { kind, assigns, sink }) = bind {
-        let event_value = match kind {
-            ChangeKind::Toggle => {
-                let on = unsafe {
-                    sys::lv_obj_has_state(target, sys::lv_state_t_LV_STATE_CHECKED)
-                };
-                EventValue::Bool(on)
-            }
-            ChangeKind::Slider => {
-                let v = unsafe { sys::lv_slider_get_value(target) };
-                EventValue::Int(v as i64)
-            }
-            ChangeKind::Dropdown => {
-                let v = unsafe { sys::lv_dropdown_get_selected(target) };
-                EventValue::Int(v as i64)
-            }
-            ChangeKind::Keypad => EventValue::String(keyboard_text(target)),
-            ChangeKind::PinEntry => {
-                let digits = keyboard_text(target);
-                let _ = sink.send(UiEvent::PinEntered { digits });
-                return;
-            }
-        };
-        let _ = sink.send(UiEvent::ChangeInlineSet { assigns, event_value });
-    }
+}
+
+/// The value a toggle, slider, dropdown or keypad reports on change.
+fn widget_value(kind: ChangeKind, target: *mut sys::lv_obj_t) -> Option<EventValue> {
+    Some(match kind {
+        ChangeKind::Toggle => {
+            let on = unsafe { sys::lv_obj_has_state(target, sys::lv_state_t_LV_STATE_CHECKED) };
+            EventValue::Bool(on)
+        }
+        ChangeKind::Slider => EventValue::Int(unsafe { sys::lv_slider_get_value(target) } as i64),
+        ChangeKind::Dropdown => EventValue::Int(unsafe { sys::lv_dropdown_get_selected(target) } as i64),
+        ChangeKind::Keypad => EventValue::String(keyboard_text(target)),
+        ChangeKind::PinEntry => return None,
+    })
 }
 
 /// Take the text of the textarea attached to keyboard `kb` and clear
@@ -893,21 +914,24 @@ impl<'ui> Obj<'ui> {
         Obj { raw, _ui: PhantomData }
     }
 
-    /// Keypad `on_submit = <action>`: on the keyboard's OK, call the
-    /// action with the digits bound as `value`.
-    pub fn on_submit_action(&self, sink: Sender<UiEvent>, action: String) {
+    /// `on_change` / `on_submit` calling `action`: the widget's value
+    /// goes along as the `value` and `event.value` args, after `args`.
+    /// Fires when an inline `set` would (see the `on_change_*`
+    /// methods).
+    pub fn on_change_action(&self, widget: ValueWidget, sink: Sender<UiEvent>, action: String, args: Vec<ActionArg>) {
+        let (kind, code) = match widget {
+            ValueWidget::Toggle => (ChangeKind::Toggle, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Slider => (ChangeKind::Slider, sys::lv_event_code_t_LV_EVENT_RELEASED),
+            ValueWidget::Dropdown => (ChangeKind::Dropdown, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Keypad => (ChangeKind::Keypad, sys::lv_event_code_t_LV_EVENT_READY),
+        };
         let idx = {
             let mut g = bindings().lock().unwrap();
-            g.push(Binding::SubmitAction { action, sink });
+            g.push(Binding::ChangeAction { kind, action, args, sink });
             g.len() - 1
         };
         unsafe {
-            sys::lv_obj_add_event_cb(
-                self.raw,
-                Some(on_change_trampoline),
-                sys::lv_event_code_t_LV_EVENT_READY,
-                idx as *mut std::ffi::c_void,
-            );
+            sys::lv_obj_add_event_cb(self.raw, Some(on_change_trampoline), code, idx as *mut std::ffi::c_void);
         }
     }
 
@@ -1056,6 +1080,12 @@ impl<'ui> Obj<'ui> {
     /// Main-axis placement (`justify`) and cross-axis placement
     /// (`align`) of this flex container's children.
     pub fn set_flex_align(&self, main: FlexAlign, cross: FlexAlign) {
+        // Spacing modes only exist on the main axis; LVGL leaves them
+        // undefined across it.
+        let cross = match cross {
+            FlexAlign::Between | FlexAlign::Around | FlexAlign::Evenly => FlexAlign::Start,
+            other => other,
+        };
         unsafe {
             sys::lv_obj_set_flex_align(self.raw, main.lvgl(), cross.lvgl(), cross.lvgl())
         };

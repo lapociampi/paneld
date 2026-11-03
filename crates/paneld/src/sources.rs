@@ -263,6 +263,7 @@ fn stream_loop(
     const RESTART_CEILING: Duration = Duration::from_secs(60);
     const RESET_AFTER: Duration = RESTART_CEILING;
     let mut delay = RESTART_FLOOR;
+    let mask = crate::secrets::Mask::from_ctx(&ctx);
 
     while !shutdown.load(Ordering::SeqCst) {
         let (run_raw, run_span) = match find_raw(&block, "run") {
@@ -290,7 +291,7 @@ fn stream_loop(
         let mut command = match run.and_then(|argv| runner::prepared_command(&argv, &opts)) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("paneld: source `{name}`: {e}; retrying in {:?}", delay);
+                eprintln!("paneld: source `{name}`: {}; retrying in {:?}", mask.apply(&e.to_string()), delay);
                 sleep_or_shutdown(delay, &shutdown);
                 delay = next_backoff(delay, RESTART_CEILING);
                 continue;
@@ -299,7 +300,7 @@ fn stream_loop(
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("paneld: source `{name}`: spawn: {e}; retrying in {:?}", delay);
+                eprintln!("paneld: source `{name}`: spawn: {}; retrying in {:?}", mask.apply(&e.to_string()), delay);
                 sleep_or_shutdown(delay, &shutdown);
                 delay = next_backoff(delay, RESTART_CEILING);
                 continue;
@@ -359,7 +360,7 @@ fn stream_loop(
                     }
                     continue;
                 }
-                Ok(Line::Text(l)) => l,
+                Ok(Line::Text(l)) => mask.apply(&l),
                 Err(e) => {
                     eprintln!("paneld: source `{name}`: read: {e}");
                     break;
@@ -568,7 +569,12 @@ pub fn resolve_one(
         cwd: Some(&cwd),
         env: &env_pairs,
     };
-    let r = runner::exec(&argv, opts).map_err(|e| format!("run: {e}"))?;
+    // What the command prints becomes a value the screen shows: mask
+    // secrets first (see `secrets::Mask`).
+    let mask = crate::secrets::Mask::from_ctx(ctx);
+    let mut r = runner::exec(&argv, opts).map_err(|e| mask.apply(&format!("run: {e}")))?;
+    r.stdout = mask.apply(&r.stdout);
+    r.stderr = mask.apply(&r.stderr);
     if r.timed_out {
         return Err("timed out".into());
     }
@@ -713,8 +719,13 @@ fn collect_env(
 /// typical `jq` or REST payload into [`Value::Map`] / [`Value::List`]
 /// trees. No streaming, no error recovery; a malformed input returns
 /// `None` and the source is treated as failed.
+/// Deepest nesting `parse_json` accepts. The parser recurses, and ctl
+/// clients and network APIs are not trusted to keep their documents
+/// shallow: a stack overflow would abort the whole daemon.
+const JSON_MAX_DEPTH: usize = 64;
+
 pub fn parse_json(s: &str) -> Option<Value> {
-    let mut p = JsonParser { bytes: s.as_bytes(), pos: 0 };
+    let mut p = JsonParser { bytes: s.as_bytes(), pos: 0, depth: 0 };
     p.skip_ws();
     let v = p.parse_value()?;
     p.skip_ws();
@@ -727,6 +738,7 @@ pub fn parse_json(s: &str) -> Option<Value> {
 struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -749,8 +761,19 @@ impl<'a> JsonParser<'a> {
     fn parse_value(&mut self) -> Option<Value> {
         self.skip_ws();
         match self.peek()? {
-            b'{' => self.parse_object(),
-            b'[' => self.parse_array(),
+            b'{' | b'[' if self.depth >= JSON_MAX_DEPTH => None,
+            b'{' => {
+                self.depth += 1;
+                let v = self.parse_object();
+                self.depth -= 1;
+                v
+            }
+            b'[' => {
+                self.depth += 1;
+                let v = self.parse_array();
+                self.depth -= 1;
+                v
+            }
             b'"' => self.parse_string().map(Value::String),
             b't' | b'f' => self.parse_bool(),
             b'n' => self.parse_null(),
@@ -898,6 +921,17 @@ mod tests {
         let (doc, diags) = paneld_config::parse(&toks, &map);
         assert!(diags.is_empty(), "parse errors: {diags:?}");
         doc
+    }
+
+    #[test]
+    fn json_nesting_is_bounded() {
+        let ok = format!("{}1{}", "[".repeat(64), "]".repeat(64));
+        assert!(parse_json(&ok).is_some());
+        let deep = format!("{}1{}", "[".repeat(65), "]".repeat(65));
+        assert_eq!(parse_json(&deep), None);
+        // Would overflow the stack without the limit.
+        assert_eq!(parse_json(&"[".repeat(200_000)), None);
+        assert_eq!(parse_json(&"{\"a\":".repeat(200_000)), None);
     }
 
     #[test]
