@@ -289,6 +289,39 @@ fn render_node(
                 obj.on_change_slider_inline_set(sink.clone(), assigns);
             }
         }
+        "select" => {
+            // Schema v1: `options` is a list expression, `value`
+            // picks the initial index (or the matching option when
+            // it's a value from the same list). Only the default
+            // `style = dropdown` ships today; `roller` and `buttons`
+            // are deferred.
+            let obj = parent.new_dropdown();
+            let options = resolve_assign_value(node, "options", ctx)
+                .map(dropdown_options)
+                .unwrap_or_default();
+            if !options.is_empty() {
+                obj.set_dropdown_options(&options.join("\n"));
+            }
+            if let Some(v) = resolve_assign_value(node, "value", ctx) {
+                let idx = match v {
+                    Value::Int(n) if n >= 0 => n as u16,
+                    Value::Double(d) if d >= 0.0 => d as u16,
+                    other => {
+                        let s = other.to_display_string();
+                        options
+                            .iter()
+                            .position(|o| o == &s)
+                            .map(|p| p as u16)
+                            .unwrap_or(0)
+                    }
+                };
+                obj.set_dropdown_selected(idx);
+            }
+            apply_props(node, ctx, sink, &obj);
+            if let Some(assigns) = inline_on_change_set(node) {
+                obj.on_change_dropdown_inline_set(sink.clone(), assigns);
+            }
+        }
         "slot" => {
             // Expand the caller's child-items here, resolving them
             // against the OUTER context (not the component's inner
@@ -860,6 +893,23 @@ fn collect_inline_set(set_block: &Block) -> Vec<InlineSetItem> {
         });
     }
     out
+}
+
+/// Flatten a `select { options = ... }` value into the per-item
+/// display strings LVGL expects, joined later with newlines. A
+/// scalar is wrapped so `options = "only"` produces a one-item
+/// dropdown; a list spreads out item by item. Any `\n` inside an
+/// option would collide with LVGL's own separator, so each entry's
+/// newlines are stripped.
+fn dropdown_options(v: Value) -> Vec<String> {
+    let items: Vec<Value> = match v {
+        Value::List(xs) => xs,
+        other => vec![other],
+    };
+    items
+        .into_iter()
+        .map(|item| item.to_display_string().replace('\n', " "))
+        .collect()
 }
 
 fn value_truthy(v: &Value) -> bool {

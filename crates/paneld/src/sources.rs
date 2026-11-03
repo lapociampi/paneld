@@ -167,13 +167,20 @@ pub fn resolve_one(b: &Block, ctx: &Context) -> Result<Value, String> {
     // the shell command before executing.
     let run = paneld_ui::interpolate(run_raw, run_span.file, run_span.start, ctx);
     let name = b.name.as_ref().map(|n| n.text.as_str()).unwrap_or("");
+    // `env { KEY = value }` on the source becomes extra env pairs on
+    // top of the clean base env (ADR 0013). Each value is
+    // interpolated with the same ctx the run string uses.
+    let env_pairs: Vec<(String, String)> = collect_env(b)
+        .into_iter()
+        .map(|(k, raw, span)| (k, paneld_ui::interpolate(&raw, span.file, span.start, ctx)))
+        .collect();
     let opts = runner::Opts {
         timeout: DEFAULT_TIMEOUT,
         max_bytes: DEFAULT_MAX_BYTES,
         kind: runner::Kind::Source,
         name,
         cwd: None,
-        env: &[],
+        env: &env_pairs,
     };
     let r = runner::exec(&run, opts).map_err(|e| format!("run: {e}"))?;
     if r.timed_out {
@@ -286,6 +293,29 @@ fn find_raw<'a>(
         }
     }
     None
+}
+
+/// Collect every `env { KEY = value }` entry on this block. Returned
+/// tuples carry the key, the raw value text and its span so the
+/// caller can interpolate against its own ctx.
+fn collect_env(
+    node: &Block,
+) -> Vec<(String, String, paneld_config::source::Span)> {
+    let mut out = Vec::new();
+    for item in &node.items {
+        let Item::Block(b) = item else { continue };
+        if b.kind.text != "env" {
+            continue;
+        }
+        for inner in &b.items {
+            let Item::Assign(a) = inner else { continue };
+            let AssignTarget::Simple { key } = &a.target else {
+                continue;
+            };
+            out.push((key.text.clone(), a.value.text.clone(), a.value.span));
+        }
+    }
+    out
 }
 
 // -- JSON parse ----------------------------------------------------------

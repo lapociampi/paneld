@@ -104,6 +104,7 @@ enum Binding {
 enum ChangeKind {
     Toggle,
     Slider,
+    Dropdown,
 }
 
 /// Global registry of per-widget bindings. [`Obj::on_tap`] /
@@ -160,6 +161,10 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
             }
             ChangeKind::Slider => {
                 let v = unsafe { sys::lv_slider_get_value(target) };
+                EventValue::Int(v as i64)
+            }
+            ChangeKind::Dropdown => {
+                let v = unsafe { sys::lv_dropdown_get_selected(target) };
                 EventValue::Int(v as i64)
             }
         };
@@ -457,6 +462,28 @@ impl<'ui> Obj<'ui> {
         }
     }
 
+    /// A dropdown (schema `select`, default `style = dropdown`).
+    /// Options come as a newline-separated string -- lvgl's own
+    /// delimiter. `set_dropdown_options` and
+    /// `set_dropdown_selected` configure it.
+    pub fn new_dropdown(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_dropdown_create(self.raw) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    pub fn set_dropdown_options(&self, options: &str) {
+        let c = match CString::new(options) {
+            Ok(c) => c,
+            Err(_) => CString::new(options.replace('\0', "")).unwrap(),
+        };
+        unsafe { sys::lv_dropdown_set_options(self.raw, c.as_ptr()) };
+    }
+
+    pub fn set_dropdown_selected(&self, idx: u16) {
+        unsafe { sys::lv_dropdown_set_selected(self.raw, idx.into()) };
+    }
+
     /// A horizontal slider (schema `slider`). Range and value set
     /// through [`Self::set_slider_range`] / [`Self::set_slider_value`].
     pub fn new_slider(&self) -> Obj<'ui> {
@@ -696,6 +723,22 @@ impl<'ui> Obj<'ui> {
             assigns,
             sink,
             sys::lv_event_code_t_LV_EVENT_RELEASED,
+        );
+    }
+
+    /// Register a VALUE_CHANGED callback on a dropdown; on pick, the
+    /// trampoline reads the selected option index and pushes an
+    /// [`UiEvent::ChangeInlineSet`] with `event.value` as an int.
+    pub fn on_change_dropdown_inline_set(
+        &self,
+        sink: Sender<UiEvent>,
+        assigns: Vec<InlineSetItem>,
+    ) {
+        self.register_change_binding(
+            ChangeKind::Dropdown,
+            assigns,
+            sink,
+            sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED,
         );
     }
 

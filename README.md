@@ -4,7 +4,7 @@ A generic touch panel: "Grafana for actions". The program draws widgets, runs co
 
 ## Status
 
-A working daemon lives in `crates/`: Rust + LVGL 9 workspace, SDL window on desktop and framebuffer on the Pi, config parser with 285 unit tests, sources (poll/once), actions (run / set / refresh / then / else) with argv-safe exec, widgets (label, button, toggle, slider, qr, bar, image placeholder), pages with `repeat` and `visible`, components, themes, hot reload and a `paneld ctl` Unix socket. Open gaps are alerts (ADR 0014), DRM output, and the full command runner (process group, env scrubbing, backoff) from ADR 0013.
+A working daemon lives in `crates/`: Rust + LVGL 9 workspace, SDL window on desktop and framebuffer on the Pi, config parser with 285 unit tests, sources (poll with exponential backoff on failure), actions (run / set / refresh / then / else) running argv-safe in their own process group with a clean environment, widgets (text, button, toggle, slider, select, qr, bar, image placeholder), pages with `repeat` and `visible`, components, themes, hot reload, a `paneld ctl` Unix socket, and a condition-mode and event-mode alert engine with its state persisted to `app:state` (ADR 0014). Open gaps are stream sources, PIN entry, action `confirm` dialogs, and the DRM output path on the Pi.
 
 ## Design in short
 

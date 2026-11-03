@@ -14,6 +14,7 @@ mod display;
 mod runner;
 mod secrets;
 mod sources;
+mod state;
 mod themes;
 mod vars;
 
@@ -190,6 +191,11 @@ fn run_daemon(config: PathBuf) -> ExitCode {
                 ctl::ControlMsg::Exit => break 'main,
                 ctl::ControlMsg::Reload => match setup_live_state(&config, &screen) {
                     Ok(fresh) => {
+                        // Flush any pending alert state before the
+                        // old Store is dropped, so a reload during
+                        // a long incident doesn't lose timestamps
+                        // that hadn't aged into the 10s window yet.
+                        live.state.force_flush();
                         live = fresh;
                         eprintln!("paneld: reloaded config");
                     }
@@ -264,8 +270,28 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         }
 
         // Drain source updates and re-render if anything changed.
+        // Each new source value is also an event for any
+        // `alert ... { from = <this source> }` rule. Insert the new
+        // sample first so `sources.<name>.value` inside the rule's
+        // expressions agrees with `event.value`, then build the eval
+        // ctx including the current `alerts` map for symmetry with
+        // the render-side ctx.
         while let Ok(update) = live.source_rx.try_recv() {
-            live.source_values.insert(update.name, update.value);
+            let event_value = update.value.clone();
+            live.source_values.insert(update.name.clone(), update.value);
+            let event_ctx = build_ctx(
+                &live.source_values,
+                &live.theme,
+                &live.secrets,
+                &live.vars,
+                Some(&live.alerts),
+            );
+            let _ = live.alerts.ingest_event(
+                &update.name,
+                &event_value,
+                &event_ctx,
+                std::time::SystemTime::now(),
+            );
             dirty = true;
         }
 
@@ -279,13 +305,19 @@ fn run_daemon(config: PathBuf) -> ExitCode {
             &live.vars,
             None,
         );
+        let now_instant = std::time::Instant::now();
         if live.alerts.tick(
             &alerts_ctx,
-            std::time::Instant::now(),
+            now_instant,
             std::time::SystemTime::now(),
         ) {
             dirty = true;
         }
+        // Keep the state file (ADR 0014) in sync. `note` is cheap:
+        // it only flags a pending write when the set actually
+        // changed. `flush_if_due` writes at most once per 10s.
+        live.state.note(live.alerts.active_alerts());
+        live.state.flush_if_due(now_instant);
 
         if dirty {
             let ctx = build_ctx(
@@ -309,6 +341,7 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         pump.step();
     }
 
+    live.state.force_flush();
     let _ = std::fs::remove_file(&sock_path);
     ExitCode::SUCCESS
 }
@@ -327,6 +360,7 @@ struct LiveState {
     action_tx: std::sync::mpsc::Sender<actions::Call>,
     current_page: String,
     alerts: alerts::Engine,
+    state: state::Store,
 }
 
 fn setup_live_state(
@@ -392,6 +426,14 @@ fn setup_live_state(
 
     let current_page = find_start_page(&doc).unwrap_or_else(|| "home".to_string());
     let mut alerts_engine = alerts::Engine::new(&doc);
+    let state_store = state::Store::open(state::config_path(&doc));
+    alerts_engine.restore(
+        state_store
+            .snapshot()
+            .iter()
+            .map(|(k, v)| (k.clone(), std::time::UNIX_EPOCH + std::time::Duration::from_secs(v.since)))
+            .collect(),
+    );
     let ctx_no_alerts =
         build_ctx(&source_values, &theme, &secret_values, &vars_shared, None);
     alerts_engine.tick(
@@ -423,6 +465,7 @@ fn setup_live_state(
         action_tx,
         current_page,
         alerts: alerts_engine,
+        state: state_store,
     })
 }
 

@@ -38,6 +38,18 @@ pub struct ActionDef {
     pub then: Option<String>,
     /// `else = NAME` -- chain on failure, same scope as `then`.
     pub else_: Option<String>,
+    /// `env { KEY = value; ... }` pairs appended to the clean child
+    /// environment (ADR 0013). Values are raw text interpolated at
+    /// run time against the eval ctx so secrets can land in env.
+    pub env: Vec<EnvPair>,
+}
+
+/// One `env { KEY = value }` entry. `value_raw` is the raw text,
+/// interpolated the same way `run` is before exec.
+#[derive(Clone, Debug)]
+pub struct EnvPair {
+    pub key: String,
+    pub value_raw: String,
 }
 
 /// One `set { key = value }` entry; `value_raw` is the raw text as it
@@ -82,7 +94,25 @@ pub fn collect(doc: &Document) -> HashMap<String, ActionDef> {
                 def.else_ = Some(t.to_string());
             }
         }
+        if let Some(env_block) = find_block(b, "env") {
+            def.env = collect_env(env_block);
+        }
         out.insert(name.text.clone(), def);
+    }
+    out
+}
+
+fn collect_env(block: &Block) -> Vec<EnvPair> {
+    let mut out = Vec::new();
+    for item in &block.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key } = &a.target else {
+            continue;
+        };
+        out.push(EnvPair {
+            key: key.text.clone(),
+            value_raw: a.value.text.clone(),
+        });
     }
     out
 }
@@ -164,13 +194,26 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                 let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.vars, &call.args);
                 let file = paneld_config::source::FileId::default();
                 let cmd = paneld_ui::interpolate(&raw, file, 0, &ctx);
+                // Interpolate each env value against the same ctx so
+                // `env { TOKEN = {{ secrets.token }} }` reaches the
+                // child.
+                let env_pairs: Vec<(String, String)> = def
+                    .env
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.key.clone(),
+                            paneld_ui::interpolate(&e.value_raw, file, 0, &ctx),
+                        )
+                    })
+                    .collect();
                 let opts = runner::Opts {
                     timeout: DEFAULT_TIMEOUT,
                     max_bytes: DEFAULT_MAX_BYTES,
                     kind: runner::Kind::Action,
                     name: &name,
                     cwd: None,
-                    env: &[],
+                    env: &env_pairs,
                 };
                 match runner::exec(&cmd, opts) {
                     Ok(r) => {
@@ -451,6 +494,19 @@ mod tests {
         );
         let a = collect(&doc).remove("a").unwrap();
         assert_eq!(a.refresh, vec!["vms".to_string()]);
+    }
+
+    #[test]
+    fn collects_env_block() {
+        let doc = parse_doc(
+            "action a { run = /bin/true\n env { FOO = bar\n BAZ = {{ secrets.token }} } }\n",
+        );
+        let a = collect(&doc).remove("a").unwrap();
+        assert_eq!(a.env.len(), 2);
+        assert_eq!(a.env[0].key, "FOO");
+        assert_eq!(a.env[0].value_raw.trim(), "bar");
+        assert_eq!(a.env[1].key, "BAZ");
+        assert!(a.env[1].value_raw.contains("secrets.token"));
     }
 
     #[test]

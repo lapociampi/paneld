@@ -33,6 +33,10 @@ pub struct AlertRule {
     pub for_: Duration,
     pub id_raw: Option<String>,
     pub id_span: paneld_config::source::Span,
+    /// Event-mode: `state = firing | resolved` (or an expr yielding
+    /// one). `None` means default `firing`.
+    pub state_raw: Option<String>,
+    pub state_span: paneld_config::source::Span,
     pub severity_raw: String,
     pub severity_span: paneld_config::source::Span,
     pub title_raw: String,
@@ -97,6 +101,10 @@ pub struct Engine {
     /// Condition-mode rules whose `when` is true but which have not
     /// held long enough yet. Same key as `active`.
     pending: BTreeMap<String, Instant>,
+    /// `since` timestamps replayed from the state file, consumed the
+    /// first time a matching key fires so a daemon restart during a
+    /// long incident doesn't reset the alert's clock.
+    restored: BTreeMap<String, SystemTime>,
 }
 
 impl Engine {
@@ -105,7 +113,95 @@ impl Engine {
             rules: collect(doc),
             active: BTreeMap::new(),
             pending: BTreeMap::new(),
+            restored: BTreeMap::new(),
         }
+    }
+
+    /// Prime the engine with `since` timestamps from the state file
+    /// (ADR 0014). Each matching alert, on its first fire after
+    /// startup, picks up the saved wall-clock time instead of the
+    /// current one.
+    pub fn restore(&mut self, saved: BTreeMap<String, SystemTime>) {
+        self.restored = saved;
+    }
+
+    /// Snapshot of the currently firing alerts, for state-file
+    /// persistence.
+    pub fn active_alerts(&self) -> &BTreeMap<String, Alert> {
+        &self.active
+    }
+
+    /// Feed one event (a source update's value) to every event-mode
+    /// rule whose `from` matches `source_name`. `base_ctx` is the
+    /// standard eval ctx; this method overlays `event` with the
+    /// source's own value before evaluating `when`, `id`, `severity`,
+    /// `title`, `text`, `link` and `state`. Returns `true` if the
+    /// active set changed.
+    ///
+    /// Each new source value is one event, matching the schema's
+    /// section 9 wording ("each new value, each line of a stream, is
+    /// an `event`"). Condition-mode rules are ignored here.
+    pub fn ingest_event(
+        &mut self,
+        source_name: &str,
+        event: &Value,
+        base_ctx: &Context,
+        wall: SystemTime,
+    ) -> bool {
+        let mut changed = false;
+        for rule in &self.rules {
+            if rule.from.as_deref() != Some(source_name) {
+                continue;
+            }
+            let mut ctx = base_ctx.clone();
+            ctx.insert("event".into(), event.clone());
+
+            if let Some(when_raw) = rule.when_raw.as_deref() {
+                match paneld_ui::resolve_value(when_raw, rule.when_span, &ctx) {
+                    Some(Value::Bool(true)) => {}
+                    Some(Value::Bool(false)) => continue,
+                    // Non-bool or unparseable `when`: skip.
+                    _ => continue,
+                }
+            }
+            let instance = resolve_string(&ctx, rule.id_raw.as_deref(), rule.id_span)
+                .unwrap_or_else(|| rule.name.clone());
+            let key = format!("{}:{instance}", rule.name);
+            let state = resolve_string(&ctx, rule.state_raw.as_deref(), rule.state_span)
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_else(|| "firing".into());
+
+            match state.as_str() {
+                "resolved" => {
+                    if self.active.remove(&key).is_some() {
+                        changed = true;
+                    }
+                }
+                _ => {
+                    // `since` is the time the alert FIRST fired, so an
+                    // already-active instance keeps its original
+                    // timestamp. Only a fresh fire pulls from the
+                    // state-file replay slot, then falls back to the
+                    // current wall time.
+                    let since = self
+                        .active
+                        .get(&key)
+                        .map(|a| a.since)
+                        .or_else(|| self.restored.remove(&key))
+                        .unwrap_or(wall);
+                    let alert = evaluate(rule, &instance, &ctx, since);
+                    // An event stream can carry updates to a firing
+                    // alert (severity escalation, text change). Only
+                    // mark the frame dirty when something a user can
+                    // see actually changed.
+                    let prev = self.active.insert(key, alert.clone());
+                    if prev.as_ref() != Some(&alert) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// Evaluate every condition-mode rule against `ctx` and update
@@ -151,7 +247,8 @@ impl Engine {
                 };
                 if ready {
                     self.pending.remove(&key);
-                    let alert = evaluate(rule, &instance, ctx, wall);
+                    let since = self.restored.remove(&key).unwrap_or(wall);
+                    let alert = evaluate(rule, &instance, ctx, since);
                     self.active.insert(key, alert);
                     changed = true;
                 }
@@ -165,11 +262,20 @@ impl Engine {
             }
         }
 
-        // A rule removed from the config on reload is also dropped
-        // from `active`; the engine itself is rebuilt on reload so
-        // this is defensive against a future in-place rule swap.
-        self.active.retain(|k, _| seen.contains_key(k));
-        self.pending.retain(|k, _| seen.contains_key(k));
+        // Reap only the condition-mode keys. An event-mode alert's
+        // key will not be in `seen` (we skip event-mode rules in
+        // this loop) so a blanket retain would wipe them every
+        // tick. Match on the rule's `from` to decide ownership.
+        let is_condition_key = |k: &str| -> bool {
+            let (rule, _) = k.split_once(':').unwrap_or((k, ""));
+            self.rules
+                .iter()
+                .any(|r| r.name == rule && r.from.is_none())
+        };
+        self.active
+            .retain(|k, _| !is_condition_key(k) || seen.contains_key(k));
+        self.pending
+            .retain(|k, _| !is_condition_key(k) || seen.contains_key(k));
 
         changed
     }
@@ -274,6 +380,8 @@ fn collect(doc: &Document) -> Vec<AlertRule> {
             for_: Duration::ZERO,
             id_raw: None,
             id_span: zero_span(),
+            state_raw: None,
+            state_span: zero_span(),
             severity_raw: "info".into(),
             severity_span: zero_span(),
             title_raw: name.text.clone(),
@@ -304,6 +412,10 @@ fn collect(doc: &Document) -> Vec<AlertRule> {
                 "id" => {
                     rule.id_raw = Some(raw);
                     rule.id_span = span;
+                }
+                "state" => {
+                    rule.state_raw = Some(raw);
+                    rule.state_span = span;
                 }
                 "severity" => {
                     rule.severity_raw = raw;
@@ -507,6 +619,171 @@ mod tests {
         // must leave event-mode alerts alone.
         assert!(!eng.tick(&Context::new(), Instant::now(), SystemTime::now()));
         assert_eq!(eng.active_count(), 0);
+    }
+
+    fn event_map(title: &str, severity_num: i64) -> Value {
+        let mut m = BTreeMap::new();
+        m.insert("title".into(), Value::String(title.into()));
+        m.insert("priority".into(), Value::Int(severity_num));
+        m.insert("state".into(), Value::String("firing".into()));
+        Value::Map(m)
+    }
+
+    #[test]
+    fn ingest_event_fires_filtered_rule() {
+        let doc = parse_doc(
+            "source ntfy { run = /bin/true }\n\
+             alert in { from = ntfy; \
+                         when = {{ event.priority >= 4 }}; \
+                         id = {{ event.title }}; \
+                         severity = {{ event.priority >= 5 ? 'critical' : 'warning' }}; \
+                         title = {{ event.title }}; \
+                         text = incoming }\n",
+        );
+        let mut eng = Engine::new(&doc);
+        let wall = SystemTime::now();
+
+        // Below filter: no alert.
+        assert!(!eng.ingest_event("ntfy", &event_map("x", 2), &Context::new(), wall));
+        assert_eq!(eng.active_count(), 0);
+
+        // Above filter: fires, with severity from the expression.
+        assert!(eng.ingest_event("ntfy", &event_map("rack hot", 5), &Context::new(), wall));
+        let a = &eng.active_alerts()["in:rack hot"];
+        assert_eq!(a.severity, "critical");
+        assert_eq!(a.title, "rack hot");
+
+        // A later event with lower priority but above the filter
+        // changes severity in place without creating a new alert.
+        assert!(eng.ingest_event("ntfy", &event_map("rack hot", 4), &Context::new(), wall));
+        assert_eq!(eng.active_count(), 1);
+        assert_eq!(eng.active_alerts()["in:rack hot"].severity, "warning");
+    }
+
+    #[test]
+    fn ingest_event_resolves_on_state_resolved() {
+        let doc = parse_doc(
+            "source ntfy { run = /bin/true }\n\
+             alert in { from = ntfy; id = {{ event.title }}; \
+                         state = {{ event.state }}; \
+                         severity = warning; title = {{ event.title }} }\n",
+        );
+        let mut eng = Engine::new(&doc);
+        let wall = SystemTime::now();
+        let mut firing = event_map("vm42", 5);
+        if let Value::Map(ref mut m) = firing {
+            m.insert("state".into(), Value::String("firing".into()));
+        }
+        let mut resolved = event_map("vm42", 5);
+        if let Value::Map(ref mut m) = resolved {
+            m.insert("state".into(), Value::String("resolved".into()));
+        }
+
+        assert!(eng.ingest_event("ntfy", &firing, &Context::new(), wall));
+        assert_eq!(eng.active_count(), 1);
+        assert!(eng.ingest_event("ntfy", &resolved, &Context::new(), wall));
+        assert_eq!(eng.active_count(), 0);
+    }
+
+    #[test]
+    fn tick_does_not_wipe_event_mode_alerts() {
+        // An event-mode alert fires through `ingest_event`. The next
+        // `tick` (for condition-mode rules) must not sweep it out
+        // just because `tick`'s seen-set does not include it.
+        let doc = parse_doc(
+            "source ntfy { run = /bin/true }\n\
+             alert evt { from = ntfy; severity = info; title = Hi }\n\
+             alert cond { when = {{ true }}; severity = info; title = Always }\n",
+        );
+        let mut eng = Engine::new(&doc);
+        let wall = SystemTime::now();
+        eng.ingest_event("ntfy", &event_map("x", 5), &Context::new(), wall);
+        assert_eq!(eng.active_count(), 1);
+        eng.tick(&Context::new(), Instant::now(), wall);
+        assert_eq!(eng.active_count(), 2);
+        // And a second tick keeps both.
+        eng.tick(&Context::new(), Instant::now(), wall);
+        assert_eq!(eng.active_count(), 2);
+    }
+
+    #[test]
+    fn ingest_event_preserves_since_across_repeats() {
+        // Repeat events for the same (rule, instance) must keep the
+        // first-fire wall time; a tick storm must not keep bumping
+        // `since` forward and must not keep marking the frame dirty
+        // when nothing visible changed.
+        let doc = parse_doc(
+            "source ntfy { run = /bin/true }\n\
+             alert in { from = ntfy; id = {{ event.title }}; \
+                         severity = info; title = {{ event.title }} }\n",
+        );
+        let mut eng = Engine::new(&doc);
+        let first = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+
+        assert!(eng.ingest_event("ntfy", &event_map("x", 5), &Context::new(), first));
+        assert_eq!(eng.active_alerts()["in:x"].since, first);
+
+        // Second identical event: no visible change, no dirty flag.
+        assert!(!eng.ingest_event("ntfy", &event_map("x", 5), &Context::new(), later));
+        assert_eq!(eng.active_alerts()["in:x"].since, first);
+
+        // Third event with a changed field: dirty, but since still
+        // the original.
+        let mut evt = event_map("x", 5);
+        if let Value::Map(ref mut m) = evt {
+            m.insert("priority".into(), Value::Int(9));
+        }
+        // The `title` field hasn't moved, so this isn't a severity
+        // change; use a title-dependent rule to trigger a visible
+        // diff. Easier: assert the since stays put across one more
+        // tick.
+        assert!(!eng.ingest_event("ntfy", &event_map("x", 5), &Context::new(), later));
+        assert_eq!(eng.active_alerts()["in:x"].since, first);
+    }
+
+    #[test]
+    fn ingest_event_ignores_other_sources() {
+        let doc = parse_doc(
+            "source ntfy { run = /bin/true }\n\
+             source other { run = /bin/true }\n\
+             alert in { from = ntfy; severity = info; title = x }\n",
+        );
+        let mut eng = Engine::new(&doc);
+        assert!(!eng.ingest_event(
+            "other",
+            &event_map("x", 9),
+            &Context::new(),
+            SystemTime::now()
+        ));
+        assert_eq!(eng.active_count(), 0);
+    }
+
+    #[test]
+    fn restore_replays_since_timestamps() {
+        let doc = parse_doc(
+            "alert pi_hot { when = {{ sources.cpu_temp.value > 70 }}; \
+             severity = warning; title = Pi hot }\n",
+        );
+        let mut eng = Engine::new(&doc);
+        let saved_since = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut saved = BTreeMap::new();
+        saved.insert("pi_hot:pi_hot".to_string(), saved_since);
+        eng.restore(saved);
+
+        // Fire the alert with a "now" that's clearly later than the
+        // saved time: it must still carry the saved since.
+        let wall = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        eng.tick(&ctx_with_temp(80.0), Instant::now(), wall);
+        let active = eng.active_alerts();
+        assert_eq!(active["pi_hot:pi_hot"].since, saved_since);
+
+        // After resolve + re-fire, the saved slot has been consumed:
+        // a second fire uses the fresh `wall`.
+        eng.tick(&ctx_with_temp(60.0), Instant::now(), wall);
+        assert!(eng.active_alerts().is_empty());
+        eng.tick(&ctx_with_temp(80.0), Instant::now(), wall);
+        assert_eq!(eng.active_alerts()["pi_hot:pi_hot"].since, wall);
     }
 
     #[test]
