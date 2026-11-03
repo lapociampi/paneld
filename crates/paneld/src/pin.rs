@@ -15,6 +15,10 @@ use argon2::Argon2;
 use paneld_config::parse::{AssignTarget, Document, Item};
 use paneld_ui::Value;
 
+/// Largest argon2 memory cost (KiB) a stored hash may ask for. The
+/// default `hash-pin` cost is 19 MiB.
+const MAX_MEMORY_KIB: u32 = 64 * 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Check {
     Ok,
@@ -110,8 +114,12 @@ impl Gate {
     /// Keep the runtime state (unlock window, lockout, failure count)
     /// of the gate this one replaces, so a config reload neither
     /// resets a lockout nor re-locks an unlocked panel.
+    /// A changed PIN hash drops the unlock window (the new PIN has
+    /// not been entered) but keeps any lockout.
     pub fn carry_from(&mut self, old: &Gate) {
-        self.unlocked_until = old.unlocked_until;
+        if self.hash == old.hash {
+            self.unlocked_until = old.unlocked_until;
+        }
         self.locked_until = old.locked_until;
         self.failures = old.failures;
     }
@@ -147,6 +155,17 @@ impl Gate {
                 return Check::NotConfigured;
             }
         };
+        // Verification uses the cost stored in the hash. Refuse one
+        // that would need more memory than a 1 GB Pi can spare.
+        if let Some(m) = parsed.params.get_decimal("m") {
+            if m > MAX_MEMORY_KIB {
+                eprintln!(
+                    "paneld: security.pin hash asks for {m} KiB of memory (max {MAX_MEMORY_KIB}); \
+                     re-create it with `paneld hash-pin`"
+                );
+                return Check::NotConfigured;
+            }
+        }
         if Argon2::default()
             .verify_password(digits.as_bytes(), &parsed)
             .is_ok()
@@ -241,6 +260,37 @@ mod tests {
         assert_eq!(g.check("0000", t0), Check::Wrong { remaining: 2 });
         assert_eq!(g.check("1234", t0), Check::Ok);
         assert_eq!(g.check("0000", t0), Check::Wrong { remaining: 2 });
+    }
+
+    #[test]
+    fn hash_with_excessive_memory_cost_is_refused() {
+        // Valid PHC shape, but m = 1 GiB.
+        let h = "$argon2id$v=19$m=1048576,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$\
+                 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut g = gate(h, 5);
+        assert_eq!(g.check("1234", Instant::now()), Check::NotConfigured);
+    }
+
+    #[test]
+    fn carry_keeps_lockout_but_drops_unlock_when_the_pin_changes() {
+        let t0 = Instant::now();
+        let h1 = hash("1234").unwrap();
+        let mut old = gate(&h1, 5);
+        assert_eq!(old.check("1234", t0), Check::Ok);
+
+        let mut same = gate(&h1, 5);
+        same.carry_from(&old);
+        assert!(same.is_unlocked(t0));
+
+        let h2 = hash("9999").unwrap();
+        let mut changed = gate(&h2, 5);
+        changed.carry_from(&old);
+        assert!(!changed.is_unlocked(t0));
+
+        old.locked_until = Some(t0 + Duration::from_secs(100));
+        let mut changed = gate(&h2, 5);
+        changed.carry_from(&old);
+        assert!(changed.locked_for(t0).is_some());
     }
 
     #[test]

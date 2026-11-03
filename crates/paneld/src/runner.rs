@@ -4,15 +4,16 @@
 //! always interpreted as an argv list -- the raw text is tokenised
 //! with POSIX-style single and double quotes so secrets and other
 //! interpolated values reach the command as argv items, never as
-//! shell syntax. The `app:timeout`, `app:max_output`, `app:max_running`
-//! and `cwd` handles come in a later phase; defaults are enforced
-//! here.
+//! shell syntax. `app:max_running` (a global cap on concurrent
+//! commands) is not enforced yet.
 
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,44 @@ pub struct RunResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// stdout or stderr went past its cap; the command was killed and
+    /// the run counts as failed (`output too large`, ADR 0013).
+    pub too_large: bool,
+}
+
+impl RunResult {
+    /// Exit 0, not timed out, output within limits.
+    pub fn succeeded(&self) -> bool {
+        self.exit_code == Some(0) && !self.timed_out && !self.too_large
+    }
+}
+
+/// ADR 0013: stderr is kept up to 64 KiB.
+pub const MAX_STDERR: usize = 64 * 1024;
+
+/// Read `r` to EOF keeping at most `cap` bytes. Reading past `cap`
+/// raises `too_large`; the bytes beyond it are dropped but the pipe is
+/// still drained so the child can never block on it.
+fn read_capped(mut r: impl Read, cap: usize, too_large: &AtomicBool) -> String {
+    let mut buf = Vec::with_capacity(cap.min(4096));
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(buf.len());
+                if n > room {
+                    buf.extend_from_slice(&chunk[..room]);
+                    too_large.store(true, Ordering::SeqCst);
+                } else {
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[derive(Debug)]
@@ -261,23 +300,31 @@ fn exec_argv(argv: &[String], opts: Opts<'_>) -> Result<RunResult, RunError> {
     // pid is also the group id for `killpg`.
     let pgid = Pid::from_raw(child.id() as i32);
 
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let mut stderr = child.stderr.take().expect("stderr piped");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
 
-    let max_bytes = opts.max_bytes;
-    let out_handle = thread::spawn(move || {
-        let mut buf = Vec::with_capacity(4096);
-        let _ = stdout.by_ref().take(max_bytes as u64).read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    });
-    let err_handle = thread::spawn(move || {
-        let mut buf = Vec::with_capacity(4096);
-        let _ = stderr.by_ref().take(max_bytes as u64).read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    // ADR 0013: stdout up to `max_output`, stderr up to 64 KiB; more
+    // fails the run. The readers only raise the flag; the wait loop
+    // below does the kill, while the child is still unreaped.
+    let too_large = Arc::new(AtomicBool::new(false));
+    let out_handle = {
+        let flag = too_large.clone();
+        let cap = opts.max_bytes;
+        thread::spawn(move || read_capped(stdout, cap, &flag))
+    };
+    let err_handle = {
+        let flag = too_large.clone();
+        let cap = opts.max_bytes.min(MAX_STDERR);
+        thread::spawn(move || read_capped(stderr, cap, &flag))
+    };
 
     let start = Instant::now();
     let (exit_code, timed_out) = loop {
+        if too_large.load(Ordering::SeqCst) && matches!(child.try_wait(), Ok(None)) {
+            let _ = killpg(pgid, Signal::SIGKILL);
+            let _ = child.wait();
+            break (None, false);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break (status.code(), false),
             Ok(None) => {
@@ -314,6 +361,7 @@ fn exec_argv(argv: &[String], opts: Opts<'_>) -> Result<RunResult, RunError> {
         stdout: stdout_s,
         stderr: stderr_s,
         timed_out,
+        too_large: too_large.load(Ordering::SeqCst),
     })
 }
 
@@ -461,6 +509,38 @@ mod tests {
         )
         .unwrap();
         assert!(r.stdout.len() <= 128, "got {} bytes", r.stdout.len());
+        assert!(r.too_large);
+        assert!(!r.succeeded());
+    }
+
+    #[test]
+    fn output_within_cap_is_not_flagged() {
+        let r = exec("/bin/echo hi", opts(2000, 128)).unwrap();
+        assert!(!r.too_large);
+        assert!(r.succeeded());
+    }
+
+    #[test]
+    fn stderr_is_capped_at_64k_even_with_a_larger_stdout_cap() {
+        // ADR 0013: stdout up to max_output, stderr up to 64 KiB.
+        let r = exec(
+            "/bin/sh -c 'head -c 100000 /dev/zero | tr \"\\\\0\" e 1>&2'",
+            opts(5000, 1024 * 1024),
+        )
+        .unwrap();
+        assert_eq!(r.stderr.len(), MAX_STDERR);
+        assert!(r.too_large);
+    }
+
+    #[test]
+    fn endless_output_fails_fast_not_at_the_timeout() {
+        // Past the cap the run is killed right away rather than
+        // waiting out the timeout.
+        let t0 = Instant::now();
+        let r = exec("/bin/sh -c 'yes'", opts(10_000, 4096)).unwrap();
+        assert!(r.too_large);
+        assert!(!r.timed_out);
+        assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
     }
 
     #[test]

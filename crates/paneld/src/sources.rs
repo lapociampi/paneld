@@ -336,14 +336,21 @@ fn stream_loop(
             .trim()
             .to_string();
         let started = Instant::now();
-        let reader = BufReader::new(stdout);
+        let mut reader = BufReader::new(stdout);
         let mut sent_any = false;
-        for line in reader.lines() {
+        loop {
             if shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            let line = match line {
-                Ok(l) => l,
+            let line = match read_line_capped(&mut reader, STREAM_LINE_CAP) {
+                Ok(Line::Eof) => break,
+                Ok(Line::TooLong) => {
+                    eprintln!(
+                        "paneld: source `{name}`: dropped a line longer than {STREAM_LINE_CAP} bytes"
+                    );
+                    continue;
+                }
+                Ok(Line::Text(l)) => l,
                 Err(e) => {
                     eprintln!("paneld: source `{name}`: read: {e}");
                     break;
@@ -386,6 +393,64 @@ fn stream_loop(
         );
         sleep_or_shutdown(delay, &shutdown);
         delay = next_backoff(delay, RESTART_CEILING);
+    }
+}
+
+/// ADR 0013: each stream line up to 64 KiB; longer lines are dropped
+/// with a warning.
+const STREAM_LINE_CAP: usize = 64 * 1024;
+
+enum Line {
+    Text(String),
+    TooLong,
+    Eof,
+}
+
+/// Read one `\n`-terminated line holding at most `cap` bytes. A
+/// longer line is consumed through its newline and reported as
+/// `TooLong`, so memory stays bounded whatever the child writes.
+fn read_line_capped(r: &mut impl BufRead, cap: usize) -> std::io::Result<Line> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut too_long = false;
+    loop {
+        let avail = match r.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if avail.is_empty() {
+            // EOF: a final unterminated line still counts.
+            return Ok(if too_long {
+                Line::TooLong
+            } else if buf.is_empty() {
+                Line::Eof
+            } else {
+                Line::Text(String::from_utf8_lossy(&buf).into_owned())
+            });
+        }
+        let (chunk, done) = match avail.iter().position(|&b| b == b'\n') {
+            Some(i) => (&avail[..i], Some(i + 1)),
+            None => (avail, None),
+        };
+        if !too_long {
+            if buf.len() + chunk.len() > cap {
+                too_long = true;
+                buf = Vec::new();
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        let used = done.unwrap_or(avail.len());
+        r.consume(used);
+        if done.is_some() {
+            if too_long {
+                return Ok(Line::TooLong);
+            }
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(Line::Text(String::from_utf8_lossy(&buf).into_owned()));
+        }
     }
 }
 
@@ -488,6 +553,9 @@ pub fn resolve_one(
     let r = runner::exec(&run, opts).map_err(|e| format!("run: {e}"))?;
     if r.timed_out {
         return Err("timed out".into());
+    }
+    if r.too_large {
+        return Err("output too large".into());
     }
     let ok = r.exit_code == Some(0);
 
@@ -877,6 +945,31 @@ mod tests {
         };
         assert_eq!(title(&u1), "a");
         assert_eq!(title(&u2), "b");
+    }
+
+    fn lines(input: &[u8], cap: usize) -> Vec<String> {
+        let mut r = std::io::BufReader::with_capacity(7, input);
+        let mut out = Vec::new();
+        loop {
+            match read_line_capped(&mut r, cap).unwrap() {
+                Line::Eof => return out,
+                Line::TooLong => out.push("<too long>".into()),
+                Line::Text(t) => out.push(t),
+            }
+        }
+    }
+
+    #[test]
+    fn stream_lines_are_capped_and_long_ones_dropped() {
+        let long = "x".repeat(40);
+        let input = format!("a\r\n{long}\nbb\nlast");
+        assert_eq!(
+            lines(input.as_bytes(), 16),
+            vec!["a", "<too long>", "bb", "last"]
+        );
+        // Exactly at the cap is fine.
+        assert_eq!(lines(b"0123456789abcdef\n", 16), vec!["0123456789abcdef"]);
+        assert!(lines(b"", 16).is_empty());
     }
 
     #[test]

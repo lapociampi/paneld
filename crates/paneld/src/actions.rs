@@ -219,9 +219,6 @@ pub struct WorkerCtx {
     pub event_tx: Sender<UiEvent>,
     pub source_blocks: BTreeMap<String, Block>,
     pub source_tx: Sender<crate::sources::SourceUpdate>,
-    /// The worker's own input, cloned so it can re-queue `then` /
-    /// `else` chained actions behind any already-pending work.
-    pub self_tx: Sender<Call>,
     /// ADR 0013 default cwd for every action command: the directory
     /// of the main config file. A per-action `cwd` overrides.
     pub config_dir: std::path::PathBuf,
@@ -231,13 +228,27 @@ pub struct WorkerCtx {
 }
 
 /// One queued action invocation: its name plus the args already
-/// evaluated at render time (empty for `on_tap = foo`). The main
-/// loop filters `confirm`-gated actions through a modal before any
-/// Call reaches the worker, so there's no bypass flag here.
+/// evaluated at render time (empty for `on_tap = foo`).
 #[derive(Debug, Clone)]
 pub struct Call {
     pub name: String,
     pub args: Vec<ActionArg>,
+    /// Set only by the main loop's gate pipeline once the action's
+    /// PIN and confirm (if any) were satisfied. The worker refuses a
+    /// gated action without it, so a new path to the worker cannot
+    /// silently skip the gates.
+    pub cleared: bool,
+}
+
+impl Call {
+    pub fn new(name: String, args: Vec<ActionArg>) -> Self {
+        Self { name, args, cleared: false }
+    }
+}
+
+/// `true` when `def` needs the main loop's gates before it may run.
+fn is_gated(def: &ActionDef) -> bool {
+    def.pin || def.confirm.is_some()
 }
 
 /// Spawn the action worker. Each incoming [`Call`] is looked up in
@@ -251,6 +262,13 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                 eprintln!("paneld: action `{}`: unknown action", call.name);
                 continue;
             };
+            if is_gated(&def) && !call.cleared {
+                eprintln!(
+                    "paneld: action `{}`: refused, its PIN / confirm gate was not passed",
+                    call.name
+                );
+                continue;
+            }
 
             let name = call.name;
             let had_run = def.run.is_some();
@@ -286,8 +304,10 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                 match runner::exec(&cmd, opts) {
                     Ok(r) => {
                         eprintln!(
-                            "paneld: action `{name}`: exit {:?}, timed_out {}",
-                            r.exit_code, r.timed_out
+                            "paneld: action `{name}`: exit {:?}, timed_out {}{}",
+                            r.exit_code,
+                            r.timed_out,
+                            if r.too_large { ", output too large" } else { "" }
                         );
                         if !r.stdout.trim().is_empty() {
                             eprintln!("paneld: action `{name}` stdout: {}", r.stdout.trim());
@@ -295,11 +315,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                         if !r.stderr.trim().is_empty() {
                             eprintln!("paneld: action `{name}` stderr: {}", r.stderr.trim());
                         }
-                        if !r.timed_out {
-                            ok = r.exit_code == Some(0);
-                        } else {
-                            ok = false;
-                        }
+                        ok = r.succeeded();
                     }
                     Err(e) => {
                         eprintln!("paneld: action `{name}`: {e}");
@@ -328,22 +344,20 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
             // failure. Chained actions start with empty args; the
             // `result.*` identifier they can read, and the block
             // form `then foo { arg = ... }` come in a later phase.
-            if had_run && ok {
-                if let Some(next) = &def.then {
-                    let _ = wctx.self_tx.send(Call {
-                        name: next.clone(),
-                        args: Vec::new(),
-                        
-                    });
-                }
-            } else if had_run && !ok {
-                if let Some(next) = &def.else_ {
-                    let _ = wctx.self_tx.send(Call {
-                        name: next.clone(),
-                        args: Vec::new(),
-                        
-                    });
-                }
+            // They go back through the main loop as a fresh call, so
+            // the chained action's own PIN and confirm still apply.
+            let next = if had_run && ok {
+                def.then.as_ref()
+            } else if had_run {
+                def.else_.as_ref()
+            } else {
+                None
+            };
+            if let Some(next) = next {
+                let _ = wctx.event_tx.send(UiEvent::Action {
+                    name: next.clone(),
+                    args: Vec::new(),
+                });
             }
 
             // `refresh` runs after a successful `run` on the same
@@ -629,6 +643,95 @@ mod tests {
         assert_eq!(ctx.get("vm"), Some(&Value::String("alpha".into())));
         assert!(ctx.contains_key("vars"));
         assert!(ctx.contains_key("sources"));
+    }
+
+    fn worker_for(doc: &Document) -> (Sender<Call>, Receiver<UiEvent>) {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (source_tx, _source_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_worker(
+            WorkerCtx {
+                actions: collect(doc),
+                base_ctx: Context::new(),
+                vars: Arc::new(Mutex::new(BTreeMap::new())),
+                source_values: Arc::new(Mutex::new(BTreeMap::new())),
+                var_types: BTreeMap::new(),
+                event_tx,
+                source_blocks: BTreeMap::new(),
+                source_tx,
+                config_dir: std::env::temp_dir(),
+                app_defaults: runner::AppDefaults::default(),
+            },
+            rx,
+        );
+        (tx, event_rx)
+    }
+
+    #[test]
+    fn chained_and_uncleared_gated_actions_never_run() {
+        // Review round 4, finding 1: `then` into a `pin = true` action
+        // must go back through the main loop's gates, and the worker
+        // must refuse a gated call that did not pass them.
+        let marker = std::env::temp_dir().join(format!(
+            "paneld-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let src = format!(
+            "action start {{ run = /bin/true\n then = boom }}\n\
+             action boom {{ pin = true\n run = /bin/touch {} }}\n",
+            marker.display()
+        );
+        let doc = parse_doc(&src);
+        let (tx, events) = worker_for(&doc);
+
+        tx.send(Call::new("start".into(), Vec::new())).unwrap();
+        match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(UiEvent::Action { name, .. }) => assert_eq!(name, "boom"),
+            other => panic!("expected the chain to come back as an Action, got {other:?}"),
+        }
+
+        // A direct uncleared call is refused too.
+        tx.send(Call::new("boom".into(), Vec::new())).unwrap();
+        // A cleared no-op afterwards proves the worker processed the
+        // refused call before we look at the marker.
+        tx.send(Call { name: "start".into(), args: Vec::new(), cleared: true }).unwrap();
+        let _ = events.recv_timeout(Duration::from_secs(5));
+        assert!(!marker.exists(), "gated action ran without passing its gate");
+
+        // And a cleared call does run.
+        tx.send(Call { name: "boom".into(), args: Vec::new(), cleared: true }).unwrap();
+        let ran = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            marker.exists()
+        });
+        let _ = std::fs::remove_file(&marker);
+        assert!(ran, "cleared gated call should run");
+    }
+
+    #[test]
+    fn action_cwd_defaults_and_overrides() {
+        use std::path::{Path, PathBuf};
+        let base = Path::new("/etc/paneld");
+        assert_eq!(resolve_action_cwd(base, None), PathBuf::from("/etc/paneld"));
+        assert_eq!(resolve_action_cwd(base, Some("  ")), PathBuf::from("/etc/paneld"));
+        assert_eq!(resolve_action_cwd(base, Some("scripts")), PathBuf::from("/etc/paneld/scripts"));
+        assert_eq!(resolve_action_cwd(base, Some("/srv")), PathBuf::from("/srv"));
+    }
+
+    #[test]
+    fn collects_pin_confirm_and_timeout() {
+        let doc = parse_doc(
+            "action a { pin = true\n confirm = Sure?\n timeout = 3s\n run = /bin/true }\n",
+        );
+        let a = collect(&doc).remove("a").unwrap();
+        assert!(a.pin);
+        assert_eq!(a.confirm.unwrap().raw.trim(), "Sure?");
+        assert_eq!(a.timeout, Some(Duration::from_secs(3)));
+        assert!(is_gated(&collect(&doc)["a"]));
     }
 
     #[test]

@@ -300,11 +300,21 @@ fn render_node(
                 .unwrap_or(false);
             let length = resolve_num(node, "length", ctx).unwrap_or(0.0) as u32;
             let ta = parent.new_textarea(masked, length);
+            ta.register_input();
             let kb = parent.new_number_keyboard();
             kb.attach_keyboard_to(&ta);
             apply_props(node, ctx, sink, &ta);
-            if let Some(assigns) = inline_on_submit_set(node) {
-                kb.on_submit_keyboard_inline_set(sink.clone(), assigns);
+            // Two forms: `on_submit = <action>` (the digits arrive as
+            // `value`) or `on_submit { set { ... } }` (`event.value`).
+            match find_simple(node, "on_submit").map(str::trim) {
+                Some(action) if is_bare_ident(action) => {
+                    kb.on_submit_action(sink.clone(), action.to_string());
+                }
+                _ => {
+                    if let Some(assigns) = inline_on_submit_set(node) {
+                        kb.on_submit_keyboard_inline_set(sink.clone(), assigns);
+                    }
+                }
             }
         }
         "select" => {

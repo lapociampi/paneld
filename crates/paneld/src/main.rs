@@ -230,20 +230,38 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         while let Ok(ev) = live.event_rx.try_recv() {
             match ev {
                 paneld_ui::UiEvent::Action { name, args } => {
-                    // A modal owns the screen: drop stray taps rather
-                    // than let them slip past the gate.
+                    // Taps cannot reach here while a modal is up (the
+                    // page's bindings are gone); `then` / `else` chains
+                    // from the worker can. Hold them until the modal
+                    // closes so they get their own gates.
+                    let call = actions::Call::new(name, args);
                     if live.pending.is_some() {
-                        continue;
+                        live.deferred.push_back(call);
+                    } else {
+                        route_call(&mut live, &screen, call, false);
                     }
-                    route_call(&mut live, &screen, actions::Call { name, args }, false);
-                    dirty = live.pending.is_none();
                 }
                 paneld_ui::UiEvent::PinEntered { digits } => {
-                    if let Some(Pending { call, stage: Stage::Pin }) = live.pending.take() {
+                    // Only meaningful while the PIN modal is up; a
+                    // stray READY (double OK) must not consume a
+                    // confirm or notice stage. An empty entry is not
+                    // an attempt.
+                    let at_pin = matches!(
+                        live.pending,
+                        Some(Pending { stage: Stage::Pin, .. })
+                    );
+                    if at_pin && !digits.is_empty() {
+                        let Some(Pending { call, .. }) = live.pending.take() else {
+                            unreachable!()
+                        };
                         let now = std::time::Instant::now();
                         match live.pin_gate.check(&digits, now) {
                             pin::Check::Ok => route_call(&mut live, &screen, call, true),
                             pin::Check::Wrong { remaining } => {
+                                eprintln!(
+                                    "paneld: wrong PIN for action `{}`, {remaining} left",
+                                    call.name
+                                );
                                 show_pin_modal(
                                     &screen,
                                     &call.name,
@@ -277,8 +295,9 @@ fn run_daemon(config: PathBuf) -> ExitCode {
                     }
                 }
                 paneld_ui::UiEvent::ConfirmReply { accept } => {
-                    if let Some(Pending { call, stage }) = live.pending.take() {
+                    if let Some(Pending { mut call, stage }) = live.pending.take() {
                         if accept && matches!(stage, Stage::Confirm) {
+                            call.cleared = true;
                             let _ = live.action_tx.send(call);
                         }
                     }
@@ -337,6 +356,13 @@ fn run_daemon(config: PathBuf) -> ExitCode {
                     dirty = true;
                 }
             }
+        }
+
+        // Chained calls that arrived while a modal was up, in order,
+        // until one of them opens a modal of its own.
+        while live.pending.is_none() {
+            let Some(call) = live.deferred.pop_front() else { break };
+            route_call(&mut live, &screen, call, false);
         }
 
         // Drain source updates and re-render if anything changed.
@@ -400,6 +426,10 @@ fn run_daemon(config: PathBuf) -> ExitCode {
                 &live.vars,
                 Some(&live.alerts),
             );
+            // A poll landing mid-entry must not wipe digits the user
+            // is typing into a keypad on the same page.
+            let typed = paneld_ui::snapshot_inputs();
+            let same_page = live.rendered_page == live.current_page;
             screen.clear_children();
             paneld_ui::reset_action_bindings();
             paneld_ui::render_page(
@@ -409,6 +439,10 @@ fn run_daemon(config: PathBuf) -> ExitCode {
                 &live.event_tx,
                 &screen,
             );
+            if same_page {
+                paneld_ui::restore_inputs(&typed);
+            }
+            live.rendered_page = live.current_page.clone();
         }
 
         pump.step();
@@ -441,6 +475,10 @@ struct LiveState {
     event_rx: std::sync::mpsc::Receiver<paneld_ui::UiEvent>,
     action_tx: std::sync::mpsc::Sender<actions::Call>,
     current_page: String,
+    /// The page of the last full render, so input text is only
+    /// restored onto the same page. (A modal resets the input list,
+    /// so nothing carries across one.)
+    rendered_page: String,
     alerts: alerts::Engine,
     state: state::Store,
     sources_shutdown: sources::ShutdownHandle,
@@ -450,6 +488,8 @@ struct LiveState {
     /// Set while a PIN / confirm / notice modal owns the screen.
     /// Blocks re-renders of the page tree so the modal stays up.
     pending: Option<Pending>,
+    /// `then` / `else` calls that arrived while a modal was up.
+    deferred: std::collections::VecDeque<actions::Call>,
     pin_gate: pin::Gate,
 }
 
@@ -475,10 +515,7 @@ fn setup_live_state(
     // ADR 0013: commands run with cwd set to the config file's
     // directory by default, so `run = ./scripts/x.sh` works. A
     // per-source / per-action `cwd` overrides on top.
-    let config_dir = config
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let config_dir = config_dir_of(config);
     let (source, mut doc, mut diags) = match load(config) {
         Ok(parts) => parts,
         Err(e) => {
@@ -552,7 +589,6 @@ fn setup_live_state(
             event_tx: event_tx.clone(),
             source_blocks,
             source_tx,
-            self_tx: action_tx.clone(),
             config_dir: config_dir.clone(),
             app_defaults,
         },
@@ -598,14 +634,26 @@ fn setup_live_state(
         event_tx,
         event_rx,
         action_tx,
+        rendered_page: current_page.clone(),
         current_page,
         alerts: alerts_engine,
         state: state_store,
         sources_shutdown,
         actions: action_table_for_main,
         pending: None,
+        deferred: std::collections::VecDeque::new(),
         pin_gate,
     })
+}
+
+/// The directory commands run in by default (ADR 0013): the config
+/// file's own. `Path::parent` gives `""` for a bare `paneld.conf`,
+/// which `current_dir` rejects, so that case maps to `.`.
+fn config_dir_of(config: &std::path::Path) -> std::path::PathBuf {
+    match config.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    }
 }
 
 /// Send `call` through the schema's gate order (section 5: PIN, then
@@ -664,6 +712,8 @@ fn route_call(
         live.pending = Some(Pending { call, stage: Stage::Confirm });
         return;
     }
+    let mut call = call;
+    call.cleared = true;
     let _ = live.action_tx.send(call);
 }
 
@@ -685,9 +735,13 @@ fn show_pin_modal(
     }
     let ta = box_.msgbox_content().new_textarea(true, 12);
     box_.msgbox_add_confirm_button("Cancel", false, sink.clone());
+    // The keyboard takes the bottom half of the screen; keep the box
+    // (and its Cancel) in the top half.
+    box_.align_top_mid(8);
     let kb = screen.new_number_keyboard();
     kb.attach_keyboard_to(&ta);
     kb.on_submit_pin(sink.clone());
+    kb.on_cancel_reply(sink.clone());
 }
 
 /// A message with a single OK that dismisses it.
@@ -922,6 +976,15 @@ mod tests {
             parse(&["ctl", "set", "foo=1", "bar=2"]),
             Ok(Cmd::Ctl { args: vec!["set".into(), "foo=1".into(), "bar=2".into()] })
         );
+    }
+
+    #[test]
+    fn config_dir_handles_bare_and_nested_paths() {
+        use std::path::Path;
+        assert_eq!(config_dir_of(Path::new("paneld.conf")), PathBuf::from("."));
+        assert_eq!(config_dir_of(Path::new("/etc/paneld/paneld.conf")), PathBuf::from("/etc/paneld"));
+        assert_eq!(config_dir_of(Path::new("conf/p.conf")), PathBuf::from("conf"));
+        assert_eq!(config_dir_of(Path::new("/")), PathBuf::from("."));
     }
 
     #[test]

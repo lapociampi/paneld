@@ -110,6 +110,9 @@ enum Binding {
     },
     /// Modal OK / Cancel button; sends [`UiEvent::ConfirmReply`].
     Confirm { accept: bool, sink: Sender<UiEvent> },
+    /// Keypad `on_submit = <action>`; sends [`UiEvent::Action`] with
+    /// the digits as the `value` arg.
+    SubmitAction { action: String, sink: Sender<UiEvent> },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,6 +144,52 @@ fn bindings() -> &'static Mutex<Vec<Binding>> {
 /// thread AFTER [`Obj::clear_children`] on the screen.
 pub fn reset_action_bindings() {
     bindings().lock().unwrap().clear();
+    INPUTS.with(|v| v.borrow_mut().clear());
+}
+
+thread_local! {
+    /// Page inputs (keypad textareas) of the current render, in
+    /// render order. LVGL objects are UI-thread only, hence a
+    /// thread-local; cleared with the bindings.
+    static INPUTS: std::cell::RefCell<Vec<*mut sys::lv_obj_t>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Text typed into each page input, in render order. Call before
+/// clearing the screen for a re-render.
+pub fn snapshot_inputs() -> Vec<String> {
+    INPUTS.with(|v| {
+        v.borrow()
+            .iter()
+            .map(|&ta| {
+                let c = unsafe { sys::lv_textarea_get_text(ta) };
+                if c.is_null() {
+                    String::new()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(c) }
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            })
+            .collect()
+    })
+}
+
+/// Put text taken by [`snapshot_inputs`] back into the freshly
+/// rendered inputs, by position. Only meaningful when the same page
+/// was re-rendered.
+pub fn restore_inputs(texts: &[String]) {
+    INPUTS.with(|v| {
+        for (&ta, text) in v.borrow().iter().zip(texts) {
+            if text.is_empty() {
+                continue;
+            }
+            if let Ok(c) = CString::new(text.as_str()) {
+                // lv_textarea_set_text copies the string.
+                unsafe { sys::lv_textarea_set_text(ta, c.as_ptr()) };
+            }
+        }
+    });
 }
 
 unsafe extern "C" fn on_tap_trampoline(e: *mut sys::lv_event_t) {
@@ -173,6 +222,17 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
         let guard = bindings().lock().unwrap();
         guard.get(idx).cloned()
     };
+    if let Some(Binding::SubmitAction { action, sink }) = &bind {
+        let digits = keyboard_text(target);
+        let _ = sink.send(UiEvent::Action {
+            name: action.clone(),
+            args: vec![ActionArg {
+                name: "value".into(),
+                value: crate::expr::Value::String(digits),
+            }],
+        });
+        return;
+    }
     if let Some(Binding::Change { kind, assigns, sink }) = bind {
         let event_value = match kind {
             ChangeKind::Toggle => {
@@ -532,16 +592,68 @@ impl<'ui> Obj<'ui> {
     /// password mode so digits render as dots; `max_length` of 0 is
     /// treated as unlimited.
     pub fn new_textarea(&self, masked: bool, max_length: u32) -> Obj<'ui> {
+        // LVGL keeps the pointer, not a copy, so the accepted set must
+        // live for the whole program.
+        static DIGITS: &std::ffi::CStr = c"0123456789";
         let raw = unsafe { sys::lv_textarea_create(self.raw) };
         assert!(!raw.is_null());
         unsafe {
             sys::lv_textarea_set_password_mode(raw, masked);
             sys::lv_textarea_set_one_line(raw, true);
+            // Schema: a keypad takes digits. The number keyboard also
+            // has `.` and `+/-` keys; the textarea ignores them.
+            sys::lv_textarea_set_accepted_chars(raw, DIGITS.as_ptr());
             if max_length > 0 {
                 sys::lv_textarea_set_max_length(raw, max_length);
             }
         }
         Obj { raw, _ui: PhantomData }
+    }
+
+    /// Remember this textarea as a page input whose typed text should
+    /// survive a re-render of the same page (see [`snapshot_inputs`]).
+    pub fn register_input(&self) {
+        INPUTS.with(|v| v.borrow_mut().push(self.raw));
+    }
+
+    pub fn align_top_mid(&self, y: i32) {
+        unsafe { sys::lv_obj_align(self.raw, sys::lv_align_t_LV_ALIGN_TOP_MID, 0, y) };
+    }
+
+    /// Register LV_EVENT_CANCEL (the number keyboard's close key) to
+    /// send `ConfirmReply { accept: false }`.
+    pub fn on_cancel_reply(&self, sink: Sender<UiEvent>) {
+        let idx = {
+            let mut g = bindings().lock().unwrap();
+            g.push(Binding::Confirm { accept: false, sink });
+            g.len() - 1
+        };
+        unsafe {
+            sys::lv_obj_add_event_cb(
+                self.raw,
+                Some(on_tap_trampoline),
+                sys::lv_event_code_t_LV_EVENT_CANCEL,
+                idx as *mut std::ffi::c_void,
+            );
+        }
+    }
+
+    /// Keypad `on_submit = <action>`: on the keyboard's OK, call the
+    /// action with the digits bound as `value`.
+    pub fn on_submit_action(&self, sink: Sender<UiEvent>, action: String) {
+        let idx = {
+            let mut g = bindings().lock().unwrap();
+            g.push(Binding::SubmitAction { action, sink });
+            g.len() - 1
+        };
+        unsafe {
+            sys::lv_obj_add_event_cb(
+                self.raw,
+                Some(on_change_trampoline),
+                sys::lv_event_code_t_LV_EVENT_READY,
+                idx as *mut std::ffi::c_void,
+            );
+        }
     }
 
     /// A modal message box (schema's action `confirm`). Call
