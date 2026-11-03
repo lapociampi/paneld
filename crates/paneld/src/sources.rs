@@ -713,7 +713,7 @@ fn collect_env(
 /// typical `jq` or REST payload into [`Value::Map`] / [`Value::List`]
 /// trees. No streaming, no error recovery; a malformed input returns
 /// `None` and the source is treated as failed.
-fn parse_json(s: &str) -> Option<Value> {
+pub fn parse_json(s: &str) -> Option<Value> {
     let mut p = JsonParser { bytes: s.as_bytes(), pos: 0 };
     p.skip_ws();
     let v = p.parse_value()?;

@@ -200,7 +200,13 @@ fn print_help() {
 Usage:
   paneld [--config PATH]              Run the daemon
   paneld check [--config PATH]        Validate a config, offline
-  paneld ctl SUBCOMMAND [ARGS...]     Talk to a running daemon
+  paneld ctl [--json] COMMAND         Talk to a running daemon:
+      ping | status | check | reload | exit
+      eval '<cel>'                    Evaluate against the live values
+      set vars.<name>=<value>         Set a var
+      goto <page>                     Show a page (`back` = previous)
+      alert fire <id> [severity=..] [title=..] [text=..] [link=..]
+      alert resolve <id>
   paneld hash-pin                     Read a PIN on stdin, print its
                                       argon2 hash for security.pin
   paneld shot -o FILE.png [--page P] [--size WxH] [--tap X,Y]...
@@ -270,35 +276,25 @@ fn run_daemon(config: PathBuf) -> ExitCode {
     // Initial live state. `reload` wipes and rebuilds this.
     let mut live = match setup_live_state(&config, &screen, None) {
         Ok(l) => l,
-        Err(code) => return code,
+        Err(_) => return ExitCode::from(1),
     };
 
     let mut pump = ui.pump();
     'main: loop {
-        // Drain the ctl channel.
+        // Drain the ctl channel (and the config watcher).
         while let Ok(msg) = control_rx.try_recv() {
             match msg {
-                ctl::ControlMsg::Exit => break 'main,
-                ctl::ControlMsg::Reload => match setup_live_state(&config, &screen, None) {
-                    Ok(mut fresh) => {
-                        fresh.pin_gate.carry_from(&live.pin_gate);
-                        // Flush any pending alert state before the
-                        // old Store is dropped, so a reload during
-                        // a long incident doesn't lose timestamps
-                        // that hadn't aged into the 10s window yet.
-                        live.state.force_flush();
-                        // Signal the previous poll/stream workers to
-                        // exit so a stream source isn't duplicated
-                        // after reload. The new state has already
-                        // spawned its own.
-                        live.sources_shutdown.stop();
-                        live = fresh;
-                        eprintln!("paneld: reloaded config");
+                ctl::ControlMsg::Reload => {
+                    let _ = reload(&mut live, &config, &screen);
+                }
+                ctl::ControlMsg::Request(req) => {
+                    if req.cmd == "exit" {
+                        let _ = req.reply.send(Ok(paneld_ui::Value::String("exiting".into())));
+                        break 'main;
                     }
-                    Err(_code) => {
-                        eprintln!("paneld: reload failed; keeping previous config");
-                    }
-                },
+                    let reply = handle_request(&req, &mut live, &config, &screen);
+                    let _ = req.reply.send(reply);
+                }
             }
         }
 
@@ -323,7 +319,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // Drain UI events: actions forward to the action worker,
     // gotos update the current page, vars changes trigger a
     // re-render (the worker already wrote the new values).
-    let mut dirty = false;
+    let mut dirty = std::mem::take(&mut live.redraw);
     while let Ok(ev) = live.event_rx.try_recv() {
         match ev {
             paneld_ui::UiEvent::Action { name, args } => {
@@ -591,6 +587,9 @@ struct LiveState {
     previous_page: Option<String>,
     /// When the current toast (top layer) is removed.
     toast_until: Option<std::time::Instant>,
+    /// Set by ctl requests that change what is shown; consumed by the
+    /// next `process`.
+    redraw: bool,
     pin_gate: pin::Gate,
 }
 
@@ -608,6 +607,37 @@ enum Stage {
     Notice,
 }
 
+/// Load and check the config; the issues, with locations, if any.
+fn load_checked(config: &std::path::Path) -> Result<paneld_config::parse::Document, Vec<ctl::CtlError>> {
+    let (source, doc, mut diags) = match paneld_config::load(config) {
+        Ok(parts) => parts,
+        Err(e) => return Err(vec![ctl::CtlError::msg(e.to_string())]),
+    };
+    diags.extend(paneld_config::check(&doc, &source));
+    if diags.is_empty() {
+        return Ok(doc);
+    }
+    Err(diags
+        .iter()
+        .map(|d| {
+            let loc = source.location(d.span);
+            ctl::CtlError {
+                message: d.message.clone(),
+                file: Some(loc.path.display().to_string()),
+                line: Some(loc.line),
+                column: Some(loc.column),
+            }
+        })
+        .collect())
+}
+
+fn issue_text(i: &ctl::CtlError) -> String {
+    match (&i.file, i.line, i.column) {
+        (Some(f), Some(l), Some(c)) => format!("{f}:{l}:{c}: {}", i.message),
+        _ => format!("paneld: {}", i.message),
+    }
+}
+
 /// `state_path`: where the alert state file lives; `None` = the
 /// config's `app:state` (the daemon). `paneld shot` passes a scratch
 /// path so it never opens, and so never touches, the real one.
@@ -615,32 +645,25 @@ fn setup_live_state(
     config: &std::path::Path,
     screen: &paneld_ui::ui::Obj<'_>,
     state_path: Option<&std::path::Path>,
-) -> Result<LiveState, ExitCode> {
-    use paneld_config::{check, load};
+) -> Result<LiveState, Vec<ctl::CtlError>> {
     // ADR 0013: commands run with cwd set to the config file's
     // directory by default, so `run = ./scripts/x.sh` works. A
     // per-source / per-action `cwd` overrides on top.
     let config_dir = config_dir_of(config);
-    let (source, mut doc, mut diags) = match load(config) {
-        Ok(parts) => parts,
-        Err(e) => {
-            eprintln!("paneld: {e}");
-            return Err(ExitCode::from(1));
+    let mut doc = match load_checked(config) {
+        Ok(doc) => doc,
+        Err(issues) => {
+            for i in &issues {
+                eprintln!("{}", issue_text(i));
+            }
+            eprintln!(
+                "paneld: {} config issue{} found; refusing to apply",
+                issues.len(),
+                if issues.len() == 1 { "" } else { "s" }
+            );
+            return Err(issues);
         }
     };
-    diags.extend(check(&doc, &source));
-    if !diags.is_empty() {
-        for d in &diags {
-            let loc = source.location(d.span);
-            eprintln!("{loc}: {}", d.message);
-        }
-        eprintln!(
-            "paneld: {} config issue{} found; refusing to apply",
-            diags.len(),
-            if diags.len() == 1 { "" } else { "s" }
-        );
-        return Err(ExitCode::from(1));
-    }
     // `kind[name]:key = value` overrides land in their blocks so every
     // consumer below reads one form (and `action[x]:pin = true` is
     // honored).
@@ -720,6 +743,18 @@ fn setup_live_state(
             .map(|(k, v)| (k.clone(), std::time::UNIX_EPOCH + std::time::Duration::from_secs(v.since)))
             .collect(),
     );
+    // Alerts raised over ctl have no rule to raise them again: bring
+    // them back from the state file as they were.
+    for saved in state_store.snapshot().values().filter(|a| a.rule == alerts::CTL_RULE) {
+        alerts_engine.fire_external(
+            &saved.instance,
+            &saved.severity,
+            &saved.title,
+            &saved.text,
+            &saved.link,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(saved.since),
+        );
+    }
     let ctx_no_alerts =
         build_ctx(&source_values, &theme, &vars_shared, None);
     alerts_engine.tick(
@@ -760,6 +795,7 @@ fn setup_live_state(
         running: std::collections::HashSet::new(),
         previous_page: None,
         toast_until: None,
+        redraw: false,
         pin_gate,
     })
 }
@@ -1099,7 +1135,7 @@ fn run_shot(o: ShotOpts) -> ExitCode {
     let scratch_state = std::env::temp_dir().join(format!("paneld-shot-{}.state", std::process::id()));
     let mut live = match setup_live_state(&o.config, &screen, Some(&scratch_state)) {
         Ok(l) => l,
-        Err(code) => return code,
+        Err(_) => return ExitCode::from(1),
     };
 
     // Run the UI for `ms`, in real time so action and source threads
@@ -1166,13 +1202,166 @@ fn run_hash_pin() -> ExitCode {
 }
 
 fn run_ctl(args: &[String]) -> ExitCode {
-    let Some(cmd) = args.first() else {
-        eprintln!("paneld ctl: missing subcommand (try `ping`, `reload`, `exit`)");
-        return ExitCode::from(2);
+    let (json, args) = match args.first().map(String::as_str) {
+        Some("--json") => (true, &args[1..]),
+        _ => (false, args),
     };
     let path = ctl::default_socket_path();
-    let code = ctl::call(&path, cmd);
-    ExitCode::from(code as u8)
+    ExitCode::from(ctl::call(&path, args, json) as u8)
+}
+
+/// Reload the config in place. On failure the running config stays
+/// (config errors never blank the screen).
+fn reload(
+    live: &mut LiveState,
+    config: &std::path::Path,
+    screen: &paneld_ui::ui::Obj<'_>,
+) -> Result<(), Vec<ctl::CtlError>> {
+    match setup_live_state(config, screen, None) {
+        Ok(mut fresh) => {
+            fresh.pin_gate.carry_from(&live.pin_gate);
+            // Flush pending alert state before the old store goes, so
+            // a reload mid-incident keeps timestamps not yet written.
+            live.state.force_flush();
+            // Stop the old poll / stream workers; the new state runs
+            // its own.
+            live.sources_shutdown.stop();
+            *live = fresh;
+            eprintln!("paneld: reloaded config");
+            Ok(())
+        }
+        Err(issues) => {
+            eprintln!("paneld: reload failed; keeping previous config");
+            Err(issues)
+        }
+    }
+}
+
+/// Answer one ctl request (ADR 0007's command set) from the main loop.
+fn handle_request(
+    req: &ctl::Request,
+    live: &mut LiveState,
+    config: &std::path::Path,
+    screen: &paneld_ui::ui::Obj<'_>,
+) -> ctl::Reply {
+    use paneld_ui::Value;
+    use std::collections::BTreeMap;
+    let issue_list = |issues: &[ctl::CtlError]| {
+        Value::List(
+            issues
+                .iter()
+                .map(|i| {
+                    let mut m = BTreeMap::new();
+                    m.insert("message".to_string(), Value::String(i.message.clone()));
+                    if let (Some(f), Some(l), Some(c)) = (&i.file, i.line, i.column) {
+                        m.insert("file".to_string(), Value::String(f.clone()));
+                        m.insert("line".to_string(), Value::Int(l.into()));
+                        m.insert("column".to_string(), Value::Int(c.into()));
+                    }
+                    Value::Map(m)
+                })
+                .collect(),
+        )
+    };
+    match req.cmd.as_str() {
+        "reload" => match reload(live, config, screen) {
+            Ok(()) => Ok(Value::String("reloaded".into())),
+            Err(issues) => {
+                let mut first = issues.first().cloned().unwrap_or_default();
+                if issues.len() > 1 {
+                    first.message = format!("{} ({} more issue(s); see `paneld ctl check`)", first.message, issues.len() - 1);
+                }
+                Err(first)
+            }
+        },
+        "check" => Ok(match load_checked(config) {
+            Ok(_) => Value::List(Vec::new()),
+            Err(issues) => issue_list(&issues),
+        }),
+        "eval" => {
+            let expr = req.arg("expr")?;
+            let file = paneld_config::source::FileId::default();
+            let (parsed, diags) = paneld_config::cel::parse_fragment(&expr, file, 0);
+            let parsed = match (parsed, diags.first()) {
+                (Some(e), None) => e,
+                (_, Some(d)) => return Err(ctl::CtlError::msg(d.message.clone())),
+                (None, None) => return Err(ctl::CtlError::msg(format!("cannot parse `{expr}`"))),
+            };
+            let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+            paneld_ui::eval(&parsed, &ctx).map_err(|e| ctl::CtlError::msg(e.message))
+        }
+        "set" => {
+            let name = req.arg("var")?;
+            let raw = req.arg("value")?;
+            let Some(ty) = live.var_types.get(&name).cloned() else {
+                return Err(ctl::CtlError::msg(format!("no var `{name}`")));
+            };
+            let span = paneld_config::source::Span {
+                file: paneld_config::source::FileId::default(),
+                start: 0,
+                end: 0,
+            };
+            let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+            let value = paneld_ui::resolve_value(&raw, span, &ctx)
+                .and_then(|v| vars::coerce(&ty, v))
+                .ok_or_else(|| ctl::CtlError::msg(format!("`{raw}` does not fit var `{name}` ({ty})")))?;
+            live.vars.lock().unwrap().insert(name, value.clone());
+            live.redraw = true;
+            Ok(value)
+        }
+        "goto" => {
+            let page = req.arg("page")?;
+            let exists = page == "back"
+                || live.doc.items.iter().any(|it| matches!(it,
+                    paneld_config::parse::Item::Block(b)
+                        if b.kind.text == "page" && b.name.as_ref().is_some_and(|n| n.text == page)));
+            if !exists {
+                return Err(ctl::CtlError::msg(format!("no page `{page}`")));
+            }
+            if go_to(live, &page) {
+                live.redraw = true;
+            }
+            Ok(Value::String(live.current_page.clone()))
+        }
+        "alert_fire" => {
+            let id = req.arg("id")?;
+            let severity = req.opt_arg("severity").unwrap_or_else(|| "warning".into());
+            if !matches!(severity.as_str(), "critical" | "warning" | "info") {
+                return Err(ctl::CtlError::msg(format!(
+                    "severity `{severity}`: use critical, warning or info"
+                )));
+            }
+            let title = req.opt_arg("title").unwrap_or_else(|| id.clone());
+            let text = req.opt_arg("text").unwrap_or_default();
+            let link = req.opt_arg("link").unwrap_or_default();
+            if live.alerts.fire_external(&id, &severity, &title, &text, &link, std::time::SystemTime::now()) {
+                live.redraw = true;
+            }
+            Ok(Value::String(format!("{}:{id}", alerts::CTL_RULE)))
+        }
+        "alert_resolve" => {
+            let id = req.arg("id")?;
+            if live.alerts.resolve_external(&id) {
+                live.redraw = true;
+                Ok(Value::String("resolved".into()))
+            } else {
+                Err(ctl::CtlError::msg(format!("no active ctl alert `{id}`")))
+            }
+        }
+        "status" => {
+            let mut m = BTreeMap::new();
+            m.insert("config".to_string(), Value::String(config.display().to_string()));
+            m.insert("page".to_string(), Value::String(live.current_page.clone()));
+            m.insert("sources".to_string(), Value::Map(live.source_values.lock().unwrap().clone()));
+            m.insert("vars".to_string(), Value::Map(live.vars.lock().unwrap().clone()));
+            m.insert("alerts".to_string(), live.alerts.context_value());
+            let mut running: Vec<Value> = live.running.iter().map(|n| Value::String(n.clone())).collect();
+            running.sort_by_key(|v| v.to_display_string());
+            m.insert("running".to_string(), Value::List(running));
+            Ok(Value::Map(m))
+        }
+        other => Err(ctl::CtlError::msg(format!("unknown command `{other}`"))),
+    }
 }
 
 /// `ctx` plus `secrets`, for interpolating commands (`run`, `env`).

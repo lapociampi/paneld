@@ -101,6 +101,9 @@ impl Alert {
     }
 }
 
+/// Rule name for alerts raised over `paneld ctl`.
+pub const CTL_RULE: &str = "ctl";
+
 /// Runtime alert engine. One per daemon instance; rebuilt on every
 /// `reload`.
 pub struct Engine {
@@ -158,6 +161,45 @@ impl Engine {
     /// persistence.
     pub fn active_alerts(&self) -> &BTreeMap<String, Alert> {
         &self.active
+    }
+
+    /// `paneld ctl alert fire <id> ...` (schema 9: "creates the same
+    /// alerts"). Kept under the rule name `ctl`; firing an id again
+    /// updates it and keeps its first `since`. Returns true if the
+    /// active set changed.
+    pub fn fire_external(
+        &mut self,
+        id: &str,
+        severity: &str,
+        title: &str,
+        text: &str,
+        link: &str,
+        wall: SystemTime,
+    ) -> bool {
+        let key = format!("{CTL_RULE}:{id}");
+        let (since, fired_at) = self
+            .active
+            .get(&key)
+            .map(|a| (a.since, a.fired_at))
+            .unwrap_or_else(|| (self.restored.remove(&key).unwrap_or(wall), Instant::now()));
+        let alert = Alert {
+            rule: CTL_RULE.to_string(),
+            instance: id.to_string(),
+            severity: severity.to_string(),
+            title: title.to_string(),
+            text: text.to_string(),
+            link: link.to_string(),
+            since,
+            fired_at,
+            acked: false,
+            snoozed_until: None,
+        };
+        self.active.insert(key, alert.clone()) != Some(alert)
+    }
+
+    /// `paneld ctl alert resolve <id>`. Returns true if it was active.
+    pub fn resolve_external(&mut self, id: &str) -> bool {
+        self.active.remove(&format!("{CTL_RULE}:{id}")).is_some()
     }
 
     /// Feed one event (a source update's value) to every event-mode

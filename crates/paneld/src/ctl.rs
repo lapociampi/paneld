@@ -1,36 +1,77 @@
 //! `paneld ctl` over a Unix socket (ADR 0007, 0014).
 //!
-//! The daemon's listener thread accepts connections, reads one line
-//! of JSON per request, and emits a [`ControlMsg`] on the main
-//! loop's channel. The reply is a one-line JSON string.
+//! Wire format (ADR 0014): one JSON object per line, both ways. On
+//! connect the daemon sends `{"paneld": "<version>", "protocol": 1}`.
+//! A request is `{"id": 1, "cmd": "eval", "args": {"expr": "..."}}`;
+//! its reply carries the same `id` and either `"ok": true, "result":
+//! ...` or `"ok": false, "error": {"message", "file", "line",
+//! "column"}`. A connection may send several requests.
 //!
-//! Scope today: `ping`, `exit`, `reload`. Status queries, source
-//! snapshots, action triggers over ctl come in later phases. No
-//! auth, no size cap on reply bodies (the surface is small).
-//!
-//! JSON shape is minimal and hand-rolled -- no `serde` dependency.
-//! The daemon only parses `"cmd": "<name>"` out of the request and
-//! writes `{"ok": true, "msg": "..."}` or `{"ok": false, "msg":
-//! "..."}` back.
+//! `ping` is answered here; everything that needs the live state goes
+//! to the main loop as a [`Request`] and is answered from there.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::thread;
+use std::time::Duration;
 
-/// Commands the ctl listener posts to the main loop.
-#[derive(Debug)]
+use paneld_ui::Value;
+
+pub const PROTOCOL: i64 = 1;
+
+/// What the main loop gets from the ctl listener (and the config
+/// watcher).
 pub enum ControlMsg {
-    Exit,
+    /// From the config file watcher; no one waits for an answer.
     Reload,
+    /// A ctl request, answered on `reply`.
+    Request(Request),
+}
+
+pub struct Request {
+    pub cmd: String,
+    pub args: BTreeMap<String, Value>,
+    pub reply: Sender<Reply>,
+}
+
+pub type Reply = Result<Value, CtlError>;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CtlError {
+    pub message: String,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+}
+
+impl CtlError {
+    pub fn msg(message: impl Into<String>) -> Self {
+        Self { message: message.into(), ..Self::default() }
+    }
+}
+
+impl Request {
+    /// A string argument, or an error naming it.
+    pub fn arg(&self, name: &str) -> Result<String, CtlError> {
+        match self.args.get(name) {
+            Some(Value::String(s)) => Ok(s.clone()),
+            Some(v) => Ok(v.to_display_string()),
+            None => Err(CtlError::msg(format!("`{}` needs `{name}`", self.cmd))),
+        }
+    }
+
+    pub fn opt_arg(&self, name: &str) -> Option<String> {
+        self.arg(name).ok()
+    }
 }
 
 /// Spawn a background thread that polls the config file's mtime
 /// every `interval` and sends [`ControlMsg::Reload`] on `tx` when
-/// it changes. Zero dependency; the device build will swap this
-/// for an inotify-based watch later.
-pub fn watch_config(path: &Path, interval: std::time::Duration, tx: Sender<ControlMsg>) {
+/// it changes.
+pub fn watch_config(path: &Path, interval: Duration, tx: Sender<ControlMsg>) {
     let path = path.to_path_buf();
     let mut last = mtime(&path);
     thread::spawn(move || loop {
@@ -63,15 +104,17 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 /// Start a background thread that listens on `path` and forwards
-/// [`ControlMsg`] on `tx`. Returns immediately. The socket file is
-/// unlinked on bind so a leftover from a crashed daemon doesn't
-/// block startup.
+/// requests on `tx`. The socket file is unlinked on bind so a
+/// leftover from a crashed daemon doesn't block startup; it is made
+/// owner and group only (ADR 0007).
 pub fn serve(path: &Path, tx: Sender<ControlMsg>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::remove_file(path);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
     let path = path.to_path_buf();
     thread::spawn(move || {
         for conn in listener.incoming() {
@@ -80,9 +123,7 @@ pub fn serve(path: &Path, tx: Sender<ControlMsg>) -> std::io::Result<()> {
                     let tx = tx.clone();
                     thread::spawn(move || handle_client(stream, tx));
                 }
-                Err(e) => {
-                    eprintln!("paneld ctl: accept on {}: {e}", path.display());
-                }
+                Err(e) => eprintln!("paneld ctl: accept on {}: {e}", path.display()),
             }
         }
     });
@@ -90,54 +131,106 @@ pub fn serve(path: &Path, tx: Sender<ControlMsg>) -> std::io::Result<()> {
 }
 
 fn handle_client(stream: UnixStream, tx: Sender<ControlMsg>) {
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    let greeting = format!(
+        r#"{{"paneld":{},"protocol":{PROTOCOL}}}"#,
+        json_string(env!("CARGO_PKG_VERSION"))
+    );
+    if writeln!(&stream, "{greeting}").is_err() {
         return;
     }
-    let cmd = extract_cmd(&line).unwrap_or_default();
-    let reply = match cmd.as_str() {
-        "ping" => reply_ok("pong"),
-        "exit" => {
-            let _ = tx.send(ControlMsg::Exit);
-            reply_ok("exiting")
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
         }
-        "reload" => {
-            let _ = tx.send(ControlMsg::Reload);
-            reply_ok("reloading")
+        if line.trim().is_empty() {
+            continue;
         }
-        other => reply_err(&format!("unknown command `{other}`")),
+        let reply = answer(&line, &tx);
+        if writeln!(&stream, "{reply}").is_err() {
+            return;
+        }
+    }
+}
+
+/// Turn one request line into its reply line.
+fn answer(line: &str, tx: &Sender<ControlMsg>) -> String {
+    let Some(Value::Map(req)) = crate::sources::parse_json(line.trim()) else {
+        return reply_line(&Value::Null, &Err(CtlError::msg("not a JSON object")));
     };
-    let stream = reader.into_inner();
-    // Best-effort write of the reply; a half-closed client is a
-    // benign case (`paneld ctl exit` disconnects after reading).
-    let _ = (&stream).write_all(reply.as_bytes());
-    let _ = (&stream).write_all(b"\n");
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let cmd = match req.get("cmd") {
+        Some(Value::String(c)) => c.clone(),
+        _ => return reply_line(&id, &Err(CtlError::msg("missing `cmd`"))),
+    };
+    let args = match req.get("args") {
+        Some(Value::Map(m)) => m.clone(),
+        None | Some(Value::Null) => BTreeMap::new(),
+        Some(_) => return reply_line(&id, &Err(CtlError::msg("`args` must be an object"))),
+    };
+    if cmd == "ping" {
+        return reply_line(&id, &Ok(Value::String("pong".into())));
+    }
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if tx.send(ControlMsg::Request(Request { cmd, args, reply: reply_tx })).is_err() {
+        return reply_line(&id, &Err(CtlError::msg("daemon is shutting down")));
+    }
+    // A reload can take a moment (it runs every source once).
+    let reply = reply_rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| Err(CtlError::msg("no answer from the daemon")));
+    reply_line(&id, &reply)
 }
 
-/// Scan a request body for `"cmd": "..."` and return the value.
-/// The daemon-side format is a single JSON object per line, with
-/// `cmd` always present. A full JSON parser is overkill for the
-/// three-command surface today.
-fn extract_cmd(line: &str) -> Option<String> {
-    let s = line.trim();
-    let key_at = s.find("\"cmd\"")?;
-    let after_key = &s[key_at + "\"cmd\"".len()..];
-    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
-    let rest = after_colon.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+fn reply_line(id: &Value, reply: &Reply) -> String {
+    match reply {
+        Ok(v) => format!(r#"{{"id":{},"ok":true,"result":{}}}"#, to_json(id), to_json(v)),
+        Err(e) => {
+            let mut err = format!(r#"{{"message":{}"#, json_string(&e.message));
+            if let Some(f) = &e.file {
+                err.push_str(&format!(r#","file":{}"#, json_string(f)));
+            }
+            if let Some(l) = e.line {
+                err.push_str(&format!(r#","line":{l}"#));
+            }
+            if let Some(c) = e.column {
+                err.push_str(&format!(r#","column":{c}"#));
+            }
+            err.push('}');
+            format!(r#"{{"id":{},"ok":false,"error":{err}}}"#, to_json(id))
+        }
+    }
 }
 
-fn reply_ok(msg: &str) -> String {
-    format!(r#"{{"ok":true,"msg":{}}}"#, json_escape(msg))
+/// Serialise a [`Value`] as JSON. Non-finite numbers become `null`.
+pub fn to_json(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::Double(d) if d.is_finite() => {
+            let s = d.to_string();
+            if s.contains(['.', 'e', 'E']) { s } else { format!("{s}.0") }
+        }
+        Value::Double(_) => "null".into(),
+        Value::String(s) => json_string(s),
+        Value::List(items) => {
+            format!("[{}]", items.iter().map(to_json).collect::<Vec<_>>().join(","))
+        }
+        Value::Map(m) => format!(
+            "{{{}}}",
+            m.iter()
+                .map(|(k, v)| format!("{}:{}", json_string(k), to_json(v)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
 }
 
-fn reply_err(msg: &str) -> String {
-    format!(r#"{{"ok":false,"msg":{}}}"#, json_escape(msg))
-}
-
-fn json_escape(s: &str) -> String {
+fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -159,9 +252,79 @@ fn json_escape(s: &str) -> String {
 // Client side (`paneld ctl ...`)
 // ---------------------------------------------------------------------------
 
-/// Send `cmd` to the daemon socket at `path` and print the reply.
-/// Returns 0 on an `ok: true` reply, 1 otherwise.
-pub fn call(path: &Path, cmd: &str) -> i32 {
+/// Build the request for `paneld ctl <args>`: `(cmd, args)`.
+pub fn parse_cli(args: &[String]) -> Result<(String, BTreeMap<String, Value>), String> {
+    let s = |v: &str| Value::String(v.to_string());
+    let mut a = BTreeMap::new();
+    let Some(cmd) = args.first() else {
+        return Err("missing command (ping, reload, check, eval, set, goto, alert, status, exit)".into());
+    };
+    let rest = &args[1..];
+    let cmd = match cmd.as_str() {
+        "ping" | "reload" | "check" | "status" | "exit" => {
+            if let Some(x) = rest.first() {
+                return Err(format!("unexpected argument `{x}`"));
+            }
+            cmd.clone()
+        }
+        "eval" => {
+            if rest.is_empty() {
+                return Err("`eval` needs an expression, e.g. paneld ctl eval 'sources.cpu.value'".into());
+            }
+            a.insert("expr".into(), s(&rest.join(" ")));
+            "eval".into()
+        }
+        "goto" => {
+            let [page] = rest else { return Err("`goto` needs one page name".into()) };
+            a.insert("page".into(), s(page));
+            "goto".into()
+        }
+        "set" => {
+            let [pair] = rest else { return Err("`set` needs `vars.<name>=<value>`".into()) };
+            let (k, v) = pair.split_once('=').ok_or("`set` needs `vars.<name>=<value>`")?;
+            let k = k.trim();
+            a.insert("var".into(), s(k.strip_prefix("vars.").unwrap_or(k)));
+            a.insert("value".into(), s(v));
+            "set".into()
+        }
+        "alert" => {
+            let (verb, id, extra) = match rest {
+                [verb, id, extra @ ..] => (verb.as_str(), id, extra),
+                _ => return Err("`alert fire|resolve <id> [severity=..] [title=..] [text=..] [link=..]`".into()),
+            };
+            a.insert("id".into(), s(id));
+            match verb {
+                "fire" => {
+                    for kv in extra {
+                        let (k, v) = kv.split_once('=').ok_or(format!("expected key=value, got `{kv}`"))?;
+                        if !matches!(k, "severity" | "title" | "text" | "link") {
+                            return Err(format!("unknown alert field `{k}`"));
+                        }
+                        a.insert(k.into(), s(v));
+                    }
+                    "alert_fire".into()
+                }
+                "resolve" if extra.is_empty() => "alert_resolve".into(),
+                "resolve" => return Err("`alert resolve` takes only the id".into()),
+                other => return Err(format!("unknown alert verb `{other}` (fire, resolve)")),
+            }
+        }
+        other => return Err(format!("unknown command `{other}`")),
+    };
+    Ok((cmd, a))
+}
+
+/// Run `paneld ctl <args>` against the socket at `path`. Prints the
+/// result for people, or the raw reply with `json`. Exit status: 0 ok,
+/// 1 the daemon reported an error, 2 usage or connection problem.
+pub fn call(path: &Path, args: &[String], json: bool) -> i32 {
+    let (cmd, a) = match parse_cli(args) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("paneld ctl: {e}");
+            return 2;
+        }
+    };
     let stream = match UnixStream::connect(path) {
         Ok(s) => s,
         Err(e) => {
@@ -169,23 +332,86 @@ pub fn call(path: &Path, cmd: &str) -> i32 {
             return 2;
         }
     };
-    let request = format!(r#"{{"cmd":{}}}"#, json_escape(cmd));
-    if let Err(e) = (&stream).write_all(request.as_bytes()).and_then(|_| (&stream).write_all(b"\n"))
-    {
-        eprintln!("paneld ctl: write: {e}");
+    let mut reader = BufReader::new(&stream);
+    let mut greeting = String::new();
+    if reader.read_line(&mut greeting).is_err() {
+        eprintln!("paneld ctl: no greeting from the daemon");
         return 2;
     }
-    let mut reader = BufReader::new(stream);
+    match crate::sources::parse_json(greeting.trim()) {
+        Some(Value::Map(g)) if g.get("protocol") == Some(&Value::Int(PROTOCOL)) => {}
+        _ => {
+            eprintln!("paneld ctl: the daemon speaks another protocol: {}", greeting.trim());
+            return 2;
+        }
+    }
+    let request = format!(
+        r#"{{"id":1,"cmd":{},"args":{}}}"#,
+        json_string(&cmd),
+        to_json(&Value::Map(a))
+    );
+    if writeln!(&stream, "{request}").is_err() {
+        eprintln!("paneld ctl: write failed");
+        return 2;
+    }
     let mut reply = String::new();
-    if let Err(e) = reader.read_line(&mut reply) {
-        eprintln!("paneld ctl: read: {e}");
+    if reader.read_line(&mut reply).is_err() || reply.is_empty() {
+        eprintln!("paneld ctl: no reply");
         return 2;
     }
-    print!("{reply}");
-    if reply.contains(r#""ok":true"#) {
+    if json {
+        print!("{reply}");
+    }
+    let Some(Value::Map(r)) = crate::sources::parse_json(reply.trim()) else {
+        eprintln!("paneld ctl: bad reply: {}", reply.trim());
+        return 2;
+    };
+    if r.get("ok") == Some(&Value::Bool(true)) {
+        if !json {
+            print_for_people(&cmd, r.get("result").unwrap_or(&Value::Null));
+        }
         0
     } else {
+        if !json {
+            if let Some(Value::Map(e)) = r.get("error") {
+                let msg = e.get("message").map(|m| m.to_display_string()).unwrap_or_default();
+                match (e.get("file"), e.get("line"), e.get("column")) {
+                    (Some(f), Some(l), Some(c)) => eprintln!(
+                        "{}:{}:{}: {msg}",
+                        f.to_display_string(),
+                        l.to_display_string(),
+                        c.to_display_string()
+                    ),
+                    _ => eprintln!("paneld ctl: {msg}"),
+                }
+            }
+        }
         1
+    }
+}
+
+/// A result as a person wants to read it: scalars plain, `check`
+/// issues one per line like `paneld check`, the rest as JSON.
+fn print_for_people(cmd: &str, result: &Value) {
+    match (cmd, result) {
+        ("check", Value::List(issues)) if issues.is_empty() => println!("ok"),
+        ("check", Value::List(issues)) => {
+            for i in issues {
+                let Value::Map(m) = i else { continue };
+                let get = |k: &str| m.get(k).map(Value::to_display_string);
+                match (get("file"), get("line"), get("column")) {
+                    (Some(f), Some(l), Some(c)) => {
+                        println!("{f}:{l}:{c}: {}", get("message").unwrap_or_default())
+                    }
+                    _ => println!("{}", get("message").unwrap_or_default()),
+                }
+            }
+        }
+        (_, Value::Null) => {}
+        (_, v @ (Value::String(_) | Value::Int(_) | Value::Double(_) | Value::Bool(_))) => {
+            println!("{}", v.to_display_string())
+        }
+        (_, v) => println!("{}", to_json(v)),
     }
 }
 
@@ -193,22 +419,93 @@ pub fn call(path: &Path, cmd: &str) -> i32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn extract_cmd_simple() {
-        assert_eq!(
-            extract_cmd(r#"{"cmd": "ping"}"#),
-            Some("ping".into())
-        );
-        assert_eq!(
-            extract_cmd(r#" {  "cmd":"reload"} "#),
-            Some("reload".into())
-        );
-        assert_eq!(extract_cmd(r#"{"other": "x"}"#), None);
+    fn cli(a: &[&str]) -> Result<(String, BTreeMap<String, Value>), String> {
+        parse_cli(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
     #[test]
-    fn json_escape_handles_quotes_and_control() {
-        assert_eq!(json_escape(r#"he said "hi""#), r#""he said \"hi\"""#);
-        assert_eq!(json_escape("a\nb"), r#""a\nb""#);
+    fn json_round_trips_through_the_reader() {
+        let mut m = BTreeMap::new();
+        m.insert("s".to_string(), Value::String("he said \"hi\"\n".into()));
+        m.insert("n".to_string(), Value::Int(-3));
+        m.insert("d".to_string(), Value::Double(2.0));
+        m.insert("l".to_string(), Value::List(vec![Value::Bool(true), Value::Null]));
+        let v = Value::Map(m);
+        assert_eq!(crate::sources::parse_json(&to_json(&v)), Some(v));
+        assert_eq!(to_json(&Value::Double(f64::NAN)), "null");
+    }
+
+    #[test]
+    fn cli_builds_requests() {
+        assert_eq!(cli(&["ping"]).unwrap().0, "ping");
+        let (c, a) = cli(&["eval", "sources.cpu.value", ">", "70"]).unwrap();
+        assert_eq!(c, "eval");
+        assert_eq!(a["expr"], Value::String("sources.cpu.value > 70".into()));
+        let (c, a) = cli(&["set", "vars.tab=2"]).unwrap();
+        assert_eq!((c.as_str(), &a["var"], &a["value"]), ("set", &Value::String("tab".into()), &Value::String("2".into())));
+        let (c, a) = cli(&["alert", "fire", "disk", "severity=critical", "title=Disk full"]).unwrap();
+        assert_eq!(c, "alert_fire");
+        assert_eq!(a["title"], Value::String("Disk full".into()));
+        assert_eq!(cli(&["alert", "resolve", "disk"]).unwrap().0, "alert_resolve");
+        assert!(cli(&["alert", "fire", "x", "color=red"]).is_err());
+        assert!(cli(&["goto"]).is_err());
+        assert!(cli(&["frobnicate"]).is_err());
+    }
+
+    #[test]
+    fn replies_follow_adr_0014() {
+        assert_eq!(
+            reply_line(&Value::Int(7), &Ok(Value::Double(48.2))),
+            r#"{"id":7,"ok":true,"result":48.2}"#
+        );
+        let e = CtlError {
+            message: "bad".into(),
+            file: Some("a.conf".into()),
+            line: Some(3),
+            column: Some(5),
+        };
+        assert_eq!(
+            reply_line(&Value::Int(1), &Err(e)),
+            r#"{"id":1,"ok":false,"error":{"message":"bad","file":"a.conf","line":3,"column":5}}"#
+        );
+    }
+
+    #[test]
+    fn a_connection_gets_a_greeting_and_several_answers() {
+        let dir = std::env::temp_dir().join(format!("paneld-ctl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let (tx, rx) = mpsc::channel();
+        serve(&sock, tx).unwrap();
+        // A fake main loop answering `eval` with the expression text.
+        thread::spawn(move || {
+            for msg in rx {
+                if let ControlMsg::Request(r) = msg {
+                    let expr = r.arg("expr");
+                    let _ = r.reply.send(expr.map(Value::String));
+                }
+            }
+        });
+        let stream = UnixStream::connect(&sock).unwrap();
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""protocol":1"#), "{line}");
+        writeln!(&stream, r#"{{"id":1,"cmd":"ping"}}"#).unwrap();
+        writeln!(&stream, r#"{{"id":2,"cmd":"eval","args":{{"expr":"1+1"}}}}"#).unwrap();
+        writeln!(&stream, r#"{{"id":3,"cmd":"eval"}}"#).unwrap();
+        let mut replies = Vec::new();
+        for _ in 0..3 {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            replies.push(line.trim().to_string());
+        }
+        assert_eq!(replies[0], r#"{"id":1,"ok":true,"result":"pong"}"#);
+        assert_eq!(replies[1], r#"{"id":2,"ok":true,"result":"1+1"}"#);
+        assert!(replies[2].starts_with(r#"{"id":3,"ok":false"#), "{}", replies[2]);
+        let mode = std::fs::metadata(&sock).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(mode.mode() & 0o777, 0o660);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
