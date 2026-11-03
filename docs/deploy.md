@@ -117,4 +117,5 @@ Without a usable `security.pin` a guarded action refuses to run. A config reload
 
 - `journalctl -u paneld -f` -- daemon logs.
 - `paneld check -c /etc/paneld/paneld.conf` -- offline config validation ([Config format](config-format.md)).
+- `paneld shot -c paneld.conf -o page.png [--page P] [--size 800x480] [--tap X,Y]...` -- render the UI without a display into a PNG, optionally after taps. Sources and tapped actions run for real; the alert state file is not touched.
 - `paneld ctl ping` / `reload` / `exit` -- talk to a running daemon over its Unix socket at `$PANELD_SOCK` (set to `/run/paneld/paneld.sock` by the service file).

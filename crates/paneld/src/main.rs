@@ -12,6 +12,7 @@ mod alerts;
 mod ctl;
 mod display;
 mod pin;
+mod png;
 mod runner;
 mod secrets;
 mod sources;
@@ -39,6 +40,7 @@ fn main() -> ExitCode {
         Ok(Cmd::Check { config }) => run_check(config),
         Ok(Cmd::Ctl { args }) => run_ctl(&args),
         Ok(Cmd::HashPin) => run_hash_pin(),
+        Ok(Cmd::Shot(opts)) => run_shot(opts),
         Err(e) => {
             eprintln!("paneld: {e}");
             eprintln!("try `paneld --help`");
@@ -55,6 +57,70 @@ enum Cmd {
     Check { config: PathBuf },
     Ctl { args: Vec<String> },
     HashPin,
+    Shot(ShotOpts),
+}
+
+/// `paneld shot`: render the config headless to a PNG.
+#[derive(Debug, PartialEq, Eq)]
+struct ShotOpts {
+    config: PathBuf,
+    out: PathBuf,
+    page: Option<String>,
+    size: (i32, i32),
+    taps: Vec<(i32, i32)>,
+    settle_ms: u32,
+}
+
+fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, String> {
+    let mut o = ShotOpts {
+        config: config.unwrap_or_else(default_config),
+        out: PathBuf::new(),
+        page: None,
+        size: (800, 480),
+        taps: Vec::new(),
+        settle_ms: 300,
+    };
+    let mut i = 0;
+    let val = |i: &mut usize, flag: &str| -> Result<String, String> {
+        *i += 1;
+        args.get(*i).cloned().ok_or(format!("`{flag}` needs a value"))
+    };
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-c" | "--config" => o.config = PathBuf::from(val(&mut i, a)?),
+            "-o" | "--out" => o.out = PathBuf::from(val(&mut i, a)?),
+            "--page" => o.page = Some(val(&mut i, a)?),
+            "--size" => {
+                let v = val(&mut i, a)?;
+                let (w, h) = v.split_once('x').ok_or("`--size` is WIDTHxHEIGHT")?;
+                o.size = (
+                    w.parse().map_err(|_| "bad `--size` width")?,
+                    h.parse().map_err(|_| "bad `--size` height")?,
+                );
+                if o.size.0 <= 0 || o.size.1 <= 0 || o.size.0 > 4096 || o.size.1 > 4096 {
+                    return Err("`--size` must be within 1x1..4096x4096".into());
+                }
+            }
+            "--tap" => {
+                let v = val(&mut i, a)?;
+                let (x, y) = v.split_once(',').ok_or("`--tap` is X,Y")?;
+                o.taps.push((
+                    x.trim().parse().map_err(|_| "bad `--tap` x")?,
+                    y.trim().parse().map_err(|_| "bad `--tap` y")?,
+                ));
+            }
+            "--settle" => {
+                o.settle_ms = val(&mut i, a)?.parse().map_err(|_| "bad `--settle` ms")?;
+            }
+            s => return Err(format!("unexpected argument `{s}` to `shot`")),
+        }
+        i += 1;
+    }
+    if o.out.as_os_str().is_empty() {
+        return Err("`shot` needs `-o FILE.png`".into());
+    }
+    Ok(o)
 }
 
 fn parse_args(args: &[String]) -> Result<Cmd, String> {
@@ -108,6 +174,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             Ok(Cmd::Check { config: config.unwrap_or_else(default_config) })
         }
         Some("ctl") => Ok(Cmd::Ctl { args: args[i..].to_vec() }),
+        Some("shot") => parse_shot(&args[i..], config).map(Cmd::Shot),
         Some("hash-pin") => match args.get(i) {
             None => Ok(Cmd::HashPin),
             Some(s) => Err(format!(
@@ -133,6 +200,10 @@ Usage:
   paneld ctl SUBCOMMAND [ARGS...]     Talk to a running daemon
   paneld hash-pin                     Read a PIN on stdin, print its
                                       argon2 hash for security.pin
+  paneld shot -o FILE.png [--page P] [--size WxH] [--tap X,Y]... [--settle MS]
+                                      Render the config headless to a PNG,
+                                      after the given taps (runs sources
+                                      and tapped actions for real)
 
 Flags:
   -c, --config PATH   Config file (default: {DEFAULT_CONFIG})
@@ -223,228 +294,7 @@ fn run_daemon(config: PathBuf) -> ExitCode {
             }
         }
 
-        // Drain UI events: actions forward to the action worker,
-        // gotos update the current page, vars changes trigger a
-        // re-render (the worker already wrote the new values).
-        let mut dirty = false;
-        while let Ok(ev) = live.event_rx.try_recv() {
-            match ev {
-                paneld_ui::UiEvent::Action { name, args } => {
-                    // Taps cannot reach here while a modal is up (the
-                    // page's bindings are gone); `then` / `else` chains
-                    // from the worker can. Hold them until the modal
-                    // closes so they get their own gates.
-                    let call = actions::Call::new(name, args);
-                    if live.pending.is_some() {
-                        live.deferred.push_back(call);
-                    } else {
-                        route_call(&mut live, &screen, call, false);
-                    }
-                }
-                paneld_ui::UiEvent::PinEntered { digits } => {
-                    // Only meaningful while the PIN modal is up; a
-                    // stray READY (double OK) must not consume a
-                    // confirm or notice stage. An empty entry is not
-                    // an attempt.
-                    let at_pin = matches!(
-                        live.pending,
-                        Some(Pending { stage: Stage::Pin, .. })
-                    );
-                    if at_pin && !digits.is_empty() {
-                        let Some(Pending { call, .. }) = live.pending.take() else {
-                            unreachable!()
-                        };
-                        let now = std::time::Instant::now();
-                        match live.pin_gate.check(&digits, now) {
-                            pin::Check::Ok => route_call(&mut live, &screen, call, true),
-                            pin::Check::Wrong { remaining } => {
-                                eprintln!(
-                                    "paneld: wrong PIN for action `{}`, {remaining} left",
-                                    call.name
-                                );
-                                show_pin_modal(
-                                    &screen,
-                                    &call.name,
-                                    Some(&format!(
-                                        "Wrong PIN, {remaining} tr{} left",
-                                        if remaining == 1 { "y" } else { "ies" }
-                                    )),
-                                    &live.event_tx,
-                                );
-                                live.pending = Some(Pending { call, stage: Stage::Pin });
-                            }
-                            pin::Check::LockedOut { for_ } => {
-                                eprintln!("paneld: PIN locked out for {for_:?}");
-                                show_notice(
-                                    &screen,
-                                    &format!("Too many wrong PINs. Locked for {}s.", for_.as_secs()),
-                                    &live.event_tx,
-                                );
-                                live.pending = Some(Pending { call, stage: Stage::Notice });
-                            }
-                            pin::Check::NotConfigured => {
-                                show_notice(
-                                    &screen,
-                                    "No PIN is configured (security.pin); action refused.",
-                                    &live.event_tx,
-                                );
-                                live.pending = Some(Pending { call, stage: Stage::Notice });
-                            }
-                        }
-                        dirty = live.pending.is_none();
-                    }
-                }
-                paneld_ui::UiEvent::ConfirmReply { accept } => {
-                    if let Some(Pending { mut call, stage }) = live.pending.take() {
-                        if accept && matches!(stage, Stage::Confirm) {
-                            call.cleared = true;
-                            let _ = live.action_tx.send(call);
-                        }
-                    }
-                    dirty = true;
-                }
-                paneld_ui::UiEvent::Goto { page } => {
-                    if page != live.current_page {
-                        live.current_page = page;
-                        dirty = true;
-                    }
-                }
-                paneld_ui::UiEvent::InlineSet { assigns } => {
-                    let ctx = build_ctx(
-                        &live.source_values,
-                        &live.theme,
-                        &live.secrets,
-                        &live.vars,
-                        Some(&live.alerts),
-                    );
-                    if actions::apply_inline_set(
-                        &assigns,
-                        &ctx,
-                        &live.var_types,
-                        &live.vars,
-                    ) {
-                        dirty = true;
-                    }
-                }
-                paneld_ui::UiEvent::ChangeInlineSet { assigns, event_value } => {
-                    let mut ctx = build_ctx(
-                        &live.source_values,
-                        &live.theme,
-                        &live.secrets,
-                        &live.vars,
-                        Some(&live.alerts),
-                    );
-                    let v = match event_value {
-                        paneld_ui::EventValue::Bool(b) => paneld_ui::Value::Bool(b),
-                        paneld_ui::EventValue::Int(n) => paneld_ui::Value::Int(n),
-                        paneld_ui::EventValue::Double(d) => paneld_ui::Value::Double(d),
-                        paneld_ui::EventValue::String(s) => paneld_ui::Value::String(s),
-                    };
-                    let mut event = std::collections::BTreeMap::new();
-                    event.insert("value".to_string(), v);
-                    ctx.insert("event".into(), paneld_ui::Value::Map(event));
-                    if actions::apply_inline_set(
-                        &assigns,
-                        &ctx,
-                        &live.var_types,
-                        &live.vars,
-                    ) {
-                        dirty = true;
-                    }
-                }
-                paneld_ui::UiEvent::VarsChanged => {
-                    dirty = true;
-                }
-            }
-        }
-
-        // Chained calls that arrived while a modal was up, in order,
-        // until one of them opens a modal of its own.
-        while live.pending.is_none() {
-            let Some(call) = live.deferred.pop_front() else { break };
-            route_call(&mut live, &screen, call, false);
-        }
-
-        // Drain source updates and re-render if anything changed.
-        // Each new source value is also an event for any
-        // `alert ... { from = <this source> }` rule. Insert the new
-        // sample first so `sources.<name>.value` inside the rule's
-        // expressions agrees with `event.value`, then build the eval
-        // ctx including the current `alerts` map for symmetry with
-        // the render-side ctx.
-        while let Ok(update) = live.source_rx.try_recv() {
-            let event_value = update.value.clone();
-            live.source_values
-                .lock()
-                .unwrap()
-                .insert(update.name.clone(), update.value);
-            let event_ctx = build_ctx(
-                &live.source_values,
-                &live.theme,
-                &live.secrets,
-                &live.vars,
-                Some(&live.alerts),
-            );
-            let _ = live.alerts.ingest_event(
-                &update.name,
-                &event_value,
-                &event_ctx,
-                std::time::SystemTime::now(),
-            );
-            dirty = true;
-        }
-
-        // Tick the alert engine against the latest sources + vars. A
-        // transition (fire or resolve) marks the frame dirty so the
-        // header badge and overview reflect it right away.
-        let alerts_ctx = build_ctx(
-            &live.source_values,
-            &live.theme,
-            &live.secrets,
-            &live.vars,
-            None,
-        );
-        let now_instant = std::time::Instant::now();
-        if live.alerts.tick(
-            &alerts_ctx,
-            now_instant,
-            std::time::SystemTime::now(),
-        ) {
-            dirty = true;
-        }
-        // Keep the state file (ADR 0014) in sync. `note` is cheap:
-        // it only flags a pending write when the set actually
-        // changed. `flush_if_due` writes at most once per 10s.
-        live.state.note(live.alerts.active_alerts());
-        live.state.flush_if_due(now_instant);
-
-        if dirty && live.pending.is_none() {
-            let ctx = build_ctx(
-                &live.source_values,
-                &live.theme,
-                &live.secrets,
-                &live.vars,
-                Some(&live.alerts),
-            );
-            // A poll landing mid-entry must not wipe digits the user
-            // is typing into a keypad on the same page.
-            let typed = paneld_ui::snapshot_inputs();
-            let same_page = live.rendered_page == live.current_page;
-            screen.clear_children();
-            paneld_ui::reset_action_bindings();
-            paneld_ui::render_page(
-                &live.doc,
-                &live.current_page,
-                &ctx,
-                &live.event_tx,
-                &screen,
-            );
-            if same_page {
-                paneld_ui::restore_inputs(&typed);
-            }
-            live.rendered_page = live.current_page.clone();
-        }
-
+        process(&mut live, &screen);
         pump.step();
     }
 
@@ -455,6 +305,234 @@ fn run_daemon(config: PathBuf) -> ExitCode {
     std::thread::sleep(std::time::Duration::from_millis(100));
     let _ = std::fs::remove_file(&sock_path);
     ExitCode::SUCCESS
+}
+
+/// One pass of the main loop after the ctl messages: UI events,
+/// deferred chained calls, source updates, alerts, state file and
+/// (when something changed) a re-render. Shared by the daemon and
+/// `paneld shot`.
+fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
+    // Drain UI events: actions forward to the action worker,
+    // gotos update the current page, vars changes trigger a
+    // re-render (the worker already wrote the new values).
+    let mut dirty = false;
+    while let Ok(ev) = live.event_rx.try_recv() {
+        match ev {
+            paneld_ui::UiEvent::Action { name, args } => {
+                // Taps cannot reach here while a modal is up (the
+                // page's bindings are gone); `then` / `else` chains
+                // from the worker can. Hold them until the modal
+                // closes so they get their own gates.
+                let call = actions::Call::new(name, args);
+                if live.pending.is_some() {
+                    live.deferred.push_back(call);
+                } else {
+                    route_call(live, screen, call, false);
+                }
+            }
+            paneld_ui::UiEvent::PinEntered { digits } => {
+                // Only meaningful while the PIN modal is up; a
+                // stray READY (double OK) must not consume a
+                // confirm or notice stage. An empty entry is not
+                // an attempt.
+                let at_pin = matches!(
+                    live.pending,
+                    Some(Pending { stage: Stage::Pin, .. })
+                );
+                if at_pin && !digits.is_empty() {
+                    let Some(Pending { call, .. }) = live.pending.take() else {
+                        unreachable!()
+                    };
+                    let now = std::time::Instant::now();
+                    match live.pin_gate.check(&digits, now) {
+                        pin::Check::Ok => route_call(live, screen, call, true),
+                        pin::Check::Wrong { remaining } => {
+                            eprintln!(
+                                "paneld: wrong PIN for action `{}`, {remaining} left",
+                                call.name
+                            );
+                            show_pin_modal(
+                                screen,
+                                &call.name,
+                                Some(&format!(
+                                    "Wrong PIN, {remaining} tr{} left",
+                                    if remaining == 1 { "y" } else { "ies" }
+                                )),
+                                &live.event_tx,
+                            );
+                            live.pending = Some(Pending { call, stage: Stage::Pin });
+                        }
+                        pin::Check::LockedOut { for_ } => {
+                            eprintln!("paneld: PIN locked out for {for_:?}");
+                            show_notice(
+                                screen,
+                                &format!("Too many wrong PINs. Locked for {}s.", for_.as_secs()),
+                                &live.event_tx,
+                            );
+                            live.pending = Some(Pending { call, stage: Stage::Notice });
+                        }
+                        pin::Check::NotConfigured => {
+                            show_notice(
+                                screen,
+                                "No PIN is configured (security.pin); action refused.",
+                                &live.event_tx,
+                            );
+                            live.pending = Some(Pending { call, stage: Stage::Notice });
+                        }
+                    }
+                    dirty = live.pending.is_none();
+                }
+            }
+            paneld_ui::UiEvent::ConfirmReply { accept } => {
+                if let Some(Pending { mut call, stage }) = live.pending.take() {
+                    if accept && matches!(stage, Stage::Confirm) {
+                        call.cleared = true;
+                        let _ = live.action_tx.send(call);
+                    }
+                }
+                dirty = true;
+            }
+            paneld_ui::UiEvent::Goto { page } => {
+                if page != live.current_page {
+                    live.current_page = page;
+                    dirty = true;
+                }
+            }
+            paneld_ui::UiEvent::InlineSet { assigns } => {
+                let ctx = build_ctx(
+                    &live.source_values,
+                    &live.theme,
+                    &live.secrets,
+                    &live.vars,
+                    Some(&live.alerts),
+                );
+                if actions::apply_inline_set(
+                    &assigns,
+                    &ctx,
+                    &live.var_types,
+                    &live.vars,
+                ) {
+                    dirty = true;
+                }
+            }
+            paneld_ui::UiEvent::ChangeInlineSet { assigns, event_value } => {
+                let mut ctx = build_ctx(
+                    &live.source_values,
+                    &live.theme,
+                    &live.secrets,
+                    &live.vars,
+                    Some(&live.alerts),
+                );
+                let v = match event_value {
+                    paneld_ui::EventValue::Bool(b) => paneld_ui::Value::Bool(b),
+                    paneld_ui::EventValue::Int(n) => paneld_ui::Value::Int(n),
+                    paneld_ui::EventValue::Double(d) => paneld_ui::Value::Double(d),
+                    paneld_ui::EventValue::String(s) => paneld_ui::Value::String(s),
+                };
+                let mut event = std::collections::BTreeMap::new();
+                event.insert("value".to_string(), v);
+                ctx.insert("event".into(), paneld_ui::Value::Map(event));
+                if actions::apply_inline_set(
+                    &assigns,
+                    &ctx,
+                    &live.var_types,
+                    &live.vars,
+                ) {
+                    dirty = true;
+                }
+            }
+            paneld_ui::UiEvent::VarsChanged => {
+                dirty = true;
+            }
+        }
+    }
+
+    // Chained calls that arrived while a modal was up, in order,
+    // until one of them opens a modal of its own.
+    while live.pending.is_none() {
+        let Some(call) = live.deferred.pop_front() else { break };
+        route_call(live, screen, call, false);
+    }
+
+    // Drain source updates and re-render if anything changed.
+    // Each new source value is also an event for any
+    // `alert ... { from = <this source> }` rule. Insert the new
+    // sample first so `sources.<name>.value` inside the rule's
+    // expressions agrees with `event.value`, then build the eval
+    // ctx including the current `alerts` map for symmetry with
+    // the render-side ctx.
+    while let Ok(update) = live.source_rx.try_recv() {
+        let event_value = update.value.clone();
+        live.source_values
+            .lock()
+            .unwrap()
+            .insert(update.name.clone(), update.value);
+        let event_ctx = build_ctx(
+            &live.source_values,
+            &live.theme,
+            &live.secrets,
+            &live.vars,
+            Some(&live.alerts),
+        );
+        let _ = live.alerts.ingest_event(
+            &update.name,
+            &event_value,
+            &event_ctx,
+            std::time::SystemTime::now(),
+        );
+        dirty = true;
+    }
+
+    // Tick the alert engine against the latest sources + vars. A
+    // transition (fire or resolve) marks the frame dirty so the
+    // header badge and overview reflect it right away.
+    let alerts_ctx = build_ctx(
+        &live.source_values,
+        &live.theme,
+        &live.secrets,
+        &live.vars,
+        None,
+    );
+    let now_instant = std::time::Instant::now();
+    if live.alerts.tick(
+        &alerts_ctx,
+        now_instant,
+        std::time::SystemTime::now(),
+    ) {
+        dirty = true;
+    }
+    // Keep the state file (ADR 0014) in sync. `note` is cheap:
+    // it only flags a pending write when the set actually
+    // changed. `flush_if_due` writes at most once per 10s.
+    live.state.note(live.alerts.active_alerts());
+    live.state.flush_if_due(now_instant);
+
+    if dirty && live.pending.is_none() {
+        let ctx = build_ctx(
+            &live.source_values,
+            &live.theme,
+            &live.secrets,
+            &live.vars,
+            Some(&live.alerts),
+        );
+        // A poll landing mid-entry must not wipe digits the user
+        // is typing into a keypad on the same page.
+        let typed = paneld_ui::snapshot_inputs();
+        let same_page = live.rendered_page == live.current_page;
+        screen.clear_children();
+        paneld_ui::reset_action_bindings();
+        paneld_ui::render_page(
+            &live.doc,
+            &live.current_page,
+            &ctx,
+            &live.event_tx,
+            screen,
+        );
+        if same_page {
+            paneld_ui::restore_inputs(&typed);
+        }
+        live.rendered_page = live.current_page.clone();
+    }
 }
 
 /// Everything the main loop re-creates on a `reload`.
@@ -729,11 +807,12 @@ fn show_pin_modal(
     paneld_ui::reset_action_bindings();
     screen.clear_children();
     let box_ = screen.new_msgbox();
-    box_.msgbox_add_title(&format!("PIN for `{action_name}`"));
+    box_.msgbox_add_title(&format!("PIN for {action_name}"));
     if let Some(e) = error {
         box_.msgbox_add_text(e);
     }
     let ta = box_.msgbox_content().new_textarea(true, 12);
+    ta.set_size(paneld_ui::ui::Size::Percent(100), paneld_ui::ui::Size::Content);
     box_.msgbox_add_confirm_button("Cancel", false, sink.clone());
     // The keyboard takes the bottom half of the screen; keep the box
     // (and its Cancel) in the top half.
@@ -768,7 +847,7 @@ fn show_confirm_modal(
     paneld_ui::reset_action_bindings();
     screen.clear_children();
     let box_ = screen.new_msgbox();
-    box_.msgbox_add_title(&format!("Run `{action_name}`?"));
+    box_.msgbox_add_title(&format!("Run {action_name}?"));
     box_.msgbox_add_text(message);
     box_.msgbox_add_confirm_button("Cancel", false, sink.clone());
     box_.msgbox_add_confirm_button("OK", true, sink.clone());
@@ -828,6 +907,61 @@ fn run_check(config: PathBuf) -> ExitCode {
         if diags.len() == 1 { "" } else { "s" }
     );
     ExitCode::from(1)
+}
+
+fn run_shot(o: ShotOpts) -> ExitCode {
+    let ui = match paneld_ui::Ui::init() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("paneld shot: {e}");
+            return ExitCode::from(70);
+        }
+    };
+    let mut mem = ui.open_memory_display(o.size.0, o.size.1);
+    let screen = ui.screen();
+    let mut live = match setup_live_state(&o.config, &screen) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    // A snapshot must never write the real alert state file.
+    let scratch_state = std::env::temp_dir().join(format!("paneld-shot-{}.state", std::process::id()));
+    live.state = state::Store::open(scratch_state.clone());
+
+    // Run the UI for `ms`, in real time so action and source threads
+    // get to finish what a tap started.
+    let settle = |live: &mut LiveState, ms: u32| {
+        for _ in 0..ms.div_ceil(20).max(1) {
+            ui.advance(20);
+            process(live, &screen);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+
+    if let Some(page) = &o.page {
+        let _ = live.event_tx.send(paneld_ui::UiEvent::Goto { page: page.clone() });
+    }
+    settle(&mut live, o.settle_ms);
+    for &(x, y) in &o.taps {
+        mem.set_pointer(x, y, true);
+        settle(&mut live, 100);
+        mem.set_pointer(x, y, false);
+        settle(&mut live, o.settle_ms);
+    }
+
+    let (w, h) = mem.size();
+    let png = png::encode_rgb(w, h, &mem.rgb());
+    live.sources_shutdown.stop();
+    let _ = std::fs::remove_file(&scratch_state);
+    match std::fs::write(&o.out, png) {
+        Ok(()) => {
+            println!("{}", o.out.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("paneld shot: writing {}: {e}", o.out.display());
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// `paneld hash-pin`: read one line (the PIN) from stdin and print
@@ -985,6 +1119,24 @@ mod tests {
         assert_eq!(config_dir_of(Path::new("/etc/paneld/paneld.conf")), PathBuf::from("/etc/paneld"));
         assert_eq!(config_dir_of(Path::new("conf/p.conf")), PathBuf::from("conf"));
         assert_eq!(config_dir_of(Path::new("/")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn shot_parses_its_options() {
+        let Ok(Cmd::Shot(o)) = parse(&[
+            "-c", "a.conf", "shot", "-o", "x.png", "--page", "p", "--size", "320x240",
+            "--tap", "10,20", "--tap", "30, 40", "--settle", "50",
+        ]) else {
+            panic!("expected shot");
+        };
+        assert_eq!(o.config, PathBuf::from("a.conf"));
+        assert_eq!(o.out, PathBuf::from("x.png"));
+        assert_eq!(o.page.as_deref(), Some("p"));
+        assert_eq!(o.size, (320, 240));
+        assert_eq!(o.taps, vec![(10, 20), (30, 40)]);
+        assert_eq!(o.settle_ms, 50);
+        assert!(parse(&["shot"]).unwrap_err().contains("-o"));
+        assert!(parse(&["shot", "-o", "x.png", "--size", "0x10"]).is_err());
     }
 
     #[test]

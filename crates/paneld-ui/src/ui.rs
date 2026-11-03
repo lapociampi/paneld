@@ -7,7 +7,7 @@
 
 use std::ffi::CString;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -260,20 +260,24 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
     }
 }
 
-/// Read the text of the textarea attached to keyboard `kb`. Empty
-/// when no textarea is linked.
+/// Take the text of the textarea attached to keyboard `kb` and clear
+/// the field: a submitted entry is consumed (and a masked one should
+/// not linger on screen). Empty when no textarea is linked.
 fn keyboard_text(kb: *mut sys::lv_obj_t) -> String {
     let ta = unsafe { sys::lv_keyboard_get_textarea(kb) };
     if ta.is_null() {
         return String::new();
     }
     let cstr = unsafe { sys::lv_textarea_get_text(ta) };
-    if cstr.is_null() {
-        return String::new();
-    }
-    unsafe { std::ffi::CStr::from_ptr(cstr) }
-        .to_string_lossy()
-        .into_owned()
+    let text = if cstr.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(cstr) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    unsafe { sys::lv_textarea_set_text(ta, c"".as_ptr()) };
+    text
 }
 
 // LVGL's `LV_SIZE_CONTENT`, `LV_PCT(x)` and the grid sentinels are C
@@ -384,6 +388,46 @@ impl Ui {
         !indev.is_null()
     }
 
+    /// A display that renders into memory instead of a screen, with a
+    /// scriptable pointer. For `paneld shot`: render a page (and the
+    /// result of taps on it) to an image without any hardware.
+    pub fn open_memory_display(&self, width: i32, height: i32) -> MemDisplay {
+        let display = unsafe { sys::lv_display_create(width, height) };
+        assert!(!display.is_null(), "lv_display_create returned null");
+        // One full-size buffer in DIRECT mode: after a refresh it holds
+        // the whole frame. u32 elements keep it 4-byte aligned and big
+        // enough for any color format up to 32 bits.
+        let mut buf = vec![0u32; (width * height) as usize].into_boxed_slice();
+        unsafe {
+            sys::lv_display_set_flush_cb(display, Some(mem_flush));
+            sys::lv_display_set_buffers(
+                display,
+                buf.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+                (buf.len() * 4) as u32,
+                sys::lv_display_render_mode_t_LV_DISPLAY_RENDER_MODE_DIRECT,
+            );
+            sys::lv_display_set_default(display);
+        }
+        let indev = unsafe { sys::lv_indev_create() };
+        assert!(!indev.is_null());
+        unsafe {
+            sys::lv_indev_set_type(indev, sys::lv_indev_type_t_LV_INDEV_TYPE_POINTER);
+            sys::lv_indev_set_read_cb(indev, Some(mem_pointer_read));
+            sys::lv_indev_set_display(indev, display);
+        }
+        MemDisplay { display, buf, width, height }
+    }
+
+    /// Advance LVGL's clock by `ms` and run its timers, without
+    /// sleeping. Drives a [`MemDisplay`].
+    pub fn advance(&self, ms: u32) {
+        unsafe {
+            sys::lv_tick_inc(ms);
+            sys::lv_timer_handler();
+        }
+    }
+
     /// Return a handle to the active screen's root `lv_obj`. Children
     /// added to it are drawn on the next frame.
     pub fn screen(&self) -> Obj<'_> {
@@ -448,6 +492,124 @@ impl Drop for Ui {
         // SAFETY: paired with `lv_init` in `Ui::init`.
         unsafe { sys::lv_deinit() };
         LVGL_INITIALIZED.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Keyboard map for digit entry. LVGL keeps the pointers (it does
+/// not copy the map), so it lives in a static. The keyboard reacts
+/// to the button texts: LV_SYMBOL_BACKSPACE deletes, LV_SYMBOL_OK
+/// sends READY.
+struct KbMap([*const std::ffi::c_char; 16]);
+// SAFETY: the pointers refer to 'static C string literals and are
+// only ever read.
+unsafe impl Sync for KbMap {}
+
+static DIGIT_MAP: KbMap = KbMap([
+    c"1".as_ptr(), c"2".as_ptr(), c"3".as_ptr(), c"\n".as_ptr(),
+    c"4".as_ptr(), c"5".as_ptr(), c"6".as_ptr(), c"\n".as_ptr(),
+    c"7".as_ptr(), c"8".as_ptr(), c"9".as_ptr(), c"\n".as_ptr(),
+    c"\xEF\x95\x9A".as_ptr(), // LV_SYMBOL_BACKSPACE
+    c"0".as_ptr(),
+    c"\xEF\x80\x8C".as_ptr(), // LV_SYMBOL_OK
+    c"".as_ptr(),
+]);
+
+/// One entry per button (newlines excluded): width 1; OK styled like
+/// LVGL's own (LV_KEYBOARD_CTRL_BUTTON_FLAGS).
+static DIGIT_CTRL: [sys::lv_buttonmatrix_ctrl_t; 12] = {
+    const K: sys::lv_buttonmatrix_ctrl_t = sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_NO_REPEAT
+        | sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_CLICK_TRIG
+        | sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_CHECKED;
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, K | 1]
+};
+
+/// See [`Ui::open_memory_display`].
+pub struct MemDisplay {
+    display: *mut sys::lv_display_t,
+    buf: Box<[u32]>,
+    width: i32,
+    height: i32,
+}
+
+// The scripted pointer of the memory display. LVGL reads it from
+// `lv_timer_handler` on the UI thread.
+static MEM_PTR_X: AtomicI32 = AtomicI32::new(0);
+static MEM_PTR_Y: AtomicI32 = AtomicI32::new(0);
+static MEM_PTR_DOWN: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn mem_flush(
+    disp: *mut sys::lv_display_t,
+    _area: *const sys::lv_area_t,
+    _px: *mut u8,
+) {
+    // DIRECT mode renders straight into the buffer; nothing to copy.
+    unsafe { sys::lv_display_flush_ready(disp) };
+}
+
+unsafe extern "C" fn mem_pointer_read(
+    _indev: *mut sys::lv_indev_t,
+    data: *mut sys::lv_indev_data_t,
+) {
+    let data = unsafe { &mut *data };
+    data.point.x = MEM_PTR_X.load(Ordering::SeqCst);
+    data.point.y = MEM_PTR_Y.load(Ordering::SeqCst);
+    data.state = if MEM_PTR_DOWN.load(Ordering::SeqCst) {
+        sys::lv_indev_state_t_LV_INDEV_STATE_PRESSED
+    } else {
+        sys::lv_indev_state_t_LV_INDEV_STATE_RELEASED
+    };
+}
+
+impl MemDisplay {
+    pub fn size(&self) -> (u32, u32) {
+        (self.width as u32, self.height as u32)
+    }
+
+    /// Put the scripted pointer at (`x`, `y`), pressed or not. Takes
+    /// effect at LVGL's next input read (drive it with
+    /// [`Ui::advance`]).
+    pub fn set_pointer(&self, x: i32, y: i32, pressed: bool) {
+        MEM_PTR_X.store(x, Ordering::SeqCst);
+        MEM_PTR_Y.store(y, Ordering::SeqCst);
+        MEM_PTR_DOWN.store(pressed, Ordering::SeqCst);
+    }
+
+    /// Redraw everything now and return the frame as packed RGB8,
+    /// row by row.
+    pub fn rgb(&mut self) -> Vec<u8> {
+        unsafe {
+            sys::lv_obj_invalidate(sys::lv_screen_active());
+            sys::lv_refr_now(self.display);
+        }
+        let cf = unsafe { sys::lv_display_get_color_format(self.display) };
+        let n = (self.width * self.height) as usize;
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.buf.len() * 4)
+        };
+        let mut out = Vec::with_capacity(n * 3);
+        match cf {
+            sys::lv_color_format_t_LV_COLOR_FORMAT_RGB565 => {
+                for px in bytes[..n * 2].chunks_exact(2) {
+                    let v = u16::from_le_bytes([px[0], px[1]]);
+                    let r = ((v >> 11) & 0x1f) as u8;
+                    let g = ((v >> 5) & 0x3f) as u8;
+                    let b = (v & 0x1f) as u8;
+                    out.extend_from_slice(&[(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]);
+                }
+            }
+            sys::lv_color_format_t_LV_COLOR_FORMAT_RGB888 => {
+                for px in bytes[..n * 3].chunks_exact(3) {
+                    out.extend_from_slice(&[px[2], px[1], px[0]]);
+                }
+            }
+            _ => {
+                // XRGB8888 / ARGB8888: B, G, R, X in memory.
+                for px in bytes[..n * 4].chunks_exact(4) {
+                    out.extend_from_slice(&[px[2], px[1], px[0]]);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -717,6 +879,14 @@ impl<'ui> Obj<'ui> {
         let raw = unsafe { sys::lv_keyboard_create(self.raw) };
         assert!(!raw.is_null());
         unsafe {
+            // Digits only: LVGL's own number map also has `+/-`, `.`
+            // and cursor keys, which a PIN or digit keypad cannot use.
+            sys::lv_keyboard_set_map(
+                raw,
+                sys::lv_keyboard_mode_t_LV_KEYBOARD_MODE_NUMBER,
+                DIGIT_MAP.0.as_ptr(),
+                DIGIT_CTRL.as_ptr(),
+            );
             sys::lv_keyboard_set_mode(raw, sys::lv_keyboard_mode_t_LV_KEYBOARD_MODE_NUMBER);
         }
         Obj { raw, _ui: PhantomData }
@@ -875,29 +1045,17 @@ impl<'ui> Obj<'ui> {
     /// Mark this object clickable (plain `obj` and `label` need this;
     /// `button` has it on by default).
     pub fn set_clickable(&self) {
-        unsafe { sys::lv_obj_add_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_CLICKABLE) };
+        unsafe { sys::lv_obj_set_clickable(self.raw, true) };
     }
 
     /// Hide / show the object.
     pub fn set_hidden(&self, hidden: bool) {
-        if hidden {
-            unsafe { sys::lv_obj_add_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_HIDDEN) };
-        } else {
-            unsafe {
-                sys::lv_obj_remove_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_HIDDEN)
-            };
-        }
+        unsafe { sys::lv_obj_set_hidden(self.raw, hidden) };
     }
 
     /// Enable / disable click handling.
     pub fn set_enabled(&self, enabled: bool) {
-        if enabled {
-            unsafe { sys::lv_obj_add_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_CLICKABLE) };
-        } else {
-            unsafe {
-                sys::lv_obj_remove_flag(self.raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_CLICKABLE)
-            };
-        }
+        unsafe { sys::lv_obj_set_clickable(self.raw, enabled) };
     }
 
     /// Register an LVGL CLICKED callback that pushes a
