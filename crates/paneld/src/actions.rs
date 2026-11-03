@@ -303,184 +303,211 @@ fn is_gated(def: &ActionDef) -> bool {
 }
 
 /// Spawn the action worker. Each incoming [`Call`] is looked up in
-/// `actions`, its `run` interpolated and executed in its own short-
-/// lived thread so a slow action never blocks the UI event stream.
-/// `set` is applied on the worker thread after the run returns.
+/// `actions` and run on a thread of its own, so a slow action never
+/// holds up another; `app:max_running` caps the commands themselves
+/// (ADR 0013). `set` is applied on that thread after the run returns.
 pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
+    let wctx = Arc::new(wctx);
     thread::spawn(move || {
         for call in rx {
+            let key = run_key(&call.name, &call.args);
+            let refused = |why: &str| {
+                eprintln!("paneld: action `{}`: {why}", call.name);
+                // Free it in the main loop all the same.
+                let _ = wctx.event_tx.send(UiEvent::ActionDone {
+                    name: call.name.clone(),
+                    key: key.clone(),
+                    ok: false,
+                    result: result_value(false, None, String::new(), why.to_string()),
+                });
+            };
             let Some(def) = wctx.actions.get(&call.name).cloned() else {
-                eprintln!("paneld: action `{}`: unknown action", call.name);
+                refused("unknown action");
                 continue;
             };
             if is_gated(&def) && !call.cleared {
-                eprintln!(
-                    "paneld: action `{}`: refused, its PIN / confirm gate was not passed",
-                    call.name
-                );
+                refused("refused, its PIN / confirm gate was not passed");
                 continue;
             }
-
-            let name = call.name;
-            let had_run = def.run.is_some();
-            let mut ok = true;
-            // Schema 5: `result` = {ok, code, stdout, stderr}.
-            let mut code: Option<i32> = None;
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-
-            if let Some(raw) = def.run {
-                let mut ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
-                ctx.insert("secrets".into(), Value::Map(wctx.secrets.clone()));
-                let file = paneld_config::source::FileId::default();
-                // Split first, then interpolate each argv item.
-                let argv = runner::command_argv(&raw, |t| paneld_ui::interpolate(t, file, 0, &ctx));
-                // Interpolate each env value against the same ctx so
-                // `env { TOKEN = {{ secrets.token }} }` reaches the
-                // child.
-                let env_pairs: Vec<(String, String)> = def
-                    .env
-                    .iter()
-                    .map(|e| {
-                        (
-                            e.key.clone(),
-                            paneld_ui::interpolate(&e.value_raw, file, 0, &ctx),
-                        )
-                    })
-                    .collect();
-                let cwd = resolve_action_cwd(&wctx.config_dir, def.cwd.as_deref());
-                let timeout = def.timeout.unwrap_or(wctx.app_defaults.timeout);
-                let opts = runner::Opts {
-                    timeout,
-                    max_bytes: wctx.app_defaults.max_output,
-                    kind: runner::Kind::Action,
-                    name: &name,
-                    cwd: Some(&cwd),
-                    env: &env_pairs,
-                };
-                // Nothing a command prints reaches the log, the screen
-                // or `result` with a secret in it.
-                let mask = crate::secrets::Mask::new(&wctx.secrets);
-                match argv.and_then(|argv| runner::exec(&argv, opts)) {
-                    Ok(mut r) => {
-                        r.stdout = mask.apply(&r.stdout);
-                        r.stderr = mask.apply(&r.stderr);
-                        eprintln!(
-                            "paneld: action `{name}`: exit {:?}, timed_out {}{}",
-                            r.exit_code,
-                            r.timed_out,
-                            if r.too_large { ", output too large" } else { "" }
-                        );
-                        if !r.stdout.trim().is_empty() {
-                            eprintln!("paneld: action `{name}` stdout: {}", r.stdout.trim());
-                        }
-                        if !r.stderr.trim().is_empty() {
-                            eprintln!("paneld: action `{name}` stderr: {}", r.stderr.trim());
-                        }
-                        ok = r.succeeded();
-                        code = r.exit_code;
-                        stdout = r.stdout;
-                        stderr = if r.too_large {
-                            "output too large".to_string()
-                        } else if r.timed_out {
-                            "timed out".to_string()
-                        } else {
-                            r.stderr
-                        };
-                    }
-                    Err(e) => {
-                        let e = mask.apply(&e.to_string());
-                        eprintln!("paneld: action `{name}`: {e}");
-                        ok = false;
-                        stderr = e;
-                    }
-                }
-            }
-
-            // `set` runs after a successful `run`, or on an action that
-            // has no `run` at all (schema allows it: "an action may
-            // only change the UI").
-            let should_set = (had_run && ok) || !had_run;
-            if should_set && !def.set.is_empty() {
-                let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
-                apply_set(
-                    &name,
-                    &def.set,
-                    &ctx,
-                    &wctx.var_types,
-                    &wctx.vars,
-                    &wctx.event_tx,
-                );
-            }
-
-
-            // `refresh` runs after a successful `run` on the same
-            // basis as `set`. Each named source is re-executed and
-            // the fresh value is sent through the normal source
-            // channel so the main loop treats it like a scheduled
-            // poll tick.
-            let should_refresh = (had_run && ok) || !had_run;
-            if should_refresh && !def.refresh.is_empty() {
-                let mut ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
-                ctx.insert("secrets".into(), Value::Map(wctx.secrets.clone()));
-                for src_name in &def.refresh {
-                    let Some(block) = wctx.source_blocks.get(src_name) else {
-                        eprintln!(
-                            "paneld: action `{name}`: refresh `{src_name}` is not a source"
-                        );
-                        continue;
-                    };
-                    match crate::sources::resolve_one(
-                        block,
-                        &ctx,
-                        &wctx.config_dir,
-                        wctx.app_defaults,
-                    ) {
-                        Ok(v) => {
-                            let _ = wctx.source_tx.send(crate::sources::SourceUpdate {
-                                name: src_name.clone(),
-                                value: v,
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "paneld: action `{name}`: refresh `{src_name}`: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-
-            let result = result_value(ok, code, stdout, stderr);
-
-            // The main loop does `goto` and the `done` / `failed`
-            // message, and frees the action for its next call. Sent
-            // before the chain: schema 5 order is goto, then `then`.
-            let _ = wctx.event_tx.send(UiEvent::ActionDone {
-                name,
-                ok,
-                result: result.clone(),
-            });
-
-            // `then` / `else` chain to another action on success /
-            // failure, with `result` bound for it. They go back through
-            // the main loop as a fresh call, so the chained action's
-            // own PIN and confirm still apply.
-            let next = if had_run && ok {
-                def.then.as_ref()
-            } else if had_run {
-                def.else_.as_ref()
-            } else {
-                None
-            };
-            if let Some(next) = next {
-                let _ = wctx.event_tx.send(UiEvent::Chained {
-                    name: next.clone(),
-                    args: vec![ActionArg { name: "result".into(), value: result }],
-                });
-            }
+            let wctx = Arc::clone(&wctx);
+            thread::spawn(move || run_call(&wctx, call, def, key));
         }
     });
+}
+
+/// What makes two calls "the same" for schema 5's "while an action
+/// runs, further calls of it are ignored": the action and its args,
+/// so each row of a `repeat` runs on its own.
+pub fn run_key(name: &str, args: &[ActionArg]) -> String {
+    let mut parts: Vec<String> = args
+        .iter()
+        .map(|a| format!("{}={}", a.name, crate::ctl::to_json(&a.value)))
+        .collect();
+    parts.sort();
+    format!("{name}({})", parts.join(","))
+}
+
+/// Run one call of `def` (gates already passed) and report it.
+fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
+    let name = call.name;
+    let had_run = def.run.is_some();
+    let mut ok = true;
+    // Schema 5: `result` = {ok, code, stdout, stderr}.
+    let mut code: Option<i32> = None;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+
+    if let Some(raw) = def.run {
+        let mut ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
+        ctx.insert("secrets".into(), Value::Map(wctx.secrets.clone()));
+        let file = paneld_config::source::FileId::default();
+        // Split first, then interpolate each argv item.
+        let argv = runner::command_argv(&raw, |t| paneld_ui::interpolate(t, file, 0, &ctx));
+        // Interpolate each env value against the same ctx so
+        // `env { TOKEN = {{ secrets.token }} }` reaches the
+        // child.
+        let env_pairs: Vec<(String, String)> = def
+            .env
+            .iter()
+            .map(|e| {
+                (
+                    e.key.clone(),
+                    paneld_ui::interpolate(&e.value_raw, file, 0, &ctx),
+                )
+            })
+            .collect();
+        let cwd = resolve_action_cwd(&wctx.config_dir, def.cwd.as_deref());
+        let timeout = def.timeout.unwrap_or(wctx.app_defaults.timeout);
+        let opts = runner::Opts {
+            timeout,
+            max_bytes: wctx.app_defaults.max_output,
+            kind: runner::Kind::Action,
+            name: &name,
+            cwd: Some(&cwd),
+            env: &env_pairs,
+        };
+        // Nothing a command prints reaches the log, the screen
+        // or `result` with a secret in it.
+        let mask = crate::secrets::Mask::new(&wctx.secrets);
+        match argv.and_then(|argv| runner::exec(&argv, opts)) {
+            Ok(mut r) => {
+                r.stdout = mask.apply(&r.stdout);
+                r.stderr = mask.apply(&r.stderr);
+                eprintln!(
+                    "paneld: action `{name}`: exit {:?}, timed_out {}{}",
+                    r.exit_code,
+                    r.timed_out,
+                    if r.too_large { ", output too large" } else { "" }
+                );
+                if !r.stdout.trim().is_empty() {
+                    eprintln!("paneld: action `{name}` stdout: {}", r.stdout.trim());
+                }
+                if !r.stderr.trim().is_empty() {
+                    eprintln!("paneld: action `{name}` stderr: {}", r.stderr.trim());
+                }
+                ok = r.succeeded();
+                code = r.exit_code;
+                stdout = r.stdout;
+                stderr = if r.too_large {
+                    "output too large".to_string()
+                } else if r.timed_out {
+                    "timed out".to_string()
+                } else {
+                    r.stderr
+                };
+            }
+            Err(e) => {
+                let e = mask.apply(&e.to_string());
+                eprintln!("paneld: action `{name}`: {e}");
+                ok = false;
+                stderr = e;
+            }
+        }
+    }
+
+    // `set` runs after a successful `run`, or on an action that
+    // has no `run` at all (schema allows it: "an action may
+    // only change the UI").
+    let should_set = (had_run && ok) || !had_run;
+    if should_set && !def.set.is_empty() {
+        let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
+        apply_set(
+            &name,
+            &def.set,
+            &ctx,
+            &wctx.var_types,
+            &wctx.vars,
+            &wctx.event_tx,
+        );
+    }
+
+
+    // `refresh` runs after a successful `run` on the same
+    // basis as `set`. Each named source is re-executed and
+    // the fresh value is sent through the normal source
+    // channel so the main loop treats it like a scheduled
+    // poll tick.
+    let should_refresh = (had_run && ok) || !had_run;
+    if should_refresh && !def.refresh.is_empty() {
+        let mut ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
+        ctx.insert("secrets".into(), Value::Map(wctx.secrets.clone()));
+        for src_name in &def.refresh {
+            let Some(block) = wctx.source_blocks.get(src_name) else {
+                eprintln!(
+                    "paneld: action `{name}`: refresh `{src_name}` is not a source"
+                );
+                continue;
+            };
+            match crate::sources::resolve_one(
+                block,
+                &ctx,
+                &wctx.config_dir,
+                wctx.app_defaults,
+            ) {
+                Ok(v) => {
+                    let _ = wctx.source_tx.send(crate::sources::SourceUpdate {
+                        name: src_name.clone(),
+                        value: v,
+                    });
+                }
+                Err(e) => {
+                    eprintln!(
+                        "paneld: action `{name}`: refresh `{src_name}`: {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    let result = result_value(ok, code, stdout, stderr);
+
+    // The main loop does `goto` and the `done` / `failed`
+    // message, and frees the action for its next call. Sent
+    // before the chain: schema 5 order is goto, then `then`.
+    let _ = wctx.event_tx.send(UiEvent::ActionDone {
+        name,
+        key,
+        ok,
+        result: result.clone(),
+    });
+
+    // `then` / `else` chain to another action on success /
+    // failure, with `result` bound for it. They go back through
+    // the main loop as a fresh call, so the chained action's
+    // own PIN and confirm still apply.
+    let next = if had_run && ok {
+        def.then.as_ref()
+    } else if had_run {
+        def.else_.as_ref()
+    } else {
+        None
+    };
+    if let Some(next) = next {
+        let _ = wctx.event_tx.send(UiEvent::Chained {
+            name: next.clone(),
+            args: vec![ActionArg { name: "result".into(), value: result }],
+        });
+    }
 }
 
 /// Schema 5's `result`: `{ok, code, stdout, stderr}`. `code` is -1
@@ -766,6 +793,32 @@ mod tests {
             rx,
         );
         (tx, event_rx)
+    }
+
+    #[test]
+    fn calls_run_side_by_side_and_each_reports_back() {
+        // Review round 6: calls ran one after another on one thread,
+        // and "still running" was keyed by name, so a second row of a
+        // `repeat` was ignored while the first ran.
+        let doc = parse_doc("action slow { run = /bin/sleep 0.6 }\n");
+        let (tx, events) = worker_for(&doc);
+        let arg = |v: &str| vec![ActionArg { name: "vm".into(), value: Value::String(v.into()) }];
+        assert_ne!(run_key("slow", &arg("a")), run_key("slow", &arg("b")));
+        assert_eq!(run_key("slow", &arg("a")), run_key("slow", &arg("a")));
+        let started = std::time::Instant::now();
+        for v in ["a", "b"] {
+            tx.send(Call { name: "slow".into(), args: arg(v), cleared: true }).unwrap();
+        }
+        tx.send(Call::new("nope".into(), Vec::new())).unwrap();
+        let mut keys = Vec::new();
+        while keys.len() < 3 {
+            if let UiEvent::ActionDone { key, .. } = events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                keys.push(key);
+            }
+        }
+        assert!(started.elapsed() < Duration::from_millis(1100), "ran one after another: {:?}", started.elapsed());
+        keys.sort();
+        assert_eq!(keys, [run_key("nope", &[]), run_key("slow", &arg("a")), run_key("slow", &arg("b"))]);
     }
 
     #[test]

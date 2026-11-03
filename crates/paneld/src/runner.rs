@@ -4,8 +4,8 @@
 //! always interpreted as an argv list -- the raw text is tokenised
 //! with POSIX-style single and double quotes so secrets and other
 //! interpolated values reach the command as argv items, never as
-//! shell syntax. `app:max_running` (a global cap on concurrent
-//! commands) is not enforced yet.
+//! shell syntax. At most `app:max_running` commands run at once
+//! (see [`Slot`]); stream sources, which never end, are not counted.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -13,7 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,7 @@ impl std::fmt::Display for RunError {
 pub struct AppDefaults {
     pub timeout: Duration,
     pub max_output: usize,
+    pub max_running: usize,
 }
 
 impl Default for AppDefaults {
@@ -93,6 +94,7 @@ impl Default for AppDefaults {
         Self {
             timeout: Duration::from_secs(10),
             max_output: 1024 * 1024,
+            max_running: 8,
         }
     }
 }
@@ -139,6 +141,11 @@ fn apply(out: &mut AppDefaults, key: &str, raw: &str) {
         "max_output" => {
             if let Some(n) = paneld_config::value::parse_bytes(raw) {
                 out.max_output = n as usize;
+            }
+        }
+        "max_running" => {
+            if let Ok(n) = raw.trim().parse::<usize>() {
+                out.max_running = n.max(1);
             }
         }
         _ => {}
@@ -293,7 +300,67 @@ pub fn command_argv(
 /// Run `argv`. The child gets a clean environment, its own process
 /// group, stdin from `/dev/null`, stdout and stderr captured up to
 /// their caps, and is killed as a group once `opts.timeout` elapses.
+/// Commands running now, the cap, and how many actions wait for a
+/// slot (they go before waiting sources, ADR 0013).
+struct Slots {
+    busy: usize,
+    max: usize,
+    actions_waiting: usize,
+}
+
+/// The `app:max_running` slots.
+pub struct Pool {
+    slots: Mutex<Slots>,
+    freed: Condvar,
+}
+
+static POOL: Pool = Pool::new(8);
+
+impl Pool {
+    const fn new(max: usize) -> Self {
+        Self { slots: Mutex::new(Slots { busy: 0, max, actions_waiting: 0 }), freed: Condvar::new() }
+    }
+
+    /// Wait for a free slot. A source also waits while an action is
+    /// waiting, so taps are not stuck behind a burst of polls.
+    pub fn acquire(&'static self, kind: Kind) -> Slot {
+        let action = !matches!(kind, Kind::Source);
+        let mut g = self.slots.lock().unwrap();
+        if action {
+            g.actions_waiting += 1;
+        }
+        while g.busy >= g.max || (!action && g.actions_waiting > 0) {
+            g = self.freed.wait(g).unwrap();
+        }
+        if action {
+            g.actions_waiting -= 1;
+            // Sources held back for this action may go now.
+            self.freed.notify_all();
+        }
+        g.busy += 1;
+        Slot(self)
+    }
+}
+
+/// Set `app:max_running` (at least 1). Runs already holding a slot
+/// keep it.
+pub fn set_max_running(n: usize) {
+    POOL.slots.lock().unwrap().max = n.max(1);
+    POOL.freed.notify_all();
+}
+
+/// One slot, held for the length of a run.
+pub struct Slot(&'static Pool);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.slots.lock().unwrap().busy -= 1;
+        self.0.freed.notify_all();
+    }
+}
+
 pub fn exec(argv: &[String], opts: Opts<'_>) -> Result<RunResult, RunError> {
+    let _slot = POOL.acquire(opts.kind);
     let program = &argv[0];
     let args = &argv[1..];
     let mut command = Command::new(program);
@@ -471,6 +538,33 @@ mod tests {
             cwd: None,
             env: &[],
         }
+    }
+
+    #[test]
+    fn pool_caps_runs_and_lets_actions_go_before_sources() {
+        use std::sync::mpsc::channel;
+        let pool: &'static Pool = Box::leak(Box::new(Pool::new(1)));
+        let first = pool.acquire(Kind::Source);
+        let (tx, rx) = channel();
+        // A source, then an action, both waiting for the one slot.
+        let t = tx.clone();
+        let source = thread::spawn(move || {
+            let _s = pool.acquire(Kind::Source);
+            t.send("source").unwrap();
+        });
+        thread::sleep(Duration::from_millis(50));
+        let action = thread::spawn(move || {
+            let _s = pool.acquire(Kind::Action);
+            tx.send("action").unwrap();
+            thread::sleep(Duration::from_millis(20));
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert!(rx.try_recv().is_err(), "nothing may start while the slot is taken");
+        drop(first);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "action");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "source");
+        source.join().unwrap();
+        action.join().unwrap();
     }
 
     #[test]

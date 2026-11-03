@@ -101,7 +101,38 @@ pub fn default_socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(dir).join("paneld.sock");
     }
-    PathBuf::from("/tmp/paneld.sock")
+    // A directory of our own in /tmp: a shared `/tmp/paneld.sock`
+    // could be bound first by another user, and `ctl` would talk to
+    // them.
+    fallback_dir().join("paneld.sock")
+}
+
+fn fallback_dir() -> PathBuf {
+    PathBuf::from(format!("/tmp/paneld-{}", current_uid()))
+}
+
+fn current_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0)
+}
+
+/// The fallback directory must be ours and closed to others, or a
+/// local user could have planted it.
+fn check_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let m = std::fs::symlink_metadata(dir)?;
+    if !m.is_dir() || m.uid() != current_uid() || m.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a private directory of this user", dir.display()),
+        ));
+    }
+    Ok(())
 }
 
 /// Start a background thread that listens on `path` and forwards
@@ -110,10 +141,22 @@ pub fn default_socket_path() -> PathBuf {
 /// owner and group only (ADR 0007).
 pub fn serve(path: &Path, tx: Sender<ControlMsg>) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::remove_file(path);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if parent == fallback_dir() {
+            check_private_dir(parent)?;
+        } else {
+            let _ = std::fs::create_dir_all(parent);
+        }
     }
+    // A socket someone answers on belongs to a running daemon: do not
+    // take it over. One nobody answers on is left from a crash.
+    if UnixStream::connect(path).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("another paneld is listening on {}", path.display()),
+        ));
+    }
+    let _ = std::fs::remove_file(path);
     // Bind with no bits for others, so the socket is never open to
     // them before the chmod below. Only "other" bits are masked: files
     // other threads create meanwhile keep working modes.
@@ -520,6 +563,24 @@ mod tests {
         nested.push(b'\n');
         assert!(talk(&nested).contains("not a JSON object"), "deep JSON");
         assert!(talk(b"{\"id\":1,\"cmd\":\"ping\"}\n").contains("pong"), "still serving");
+        // A second daemon must not take the socket over.
+        let (tx2, _rx2) = mpsc::channel();
+        assert_eq!(serve(&path, tx2).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        assert!(talk(b"{\"id\":2,\"cmd\":\"ping\"}\n").contains("pong"), "first daemon lost its socket");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fallback_dir_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("paneld-priv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        check_private_dir(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        check_private_dir(&dir).unwrap();
+        // Opened up (as a planted one would be): refused.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_private_dir(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

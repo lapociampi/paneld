@@ -57,9 +57,10 @@ pub enum UiEvent {
     Chained { name: String, args: Vec<ActionArg> },
     /// The sleeping screen was touched (schema 12, `first_tap = wake`).
     Wake,
-    /// The worker finished a call of action `name`; `result` is the
-    /// schema's `{ok, code, stdout, stderr}`.
-    ActionDone { name: String, ok: bool, result: crate::expr::Value },
+    /// The worker finished a call of action `name` (`key` tells it
+    /// from calls with other args); `result` is the schema's
+    /// `{ok, code, stdout, stderr}`.
+    ActionDone { name: String, key: String, ok: bool, result: crate::expr::Value },
 }
 
 /// The scalar an input widget's `on_change` handler sees as

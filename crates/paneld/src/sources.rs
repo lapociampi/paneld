@@ -50,29 +50,57 @@ pub fn resolve_all(
     base_cwd: &std::path::Path,
     app_defaults: runner::AppDefaults,
 ) -> BTreeMap<String, Value> {
-    let mut out = BTreeMap::new();
-    for item in &doc.items {
-        let Item::Block(b) = item else { continue };
-        if b.kind.text != "source" {
-            continue;
-        }
-        let Some(name) = &b.name else { continue };
-        // Stream sources are long-lived children started by
-        // `spawn_pollers`; resolving them as a one-shot would just
-        // time out after 5s and log a spurious error on every reload.
-        if is_stream(b) {
-            continue;
-        }
-        match resolve_one(b, ctx, base_cwd, app_defaults) {
-            Ok(v) => {
-                out.insert(name.text.clone(), v);
+    // All at once (within `app:max_running`): the wait is the slowest
+    // source, not the sum of them.
+    let blocks: Vec<(&str, &Block)> = doc
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            // Stream sources are long-lived children started by
+            // `spawn_pollers`; resolving them as a one-shot would just
+            // time out and log a spurious error on every reload.
+            Item::Block(b) if b.kind.text == "source" && !is_stream(b) => {
+                b.name.as_ref().map(|n| (n.text.as_str(), b))
             }
-            Err(e) => {
-                eprintln!("paneld: source `{}`: {}", name.text, e);
+            _ => None,
+        })
+        .collect();
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = blocks
+            .iter()
+            .map(|&(name, b)| (name, scope.spawn(move || resolve_one(b, ctx, base_cwd, app_defaults))))
+            .collect();
+        let mut out = BTreeMap::new();
+        for (name, run) in runs {
+            match run.join() {
+                Ok(Ok(v)) => {
+                    out.insert(name.to_string(), v);
+                }
+                Ok(Err(e)) => eprintln!("paneld: source `{name}`: {e}"),
+                Err(_) => eprintln!("paneld: source `{name}`: the run panicked"),
             }
         }
-    }
-    out
+        out
+    })
+}
+
+/// [`resolve_all`] on a thread of its own, each value sent on `tx` as
+/// it would come from a poll. A reload uses it so the screen keeps
+/// the previous values meanwhile instead of waiting.
+pub fn resolve_all_in_background(
+    doc: Document,
+    ctx: Context,
+    base_cwd: std::path::PathBuf,
+    app_defaults: runner::AppDefaults,
+    tx: Sender<SourceUpdate>,
+) {
+    thread::spawn(move || {
+        for (name, value) in resolve_all(&doc, &ctx, &base_cwd, app_defaults) {
+            if tx.send(SourceUpdate { name, value }).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 /// Spawn a background worker for each source that declares a

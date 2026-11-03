@@ -222,6 +222,7 @@ Usage:
       alert fire <id> [severity=..] [title=..] [text=..] [link=..]
       alert resolve <id>
       alert ack <id> | alert snooze <id> [duration]
+      reminder done <name>
   paneld hash-pin                     Read a PIN on stdin, print its
                                       argon2 hash for security.pin
   paneld shot -o FILE.png [--page P] [--size WxH] [--settle MS]
@@ -289,7 +290,7 @@ fn run_daemon(config: PathBuf) -> ExitCode {
     let screen = ui.screen();
 
     // Initial live state. `reload` wipes and rebuilds this.
-    let mut live = match setup_live_state(&config, &screen, None) {
+    let mut live = match setup_live_state(&config, &screen, None, None) {
         Ok(l) => l,
         Err(_) => return ExitCode::from(1),
     };
@@ -335,6 +336,23 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // gotos update the current page, vars changes trigger a
     // re-render (the worker already wrote the new values).
     let mut dirty = std::mem::take(&mut live.redraw);
+    // Runs from before a reload: only their completion matters.
+    let mut stale = std::mem::take(&mut live.stale_events);
+    stale.retain(|rx| loop {
+        match rx.try_recv() {
+            Ok(paneld_ui::UiEvent::ActionDone { name, key, ok, result }) => {
+                live.running.remove(&key);
+                dirty |= action_done(live, screen, &name, ok, result);
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => break true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break false,
+        }
+    });
+    // Nothing left running: nothing more to wait for from them.
+    if !live.running.is_empty() {
+        live.stale_events = stale;
+    }
     while let Ok(ev) = live.event_rx.try_recv() {
         match ev {
             paneld_ui::UiEvent::Action { name, args } => {
@@ -422,8 +440,8 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 }
             }
             paneld_ui::UiEvent::Wake => live.touched = true,
-            paneld_ui::UiEvent::ActionDone { name, ok, result } => {
-                live.running.remove(&name);
+            paneld_ui::UiEvent::ActionDone { name, key, ok, result } => {
+                live.running.remove(&key);
                 if action_done(live, screen, &name, ok, result) {
                     dirty = true;
                 }
@@ -609,8 +627,12 @@ struct LiveState {
     pending: Option<Pending>,
     /// `then` / `else` calls that arrived while a modal was up.
     deferred: std::collections::VecDeque<actions::Call>,
-    /// Actions handed to the worker and not yet done.
-    running: std::collections::HashSet<String>,
+    /// Calls handed to the worker and not yet done, by
+    /// [`actions::run_key`], with the action's name.
+    running: std::collections::HashMap<String, String>,
+    /// Event queues of configs replaced by a reload, kept until their
+    /// worker has reported the runs it still had (see `reload`).
+    stale_events: Vec<std::sync::mpsc::Receiver<paneld_ui::UiEvent>>,
     /// The page before the last navigation, for `goto = back`.
     previous_page: Option<String>,
     /// When the current toast (top layer) is removed.
@@ -677,6 +699,7 @@ fn setup_live_state(
     config: &std::path::Path,
     screen: &paneld_ui::ui::Obj<'_>,
     state_path: Option<&std::path::Path>,
+    previous_sources: Option<&std::collections::BTreeMap<String, paneld_ui::Value>>,
 ) -> Result<LiveState, Vec<ctl::CtlError>> {
     // ADR 0013: commands run with cwd set to the config file's
     // directory by default, so `run = ./scripts/x.sh` works. A
@@ -705,6 +728,7 @@ fn setup_live_state(
     // max_output unless `app:timeout` / `app:max_output` say
     // otherwise). Per-source and per-action overrides apply on top.
     let app_defaults = runner::AppDefaults::from_doc(&doc);
+    runner::set_max_running(app_defaults.max_running);
 
     // Resolve secrets first so they're available for the first
     // source-run's interpolation. (Secrets never change at runtime
@@ -723,10 +747,28 @@ fn setup_live_state(
     // Sources interpolate only their `run` and `env`, where secrets
     // are allowed.
     let command_ctx = with_secrets(base_ctx.clone(), &secret_values);
-    let initial_sources = sources::resolve_all(&doc, &command_ctx, &config_dir, app_defaults);
-    *source_values.lock().unwrap() = initial_sources;
     let (source_tx, source_rx) =
         std::sync::mpsc::channel::<sources::SourceUpdate>();
+    match previous_sources {
+        // A reload: show the values we have and refresh them behind
+        // the screen, so a slow source does not freeze the UI.
+        Some(prev) => {
+            let names = sources::collect_blocks(&doc);
+            *source_values.lock().unwrap() =
+                prev.iter().filter(|(k, _)| names.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+            sources::resolve_all_in_background(
+                doc.clone(),
+                command_ctx.clone(),
+                config_dir.clone(),
+                app_defaults,
+                source_tx.clone(),
+            );
+        }
+        None => {
+            *source_values.lock().unwrap() =
+                sources::resolve_all(&doc, &command_ctx, &config_dir, app_defaults);
+        }
+    }
     let sources_shutdown = sources::spawn_pollers(
         &doc,
         &command_ctx,
@@ -842,7 +884,8 @@ fn setup_live_state(
         actions: action_table_for_main,
         pending: None,
         deferred: std::collections::VecDeque::new(),
-        running: std::collections::HashSet::new(),
+        running: std::collections::HashMap::new(),
+        stale_events: Vec::new(),
         previous_page: None,
         toast_until: None,
         redraw: false,
@@ -878,7 +921,7 @@ fn route_call(
         return;
     };
     // Schema 5: while an action runs, further calls of it are ignored.
-    if live.running.contains(&call.name) {
+    if live.running.contains_key(&actions::run_key(&call.name, &call.args)) {
         eprintln!("paneld: action `{}` is still running; call ignored", call.name);
         return;
     }
@@ -1053,10 +1096,12 @@ fn dispatch(live: &mut LiveState, call: actions::Call) {
         }
         return;
     }
-    if !live.running.insert(call.name.clone()) {
+    let key = actions::run_key(&call.name, &call.args);
+    if live.running.contains_key(&key) {
         eprintln!("paneld: action `{}` is still running; call ignored", call.name);
         return;
     }
+    live.running.insert(key, call.name.clone());
     let _ = live.action_tx.send(call);
 }
 
@@ -1303,7 +1348,7 @@ fn run_shot(o: ShotOpts) -> ExitCode {
     let screen = ui.screen();
     // A snapshot must never touch the real alert state file.
     let scratch_state = std::env::temp_dir().join(format!("paneld-shot-{}.state", std::process::id()));
-    let mut live = match setup_live_state(&o.config, &screen, Some(&scratch_state)) {
+    let mut live = match setup_live_state(&o.config, &screen, Some(&scratch_state), None) {
         Ok(l) => l,
         Err(_) => return ExitCode::from(1),
     };
@@ -1396,10 +1441,22 @@ fn reload(
     // reads the file, and an ack from a moment ago must be in it.
     live.state.force_flush();
     let state_path = live.state.path().to_path_buf();
-    match setup_live_state(config, screen, Some(&state_path)) {
+    let previous_sources = live.source_values.lock().unwrap().clone();
+    match setup_live_state(config, screen, Some(&state_path), Some(&previous_sources)) {
         Ok(mut fresh) => {
             fresh.pin_gate.carry_from(&live.pin_gate);
             fresh.screen.carry_from(&live.screen);
+            // Runs started under the old config finish on its worker,
+            // which reports to the old event queue: keep reading that
+            // queue for them, so a run is not started twice meanwhile
+            // and its toast still shows.
+            fresh.running = std::mem::take(&mut live.running);
+            fresh.stale_events = std::mem::take(&mut live.stale_events);
+            if !fresh.running.is_empty() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                drop(tx);
+                fresh.stale_events.push(std::mem::replace(&mut live.event_rx, rx));
+            }
             // Stop the old poll / stream workers; the new state runs
             // its own.
             live.sources_shutdown.stop();
@@ -1553,8 +1610,8 @@ fn handle_request(
             m.insert("sources".to_string(), Value::Map(live.source_values.lock().unwrap().clone()));
             m.insert("vars".to_string(), Value::Map(live.vars.lock().unwrap().clone()));
             m.insert("alerts".to_string(), live.alerts.context_value());
-            let mut running: Vec<Value> = live.running.iter().map(|n| Value::String(n.clone())).collect();
-            running.sort_by_key(|v| v.to_display_string());
+            let names: std::collections::BTreeSet<&String> = live.running.values().collect();
+            let running: Vec<Value> = names.into_iter().map(|n| Value::String(n.clone())).collect();
             m.insert("running".to_string(), Value::List(running));
             Ok(Value::Map(m))
         }
