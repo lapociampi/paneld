@@ -255,6 +255,7 @@ fn run_daemon(config: PathBuf) -> ExitCode {
                         paneld_ui::EventValue::Bool(b) => paneld_ui::Value::Bool(b),
                         paneld_ui::EventValue::Int(n) => paneld_ui::Value::Int(n),
                         paneld_ui::EventValue::Double(d) => paneld_ui::Value::Double(d),
+                        paneld_ui::EventValue::String(s) => paneld_ui::Value::String(s),
                     };
                     let mut event = std::collections::BTreeMap::new();
                     event.insert("value".to_string(), v);
@@ -283,7 +284,10 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         // the render-side ctx.
         while let Ok(update) = live.source_rx.try_recv() {
             let event_value = update.value.clone();
-            live.source_values.insert(update.name.clone(), update.value);
+            live.source_values
+                .lock()
+                .unwrap()
+                .insert(update.name.clone(), update.value);
             let event_ctx = build_ctx(
                 &live.source_values,
                 &live.theme,
@@ -358,7 +362,12 @@ fn run_daemon(config: PathBuf) -> ExitCode {
 /// Everything the main loop re-creates on a `reload`.
 struct LiveState {
     doc: paneld_config::parse::Document,
-    source_values: std::collections::BTreeMap<String, paneld_ui::Value>,
+    /// Shared with the action worker so a `run =` that references
+    /// `sources.X.value` sees the current sample, not whatever was
+    /// in the base ctx snapshot at daemon start.
+    source_values: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>,
+    >,
     source_rx: std::sync::mpsc::Receiver<sources::SourceUpdate>,
     theme: std::collections::BTreeMap<String, paneld_ui::Value>,
     secrets: std::collections::BTreeMap<String, paneld_ui::Value>,
@@ -378,6 +387,13 @@ fn setup_live_state(
     screen: &paneld_ui::ui::Obj<'_>,
 ) -> Result<LiveState, ExitCode> {
     use paneld_config::{check, load};
+    // ADR 0013: commands run with cwd set to the config file's
+    // directory by default, so `run = ./scripts/x.sh` works. A
+    // per-source / per-action `cwd` overrides on top.
+    let config_dir = config
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let (source, doc, mut diags) = match load(config) {
         Ok(parts) => parts,
         Err(e) => {
@@ -399,6 +415,11 @@ fn setup_live_state(
         return Err(ExitCode::from(1));
     }
 
+    // Pull the ADR 0013 defaults out once (10s timeout, 1 MiB
+    // max_output unless `app:timeout` / `app:max_output` say
+    // otherwise). Per-source and per-action overrides apply on top.
+    let app_defaults = runner::AppDefaults::from_doc(&doc);
+
     // Resolve secrets first so they're available for the first
     // source-run's interpolation. (Secrets never change at runtime
     // in v1; a reload re-reads them.)
@@ -407,12 +428,22 @@ fn setup_live_state(
     let vars_map = vars::initial_values(&doc);
     let var_types = vars::types(&doc);
     let vars_shared = std::sync::Arc::new(std::sync::Mutex::new(vars_map));
+    let source_values = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::BTreeMap::<String, paneld_ui::Value>::new(),
+    ));
     let base_ctx =
-        build_ctx(&Default::default(), &theme, &secret_values, &vars_shared, None);
-    let source_values = sources::resolve_all(&doc, &base_ctx);
+        build_ctx(&source_values, &theme, &secret_values, &vars_shared, None);
+    let initial_sources = sources::resolve_all(&doc, &base_ctx, &config_dir, app_defaults);
+    *source_values.lock().unwrap() = initial_sources;
     let (source_tx, source_rx) =
         std::sync::mpsc::channel::<sources::SourceUpdate>();
-    let sources_shutdown = sources::spawn_pollers(&doc, &base_ctx, source_tx.clone());
+    let sources_shutdown = sources::spawn_pollers(
+        &doc,
+        &base_ctx,
+        source_tx.clone(),
+        &config_dir,
+        app_defaults,
+    );
     let action_table = actions::collect(&doc);
     let source_blocks = sources::collect_blocks(&doc);
 
@@ -425,11 +456,14 @@ fn setup_live_state(
             actions: action_table,
             base_ctx: base_ctx.clone(),
             vars: vars_shared.clone(),
+            source_values: source_values.clone(),
             var_types: var_types.clone(),
             event_tx: event_tx.clone(),
             source_blocks,
             source_tx,
             self_tx: action_tx.clone(),
+            config_dir: config_dir.clone(),
+            app_defaults,
         },
         action_rx,
     );
@@ -547,14 +581,17 @@ fn run_ctl(args: &[String]) -> ExitCode {
 }
 
 fn build_ctx(
-    source_values: &std::collections::BTreeMap<String, paneld_ui::Value>,
+    source_values: &std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>,
+    >,
     theme: &std::collections::BTreeMap<String, paneld_ui::Value>,
     secret_values: &std::collections::BTreeMap<String, paneld_ui::Value>,
     vars: &std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
     alerts: Option<&alerts::Engine>,
 ) -> paneld_ui::Context {
     let mut ctx = paneld_ui::Context::new();
-    ctx.insert("sources".into(), paneld_ui::Value::Map(source_values.clone()));
+    let sources_snapshot = source_values.lock().unwrap().clone();
+    ctx.insert("sources".into(), paneld_ui::Value::Map(sources_snapshot));
     ctx.insert("theme".into(), paneld_ui::Value::Map(theme.clone()));
     ctx.insert("secrets".into(), paneld_ui::Value::Map(secret_values.clone()));
     let snapshot = vars.lock().unwrap().clone();

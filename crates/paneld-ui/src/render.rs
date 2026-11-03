@@ -289,6 +289,24 @@ fn render_node(
                 obj.on_change_slider_inline_set(sink.clone(), assigns);
             }
         }
+        "keypad" => {
+            // Schema v1: `length` (max digits, default 0 = any),
+            // `masked` (bool, default false), `on_submit`. Rendered
+            // as an LVGL textarea stacked above a numeric keyboard;
+            // the keyboard's OK fires `on_submit` with
+            // `event.value` = the typed string.
+            let masked = resolve_assign_value(node, "masked", ctx)
+                .map(|v| value_truthy(&v))
+                .unwrap_or(false);
+            let length = resolve_num(node, "length", ctx).unwrap_or(0.0) as u32;
+            let ta = parent.new_textarea(masked, length);
+            let kb = parent.new_number_keyboard();
+            kb.attach_keyboard_to(&ta);
+            apply_props(node, ctx, sink, &ta);
+            if let Some(assigns) = inline_on_submit_set(node) {
+                kb.on_submit_keyboard_inline_set(sink.clone(), assigns);
+            }
+        }
         "select" => {
             // Schema v1: `options` is a list expression, `value`
             // picks the initial index (or the matching option when
@@ -847,9 +865,18 @@ fn find_block<'a>(node: &'a Block, kind: &str) -> Option<&'a Block> {
 /// Scan a widget node for `on_change { set { ... } }` and return the
 /// inline set payload. Returns `None` if no such handler is present.
 fn inline_on_change_set(node: &Block) -> Option<Vec<InlineSetItem>> {
+    inline_set_for_handler(node, "on_change")
+}
+
+/// Same shape, for a `keypad`'s `on_submit { set { ... } }`.
+fn inline_on_submit_set(node: &Block) -> Option<Vec<InlineSetItem>> {
+    inline_set_for_handler(node, "on_submit")
+}
+
+fn inline_set_for_handler(node: &Block, handler: &str) -> Option<Vec<InlineSetItem>> {
     for item in &node.items {
         let Item::Block(child) = item else { continue };
-        if child.kind.text != "on_change" || child.name.is_some() {
+        if child.kind.text != handler || child.name.is_some() {
             continue;
         }
         if let Some(set_block) = find_block(child, "set") {

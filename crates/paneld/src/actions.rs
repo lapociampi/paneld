@@ -20,8 +20,6 @@ use paneld_ui::{ActionArg, Context, InlineSetItem, UiEvent, Value};
 use crate::runner;
 use crate::vars;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 
 /// A collected top-level `action NAME { ... }`.
 #[derive(Clone, Debug, Default)]
@@ -42,6 +40,13 @@ pub struct ActionDef {
     /// environment (ADR 0013). Values are raw text interpolated at
     /// run time against the eval ctx so secrets can land in env.
     pub env: Vec<EnvPair>,
+    /// `cwd = <path>` on the action, overriding ADR 0013's default
+    /// (the config file's directory). A relative path joins onto
+    /// the default.
+    pub cwd: Option<String>,
+    /// Per-action `timeout = <dur>`; falls back to
+    /// `WorkerCtx::app_defaults.timeout`.
+    pub timeout: Option<Duration>,
 }
 
 /// One `env { KEY = value }` entry. `value_raw` is the raw text,
@@ -97,9 +102,37 @@ pub fn collect(doc: &Document) -> HashMap<String, ActionDef> {
         if let Some(env_block) = find_block(b, "env") {
             def.env = collect_env(env_block);
         }
+        if let Some(raw) = find_simple(b, "cwd") {
+            let t = raw.trim();
+            if !t.is_empty() {
+                def.cwd = Some(t.to_string());
+            }
+        }
+        if let Some(raw) = find_simple(b, "timeout") {
+            if let Some(d) = paneld_config::value::parse_duration(raw) {
+                def.timeout = Some(d);
+            }
+        }
         out.insert(name.text.clone(), def);
     }
     out
+}
+
+/// Pick an action's effective cwd per ADR 0013: an explicit `cwd =
+/// <path>` on the action if present (joined onto `base` when
+/// relative), otherwise `base` itself (the config file's directory).
+fn resolve_action_cwd(base: &std::path::Path, cwd: Option<&str>) -> std::path::PathBuf {
+    match cwd.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            let p = std::path::Path::new(raw);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            }
+        }
+        None => base.to_path_buf(),
+    }
 }
 
 fn collect_env(block: &Block) -> Vec<EnvPair> {
@@ -157,6 +190,10 @@ pub struct WorkerCtx {
     pub actions: HashMap<String, ActionDef>,
     pub base_ctx: Context,
     pub vars: Arc<Mutex<BTreeMap<String, Value>>>,
+    /// Live-shared source values so a `run =` that references
+    /// `sources.X.value` sees the current sample. Updated by the
+    /// main loop as `SourceUpdate`s arrive.
+    pub source_values: Arc<Mutex<BTreeMap<String, Value>>>,
     pub var_types: BTreeMap<String, String>,
     pub event_tx: Sender<UiEvent>,
     pub source_blocks: BTreeMap<String, Block>,
@@ -164,6 +201,12 @@ pub struct WorkerCtx {
     /// The worker's own input, cloned so it can re-queue `then` /
     /// `else` chained actions behind any already-pending work.
     pub self_tx: Sender<Call>,
+    /// ADR 0013 default cwd for every action command: the directory
+    /// of the main config file. A per-action `cwd` overrides.
+    pub config_dir: std::path::PathBuf,
+    /// ADR 0013 daemon-wide defaults (timeout, max_output) with
+    /// per-action overrides on top.
+    pub app_defaults: runner::AppDefaults,
 }
 
 /// One queued action invocation: its name plus the args already
@@ -191,7 +234,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
             let mut ok = true;
 
             if let Some(raw) = def.run {
-                let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.vars, &call.args);
+                let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
                 let file = paneld_config::source::FileId::default();
                 let cmd = paneld_ui::interpolate(&raw, file, 0, &ctx);
                 // Interpolate each env value against the same ctx so
@@ -207,12 +250,14 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                         )
                     })
                     .collect();
+                let cwd = resolve_action_cwd(&wctx.config_dir, def.cwd.as_deref());
+                let timeout = def.timeout.unwrap_or(wctx.app_defaults.timeout);
                 let opts = runner::Opts {
-                    timeout: DEFAULT_TIMEOUT,
-                    max_bytes: DEFAULT_MAX_BYTES,
+                    timeout,
+                    max_bytes: wctx.app_defaults.max_output,
                     kind: runner::Kind::Action,
                     name: &name,
-                    cwd: None,
+                    cwd: Some(&cwd),
                     env: &env_pairs,
                 };
                 match runner::exec(&cmd, opts) {
@@ -245,7 +290,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
             // only change the UI").
             let should_set = (had_run && ok) || !had_run;
             if should_set && !def.set.is_empty() {
-                let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.vars, &call.args);
+                let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
                 apply_set(
                     &name,
                     &def.set,
@@ -283,7 +328,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
             // poll tick.
             let should_refresh = (had_run && ok) || !had_run;
             if should_refresh && !def.refresh.is_empty() {
-                let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.vars, &call.args);
+                let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
                 for src_name in &def.refresh {
                     let Some(block) = wctx.source_blocks.get(src_name) else {
                         eprintln!(
@@ -291,7 +336,12 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                         );
                         continue;
                     };
-                    match crate::sources::resolve_one(block, &ctx) {
+                    match crate::sources::resolve_one(
+                        block,
+                        &ctx,
+                        &wctx.config_dir,
+                        wctx.app_defaults,
+                    ) {
                         Ok(v) => {
                             let _ = wctx.source_tx.send(crate::sources::SourceUpdate {
                                 name: src_name.clone(),
@@ -311,16 +361,20 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
 }
 
 /// Build an eval context from the worker-side pieces: the base ctx
-/// (sources/theme/secrets, snapshotted at daemon start), a fresh
-/// snapshot of `vars` and each action-call arg bound as a bare
+/// (theme/secrets, snapshotted at daemon start), a fresh snapshot
+/// of `sources` and `vars` (the main loop writes to both as new
+/// samples arrive), and each action-call arg bound as a bare
 /// identifier so `{{ vm }}` in a `run` string resolves to the arg
 /// value. Args win over base ctx bindings on name clash.
 fn ctx_with_vars_and_args(
     base: &Context,
+    sources: &Arc<Mutex<BTreeMap<String, Value>>>,
     vars: &Arc<Mutex<BTreeMap<String, Value>>>,
     args: &[ActionArg],
 ) -> Context {
     let mut ctx = base.clone();
+    let sources_snapshot = sources.lock().unwrap().clone();
+    ctx.insert("sources".into(), Value::Map(sources_snapshot));
     let snapshot = vars.lock().unwrap().clone();
     ctx.insert("vars".into(), Value::Map(snapshot));
     for a in args {
@@ -524,13 +578,39 @@ mod tests {
     #[test]
     fn ctx_overlay_puts_args_on_top_of_base_bindings() {
         let base = Context::new();
+        let sources = Arc::new(Mutex::new(BTreeMap::new()));
         let vars = Arc::new(Mutex::new(BTreeMap::new()));
         let args = vec![ActionArg {
             name: "vm".into(),
             value: Value::String("alpha".into()),
         }];
-        let ctx = ctx_with_vars_and_args(&base, &vars, &args);
+        let ctx = ctx_with_vars_and_args(&base, &sources, &vars, &args);
         assert_eq!(ctx.get("vm"), Some(&Value::String("alpha".into())));
         assert!(ctx.contains_key("vars"));
+        assert!(ctx.contains_key("sources"));
+    }
+
+    #[test]
+    fn ctx_overlay_reads_live_source_values() {
+        // Pre-existing bug fix: the action worker now sees fresh
+        // sources (not a daemon-start snapshot). Push a value into
+        // the shared map and prove `ctx.sources` reflects it.
+        let base = Context::new();
+        let sources = Arc::new(Mutex::new(BTreeMap::new()));
+        let vars = Arc::new(Mutex::new(BTreeMap::new()));
+        {
+            let mut g = sources.lock().unwrap();
+            let mut inner = BTreeMap::new();
+            inner.insert("value".to_string(), Value::Int(42));
+            g.insert("cpu".to_string(), Value::Map(inner));
+        }
+        let ctx = ctx_with_vars_and_args(&base, &sources, &vars, &[]);
+        let Some(Value::Map(ref smap)) = ctx.get("sources") else {
+            panic!("sources missing");
+        };
+        let Some(Value::Map(ref cpu)) = smap.get("cpu") else {
+            panic!("cpu missing");
+        };
+        assert_eq!(cpu.get("value"), Some(&Value::Int(42)));
     }
 }

@@ -30,9 +30,6 @@ use paneld_ui::{Context, Value};
 
 use crate::runner;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_MAX_BYTES: usize = 64 * 1024;
-
 /// A fresh value for a named source, broadcast each time a polling
 /// worker runs its `run` command.
 #[derive(Debug)]
@@ -47,7 +44,12 @@ pub struct SourceUpdate {
 /// Writes a one-line warning to stderr for each source that failed to
 /// run; the UI still renders, with that source missing from the
 /// context.
-pub fn resolve_all(doc: &Document, ctx: &Context) -> BTreeMap<String, Value> {
+pub fn resolve_all(
+    doc: &Document,
+    ctx: &Context,
+    base_cwd: &std::path::Path,
+    app_defaults: runner::AppDefaults,
+) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     for item in &doc.items {
         let Item::Block(b) = item else { continue };
@@ -61,7 +63,7 @@ pub fn resolve_all(doc: &Document, ctx: &Context) -> BTreeMap<String, Value> {
         if is_stream(b) {
             continue;
         }
-        match resolve_one(b, ctx) {
+        match resolve_one(b, ctx, base_cwd, app_defaults) {
             Ok(v) => {
                 out.insert(name.text.clone(), v);
             }
@@ -84,6 +86,8 @@ pub fn spawn_pollers(
     doc: &Document,
     ctx: &Context,
     tx: Sender<SourceUpdate>,
+    base_cwd: &std::path::Path,
+    app_defaults: runner::AppDefaults,
 ) -> ShutdownHandle {
     let shutdown = Arc::new(AtomicBool::new(false));
     let stream_pgids: Arc<Mutex<Vec<runner::Pid>>> = Arc::new(Mutex::new(Vec::new()));
@@ -104,6 +108,7 @@ pub fn spawn_pollers(
             let ctx_clone = ctx.clone();
             let shutdown_clone = shutdown.clone();
             let pgids_clone = stream_pgids.clone();
+            let cwd = resolve_cwd(b, base_cwd);
             thread::spawn(move || {
                 stream_loop(
                     block_clone,
@@ -112,6 +117,7 @@ pub fn spawn_pollers(
                     ctx_clone,
                     shutdown_clone,
                     pgids_clone,
+                    cwd,
                 )
             });
             continue;
@@ -136,11 +142,39 @@ pub fn spawn_pollers(
         let tx_clone: Sender<SourceUpdate> = tx.clone();
         let ctx_clone = ctx.clone();
         let shutdown_clone = shutdown.clone();
+        let cwd = resolve_cwd(b, base_cwd);
         thread::spawn(move || {
-            poll_loop(block_clone, name_clone, poll, tx_clone, ctx_clone, shutdown_clone)
+            poll_loop(
+                block_clone,
+                name_clone,
+                poll,
+                tx_clone,
+                ctx_clone,
+                shutdown_clone,
+                cwd,
+                app_defaults,
+            )
         });
     }
     ShutdownHandle { flag: shutdown, stream_pgids }
+}
+
+/// Resolve a block's effective cwd per ADR 0013. `base_cwd` is the
+/// main config file's directory. A `cwd = <path>` on the block
+/// overrides: an absolute path is used as-is, a relative one joins
+/// onto `base_cwd`.
+fn resolve_cwd(b: &Block, base_cwd: &std::path::Path) -> std::path::PathBuf {
+    match find_simple(b, "cwd").map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            let p = std::path::Path::new(raw);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base_cwd.join(p)
+            }
+        }
+        None => base_cwd.to_path_buf(),
+    }
 }
 
 /// `true` for a source block carrying `stream = true` (or an
@@ -175,6 +209,7 @@ impl ShutdownHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn poll_loop(
     block: Block,
     name: String,
@@ -182,6 +217,8 @@ fn poll_loop(
     tx: Sender<SourceUpdate>,
     ctx: Context,
     shutdown: Arc<AtomicBool>,
+    cwd: std::path::PathBuf,
+    app_defaults: runner::AppDefaults,
 ) {
     let max_delay = backoff_ceiling(interval);
     let mut delay = interval;
@@ -190,7 +227,7 @@ fn poll_loop(
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        match resolve_one(&block, &ctx) {
+        match resolve_one(&block, &ctx, &cwd, app_defaults) {
             Ok(v) => {
                 delay = interval;
                 if tx.send(SourceUpdate { name: name.clone(), value: v }).is_err() {
@@ -220,6 +257,7 @@ fn stream_loop(
     ctx: Context,
     shutdown: Arc<AtomicBool>,
     pgids: Arc<Mutex<Vec<runner::Pid>>>,
+    cwd: std::path::PathBuf,
 ) {
     const RESTART_FLOOR: Duration = Duration::from_secs(1);
     const RESTART_CEILING: Duration = Duration::from_secs(60);
@@ -244,7 +282,7 @@ fn stream_loop(
             max_bytes: usize::MAX,
             kind: runner::Kind::Source,
             name: &name,
-            cwd: None,
+            cwd: Some(&cwd),
             env: &env_pairs,
         };
         let mut command = match runner::prepared_command(&run, &opts) {
@@ -414,7 +452,12 @@ pub fn collect_blocks(doc: &Document) -> BTreeMap<String, Block> {
 /// under its name in the sources map; `.value` is set so the
 /// idiomatic `sources.X.value` works. `.ok` reflects the command's
 /// exit code (missing today -> `false`).
-pub fn resolve_one(b: &Block, ctx: &Context) -> Result<Value, String> {
+pub fn resolve_one(
+    b: &Block,
+    ctx: &Context,
+    base_cwd: &std::path::Path,
+    app_defaults: runner::AppDefaults,
+) -> Result<Value, String> {
     let (run_raw, run_span) =
         find_raw(b, "run").ok_or_else(|| "missing `run`".to_string())?;
     let parse_mode = find_simple(b, "parse").unwrap_or("text").trim().to_string();
@@ -430,12 +473,16 @@ pub fn resolve_one(b: &Block, ctx: &Context) -> Result<Value, String> {
         .into_iter()
         .map(|(k, raw, span)| (k, paneld_ui::interpolate(&raw, span.file, span.start, ctx)))
         .collect();
+    let cwd = resolve_cwd(b, base_cwd);
+    let timeout = find_simple(b, "timeout")
+        .and_then(paneld_config::value::parse_duration)
+        .unwrap_or(app_defaults.timeout);
     let opts = runner::Opts {
-        timeout: DEFAULT_TIMEOUT,
-        max_bytes: DEFAULT_MAX_BYTES,
+        timeout,
+        max_bytes: app_defaults.max_output,
         kind: runner::Kind::Source,
         name,
-        cwd: None,
+        cwd: Some(&cwd),
         env: &env_pairs,
     };
     let r = runner::exec(&run, opts).map_err(|e| format!("run: {e}"))?;
@@ -782,7 +829,7 @@ mod tests {
         );
         let doc = parse_doc(src);
         let (tx, rx) = channel();
-        let handle = spawn_pollers(&doc, &Context::new(), tx);
+        let handle = spawn_pollers(&doc, &Context::new(), tx, std::path::Path::new("."), runner::AppDefaults::default());
 
         let mut got = Vec::new();
         for _ in 0..2 {
@@ -816,7 +863,7 @@ mod tests {
         );
         let doc = parse_doc(src);
         let (tx, rx) = channel();
-        let handle = spawn_pollers(&doc, &Context::new(), tx);
+        let handle = spawn_pollers(&doc, &Context::new(), tx, std::path::Path::new("."), runner::AppDefaults::default());
 
         let u1 = rx.recv_timeout(Duration::from_secs(5)).expect("one");
         let u2 = rx.recv_timeout(Duration::from_secs(5)).expect("two");
@@ -849,7 +896,7 @@ mod tests {
         );
         let doc = parse_doc(src);
         let (tx, rx) = channel();
-        let handle = spawn_pollers(&doc, &Context::new(), tx);
+        let handle = spawn_pollers(&doc, &Context::new(), tx, std::path::Path::new("."), runner::AppDefaults::default());
 
         // First line arrives, confirming the child is up.
         let first = rx.recv_timeout(Duration::from_secs(5)).expect("first line");

@@ -51,11 +51,14 @@ pub enum UiEvent {
 /// `event.value`. Kept primitive so the UI thread can snapshot it
 /// without allocating; the main loop lifts it into a
 /// [`crate::Value`] when building the eval context.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum EventValue {
     Bool(bool),
     Int(i64),
     Double(f64),
+    /// Full typed string from a keypad on submit, or any widget that
+    /// carries a non-numeric payload.
+    String(String),
 }
 
 /// One `k = v` entry inside an inline `on_tap { set { ... } }`.
@@ -105,6 +108,10 @@ enum ChangeKind {
     Toggle,
     Slider,
     Dropdown,
+    /// Keypad: READY on the keyboard. The trampoline reads the
+    /// attached textarea's typed content and emits it as a
+    /// [`EventValue::String`].
+    Keypad,
 }
 
 /// Global registry of per-widget bindings. [`Obj::on_tap`] /
@@ -166,6 +173,26 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
             ChangeKind::Dropdown => {
                 let v = unsafe { sys::lv_dropdown_get_selected(target) };
                 EventValue::Int(v as i64)
+            }
+            ChangeKind::Keypad => {
+                // Keyboard READY event: fetch the attached textarea
+                // and read its NUL-terminated text out as a Rust
+                // String. Empty submission (no textarea linked)
+                // yields an empty string.
+                let ta = unsafe { sys::lv_keyboard_get_textarea(target) };
+                let text = if ta.is_null() {
+                    String::new()
+                } else {
+                    let cstr = unsafe { sys::lv_textarea_get_text(ta) };
+                    if cstr.is_null() {
+                        String::new()
+                    } else {
+                        unsafe { std::ffi::CStr::from_ptr(cstr) }
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                };
+                EventValue::String(text)
             }
         };
         let _ = sink.send(UiEvent::ChangeInlineSet { assigns, event_value });
@@ -484,6 +511,38 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_dropdown_set_selected(self.raw, idx.into()) };
     }
 
+    /// A textarea (schema `keypad`'s display line). `masked` turns on
+    /// password mode so digits render as dots; `max_length` of 0 is
+    /// treated as unlimited.
+    pub fn new_textarea(&self, masked: bool, max_length: u32) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_textarea_create(self.raw) };
+        assert!(!raw.is_null());
+        unsafe {
+            sys::lv_textarea_set_password_mode(raw, masked);
+            sys::lv_textarea_set_one_line(raw, true);
+            if max_length > 0 {
+                sys::lv_textarea_set_max_length(raw, max_length);
+            }
+        }
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// A keyboard, pinned to numeric mode for the `keypad` widget.
+    pub fn new_number_keyboard(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_keyboard_create(self.raw) };
+        assert!(!raw.is_null());
+        unsafe {
+            sys::lv_keyboard_set_mode(raw, sys::lv_keyboard_mode_t_LV_KEYBOARD_MODE_NUMBER);
+        }
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// Attach the keyboard self references to the given textarea so
+    /// keypad presses populate it.
+    pub fn attach_keyboard_to(&self, textarea: &Obj<'ui>) {
+        unsafe { sys::lv_keyboard_set_textarea(self.raw, textarea.raw) };
+    }
+
     /// A horizontal slider (schema `slider`). Range and value set
     /// through [`Self::set_slider_range`] / [`Self::set_slider_value`].
     pub fn new_slider(&self) -> Obj<'ui> {
@@ -739,6 +798,22 @@ impl<'ui> Obj<'ui> {
             assigns,
             sink,
             sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED,
+        );
+    }
+
+    /// Register a READY callback on a keyboard; on OK the trampoline
+    /// reads the attached textarea's content and pushes an
+    /// [`UiEvent::ChangeInlineSet`] with `event.value` as a string.
+    pub fn on_submit_keyboard_inline_set(
+        &self,
+        sink: Sender<UiEvent>,
+        assigns: Vec<InlineSetItem>,
+    ) {
+        self.register_change_binding(
+            ChangeKind::Keypad,
+            assigns,
+            sink,
+            sys::lv_event_code_t_LV_EVENT_READY,
         );
     }
 

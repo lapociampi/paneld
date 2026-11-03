@@ -39,6 +39,73 @@ impl std::fmt::Display for RunError {
     }
 }
 
+/// Daemon-wide command defaults read from the top-level `app` block
+/// (ADR 0013). Per-source / per-action keys override these for one
+/// command.
+#[derive(Debug, Clone, Copy)]
+pub struct AppDefaults {
+    pub timeout: Duration,
+    pub max_output: usize,
+}
+
+impl Default for AppDefaults {
+    fn default() -> Self {
+        // ADR 0013 defaults.
+        Self {
+            timeout: Duration::from_secs(10),
+            max_output: 1024 * 1024,
+        }
+    }
+}
+
+impl AppDefaults {
+    /// Read the ADR 0013 app defaults from `doc`. Accepts both the
+    /// `app:timeout = ...` qualified form and the `app { timeout =
+    /// ... }` block form. Missing keys fall back to [`Default`].
+    pub fn from_doc(doc: &paneld_config::parse::Document) -> Self {
+        use paneld_config::parse::{AssignTarget, Item};
+        let mut out = Self::default();
+        for item in &doc.items {
+            match item {
+                Item::Assign(a) => {
+                    if let AssignTarget::Qualified { category, key } = &a.target {
+                        if category.text == "app" {
+                            apply(&mut out, key.text.as_str(), &a.value.text);
+                        }
+                    }
+                }
+                Item::Block(b) if b.kind.text == "app" => {
+                    for inner in &b.items {
+                        if let Item::Assign(a) = inner {
+                            if let AssignTarget::Simple { key } = &a.target {
+                                apply(&mut out, key.text.as_str(), &a.value.text);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+fn apply(out: &mut AppDefaults, key: &str, raw: &str) {
+    match key {
+        "timeout" => {
+            if let Some(d) = paneld_config::value::parse_duration(raw) {
+                out.timeout = d;
+            }
+        }
+        "max_output" => {
+            if let Some(n) = paneld_config::value::parse_bytes(raw) {
+                out.max_output = n as usize;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// What the command is run as (source `foo` vs action `bar`). Used
 /// to set `PANELD_SOURCE` / `PANELD_ACTION` and nothing else.
 #[derive(Debug, Clone, Copy)]
