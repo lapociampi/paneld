@@ -2,6 +2,7 @@
 title: "Schema"
 description: "Every item, category, building block and property the config can hold."
 date: 2026-10-29
+updated: 2026-11-03
 tags: [paneld, config, reference]
 series: paneld
 order: 4
@@ -403,6 +404,8 @@ screen {
 | `unlock_for` | duration | Default 1m |
 | `attempts` | int | Default 5, then locked out |
 | `lockout` | duration | Default 5m |
+
+`paneld hash-pin` reads a PIN (digits) on stdin and prints the hash to store in that secret. A `pin = true` action with no usable hash refuses to run.
 
 ## 15. App
 

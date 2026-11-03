@@ -17,6 +17,10 @@ paneld-ui = { path = "../paneld-ui", default-features = false }
 # needs (killpg + kill(_, 0) for liveness) so the whole crate stays
 # on the workspace's `unsafe_code = "forbid"` lint.
 nix = { version = "0.29", default-features = false, features = ["signal"] }
+# Schema section 14: the PIN is stored as an argon2 PHC hash in a
+# secret. Verifying it needs the real KDF; `alloc` + `password-hash`
+# only, no rand/std extras.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 
 [features]
 default = ["sdl"]

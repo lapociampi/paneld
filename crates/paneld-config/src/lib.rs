@@ -7,6 +7,7 @@
 pub mod cel;
 pub mod lex;
 pub mod load;
+pub mod overrides;
 pub mod parse;
 pub mod schema;
 pub mod source;
@@ -14,6 +15,7 @@ pub mod value;
 
 pub use lex::{LexError, Lexer, Token, TokenKind};
 pub use load::{load, LoadError};
+pub use overrides::apply_overrides;
 pub use parse::{
     parse, Assign, AssignTarget, Block, Diagnostic, Document, Expr, Ident, Item, OptionsBlock,
     Param, RawValue, Repeat, VarDecl,

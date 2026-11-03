@@ -2,6 +2,7 @@
 title: "Deploy"
 description: "Cross-compile paneld for an arm64 Linux board and run it as a systemd service."
 date: 2026-10-30
+updated: 2026-11-03
 tags: [paneld, deploy, pi, systemd]
 series: paneld
 order: 7
@@ -35,7 +36,7 @@ Every build also includes the fbdev + evdev drivers; they have no external depen
 ## Cross-compile for the Pi
 
 ```
-# From the workspace root. Produces a stripped, 1.5-2 MB static binary.
+# From the workspace root. Produces a stripped, about 1.8 MB static binary.
 cargo zigbuild --target aarch64-unknown-linux-musl \
     -p paneld --no-default-features --release
 ```
@@ -84,6 +85,33 @@ display {
 ```
 
 Device paths vary: `card0` on the Pi 3B+ (one GPU device), `card1` on the Pi 4 and 5 (`card0` is the 3D-only V3D there). `ls /sys/class/drm/` shows which card has the connector (e.g. `card0-DSI-1`). The touch controller shows up under `/dev/input/`; `evtest` lists the available devices.
+
+## PIN for guarded actions
+
+Actions marked `pin = true` ask for a PIN first ([Schema](schema.md), section 14). The config never holds the PIN, only an argon2 hash in a secret:
+
+```
+# On the device. The PIN is read from stdin, so it stays out of
+# shell history and `ps`.
+read -rs PIN && printf '%s\n' "$PIN" | paneld hash-pin \
+    | sudo tee /etc/paneld/pin.hash >/dev/null
+unset PIN
+sudo chown paneld:paneld /etc/paneld/pin.hash
+sudo chmod 0600 /etc/paneld/pin.hash
+```
+
+```
+secret pin_hash { file = /etc/paneld/pin.hash }
+
+security {
+    pin        = pin_hash
+    unlock_for = 1m     # one PIN unlocks every guarded action this long
+    attempts   = 5      # wrong PINs in a row before a lockout
+    lockout    = 5m
+}
+```
+
+Without a usable `security.pin` a guarded action refuses to run. A config reload keeps the unlock window and any active lockout.
 
 ## Diagnostics
 

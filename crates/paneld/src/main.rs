@@ -11,6 +11,7 @@ mod actions;
 mod alerts;
 mod ctl;
 mod display;
+mod pin;
 mod runner;
 mod secrets;
 mod sources;
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
         Ok(Cmd::Run { config }) => run_daemon(config),
         Ok(Cmd::Check { config }) => run_check(config),
         Ok(Cmd::Ctl { args }) => run_ctl(&args),
+        Ok(Cmd::HashPin) => run_hash_pin(),
         Err(e) => {
             eprintln!("paneld: {e}");
             eprintln!("try `paneld --help`");
@@ -52,6 +54,7 @@ enum Cmd {
     Run { config: PathBuf },
     Check { config: PathBuf },
     Ctl { args: Vec<String> },
+    HashPin,
 }
 
 fn parse_args(args: &[String]) -> Result<Cmd, String> {
@@ -105,6 +108,12 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             Ok(Cmd::Check { config: config.unwrap_or_else(default_config) })
         }
         Some("ctl") => Ok(Cmd::Ctl { args: args[i..].to_vec() }),
+        Some("hash-pin") => match args.get(i) {
+            None => Ok(Cmd::HashPin),
+            Some(s) => Err(format!(
+                "unexpected argument `{s}` to `hash-pin` (the PIN is read from stdin)"
+            )),
+        },
         Some(other) if other.starts_with('-') => Err(format!("unknown option `{other}`")),
         Some(other) => Err(format!("unknown subcommand `{other}`")),
     }
@@ -122,6 +131,8 @@ Usage:
   paneld [--config PATH]              Run the daemon
   paneld check [--config PATH]        Validate a config, offline
   paneld ctl SUBCOMMAND [ARGS...]     Talk to a running daemon
+  paneld hash-pin                     Read a PIN on stdin, print its
+                                      argon2 hash for security.pin
 
 Flags:
   -c, --config PATH   Config file (default: {DEFAULT_CONFIG})
@@ -190,7 +201,8 @@ fn run_daemon(config: PathBuf) -> ExitCode {
             match msg {
                 ctl::ControlMsg::Exit => break 'main,
                 ctl::ControlMsg::Reload => match setup_live_state(&config, &screen) {
-                    Ok(fresh) => {
+                    Ok(mut fresh) => {
+                        fresh.pin_gate.carry_from(&live.pin_gate);
                         // Flush any pending alert state before the
                         // old Store is dropped, so a reload during
                         // a long incident doesn't lose timestamps
@@ -218,7 +230,59 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         while let Ok(ev) = live.event_rx.try_recv() {
             match ev {
                 paneld_ui::UiEvent::Action { name, args } => {
-                    let _ = live.action_tx.send(actions::Call { name, args });
+                    // A modal owns the screen: drop stray taps rather
+                    // than let them slip past the gate.
+                    if live.pending.is_some() {
+                        continue;
+                    }
+                    route_call(&mut live, &screen, actions::Call { name, args }, false);
+                    dirty = live.pending.is_none();
+                }
+                paneld_ui::UiEvent::PinEntered { digits } => {
+                    if let Some(Pending { call, stage: Stage::Pin }) = live.pending.take() {
+                        let now = std::time::Instant::now();
+                        match live.pin_gate.check(&digits, now) {
+                            pin::Check::Ok => route_call(&mut live, &screen, call, true),
+                            pin::Check::Wrong { remaining } => {
+                                show_pin_modal(
+                                    &screen,
+                                    &call.name,
+                                    Some(&format!(
+                                        "Wrong PIN, {remaining} tr{} left",
+                                        if remaining == 1 { "y" } else { "ies" }
+                                    )),
+                                    &live.event_tx,
+                                );
+                                live.pending = Some(Pending { call, stage: Stage::Pin });
+                            }
+                            pin::Check::LockedOut { for_ } => {
+                                eprintln!("paneld: PIN locked out for {for_:?}");
+                                show_notice(
+                                    &screen,
+                                    &format!("Too many wrong PINs. Locked for {}s.", for_.as_secs()),
+                                    &live.event_tx,
+                                );
+                                live.pending = Some(Pending { call, stage: Stage::Notice });
+                            }
+                            pin::Check::NotConfigured => {
+                                show_notice(
+                                    &screen,
+                                    "No PIN is configured (security.pin); action refused.",
+                                    &live.event_tx,
+                                );
+                                live.pending = Some(Pending { call, stage: Stage::Notice });
+                            }
+                        }
+                        dirty = live.pending.is_none();
+                    }
+                }
+                paneld_ui::UiEvent::ConfirmReply { accept } => {
+                    if let Some(Pending { call, stage }) = live.pending.take() {
+                        if accept && matches!(stage, Stage::Confirm) {
+                            let _ = live.action_tx.send(call);
+                        }
+                    }
+                    dirty = true;
                 }
                 paneld_ui::UiEvent::Goto { page } => {
                     if page != live.current_page {
@@ -328,7 +392,7 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         live.state.note(live.alerts.active_alerts());
         live.state.flush_if_due(now_instant);
 
-        if dirty {
+        if dirty && live.pending.is_none() {
             let ctx = build_ctx(
                 &live.source_values,
                 &live.theme,
@@ -380,6 +444,27 @@ struct LiveState {
     alerts: alerts::Engine,
     state: state::Store,
     sources_shutdown: sources::ShutdownHandle,
+    /// Clone of the action table the worker holds. Lets the main
+    /// loop look up `confirm` without crossing the channel.
+    actions: std::collections::HashMap<String, actions::ActionDef>,
+    /// Set while a PIN / confirm / notice modal owns the screen.
+    /// Blocks re-renders of the page tree so the modal stays up.
+    pending: Option<Pending>,
+    pin_gate: pin::Gate,
+}
+
+/// An action parked behind a modal, and which modal it is.
+struct Pending {
+    call: actions::Call,
+    stage: Stage,
+}
+
+enum Stage {
+    Pin,
+    Confirm,
+    /// A message with only OK (lockout, PIN not configured). The
+    /// parked call is dropped on dismiss.
+    Notice,
 }
 
 fn setup_live_state(
@@ -394,7 +479,7 @@ fn setup_live_state(
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let (source, doc, mut diags) = match load(config) {
+    let (source, mut doc, mut diags) = match load(config) {
         Ok(parts) => parts,
         Err(e) => {
             eprintln!("paneld: {e}");
@@ -414,6 +499,10 @@ fn setup_live_state(
         );
         return Err(ExitCode::from(1));
     }
+    // `kind[name]:key = value` overrides land in their blocks so every
+    // consumer below reads one form (and `action[x]:pin = true` is
+    // honored).
+    paneld_config::apply_overrides(&mut doc);
 
     // Pull the ADR 0013 defaults out once (10s timeout, 1 MiB
     // max_output unless `app:timeout` / `app:max_output` say
@@ -424,6 +513,7 @@ fn setup_live_state(
     // source-run's interpolation. (Secrets never change at runtime
     // in v1; a reload re-reads them.)
     let secret_values = secrets::resolve(&doc);
+    let pin_gate = pin::Gate::from_doc(&doc, &secret_values);
     let theme = themes::resolve(&doc);
     let vars_map = vars::initial_values(&doc);
     let var_types = vars::types(&doc);
@@ -445,6 +535,7 @@ fn setup_live_state(
         app_defaults,
     );
     let action_table = actions::collect(&doc);
+    let action_table_for_main = action_table.clone();
     let source_blocks = sources::collect_blocks(&doc);
 
     // One channel carries actions, goto navs and vars-changed events.
@@ -511,7 +602,122 @@ fn setup_live_state(
         alerts: alerts_engine,
         state: state_store,
         sources_shutdown,
+        actions: action_table_for_main,
+        pending: None,
+        pin_gate,
     })
+}
+
+/// Send `call` through the schema's gate order (section 5: PIN, then
+/// confirm, then run). Parks it in `live.pending` behind a modal when
+/// a gate applies; otherwise forwards it to the worker. `pin_done`
+/// is true when the caller just verified the PIN for this call.
+fn route_call(
+    live: &mut LiveState,
+    screen: &paneld_ui::ui::Obj<'_>,
+    call: actions::Call,
+    pin_done: bool,
+) {
+    let Some(def) = live.actions.get(&call.name).cloned() else {
+        // Unknown action: let the worker log it.
+        let _ = live.action_tx.send(call);
+        return;
+    };
+    let now = std::time::Instant::now();
+    if def.pin && !pin_done && !live.pin_gate.is_unlocked(now) {
+        if !live.pin_gate.configured() {
+            eprintln!(
+                "paneld: action `{}` needs a PIN but security.pin is not set; refused",
+                call.name
+            );
+            show_notice(
+                screen,
+                "No PIN is configured (security.pin); action refused.",
+                &live.event_tx,
+            );
+            live.pending = Some(Pending { call, stage: Stage::Notice });
+            return;
+        }
+        if let Some(d) = live.pin_gate.locked_for(now) {
+            show_notice(
+                screen,
+                &format!("Too many wrong PINs. Locked for {}s.", d.as_secs().max(1)),
+                &live.event_tx,
+            );
+            live.pending = Some(Pending { call, stage: Stage::Notice });
+            return;
+        }
+        show_pin_modal(screen, &call.name, None, &live.event_tx);
+        live.pending = Some(Pending { call, stage: Stage::Pin });
+        return;
+    }
+    if let Some(cp) = def.confirm {
+        let ctx = build_ctx(
+            &live.source_values,
+            &live.theme,
+            &live.secrets,
+            &live.vars,
+            Some(&live.alerts),
+        );
+        let message = paneld_ui::interpolate(&cp.raw, cp.span.file, cp.span.start, &ctx);
+        show_confirm_modal(screen, &call.name, &message, &live.event_tx);
+        live.pending = Some(Pending { call, stage: Stage::Confirm });
+        return;
+    }
+    let _ = live.action_tx.send(call);
+}
+
+/// PIN entry modal: masked textarea in a msgbox plus a numeric
+/// keyboard. The keyboard's OK sends `PinEntered`; Cancel sends a
+/// `ConfirmReply { accept: false }` which drops the parked call.
+fn show_pin_modal(
+    screen: &paneld_ui::ui::Obj<'_>,
+    action_name: &str,
+    error: Option<&str>,
+    sink: &std::sync::mpsc::Sender<paneld_ui::UiEvent>,
+) {
+    paneld_ui::reset_action_bindings();
+    screen.clear_children();
+    let box_ = screen.new_msgbox();
+    box_.msgbox_add_title(&format!("PIN for `{action_name}`"));
+    if let Some(e) = error {
+        box_.msgbox_add_text(e);
+    }
+    let ta = box_.msgbox_content().new_textarea(true, 12);
+    box_.msgbox_add_confirm_button("Cancel", false, sink.clone());
+    let kb = screen.new_number_keyboard();
+    kb.attach_keyboard_to(&ta);
+    kb.on_submit_pin(sink.clone());
+}
+
+/// A message with a single OK that dismisses it.
+fn show_notice(
+    screen: &paneld_ui::ui::Obj<'_>,
+    message: &str,
+    sink: &std::sync::mpsc::Sender<paneld_ui::UiEvent>,
+) {
+    paneld_ui::reset_action_bindings();
+    screen.clear_children();
+    let box_ = screen.new_msgbox();
+    box_.msgbox_add_text(message);
+    box_.msgbox_add_confirm_button("OK", false, sink.clone());
+}
+
+/// Pop an action-confirm modal on `screen`, replacing the page so
+/// the modal is the only live binding target until the user replies.
+fn show_confirm_modal(
+    screen: &paneld_ui::ui::Obj<'_>,
+    action_name: &str,
+    message: &str,
+    sink: &std::sync::mpsc::Sender<paneld_ui::UiEvent>,
+) {
+    paneld_ui::reset_action_bindings();
+    screen.clear_children();
+    let box_ = screen.new_msgbox();
+    box_.msgbox_add_title(&format!("Run `{action_name}`?"));
+    box_.msgbox_add_text(message);
+    box_.msgbox_add_confirm_button("Cancel", false, sink.clone());
+    box_.msgbox_add_confirm_button("OK", true, sink.clone());
 }
 
 fn find_start_page(doc: &paneld_config::parse::Document) -> Option<String> {
@@ -568,6 +774,32 @@ fn run_check(config: PathBuf) -> ExitCode {
         if diags.len() == 1 { "" } else { "s" }
     );
     ExitCode::from(1)
+}
+
+/// `paneld hash-pin`: read one line (the PIN) from stdin and print
+/// the argon2id PHC string to store in the secret `security.pin`
+/// names. Digits only, since the panel's PIN pad is numeric.
+fn run_hash_pin() -> ExitCode {
+    let mut line = String::new();
+    if let Err(e) = std::io::stdin().read_line(&mut line) {
+        eprintln!("paneld hash-pin: reading stdin: {e}");
+        return ExitCode::from(1);
+    }
+    let pin = line.trim_end_matches(['\n', '\r']);
+    if pin.is_empty() || !pin.bytes().all(|b| b.is_ascii_digit()) {
+        eprintln!("paneld hash-pin: the PIN must be one or more digits");
+        return ExitCode::from(2);
+    }
+    match pin::hash(pin) {
+        Ok(h) => {
+            println!("{h}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("paneld hash-pin: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn run_ctl(args: &[String]) -> ExitCode {
@@ -690,6 +922,13 @@ mod tests {
             parse(&["ctl", "set", "foo=1", "bar=2"]),
             Ok(Cmd::Ctl { args: vec!["set".into(), "foo=1".into(), "bar=2".into()] })
         );
+    }
+
+    #[test]
+    fn hash_pin_takes_no_positional_pin() {
+        assert_eq!(parse(&["hash-pin"]), Ok(Cmd::HashPin));
+        let err = parse(&["hash-pin", "1234"]).unwrap_err();
+        assert!(err.contains("stdin"), "got: {err}");
     }
 
     #[test]

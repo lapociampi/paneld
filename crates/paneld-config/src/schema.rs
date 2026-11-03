@@ -68,6 +68,12 @@ fn classify_kind(kind: &str) -> Option<KindKind> {
     }
 }
 
+/// `true` for a settings category (`app`, `screen`, ...), whose keys
+/// are options: settable many times, last one in load order wins.
+pub(crate) fn is_category(kind: &str) -> bool {
+    matches!(classify_kind(kind), Some(KindKind::Category))
+}
+
 fn is_legal_top_assign(key: &str) -> bool {
     matches!(key, "include")
 }
@@ -1217,6 +1223,7 @@ pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     }
 
     resolve_refs(doc, &names, &mut diags);
+    check_override_targets(doc, &mut diags);
 
     // Phase 10: parse every `{{ ... }}` fragment as CEL, surface parse
     // errors, and cross-reference `sources.<name>` against the collected
@@ -1224,6 +1231,40 @@ pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     check_cel_in_doc(doc, &names, &mut diags);
 
     diags
+}
+
+/// `kind[name]:key = value` overrides one property of an existing
+/// named item (config-format, "Blocks"). An override whose item is
+/// not defined would otherwise be dropped silently: for
+/// `action[x]:pin = true` that means a misspelled name leaves the
+/// real action without its PIN.
+fn check_override_targets(doc: &Document, diags: &mut Vec<Diagnostic>) {
+    let mut defined: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    for item in &doc.items {
+        if let Item::Block(b) = item {
+            if let Some(name) = &b.name {
+                defined.insert((b.kind.text.as_str(), name.text.as_str()));
+            }
+        }
+    }
+    for item in &doc.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Indexed { kind, name, .. } = &a.target else {
+            continue;
+        };
+        if !matches!(classify_kind(&kind.text), Some(KindKind::Named)) {
+            continue;
+        }
+        if !defined.contains(&(kind.text.as_str(), name.text.as_str())) {
+            diags.push(Diagnostic::new(
+                name.span,
+                format!(
+                    "`{0}[{1}]` overrides an item that is not defined (no `{0} {1} {{ }}`)",
+                    kind.text, name.text
+                ),
+            ));
+        }
+    }
 }
 
 fn collect_user_components(doc: &Document) -> std::collections::HashSet<String> {
@@ -4111,6 +4152,25 @@ page home { text { on_tap = {{ some_expr }} } }
     fn indexed_top_level_alert_from_ref_is_resolved() {
         let diags = check_text("alert[a]:from = ghost\n");
         assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn override_of_undefined_item_is_flagged() {
+        let diags = check_text(
+            "action reboot_rack { run = /bin/true }\naction[reboot_rak]:pin = true\n",
+        );
+        assert_msg(
+            &diags,
+            "`action[reboot_rak]` overrides an item that is not defined (no `action reboot_rak { }`)",
+        );
+    }
+
+    #[test]
+    fn override_of_defined_item_is_clean() {
+        let diags = check_text(
+            "action reboot_rack { run = /bin/true }\naction[reboot_rack]:pin = true\n",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

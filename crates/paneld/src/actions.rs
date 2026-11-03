@@ -47,6 +47,21 @@ pub struct ActionDef {
     /// Per-action `timeout = <dur>`; falls back to
     /// `WorkerCtx::app_defaults.timeout`.
     pub timeout: Option<Duration>,
+    /// `confirm = <message>` on an action pops a modal with OK /
+    /// Cancel before running. Interpolated against the eval ctx at
+    /// prompt time so the message can mention the item.
+    pub confirm: Option<ConfirmPrompt>,
+    /// `pin = true`: ask the PIN (schema section 14) before
+    /// `confirm` and `run`.
+    pub pin: bool,
+}
+
+/// Raw text + span for a `confirm = <message>`, held so the main
+/// loop can interpolate it at prompt time against the eval ctx.
+#[derive(Clone, Debug)]
+pub struct ConfirmPrompt {
+    pub raw: String,
+    pub span: paneld_config::source::Span,
 }
 
 /// One `env { KEY = value }` entry. `value_raw` is the raw text,
@@ -112,6 +127,12 @@ pub fn collect(doc: &Document) -> HashMap<String, ActionDef> {
             if let Some(d) = paneld_config::value::parse_duration(raw) {
                 def.timeout = Some(d);
             }
+        }
+        if let Some((raw, span)) = find_simple_with_span(b, "confirm") {
+            def.confirm = Some(ConfirmPrompt { raw: raw.to_string(), span });
+        }
+        if let Some(raw) = find_simple(b, "pin") {
+            def.pin = paneld_config::value::parse_bool(raw.trim()).unwrap_or(false);
         }
         out.insert(name.text.clone(), def);
     }
@@ -210,7 +231,9 @@ pub struct WorkerCtx {
 }
 
 /// One queued action invocation: its name plus the args already
-/// evaluated at render time (empty for `on_tap = foo`).
+/// evaluated at render time (empty for `on_tap = foo`). The main
+/// loop filters `confirm`-gated actions through a modal before any
+/// Call reaches the worker, so there's no bypass flag here.
 #[derive(Debug, Clone)]
 pub struct Call {
     pub name: String,
@@ -310,6 +333,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                     let _ = wctx.self_tx.send(Call {
                         name: next.clone(),
                         args: Vec::new(),
+                        
                     });
                 }
             } else if had_run && !ok {
@@ -317,6 +341,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                     let _ = wctx.self_tx.send(Call {
                         name: next.clone(),
                         args: Vec::new(),
+                        
                     });
                 }
             }
@@ -455,6 +480,22 @@ pub fn apply_inline_set(
         changed = true;
     }
     changed
+}
+
+fn find_simple_with_span<'a>(
+    node: &'a Block,
+    key: &str,
+) -> Option<(&'a str, paneld_config::source::Span)> {
+    for item in &node.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key: k } = &a.target else {
+            continue;
+        };
+        if k.text == key {
+            return Some((a.value.text.as_str(), a.value.span));
+        }
+    }
+    None
 }
 
 fn find_simple<'a>(node: &'a Block, key: &str) -> Option<&'a str> {

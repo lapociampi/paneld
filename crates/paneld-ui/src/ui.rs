@@ -45,6 +45,13 @@ pub enum UiEvent {
     /// [`UiEvent::InlineSet`] on tap). The main loop treats this like
     /// a source update: rebuild ctx, re-render.
     VarsChanged,
+    /// A confirm modal's OK or Cancel was tapped; the main loop
+    /// uses this to resolve the `pending_confirm` state and either
+    /// forward the pending action or drop it.
+    ConfirmReply { accept: bool },
+    /// The PIN modal's keyboard OK was pressed. Carries the typed
+    /// digits; the main loop verifies them and must never log them.
+    PinEntered { digits: String },
 }
 
 /// The scalar an input widget's `on_change` handler sees as
@@ -101,6 +108,8 @@ enum Binding {
         assigns: Vec<InlineSetItem>,
         sink: Sender<UiEvent>,
     },
+    /// Modal OK / Cancel button; sends [`UiEvent::ConfirmReply`].
+    Confirm { accept: bool, sink: Sender<UiEvent> },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +121,9 @@ enum ChangeKind {
     /// attached textarea's typed content and emits it as a
     /// [`EventValue::String`].
     Keypad,
+    /// Same keyboard READY, but for the PIN modal: emits
+    /// [`UiEvent::PinEntered`] instead of an inline `set`.
+    PinEntry,
 }
 
 /// Global registry of per-widget bindings. [`Obj::on_tap`] /
@@ -147,6 +159,9 @@ unsafe extern "C" fn on_tap_trampoline(e: *mut sys::lv_event_t) {
         Some(Binding::InlineSet { assigns, sink }) => {
             let _ = sink.send(UiEvent::InlineSet { assigns });
         }
+        Some(Binding::Confirm { accept, sink }) => {
+            let _ = sink.send(UiEvent::ConfirmReply { accept });
+        }
         _ => {}
     }
 }
@@ -174,29 +189,31 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
                 let v = unsafe { sys::lv_dropdown_get_selected(target) };
                 EventValue::Int(v as i64)
             }
-            ChangeKind::Keypad => {
-                // Keyboard READY event: fetch the attached textarea
-                // and read its NUL-terminated text out as a Rust
-                // String. Empty submission (no textarea linked)
-                // yields an empty string.
-                let ta = unsafe { sys::lv_keyboard_get_textarea(target) };
-                let text = if ta.is_null() {
-                    String::new()
-                } else {
-                    let cstr = unsafe { sys::lv_textarea_get_text(ta) };
-                    if cstr.is_null() {
-                        String::new()
-                    } else {
-                        unsafe { std::ffi::CStr::from_ptr(cstr) }
-                            .to_string_lossy()
-                            .into_owned()
-                    }
-                };
-                EventValue::String(text)
+            ChangeKind::Keypad => EventValue::String(keyboard_text(target)),
+            ChangeKind::PinEntry => {
+                let digits = keyboard_text(target);
+                let _ = sink.send(UiEvent::PinEntered { digits });
+                return;
             }
         };
         let _ = sink.send(UiEvent::ChangeInlineSet { assigns, event_value });
     }
+}
+
+/// Read the text of the textarea attached to keyboard `kb`. Empty
+/// when no textarea is linked.
+fn keyboard_text(kb: *mut sys::lv_obj_t) -> String {
+    let ta = unsafe { sys::lv_keyboard_get_textarea(kb) };
+    if ta.is_null() {
+        return String::new();
+    }
+    let cstr = unsafe { sys::lv_textarea_get_text(ta) };
+    if cstr.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(cstr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 // LVGL's `LV_SIZE_CONTENT`, `LV_PCT(x)` and the grid sentinels are C
@@ -527,6 +544,62 @@ impl<'ui> Obj<'ui> {
         Obj { raw, _ui: PhantomData }
     }
 
+    /// A modal message box (schema's action `confirm`). Call
+    /// `add_title`, `add_text` and `add_confirm_button` / `add_cancel_button`
+    /// to flesh it out. `parent = screen` makes it an overlay.
+    pub fn new_msgbox(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_msgbox_create(self.raw) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    pub fn msgbox_add_title(&self, text: &str) {
+        let c = CString::new(text).unwrap_or_else(|_| CString::new("").unwrap());
+        unsafe { sys::lv_msgbox_add_title(self.raw, c.as_ptr()) };
+    }
+
+    /// The msgbox's content area, for adding custom children (the
+    /// PIN modal's textarea lives here).
+    pub fn msgbox_content(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_msgbox_get_content(self.raw) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    pub fn msgbox_add_text(&self, text: &str) {
+        let c = CString::new(text).unwrap_or_else(|_| CString::new("").unwrap());
+        unsafe { sys::lv_msgbox_add_text(self.raw, c.as_ptr()) };
+    }
+
+    /// Add a footer button to a msgbox and register a `Confirm`
+    /// binding for `accept`. Returns the created button so the
+    /// caller can style it.
+    pub fn msgbox_add_confirm_button(
+        &self,
+        label: &str,
+        accept: bool,
+        sink: Sender<UiEvent>,
+    ) -> Obj<'ui> {
+        let c = CString::new(label).unwrap_or_else(|_| CString::new("").unwrap());
+        let raw = unsafe { sys::lv_msgbox_add_footer_button(self.raw, c.as_ptr()) };
+        assert!(!raw.is_null());
+        let btn = Obj { raw, _ui: PhantomData };
+        let idx = {
+            let mut g = bindings().lock().unwrap();
+            g.push(Binding::Confirm { accept, sink });
+            g.len() - 1
+        };
+        unsafe {
+            sys::lv_obj_add_event_cb(
+                raw,
+                Some(on_tap_trampoline),
+                sys::lv_event_code_t_LV_EVENT_CLICKED,
+                idx as *mut std::ffi::c_void,
+            );
+        }
+        btn
+    }
+
     /// A keyboard, pinned to numeric mode for the `keypad` widget.
     pub fn new_number_keyboard(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_keyboard_create(self.raw) };
@@ -798,6 +871,17 @@ impl<'ui> Obj<'ui> {
             assigns,
             sink,
             sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED,
+        );
+    }
+
+    /// Register a READY callback on the PIN modal's keyboard; on OK
+    /// the trampoline pushes [`UiEvent::PinEntered`] with the digits.
+    pub fn on_submit_pin(&self, sink: Sender<UiEvent>) {
+        self.register_change_binding(
+            ChangeKind::PinEntry,
+            Vec::new(),
+            sink,
+            sys::lv_event_code_t_LV_EVENT_READY,
         );
     }
 
