@@ -650,6 +650,7 @@ mod tests {
             text: "72.3 C".into(),
             link: "".into(),
             since: UNIX_EPOCH + Duration::from_secs(1_762_000_000),
+            fired_at: Instant::now(),
             acked: false,
             snoozed_until: None,
         }

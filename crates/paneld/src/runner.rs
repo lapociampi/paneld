@@ -16,8 +16,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{killpg, Signal};
-use nix::unistd::Pid;
+pub use nix::sys::signal::Signal;
+use nix::sys::signal::killpg;
+pub use nix::unistd::Pid;
 
 #[derive(Debug)]
 pub struct RunResult {
@@ -247,6 +248,37 @@ fn exec_argv(argv: &[String], opts: Opts<'_>) -> Result<RunResult, RunError> {
         stderr: stderr_s,
         timed_out,
     })
+}
+
+/// Send `sig` to the group whose leader is `pid`. The caller is
+/// responsible for having spawned the child with `process_group(0)`.
+/// Errors (including `ESRCH` for an already-gone group) are
+/// swallowed, matching the one-shot `exec` path.
+pub fn kill_group(pid: Pid, sig: Signal) {
+    let _ = killpg(pid, sig);
+}
+
+/// Build a [`Command`] primed with the ADR 0013 base environment
+/// (clean env, PATH, HOME, LANG, PANELD, PANELD_SOURCE / _ACTION),
+/// stdin from /dev/null, stdout and stderr piped, and the child in
+/// its own process group. The caller spawns, drains output, and
+/// kills on their own terms -- used by [`exec`] for one-shots and by
+/// `sources.rs` for long-lived stream children.
+pub fn prepared_command(cmd: &str, opts: &Opts<'_>) -> Result<Command, RunError> {
+    let argv = tokenize(cmd)?;
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .env_clear()
+        .envs(clean_env(opts))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    if let Some(cwd) = opts.cwd {
+        command.current_dir(cwd);
+    }
+    Ok(command)
 }
 
 fn clean_env(opts: &Opts<'_>) -> Vec<(OsString, OsString)> {

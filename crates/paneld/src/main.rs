@@ -196,6 +196,11 @@ fn run_daemon(config: PathBuf) -> ExitCode {
                         // a long incident doesn't lose timestamps
                         // that hadn't aged into the 10s window yet.
                         live.state.force_flush();
+                        // Signal the previous poll/stream workers to
+                        // exit so a stream source isn't duplicated
+                        // after reload. The new state has already
+                        // spawned its own.
+                        live.sources_shutdown.stop();
                         live = fresh;
                         eprintln!("paneld: reloaded config");
                     }
@@ -342,6 +347,10 @@ fn run_daemon(config: PathBuf) -> ExitCode {
     }
 
     live.state.force_flush();
+    live.sources_shutdown.stop();
+    // Give the SIGTERMs from `stop` a brief moment to land on stream
+    // children before the daemon process exits and reparents them.
+    std::thread::sleep(std::time::Duration::from_millis(100));
     let _ = std::fs::remove_file(&sock_path);
     ExitCode::SUCCESS
 }
@@ -361,6 +370,7 @@ struct LiveState {
     current_page: String,
     alerts: alerts::Engine,
     state: state::Store,
+    sources_shutdown: sources::ShutdownHandle,
 }
 
 fn setup_live_state(
@@ -402,7 +412,7 @@ fn setup_live_state(
     let source_values = sources::resolve_all(&doc, &base_ctx);
     let (source_tx, source_rx) =
         std::sync::mpsc::channel::<sources::SourceUpdate>();
-    sources::spawn_pollers(&doc, &base_ctx, source_tx.clone());
+    let sources_shutdown = sources::spawn_pollers(&doc, &base_ctx, source_tx.clone());
     let action_table = actions::collect(&doc);
     let source_blocks = sources::collect_blocks(&doc);
 
@@ -466,6 +476,7 @@ fn setup_live_state(
         current_page,
         alerts: alerts_engine,
         state: state_store,
+        sources_shutdown,
     })
 }
 

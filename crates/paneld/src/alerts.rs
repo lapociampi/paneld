@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use paneld_config::parse::{AssignTarget, Document, Item};
+use paneld_config::value::parse_duration;
 use paneld_ui::{Context, Value};
 
 /// One parsed `alert NAME { ... }` block, held raw so each tick can
@@ -62,7 +63,15 @@ pub struct Alert {
     pub title: String,
     pub text: String,
     pub link: String,
+    /// Wall-clock first-fire time. Shown to the user and persisted
+    /// to the state file.
     pub since: SystemTime,
+    /// Monotonic first-fire moment, used only to break ties in the
+    /// same-severity sort so an NTP step or DST change can't reorder
+    /// two active alerts. Resets to `Instant::now()` on state-file
+    /// restore (monotonic clocks can't be serialised) which is fine:
+    /// the user-visible sort within one session stays stable.
+    pub fired_at: Instant,
     pub acked: bool,
     pub snoozed_until: Option<SystemTime>,
 }
@@ -105,15 +114,35 @@ pub struct Engine {
     /// first time a matching key fires so a daemon restart during a
     /// long incident doesn't reset the alert's clock.
     restored: BTreeMap<String, SystemTime>,
+    /// Monotonic timestamp of the last event we saw per source that
+    /// feeds at least one event-mode alert. ADR 0013's `source_down`
+    /// watchdog raises a built-in warning when one goes silent for
+    /// too long.
+    source_last: BTreeMap<String, Instant>,
+    source_down_after: Duration,
 }
 
 impl Engine {
     pub fn new(doc: &Document) -> Self {
+        let rules = collect(doc);
+        // Prime the watchdog clock for every source referenced by an
+        // event-mode rule, so a startup during a down window still
+        // fires `source_down` instead of pretending the source is
+        // live until the next tick.
+        let now = Instant::now();
+        let mut source_last = BTreeMap::new();
+        for r in &rules {
+            if let Some(src) = &r.from {
+                source_last.entry(src.clone()).or_insert(now);
+            }
+        }
         Self {
-            rules: collect(doc),
+            rules,
             active: BTreeMap::new(),
             pending: BTreeMap::new(),
             restored: BTreeMap::new(),
+            source_last,
+            source_down_after: parse_source_down(doc),
         }
     }
 
@@ -148,7 +177,19 @@ impl Engine {
         base_ctx: &Context,
         wall: SystemTime,
     ) -> bool {
+        // Mark the source alive for the ADR 0013 watchdog, even if
+        // the event doesn't match any rule (schema says "each new
+        // value is an `event`"). Resolve any outstanding
+        // `source_down:<name>` right here so the UI reflects the
+        // recovery without waiting for the next `tick`.
         let mut changed = false;
+        if self.source_last.contains_key(source_name) {
+            self.source_last.insert(source_name.to_string(), Instant::now());
+            let down_key = format!("source_down:{source_name}");
+            if self.active.remove(&down_key).is_some() {
+                changed = true;
+            }
+        }
         for rule in &self.rules {
             if rule.from.as_deref() != Some(source_name) {
                 continue;
@@ -178,18 +219,26 @@ impl Engine {
                     }
                 }
                 _ => {
-                    // `since` is the time the alert FIRST fired, so an
-                    // already-active instance keeps its original
-                    // timestamp. Only a fresh fire pulls from the
-                    // state-file replay slot, then falls back to the
-                    // current wall time.
-                    let since = self
+                    // `since` and `fired_at` are the first-fire
+                    // timestamps, so an already-active instance keeps
+                    // its originals. Only a fresh fire pulls from the
+                    // state-file replay slot for `since`, then falls
+                    // back to the current wall time. `fired_at` is a
+                    // monotonic Instant that we always refresh on a
+                    // fresh fire; this is what makes same-severity
+                    // sort stable across NTP steps.
+                    let (since, fired_at) = self
                         .active
                         .get(&key)
-                        .map(|a| a.since)
-                        .or_else(|| self.restored.remove(&key))
-                        .unwrap_or(wall);
-                    let alert = evaluate(rule, &instance, &ctx, since);
+                        .map(|a| (a.since, a.fired_at))
+                        .unwrap_or_else(|| {
+                            (
+                                self.restored.remove(&key).unwrap_or(wall),
+                                Instant::now(),
+                            )
+                        });
+                    let mut alert = evaluate(rule, &instance, &ctx, since);
+                    alert.fired_at = fired_at;
                     // An event stream can carry updates to a firing
                     // alert (severity escalation, text change). Only
                     // mark the frame dirty when something a user can
@@ -265,7 +314,8 @@ impl Engine {
         // Reap only the condition-mode keys. An event-mode alert's
         // key will not be in `seen` (we skip event-mode rules in
         // this loop) so a blanket retain would wipe them every
-        // tick. Match on the rule's `from` to decide ownership.
+        // tick. Match on the rule's `from` to decide ownership. The
+        // built-in `source_down:*` keys we manage separately.
         let is_condition_key = |k: &str| -> bool {
             let (rule, _) = k.split_once(':').unwrap_or((k, ""));
             self.rules
@@ -276,6 +326,40 @@ impl Engine {
             .retain(|k, _| !is_condition_key(k) || seen.contains_key(k));
         self.pending
             .retain(|k, _| !is_condition_key(k) || seen.contains_key(k));
+
+        // Watchdog pass (ADR 0013). For every source feeding an
+        // event-mode alert: if silent longer than `source_down`,
+        // raise the built-in `source_down:<name>`; otherwise, if we
+        // raised one earlier, resolve it.
+        for (src_name, last) in &self.source_last {
+            let down = now.duration_since(*last) >= self.source_down_after;
+            let key = format!("source_down:{src_name}");
+            if down {
+                if !self.active.contains_key(&key) {
+                    self.active.insert(
+                        key.clone(),
+                        Alert {
+                            rule: "source_down".into(),
+                            instance: src_name.clone(),
+                            severity: "warning".into(),
+                            title: format!("Source `{src_name}` is down"),
+                            text: format!(
+                                "No events from `{src_name}` in {:?}",
+                                self.source_down_after
+                            ),
+                            link: String::new(),
+                            since: wall,
+                            fired_at: now,
+                            acked: false,
+                            snoozed_until: None,
+                        },
+                    );
+                    changed = true;
+                }
+            } else if self.active.remove(&key).is_some() {
+                changed = true;
+            }
+        }
 
         changed
     }
@@ -288,7 +372,7 @@ impl Engine {
         sorted.sort_by(|a, b| {
             severity_rank(&b.severity)
                 .cmp(&severity_rank(&a.severity))
-                .then_with(|| a.since.cmp(&b.since))
+                .then_with(|| a.fired_at.cmp(&b.fired_at))
         });
         let active: Vec<Value> = sorted.iter().map(|a| a.to_value()).collect();
         let worst = sorted
@@ -332,6 +416,7 @@ fn evaluate(
         text,
         link,
         since: wall,
+        fired_at: Instant::now(),
         acked: false,
         snoozed_until: None,
     }
@@ -440,6 +525,36 @@ fn collect(doc: &Document) -> Vec<AlertRule> {
         out.push(rule);
     }
     out
+}
+
+/// Parse `alerts:source_down` out of the config, falling back to
+/// ADR 0013's default of 2 minutes. Accepts both the `category:key`
+/// qualified form and the `alerts { source_down = ... }` block form.
+fn parse_source_down(doc: &Document) -> Duration {
+    let default = Duration::from_secs(120);
+    for item in &doc.items {
+        if let Item::Assign(a) = item {
+            if let AssignTarget::Qualified { category, key } = &a.target {
+                if category.text == "alerts" && key.text == "source_down" {
+                    return parse_duration(&a.value.text).unwrap_or(default);
+                }
+            }
+        }
+        if let Item::Block(b) = item {
+            if b.kind.text == "alerts" {
+                for inner in &b.items {
+                    if let Item::Assign(a) = inner {
+                        if let AssignTarget::Simple { key } = &a.target {
+                            if key.text == "source_down" {
+                                return parse_duration(&a.value.text).unwrap_or(default);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    default
 }
 
 fn zero_span() -> paneld_config::source::Span {
@@ -784,6 +899,48 @@ mod tests {
         assert!(eng.active_alerts().is_empty());
         eng.tick(&ctx_with_temp(80.0), Instant::now(), wall);
         assert_eq!(eng.active_alerts()["pi_hot:pi_hot"].since, wall);
+    }
+
+    #[test]
+    fn source_down_watchdog_fires_and_resolves() {
+        let doc = parse_doc(
+            "source ntfy { run = /bin/true }\n\
+             alert in { from = ntfy; severity = info; title = x }\n\
+             alerts { source_down = 2s }\n",
+        );
+        let mut eng = Engine::new(&doc);
+        assert_eq!(eng.source_down_after, Duration::from_secs(2));
+        let wall = SystemTime::now();
+        let t0 = eng.source_last["ntfy"];
+
+        // Just after priming, nothing fires.
+        assert!(!eng.tick(&Context::new(), t0, wall));
+        assert_eq!(eng.active_count(), 0);
+
+        // Two seconds later with no events, source_down raised.
+        let t2 = t0 + Duration::from_secs(2);
+        assert!(eng.tick(&Context::new(), t2, wall));
+        assert!(eng.active_alerts().contains_key("source_down:ntfy"));
+
+        // An event resets the clock and resolves the alert.
+        assert!(eng.ingest_event("ntfy", &event_map("hi", 3), &Context::new(), wall));
+        // After ingest, source_last is Instant::now(); the next tick
+        // uses that same instant so no watchdog should fire.
+        let now = Instant::now();
+        assert!(!eng.active_alerts().contains_key("source_down:ntfy"));
+        // Belt-and-braces: tick again at the current time.
+        eng.tick(&Context::new(), now, wall);
+        assert!(!eng.active_alerts().contains_key("source_down:ntfy"));
+    }
+
+    #[test]
+    fn source_down_default_is_two_minutes() {
+        let doc = parse_doc(
+            "source ntfy { run = /bin/true }\n\
+             alert in { from = ntfy; severity = info; title = x }\n",
+        );
+        let eng = Engine::new(&doc);
+        assert_eq!(eng.source_down_after, Duration::from_secs(120));
     }
 
     #[test]

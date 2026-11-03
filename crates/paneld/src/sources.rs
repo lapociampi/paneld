@@ -17,9 +17,12 @@
 //! substitution come in later phases.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::parse_duration;
@@ -52,6 +55,12 @@ pub fn resolve_all(doc: &Document, ctx: &Context) -> BTreeMap<String, Value> {
             continue;
         }
         let Some(name) = &b.name else { continue };
+        // Stream sources are long-lived children started by
+        // `spawn_pollers`; resolving them as a one-shot would just
+        // time out after 5s and log a spurious error on every reload.
+        if is_stream(b) {
+            continue;
+        }
         match resolve_one(b, ctx) {
             Ok(v) => {
                 out.insert(name.text.clone(), v);
@@ -71,13 +80,43 @@ pub fn resolve_all(doc: &Document, ctx: &Context) -> BTreeMap<String, Value> {
 /// value [`resolve_all`] produced. The sender is cloned per worker,
 /// so the caller can keep its own clone to hand to other producers
 /// (the action `refresh` step reuses it).
-pub fn spawn_pollers(doc: &Document, ctx: &Context, tx: Sender<SourceUpdate>) {
+pub fn spawn_pollers(
+    doc: &Document,
+    ctx: &Context,
+    tx: Sender<SourceUpdate>,
+) -> ShutdownHandle {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let stream_pgids: Arc<Mutex<Vec<runner::Pid>>> = Arc::new(Mutex::new(Vec::new()));
     for item in &doc.items {
         let Item::Block(b) = item else { continue };
         if b.kind.text != "source" {
             continue;
         }
         let Some(name) = &b.name else { continue };
+        let streaming = is_stream(b);
+
+        if streaming {
+            // ADR 0013: stream source. Long-lived child whose stdout
+            // feeds one event per line; restart with backoff on exit.
+            let block_clone = b.clone();
+            let name_clone = name.text.clone();
+            let tx_clone: Sender<SourceUpdate> = tx.clone();
+            let ctx_clone = ctx.clone();
+            let shutdown_clone = shutdown.clone();
+            let pgids_clone = stream_pgids.clone();
+            thread::spawn(move || {
+                stream_loop(
+                    block_clone,
+                    name_clone,
+                    tx_clone,
+                    ctx_clone,
+                    shutdown_clone,
+                    pgids_clone,
+                )
+            });
+            continue;
+        }
+
         let Some(poll_raw) = find_simple(b, "poll") else {
             continue;
         };
@@ -96,7 +135,43 @@ pub fn spawn_pollers(doc: &Document, ctx: &Context, tx: Sender<SourceUpdate>) {
         let name_clone = name.text.clone();
         let tx_clone: Sender<SourceUpdate> = tx.clone();
         let ctx_clone = ctx.clone();
-        thread::spawn(move || poll_loop(block_clone, name_clone, poll, tx_clone, ctx_clone));
+        let shutdown_clone = shutdown.clone();
+        thread::spawn(move || {
+            poll_loop(block_clone, name_clone, poll, tx_clone, ctx_clone, shutdown_clone)
+        });
+    }
+    ShutdownHandle { flag: shutdown, stream_pgids }
+}
+
+/// `true` for a source block carrying `stream = true` (or an
+/// equivalent truthy spelling).
+fn is_stream(b: &Block) -> bool {
+    find_simple(b, "stream")
+        .map(|s| matches!(s.trim(), "true" | "yes" | "1"))
+        .unwrap_or(false)
+}
+
+/// Returned by [`spawn_pollers`]. Calling `stop` flips the shared
+/// flag AND SIGTERMs every live stream child's process group, so a
+/// stream whose child is between lines wakes up and sees the flag
+/// (its stdout pipe closes). Pollers notice the flag between sleeps.
+pub struct ShutdownHandle {
+    flag: Arc<AtomicBool>,
+    /// Live stream pgids; each `stream_loop` registers on spawn and
+    /// removes on child exit.
+    stream_pgids: Arc<Mutex<Vec<runner::Pid>>>,
+}
+
+impl ShutdownHandle {
+    pub fn stop(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        let pgids = {
+            let g = self.stream_pgids.lock().unwrap();
+            g.clone()
+        };
+        for pgid in pgids {
+            runner::kill_group(pgid, runner::Signal::SIGTERM);
+        }
     }
 }
 
@@ -106,11 +181,15 @@ fn poll_loop(
     interval: Duration,
     tx: Sender<SourceUpdate>,
     ctx: Context,
+    shutdown: Arc<AtomicBool>,
 ) {
     let max_delay = backoff_ceiling(interval);
     let mut delay = interval;
-    loop {
+    while !shutdown.load(Ordering::SeqCst) {
         thread::sleep(delay);
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
         match resolve_one(&block, &ctx) {
             Ok(v) => {
                 delay = interval;
@@ -125,6 +204,183 @@ fn poll_loop(
             }
         }
     }
+}
+
+/// Stream source worker. Spawns the child, reads stdout line by line,
+/// sends each parsed line as a [`SourceUpdate`], and restarts with
+/// exponential backoff ([`RESTART_FLOOR`] doubling to
+/// [`RESTART_CEILING`], reset after [`RESET_AFTER`] of successful
+/// run) when the child exits. Each live child's pgid is registered
+/// in the shared `pgids` list so [`ShutdownHandle::stop`] can
+/// SIGTERM a quiet one and break it out of its blocking stdout read.
+fn stream_loop(
+    block: Block,
+    name: String,
+    tx: Sender<SourceUpdate>,
+    ctx: Context,
+    shutdown: Arc<AtomicBool>,
+    pgids: Arc<Mutex<Vec<runner::Pid>>>,
+) {
+    const RESTART_FLOOR: Duration = Duration::from_secs(1);
+    const RESTART_CEILING: Duration = Duration::from_secs(60);
+    const RESET_AFTER: Duration = RESTART_CEILING;
+    let mut delay = RESTART_FLOOR;
+
+    while !shutdown.load(Ordering::SeqCst) {
+        let (run_raw, run_span) = match find_raw(&block, "run") {
+            Some(r) => r,
+            None => {
+                eprintln!("paneld: source `{name}`: missing `run`; stream disabled");
+                return;
+            }
+        };
+        let run = paneld_ui::interpolate(run_raw, run_span.file, run_span.start, &ctx);
+        let env_pairs: Vec<(String, String)> = collect_env(&block)
+            .into_iter()
+            .map(|(k, raw, span)| (k, paneld_ui::interpolate(&raw, span.file, span.start, &ctx)))
+            .collect();
+        let opts = runner::Opts {
+            timeout: Duration::MAX,
+            max_bytes: usize::MAX,
+            kind: runner::Kind::Source,
+            name: &name,
+            cwd: None,
+            env: &env_pairs,
+        };
+        let mut command = match runner::prepared_command(&run, &opts) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("paneld: source `{name}`: {e}; retrying in {:?}", delay);
+                sleep_or_shutdown(delay, &shutdown);
+                delay = next_backoff(delay, RESTART_CEILING);
+                continue;
+            }
+        };
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("paneld: source `{name}`: spawn: {e}; retrying in {:?}", delay);
+                sleep_or_shutdown(delay, &shutdown);
+                delay = next_backoff(delay, RESTART_CEILING);
+                continue;
+            }
+        };
+        let pid = runner::Pid::from_raw(child.id() as i32);
+        // Register this child's pgid so ShutdownHandle::stop can
+        // deliver SIGTERM even while we're blocked in read_line.
+        {
+            let mut g = pgids.lock().unwrap();
+            g.push(pid);
+        }
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                eprintln!("paneld: source `{name}`: no stdout; retrying");
+                let _ = child.kill();
+                let _ = child.wait();
+                unregister_pgid(&pgids, pid);
+                sleep_or_shutdown(delay, &shutdown);
+                delay = next_backoff(delay, RESTART_CEILING);
+                continue;
+            }
+        };
+        // Discard stderr so the child's pipe doesn't fill up and
+        // block it; a dedicated drainer thread keeps it reading.
+        if let Some(stderr) = child.stderr.take() {
+            thread::spawn(move || {
+                let r = BufReader::new(stderr);
+                for _ in r.lines().map_while(Result::ok) {}
+            });
+        }
+
+        let parse_mode = find_simple(&block, "parse")
+            .unwrap_or("text")
+            .trim()
+            .to_string();
+        let started = Instant::now();
+        let reader = BufReader::new(stdout);
+        let mut sent_any = false;
+        for line in reader.lines() {
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("paneld: source `{name}`: read: {e}");
+                    break;
+                }
+            };
+            let Some(parsed) = parse_output(&line, &parse_mode) else {
+                eprintln!("paneld: source `{name}`: cannot parse `{line}` as {parse_mode}");
+                continue;
+            };
+            let value = finish_stream_value(&block, &ctx, parsed);
+            if tx.send(SourceUpdate { name: name.clone(), value }).is_err() {
+                // Receiver dropped: daemon is going down.
+                runner::kill_group(pid, runner::Signal::SIGTERM);
+                let _ = child.wait();
+                unregister_pgid(&pgids, pid);
+                return;
+            }
+            sent_any = true;
+        }
+
+        // Child's stdout EOF (or shutdown-triggered SIGTERM from the
+        // handle). Reap the child and drop its pgid from the
+        // registry.
+        if shutdown.load(Ordering::SeqCst) {
+            runner::kill_group(pid, runner::Signal::SIGTERM);
+        }
+        let _ = child.wait();
+        unregister_pgid(&pgids, pid);
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+
+        if sent_any && started.elapsed() >= RESET_AFTER {
+            delay = RESTART_FLOOR;
+        }
+        eprintln!(
+            "paneld: source `{name}`: stream exited after {:?}; restarting in {:?}",
+            started.elapsed(),
+            delay
+        );
+        sleep_or_shutdown(delay, &shutdown);
+        delay = next_backoff(delay, RESTART_CEILING);
+    }
+}
+
+fn unregister_pgid(pgids: &Arc<Mutex<Vec<runner::Pid>>>, pid: runner::Pid) {
+    let mut g = pgids.lock().unwrap();
+    g.retain(|p| p.as_raw() != pid.as_raw());
+}
+
+fn sleep_or_shutdown(d: Duration, shutdown: &Arc<AtomicBool>) {
+    let deadline = Instant::now() + d;
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100).min(deadline - Instant::now()));
+    }
+}
+
+/// Build the public source Value for one streamed line, following
+/// the same `value = {{ ... }}` + `ok = true` shape as [`resolve_one`].
+/// `ctx` is unused for now: event-mode alerts see `event = <this
+/// value>` on their side, and `value = ...` on a stream source
+/// evaluates against `out` only (same as `resolve_one`).
+fn finish_stream_value(b: &Block, _ctx: &Context, out: Value) -> Value {
+    let value = if let Some((raw, span)) = find_raw(b, "value") {
+        eval_value_transform(raw, span, &out).unwrap_or(out)
+    } else {
+        out
+    };
+    let mut m = BTreeMap::new();
+    m.insert("value".to_string(), value);
+    m.insert("ok".to_string(), Value::Bool(true));
+    Value::Map(m)
 }
 
 /// ADR 0013: on failure, the next run waits `interval`, then
@@ -497,6 +753,125 @@ impl<'a> JsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_doc(src: &str) -> paneld_config::parse::Document {
+        use paneld_config::lex::tokenize;
+        use paneld_config::source::SourceMap;
+        use std::path::PathBuf;
+        let mut map = SourceMap::new();
+        let id = map.add(PathBuf::from("t.conf"), src.to_string());
+        let (toks, lex_errs) = tokenize(id, src);
+        assert!(lex_errs.is_empty(), "lex errors: {lex_errs:?}");
+        let (doc, diags) = paneld_config::parse(&toks, &map);
+        assert!(diags.is_empty(), "parse errors: {diags:?}");
+        doc
+    }
+
+    #[test]
+    fn stream_source_emits_one_update_per_line_and_restarts() {
+        // Child prints two lines, exits. The stream worker emits two
+        // SourceUpdates, then restarts the child; since restart floor
+        // is 1s we only need to assert the first two came through.
+        use std::sync::mpsc::channel;
+        let src = concat!(
+            "source lines {\n",
+            "  run = /bin/sh -c \"printf 'a\\nb\\n'\"\n",
+            "  stream = true\n",
+            "  parse = text\n",
+            "}\n",
+        );
+        let doc = parse_doc(src);
+        let (tx, rx) = channel();
+        let handle = spawn_pollers(&doc, &Context::new(), tx);
+
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(u) => got.push(u),
+                Err(e) => panic!("stream update timed out: {e}"),
+            }
+        }
+        handle.stop();
+
+        assert_eq!(got.len(), 2);
+        for (u, expected) in got.iter().zip(["a", "b"].iter()) {
+            assert_eq!(u.name, "lines");
+            let Value::Map(ref m) = u.value else {
+                panic!("expected map, got {:?}", u.value);
+            };
+            assert_eq!(m["value"], Value::String((*expected).into()));
+            assert_eq!(m["ok"], Value::Bool(true));
+        }
+    }
+
+    #[test]
+    fn stream_source_json_parses_each_line_as_json() {
+        use std::sync::mpsc::channel;
+        let src = concat!(
+            "source events {\n",
+            "  run = /bin/sh -c \"printf '{\\\"title\\\":\\\"a\\\"}\\n{\\\"title\\\":\\\"b\\\"}\\n'\"\n",
+            "  stream = true\n",
+            "  parse = json\n",
+            "}\n",
+        );
+        let doc = parse_doc(src);
+        let (tx, rx) = channel();
+        let handle = spawn_pollers(&doc, &Context::new(), tx);
+
+        let u1 = rx.recv_timeout(Duration::from_secs(5)).expect("one");
+        let u2 = rx.recv_timeout(Duration::from_secs(5)).expect("two");
+        handle.stop();
+
+        let title = |u: &SourceUpdate| -> String {
+            let Value::Map(ref m) = u.value else { panic!() };
+            let Value::Map(ref vm) = m["value"] else { panic!() };
+            let Value::String(ref s) = vm["title"] else { panic!() };
+            s.clone()
+        };
+        assert_eq!(title(&u1), "a");
+        assert_eq!(title(&u2), "b");
+    }
+
+    #[test]
+    fn stream_shutdown_wakes_a_quiet_child() {
+        // Reviewer round 3 blocker: a stream child that goes silent
+        // (sleep after one line) must be killed by ShutdownHandle::
+        // stop, not just left blocked in BufReader::lines().
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use std::sync::mpsc::channel;
+        let src = concat!(
+            "source quiet {\n",
+            "  run = /bin/sh -c \"printf 'first\\n'; sleep 300\"\n",
+            "  stream = true\n",
+            "  parse = text\n",
+            "}\n",
+        );
+        let doc = parse_doc(src);
+        let (tx, rx) = channel();
+        let handle = spawn_pollers(&doc, &Context::new(), tx);
+
+        // First line arrives, confirming the child is up.
+        let first = rx.recv_timeout(Duration::from_secs(5)).expect("first line");
+        assert_eq!(first.name, "quiet");
+
+        // Capture the live pgid for a liveness check post-stop.
+        let pgid = {
+            let g = handle.stream_pgids.lock().unwrap();
+            assert_eq!(g.len(), 1, "one stream pgid should be registered");
+            g[0]
+        };
+
+        // Trigger shutdown. The child was in `sleep 300`; stop must
+        // SIGTERM its group, the reader unblocks, the loop exits.
+        handle.stop();
+
+        let gone = (0..40).any(|_| {
+            thread::sleep(Duration::from_millis(50));
+            matches!(kill(pgid, None), Err(Errno::ESRCH))
+        });
+        assert!(gone, "stream child pgid {pgid} outlived stop()");
+    }
 
     #[test]
     fn poll_backoff_doubles_until_ceiling() {
