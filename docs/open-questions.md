@@ -2,6 +2,7 @@
 title: "Open questions"
 description: "Design decisions still to make."
 date: 2026-10-29
+updated: 2026-11-03
 tags: [paneld, planning]
 series: paneld
 order: 6
@@ -18,3 +19,6 @@ order: 6
 - [ ] Remote view from a phone or desktop: not in v1; how, if ever.
 - [ ] Docker image: deferred. Commands run inside the container, so host actions would need ssh to the host or a privileged container.
 - [x] Name of the program: paneld.
+- [ ] `ssh host cmd {{ x }}`: ssh hands its command to a remote shell, so a value there is shell code on the far side. `paneld check` does not flag it yet; options are a lint, or a helper that quotes for the remote shell.
+- [ ] Reload: a source's background refresh can land after the new poller's first sample and briefly show the older value; `set` and `refresh` of a run started before the reload go to the old config's vars and sources.
+- [ ] ctl limits: the idle timeout is per read, so 16 clients sending a byte a minute hold every slot. The service's socket is group-only, so only local admins can do it.

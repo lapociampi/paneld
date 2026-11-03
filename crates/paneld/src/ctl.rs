@@ -203,6 +203,8 @@ static CLIENTS: AtomicUsize = AtomicUsize::new(0);
 
 fn handle_client(stream: UnixStream, tx: Sender<ControlMsg>) {
     let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
+    // A client that never reads its replies must not hold a thread.
+    let _ = stream.set_write_timeout(Some(IDLE_TIMEOUT));
     let greeting = format!(
         r#"{{"paneld":{},"protocol":{PROTOCOL}}}"#,
         json_string(env!("CARGO_PKG_VERSION"))
@@ -420,6 +422,14 @@ pub fn call(path: &Path, args: &[String], json: bool) -> i32 {
             return 2;
         }
     };
+    // Talk only to a socket in our own private fallback directory:
+    // another user could have made it first.
+    if let Some(parent) = path.parent().filter(|p| *p == fallback_dir()) {
+        if let Err(e) = check_private_dir(parent) {
+            eprintln!("paneld ctl: {e}");
+            return 2;
+        }
+    }
     let stream = match UnixStream::connect(path) {
         Ok(s) => s,
         Err(e) => {

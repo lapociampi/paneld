@@ -101,6 +101,10 @@ pub enum BinaryOp {
 pub fn parse_fragment(src: &str, file: FileId, base: u32) -> (Option<Expr>, Vec<Diagnostic>) {
     let mut parser = Parser::new(src, file, base);
     let mut expr = parser.parse_expression();
+    // Cut off at MAX_TOKENS: what parsed is not the whole expression.
+    if parser.tokens >= MAX_TOKENS {
+        expr = None;
+    }
     // Evaluation recurses on the tree: refuse one too deep for it
     // (`1+1+1+...` nests without the parser recursing).
     if let Some(e) = &expr {

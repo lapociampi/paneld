@@ -135,7 +135,7 @@ page home {
 
 - `run = curl -sf -u {{ secrets.adguard }} http://localhost:8080/control/status` is split into argv like a shell would split it (single and double quotes, backslash escapes), but no shell ever runs it.
 - `$vars` and `{{ }}` are filled in inside each argument separately, so a value can never become a second argument or a shell command.
-- Pipes and redirections need an explicit shell: `run = sh -c 'curl -sf ... | jq .data'`. Values reach that script as arguments after it (`sh -c 'echo "$$1"' sh {{ x }}`) or as environment variables, never pasted into it: `paneld check` rejects `{{ }}` inside a `-c` script.
+- Pipes and redirections need an explicit shell: `run = sh -c 'curl -sf ... | jq .data'`. Values reach that script as arguments after it (`sh -c 'echo "$$1"' sh {{ x }}`) or as environment variables, never pasted into it: `paneld check` rejects `{{ }}` inside an inline script (`sh -c`, `bash -ec`, `python -c`, `perl -e`, also behind `env`, `sudo` or `timeout`).
 
 ## Structure
 

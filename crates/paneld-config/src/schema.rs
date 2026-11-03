@@ -1270,30 +1270,108 @@ fn check_override_targets(doc: &Document, diags: &mut Vec<Diagnostic>) {
     }
 }
 
-/// True if `cmd` runs a shell with `-c` and the script (the next word,
-/// quoted or not) holds a `{{ }}`. Values must reach commands as argv
-/// items or env vars, never as shell code (requirements, "Inputs").
+/// True if `cmd` runs a shell or an interpreter with a script given
+/// inline (`sh -c`, `bash -ec`, `python3 -c`, `perl -e`, also behind
+/// `env`, `sudo`, `timeout` and the like) and that script holds a
+/// `{{ }}`. Values must reach commands as argv items or env vars,
+/// never as code (requirements, "Inputs").
 fn shell_script_interpolates(cmd: &str) -> bool {
-    const SHELLS: &[&str] = &["sh", "bash", "dash", "ash", "zsh", "ksh"];
-    let first = cmd.split_whitespace().next().unwrap_or("");
-    if !SHELLS.contains(&first.rsplit('/').next().unwrap_or(first)) {
-        return false;
-    }
-    let mut rest = cmd;
-    while let Some(at) = rest.find("-c") {
-        let before_ok = at == 0 || rest[..at].ends_with(char::is_whitespace);
-        let after = &rest[at + 2..];
-        if before_ok && after.starts_with(char::is_whitespace) {
-            let script = after.trim_start();
-            let body = match script.chars().next() {
-                Some(q @ ('\'' | '"')) => script[1..].split(q).next().unwrap_or(""),
-                _ => script.split(char::is_whitespace).next().unwrap_or(""),
-            };
-            return body.contains("{{");
+    // Program -> the option that takes the script.
+    const RUNNERS: &[(&str, char)] = &[
+        ("sh", 'c'), ("bash", 'c'), ("dash", 'c'), ("ash", 'c'), ("zsh", 'c'), ("ksh", 'c'),
+        ("python", 'c'), ("python3", 'c'), ("perl", 'e'), ("ruby", 'e'), ("node", 'e'), ("php", 'r'),
+    ];
+    const WRAPPERS: &[&str] = &[
+        "env", "sudo", "doas", "nice", "ionice", "timeout", "nohup", "stdbuf", "chrt", "setsid", "busybox", "exec",
+        "flock",
+    ];
+    let words = split_words(cmd);
+    let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
+    let mut i = 0;
+    // Past wrappers and their own options and arguments, up to the
+    // first word that names a runner.
+    while i < words.len() && WRAPPERS.contains(&base(&words[i]).as_str()) {
+        i += 1;
+        while i < words.len() && !RUNNERS.iter().any(|(r, _)| *r == base(&words[i])) {
+            if !(words[i].starts_with('-') || words[i].contains('=') || words[i].chars().all(|c| c.is_ascii_digit() || c == '.' || c.is_ascii_alphabetic())) {
+                break;
+            }
+            i += 1;
         }
-        rest = after;
+    }
+    let Some(&(_, flag)) = words.get(i).and_then(|w| RUNNERS.iter().find(|(r, _)| *r == base(w))) else {
+        return false;
+    };
+    let mut j = i + 1;
+    while j < words.len() && words[j].starts_with('-') && words[j] != "--" {
+        let w = &words[j];
+        j += 1;
+        // `-c`, `-ec`, `-lc` (not a long `--option`).
+        if !w.starts_with("--") && w[1..].contains(flag) {
+            return words.get(j).is_some_and(|script| script.contains("{{"));
+        }
     }
     false
+}
+
+/// `cmd` split into words the way the runner does (quotes removed,
+/// `{{ }}` kept whole); good enough to find a script argument.
+fn split_words(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut i = 0;
+    let b = cmd.as_bytes();
+    while i < b.len() {
+        let c = cmd[i..].chars().next().unwrap_or(' ');
+        if cmd[i..].starts_with("{{") {
+            let end = crate::cel::expr_end(cmd, i).unwrap_or(cmd.len());
+            cur.push_str(&cmd[i..end]);
+            in_word = true;
+            i = end;
+            continue;
+        }
+        i += c.len_utf8();
+        match c {
+            ' ' | '\t' | '\n' => {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '\'' | '"' => {
+                in_word = true;
+                while i < b.len() {
+                    if cmd[i..].starts_with("{{") {
+                        let end = crate::cel::expr_end(cmd, i).unwrap_or(cmd.len());
+                        cur.push_str(&cmd[i..end]);
+                        i = end;
+                        continue;
+                    }
+                    let c2 = cmd[i..].chars().next().unwrap_or(c);
+                    i += c2.len_utf8();
+                    if c2 == c {
+                        break;
+                    }
+                    if c == '"' && c2 == '\\' && i < b.len() {
+                        let n = cmd[i..].chars().next().unwrap_or(' ');
+                        cur.push(n);
+                        i += n.len_utf8();
+                        continue;
+                    }
+                    cur.push(c2);
+                }
+            }
+            c => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        out.push(cur);
+    }
+    out
 }
 
 /// Alert rule names the daemon uses for its own alerts: ctl, reminders
@@ -1788,8 +1866,8 @@ fn check_value_type(
         ValueShape::Interp(_) if matches!(ty, ExpectedType::Command) && shell_script_interpolates(raw) => {
             diags.push(Diagnostic::new(
                 span,
-                "`{{ }}` inside a `-c` shell script pastes the value into shell code; pass it as an \
-                 argument (`sh -c '... \"$$1\"' sh {{ x }}`) or in `env { }`"
+                "`{{ }}` inside an inline script (`sh -c`, `python -c`, `perl -e`, ...) pastes the value \
+                 into code; pass it as an argument (`sh -c '... \"$$1\"' sh {{ x }}`) or in `env { }`"
                     .to_string(),
             ));
         }
@@ -3791,11 +3869,26 @@ reminder restore_test {
 
     #[test]
     fn interpolating_into_a_shell_script_is_flagged() {
-        assert_msg(&check_text("action a { run = sh -c 'echo {{ vars.x }} > /tmp/f' }\n"), "pastes the value into shell code");
+        assert_msg(&check_text("action a { run = sh -c 'echo {{ vars.x }} > /tmp/f' }\n"), "pastes the value");
         assert_msg(&check_text("screen { dim = /bin/bash -c 'echo {{ level }}' }\n"), "pastes the value");
         // As an argument after the script, or with no shell: fine.
         assert!(check_text("action a { run = sh -c 'echo \"$$1\" > /tmp/f' sh {{ vars.x }} }\n").is_empty());
         assert!(check_text("action a { run = ssh -c aes128-ctr {{ vars.x }} }\n").is_empty());
+        // Review round 7: ways around the first version.
+        for cmd in [
+            "sh -ec 'echo {{ vars.x }}'",
+            "bash -lc 'echo {{ vars.x }}'",
+            "/usr/bin/env sh -c 'echo {{ vars.x }}'",
+            "sudo -u pi bash -c 'echo {{ vars.x }}'",
+            "timeout 5 sh -c 'echo {{ vars.x }}'",
+            "busybox sh -c 'echo {{ vars.x }}'",
+            "python3 -c 'print({{ vars.x }})'",
+            "perl -e 'print {{ vars.x }}'",
+        ] {
+            assert_msg(&check_text(&format!("action a {{ run = {cmd} }}\n")), "pastes the value");
+        }
+        assert!(check_text("action a { run = sudo systemctl restart {{ vars.x }} }\n").is_empty());
+        assert!(check_text("action a { run = python3 /opt/x.py {{ vars.x }} }\n").is_empty());
         assert!(check_text("action a { run = curl -H {{ vars.x }} http://x }\n").is_empty());
     }
 

@@ -303,12 +303,16 @@ fn is_gated(def: &ActionDef) -> bool {
 }
 
 /// Spawn the action worker. Each incoming [`Call`] is looked up in
-/// `actions` and run on a thread of its own, so a slow action never
-/// holds up another; `app:max_running` caps the commands themselves
-/// (ADR 0013). `set` is applied on that thread after the run returns.
+/// `actions`. Calls of one action run in the order they came, on
+/// that action's own thread (its lane), so a slow action never holds
+/// up another and two quick toggles reach the device in order;
+/// `app:max_running` caps the commands themselves (ADR 0013). An
+/// action that only sets vars runs here at once, in order with the
+/// others like it.
 pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
     let wctx = Arc::new(wctx);
     thread::spawn(move || {
+        let mut lanes: HashMap<String, Sender<(Call, ActionDef, String)>> = HashMap::new();
         for call in rx {
             let key = run_key(&call.name, &call.args);
             let refused = |why: &str| {
@@ -329,10 +333,32 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                 refused("refused, its PIN / confirm gate was not passed");
                 continue;
             }
-            let wctx = Arc::clone(&wctx);
-            thread::spawn(move || run_call(&wctx, call, def, key));
+            if def.run.is_none() && def.refresh.is_empty() {
+                run_call(&wctx, call, def, key);
+                continue;
+            }
+            let lane = lanes.entry(call.name.clone()).or_insert_with(|| {
+                let (tx, rx) = std::sync::mpsc::channel::<(Call, ActionDef, String)>();
+                let wctx = Arc::clone(&wctx);
+                thread::spawn(move || {
+                    for (call, def, key) in rx {
+                        run_call(&wctx, call, def, key);
+                    }
+                });
+                tx
+            });
+            let _ = lane.send((call, def, key));
         }
     });
+}
+
+/// Held from reading `vars` for a `set` to writing the result, so two
+/// actions counting up do not lose one of the steps.
+static SET_LOCK: Mutex<()> = Mutex::new(());
+
+/// [`SET_LOCK`], for the main loop's inline `set`s.
+pub fn set_lock() -> std::sync::MutexGuard<'static, ()> {
+    SET_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// What makes two calls "the same" for schema 5's "while an action
@@ -430,6 +456,7 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
     // only change the UI").
     let should_set = (had_run && ok) || !had_run;
     if should_set && !def.set.is_empty() {
+        let _set = set_lock();
         let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
         apply_set(
             &name,
@@ -773,6 +800,16 @@ mod tests {
     }
 
     fn worker_with(doc: &Document, secrets: BTreeMap<String, Value>) -> (Sender<Call>, Receiver<UiEvent>) {
+        let (tx, rx, _) = worker_full(doc, secrets);
+        (tx, rx)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn worker_full(
+        doc: &Document,
+        secrets: BTreeMap<String, Value>,
+    ) -> (Sender<Call>, Receiver<UiEvent>, Arc<Mutex<BTreeMap<String, Value>>>) {
+        let vars = Arc::new(Mutex::new(crate::vars::initial_values(doc)));
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (source_tx, _source_rx) = std::sync::mpsc::channel();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -781,9 +818,9 @@ mod tests {
                 actions: collect(doc),
                 base_ctx: Context::new(),
                 secrets,
-                vars: Arc::new(Mutex::new(BTreeMap::new())),
+                vars: vars.clone(),
                 source_values: Arc::new(Mutex::new(BTreeMap::new())),
-                var_types: BTreeMap::new(),
+                var_types: crate::vars::types(doc),
                 event_tx,
                 source_blocks: BTreeMap::new(),
                 source_tx,
@@ -792,22 +829,58 @@ mod tests {
             },
             rx,
         );
-        (tx, event_rx)
+        (tx, event_rx, vars)
     }
 
     #[test]
-    fn calls_run_side_by_side_and_each_reports_back() {
-        // Review round 6: calls ran one after another on one thread,
-        // and "still running" was keyed by name, so a second row of a
-        // `repeat` was ignored while the first ran.
-        let doc = parse_doc("action slow { run = /bin/sleep 0.6 }\n");
+    fn sets_keep_their_order_and_no_step_is_lost() {
+        // Review round 7: per-call threads let `two` finish before
+        // `one`, and two counters read the same old value.
+        let doc = parse_doc(
+            "var n: int = 0\nvar c: int = 0\n\
+             action one { set { n = 1 } }\naction two { set { n = 2 } }\n\
+             action up_a { run = /bin/true\n set { c = {{ vars.c + 1 }} } }\n\
+             action up_b { run = /bin/true\n set { c = {{ vars.c + 1 }} } }\n",
+        );
+        let (tx, events, vars) = worker_full(&doc, BTreeMap::new());
+        let call = |n: &str| Call { name: n.into(), args: Vec::new(), cleared: true };
+        let wait = |count: usize| {
+            let mut done = 0;
+            while done < count {
+                if let UiEvent::ActionDone { .. } = events.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    done += 1;
+                }
+            }
+        };
+        for _ in 0..50 {
+            tx.send(call("one")).unwrap();
+            tx.send(call("two")).unwrap();
+            wait(2);
+            assert_eq!(vars.lock().unwrap()["n"], Value::Int(2));
+        }
+        for _ in 0..25 {
+            tx.send(call("up_a")).unwrap();
+            tx.send(call("up_b")).unwrap();
+        }
+        wait(50);
+        assert_eq!(vars.lock().unwrap()["c"], Value::Int(50));
+    }
+
+    #[test]
+    fn different_actions_run_side_by_side_and_calls_of_one_queue() {
+        // Review round 6: everything ran one after another on one
+        // thread. Review round 7: calls of one action must keep their
+        // order (a toggle switched on then off).
+        let doc = parse_doc(
+            "action slow { run = /bin/sleep 0.5 }\naction slower { run = /bin/sleep 0.5 }\n\
+             action log { run = /bin/sh -c 'sleep $1; echo $2' x {{ wait }} {{ tag }} }\n",
+        );
         let (tx, events) = worker_for(&doc);
-        let arg = |v: &str| vec![ActionArg { name: "vm".into(), value: Value::String(v.into()) }];
-        assert_ne!(run_key("slow", &arg("a")), run_key("slow", &arg("b")));
-        assert_eq!(run_key("slow", &arg("a")), run_key("slow", &arg("a")));
+        let arg = |k: &str, v: &str| ActionArg { name: k.into(), value: Value::String(v.into()) };
+        assert_ne!(run_key("slow", &[arg("vm", "a")]), run_key("slow", &[arg("vm", "b")]));
         let started = std::time::Instant::now();
-        for v in ["a", "b"] {
-            tx.send(Call { name: "slow".into(), args: arg(v), cleared: true }).unwrap();
+        for name in ["slow", "slower"] {
+            tx.send(Call { name: name.into(), args: Vec::new(), cleared: true }).unwrap();
         }
         tx.send(Call::new("nope".into(), Vec::new())).unwrap();
         let mut keys = Vec::new();
@@ -816,9 +889,21 @@ mod tests {
                 keys.push(key);
             }
         }
-        assert!(started.elapsed() < Duration::from_millis(1100), "ran one after another: {:?}", started.elapsed());
+        assert!(started.elapsed() < Duration::from_millis(950), "ran one after another: {:?}", started.elapsed());
         keys.sort();
-        assert_eq!(keys, [run_key("nope", &[]), run_key("slow", &arg("a")), run_key("slow", &arg("b"))]);
+        assert_eq!(keys, [run_key("nope", &[]), run_key("slow", &[]), run_key("slower", &[])]);
+
+        // The first call is slower than the second, yet finishes first.
+        for (wait, tag) in [("0.3", "first"), ("0", "second")] {
+            tx.send(Call { name: "log".into(), args: vec![arg("wait", wait), arg("tag", tag)], cleared: true }).unwrap();
+        }
+        let mut order = Vec::new();
+        while order.len() < 2 {
+            if let UiEvent::ActionDone { result: Value::Map(m), .. } = events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                order.push(m["stdout"].to_display_string().trim().to_string());
+            }
+        }
+        assert_eq!(order, ["first", "second"]);
     }
 
     #[test]

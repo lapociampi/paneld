@@ -388,16 +388,17 @@ fn stream_loop(
                     }
                     continue;
                 }
-                Ok(Line::Text(l)) => mask.apply(&l),
+                Ok(Line::Text(l)) => l,
                 Err(e) => {
                     eprintln!("paneld: source `{name}`: read: {e}");
                     break;
                 }
             };
             let Some(parsed) = parse_output(&line, &parse_mode) else {
-                eprintln!("paneld: source `{name}`: cannot parse `{line}` as {parse_mode}");
+                eprintln!("paneld: source `{name}`: cannot parse `{}` as {parse_mode}", mask.apply(&line));
                 continue;
             };
+            let parsed = mask.apply_value(parsed);
             let value = finish_stream_value(&block, &ctx, parsed);
             if tx.send(SourceUpdate { name: name.clone(), value }).is_err() {
                 // Receiver dropped: daemon is going down.
@@ -598,11 +599,11 @@ pub fn resolve_one(
         env: &env_pairs,
     };
     // What the command prints becomes a value the screen shows: mask
-    // secrets first (see `secrets::Mask`).
+    // secrets (see `secrets::Mask`). Parsed output is masked after
+    // parsing, where JSON escapes are undone and numbers are left
+    // alone; the raw `stdout` / `stderr` as text.
     let mask = crate::secrets::Mask::from_ctx(ctx);
-    let mut r = runner::exec(&argv, opts).map_err(|e| mask.apply(&format!("run: {e}")))?;
-    r.stdout = mask.apply(&r.stdout);
-    r.stderr = mask.apply(&r.stderr);
+    let r = runner::exec(&argv, opts).map_err(|e| mask.apply(&format!("run: {e}")))?;
     if r.timed_out {
         return Err("timed out".into());
     }
@@ -612,6 +613,7 @@ pub fn resolve_one(
     let ok = r.exit_code == Some(0);
 
     let out = parse_output(&r.stdout, &parse_mode)
+        .map(|v| mask.apply_value(v))
         .ok_or_else(|| format!("could not parse output as `{parse_mode}`"))?;
 
     // If the source has `value = {{ ... }}`, evaluate it with `out`
@@ -628,8 +630,8 @@ pub fn resolve_one(
     m.insert("value".into(), value);
     m.insert("ok".into(), Value::Bool(ok));
     m.insert("exit".into(), r.exit_code.map(|n| Value::Int(n as i64)).unwrap_or(Value::Null));
-    m.insert("stdout".into(), Value::String(r.stdout));
-    m.insert("stderr".into(), Value::String(r.stderr));
+    m.insert("stdout".into(), Value::String(mask.apply(&r.stdout)));
+    m.insert("stderr".into(), Value::String(mask.apply(&r.stderr)));
     Ok(Value::Map(m))
 }
 
@@ -949,6 +951,28 @@ mod tests {
         let (doc, diags) = paneld_config::parse(&toks, &map);
         assert!(diags.is_empty(), "parse errors: {diags:?}");
         doc
+    }
+
+    #[test]
+    fn secrets_are_masked_after_parsing() {
+        // Review round 7: the raw text held `a\/b-tok` (JSON escape),
+        // so masking it missed the secret, and masking `1234` inside a
+        // number broke the JSON.
+        let doc = parse_doc(
+            "source s { run = /bin/echo '{\"user\": \"a\\/b-tok\", \"ts\": 1762341234}'\n parse = json }\n",
+        );
+        let block = collect_blocks(&doc).remove("s").unwrap();
+        let mut ctx = Context::new();
+        let secrets = BTreeMap::from([
+            ("t".to_string(), Value::String("a/b-tok".into())),
+            ("p".to_string(), Value::String("1234".into())),
+        ]);
+        ctx.insert("secrets".into(), Value::Map(secrets));
+        let v = resolve_one(&block, &ctx, std::path::Path::new("/"), runner::AppDefaults::default()).unwrap();
+        let Value::Map(m) = v else { panic!() };
+        let Value::Map(value) = &m["value"] else { panic!("{:?}", m["value"]) };
+        assert_eq!(value["user"], Value::String("****".into()));
+        assert_eq!(value["ts"], Value::Int(1_762_341_234));
     }
 
     #[test]

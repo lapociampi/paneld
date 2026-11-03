@@ -135,7 +135,7 @@ action pause_adblock {
 | `done` | string, expr | Shown briefly on success; `output` shows stdout |
 | `failed` | string, expr | Shown on failure (default: stderr) |
 
-Order: params asked, PIN, confirm, `run`, then on success `set`, `goto`, `refresh`, `then`; on failure `else`. While an action runs, further calls of it with the same args are ignored (each row of a `repeat` runs on its own, also across a reload). Different actions run side by side, at most `app:max_running` commands at once.
+Order: params asked, PIN, confirm, `run`, then on success `set`, `goto`, `refresh`, `then`; on failure `else`. While an action runs, further calls of it with the same args are ignored, also across a reload; calls with other args (another row of a `repeat`, a toggle switched back) wait and run in the order they were made. Different actions run side by side, at most `app:max_running` commands at once.
 
 `result`: `{ok: bool, code: int, stdout: string, stderr: string, out: <parsed>}`.
 

@@ -154,16 +154,15 @@ pub fn parse_number(text: &str) -> Option<f64> {
 
 // --- duration ---
 
-/// Parse a duration literal: `500ms`, `30s`, `2m`, `1h`, `1d`,
-/// `1 month`. A space before the unit is tolerated.
 /// `YYYY-MM-DD` as `(year, month, day)`, checked against the month's
-/// length.
+/// length; years 1970 to 9999.
 pub fn parse_date(text: &str) -> Option<(i64, u32, u32)> {
     let mut it = text.trim().split('-');
     let y: i64 = it.next()?.parse().ok()?;
     let m: u32 = it.next()?.parse().ok()?;
     let d: u32 = it.next()?.parse().ok()?;
-    if it.next().is_some() || !(1..=12).contains(&m) || d == 0 {
+    // Bounded so date math (seconds since 1970) cannot overflow.
+    if it.next().is_some() || !(1970..=9999).contains(&y) || !(1..=12).contains(&m) || d == 0 {
         return None;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
@@ -178,6 +177,9 @@ pub fn parse_date(text: &str) -> Option<(i64, u32, u32)> {
 
 const MAX_DURATION_SECS: f64 = 100.0 * 365.0 * 86_400.0;
 
+/// Parse a duration literal: `500ms`, `30s`, `2m`, `1h`, `1d`, `1w`,
+/// `1 month`, `1y`, at most 100 years. A space before the unit is
+/// tolerated.
 pub fn parse_duration(text: &str) -> Option<Duration> {
     let t = text.trim();
     // Split on first non-numeric (and non-`.`, non-`-`) byte.
@@ -532,6 +534,9 @@ mod tests {
         assert_eq!(parse_date("2026-02-29"), None);
         assert_eq!(parse_date("2026-11"), None);
         assert_eq!(parse_date("tomorrow"), None);
+        assert_eq!(parse_date("100000000000000-01-01"), None);
+        assert_eq!(parse_date("1969-12-31"), None);
+        assert_eq!(parse_date("9999-12-31"), Some((9999, 12, 31)));
     }
 
     #[test]

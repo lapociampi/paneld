@@ -300,12 +300,17 @@ pub fn command_argv(
 /// Run `argv`. The child gets a clean environment, its own process
 /// group, stdin from `/dev/null`, stdout and stderr captured up to
 /// their caps, and is killed as a group once `opts.timeout` elapses.
-/// Commands running now, the cap, and how many actions wait for a
-/// slot (they go before waiting sources, ADR 0013).
+/// Commands running now, the cap, and the waiting line. Waiters get
+/// a ticket and are served in ticket order, actions before sources
+/// (ADR 0013): two quick calls reach their commands in the order they
+/// were made.
 struct Slots {
     busy: usize,
     max: usize,
-    actions_waiting: usize,
+    /// Next ticket to hand out and next to serve, per line
+    /// (`[actions, sources]`).
+    issued: [u64; 2],
+    served: [u64; 2],
 }
 
 /// The `app:max_running` slots.
@@ -318,26 +323,29 @@ static POOL: Pool = Pool::new(8);
 
 impl Pool {
     const fn new(max: usize) -> Self {
-        Self { slots: Mutex::new(Slots { busy: 0, max, actions_waiting: 0 }), freed: Condvar::new() }
+        Self { slots: Mutex::new(Slots { busy: 0, max, issued: [0; 2], served: [0; 2] }), freed: Condvar::new() }
     }
 
-    /// Wait for a free slot. A source also waits while an action is
-    /// waiting, so taps are not stuck behind a burst of polls.
+    /// Wait for a free slot, in turn. A source also waits while an
+    /// action is waiting, so taps are not stuck behind a burst of
+    /// polls.
     pub fn acquire(&'static self, kind: Kind) -> Slot {
-        let action = !matches!(kind, Kind::Source);
+        let line = usize::from(matches!(kind, Kind::Source));
         let mut g = self.slots.lock().unwrap();
-        if action {
-            g.actions_waiting += 1;
-        }
-        while g.busy >= g.max || (!action && g.actions_waiting > 0) {
+        let ticket = g.issued[line];
+        g.issued[line] += 1;
+        loop {
+            let my_turn = g.served[line] == ticket;
+            let actions_waiting = g.issued[0] > g.served[0];
+            if g.busy < g.max && my_turn && (line == 0 || !actions_waiting) {
+                break;
+            }
             g = self.freed.wait(g).unwrap();
         }
-        if action {
-            g.actions_waiting -= 1;
-            // Sources held back for this action may go now.
-            self.freed.notify_all();
-        }
+        g.served[line] += 1;
         g.busy += 1;
+        // The next in line may be able to go too.
+        self.freed.notify_all();
         Slot(self)
     }
 }
@@ -565,6 +573,30 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "source");
         source.join().unwrap();
         action.join().unwrap();
+    }
+
+    #[test]
+    fn pool_serves_waiters_in_order() {
+        use std::sync::mpsc::channel;
+        let pool: &'static Pool = Box::leak(Box::new(Pool::new(1)));
+        let first = pool.acquire(Kind::Action);
+        let (tx, rx) = channel();
+        let mut waiters = Vec::new();
+        for i in 0..5 {
+            let tx = tx.clone();
+            waiters.push(thread::spawn(move || {
+                let _s = pool.acquire(Kind::Action);
+                tx.send(i).unwrap();
+            }));
+            // Each takes its ticket before the next starts.
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(first);
+        let order: Vec<i32> = (0..5).map(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap()).collect();
+        assert_eq!(order, [0, 1, 2, 3, 4]);
+        for w in waiters {
+            w.join().unwrap();
+        }
     }
 
     #[test]

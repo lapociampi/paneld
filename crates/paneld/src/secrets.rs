@@ -88,6 +88,21 @@ impl Mask {
         }
     }
 
+    /// `value` with every string in it (map keys too) masked; numbers
+    /// and the shape stay as they are. Used on parsed output, where a
+    /// secret is in its unescaped form.
+    pub fn apply_value(&self, value: Value) -> Value {
+        if self.0.is_empty() {
+            return value;
+        }
+        match value {
+            Value::String(s) => Value::String(self.apply(&s)),
+            Value::List(l) => Value::List(l.into_iter().map(|v| self.apply_value(v)).collect()),
+            Value::Map(m) => Value::Map(m.into_iter().map(|(k, v)| (self.apply(&k), self.apply_value(v))).collect()),
+            other => other,
+        }
+    }
+
     pub fn apply(&self, text: &str) -> String {
         let mut out = text.to_string();
         for v in &self.0 {
@@ -112,5 +127,14 @@ mod tests {
         let mask = Mask::new(&m);
         assert_eq!(mask.apply("auth s3cr3t-token / s3cr3t: ok"), "auth **** / ****: ok");
         assert_eq!(Mask::default().apply("s3cr3t"), "s3cr3t");
+        // Parsed values: strings masked, numbers untouched.
+        let mut m2 = BTreeMap::new();
+        m2.insert("pin".to_string(), Value::String("1234".into()));
+        let mask = Mask::new(&m2);
+        let v = crate::sources::parse_json(r#"{"ts": 1762341234, "user": "a 1234 b", "1234": true}"#).unwrap();
+        let Value::Map(out) = mask.apply_value(v) else { panic!() };
+        assert_eq!(out["ts"], Value::Int(1_762_341_234));
+        assert_eq!(out["user"], Value::String("a **** b".into()));
+        assert!(out.contains_key("****"));
     }
 }

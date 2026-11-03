@@ -337,7 +337,9 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // gotos update the current page, vars changes trigger a
     // re-render (the worker already wrote the new values).
     let mut dirty = std::mem::take(&mut live.redraw);
-    // Runs from before a reload: only their completion matters.
+    // Runs from before a reload: their completion, and their `then` /
+    // `else`, which go through the new config's gates. (Their `set`
+    // and `refresh` went to the old config's vars and sources.)
     let mut stale = std::mem::take(&mut live.stale_events);
     stale.retain(|rx| loop {
         match rx.try_recv() {
@@ -345,15 +347,20 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 live.running.remove(&key);
                 dirty |= action_done(live, screen, &name, ok, result);
             }
+            Ok(paneld_ui::UiEvent::Chained { name, args }) => {
+                live.deferred.push_back(actions::Call::new(name, args));
+            }
             Ok(_) => {}
             Err(std::sync::mpsc::TryRecvError::Empty) => break true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break false,
         }
     });
-    // Nothing left running: nothing more to wait for from them.
-    if !live.running.is_empty() {
-        live.stale_events = stale;
+    // Kept until the old worker has gone (its queue disconnects); a
+    // few reloads in a row keep at most the newest four.
+    if stale.len() > 4 {
+        stale.drain(..stale.len() - 4);
     }
+    live.stale_events = stale;
     while let Ok(ev) = live.event_rx.try_recv() {
         match ev {
             paneld_ui::UiEvent::Action { name, args } => {
@@ -448,6 +455,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 }
             }
             paneld_ui::UiEvent::InlineSet { assigns } => {
+                let _set = actions::set_lock();
                 let ctx = build_ctx(
                     &live.source_values,
                     &live.theme,
@@ -464,6 +472,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 }
             }
             paneld_ui::UiEvent::ChangeInlineSet { assigns, event_value } => {
+                let _set = actions::set_lock();
                 let mut ctx = build_ctx(
                     &live.source_values,
                     &live.theme,
@@ -626,6 +635,8 @@ struct LiveState {
     /// Schema 10; due reminders are alerts in `alerts`.
     reminders: reminders::Book,
     state: state::Store,
+    /// The state file `paneld shot` uses instead of `app:state`.
+    state_override: Option<std::path::PathBuf>,
     sources_shutdown: sources::ShutdownHandle,
     /// Clone of the action table the worker holds. Lets the main
     /// loop look up `confirm` without crossing the channel.
@@ -897,6 +908,7 @@ fn setup_live_state(
         histories,
         reminders: reminder_book,
         state: state_store,
+        state_override: state_path.map(std::path::Path::to_path_buf),
         sources_shutdown,
         actions: action_table_for_main,
         pending: None,
@@ -1073,33 +1085,52 @@ fn screen_step(live: &mut LiveState) -> bool {
 /// background: a slow backlight must not stall the UI.
 fn screen_command(s: &screen::Screen, template: Option<String>, level: Option<u8>) {
     let Some(template) = template else { return };
-    let cwd = s.cwd.clone();
-    std::thread::spawn(move || {
-        let mut ctx = paneld_ui::Context::new();
-        if let Some(l) = level {
-            ctx.insert("level".into(), paneld_ui::Value::Int(l.into()));
-        }
-        let file = paneld_config::source::FileId::default();
-        let result = runner::command_argv(&template, |t| paneld_ui::interpolate(t, file, 0, &ctx))
-            .and_then(|argv| {
-                runner::exec(
-                    &argv,
-                    runner::Opts {
-                        timeout: std::time::Duration::from_secs(10),
-                        max_bytes: 64 * 1024,
-                        kind: runner::Kind::Other,
-                        name: "screen",
-                        cwd: Some(&cwd),
-                        env: &[],
-                    },
-                )
-            });
-        match result {
-            Ok(r) if r.succeeded() => {}
-            Ok(r) => eprintln!("paneld: screen command failed: exit {:?} {}", r.exit_code, r.stderr.trim()),
-            Err(e) => eprintln!("paneld: screen command: {e}"),
-        }
+    // One thread runs them all, in order: an `on` must not overtake
+    // the `off` before it.
+    static QUEUE: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<ScreenJob>>> = std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ScreenJob>();
+        std::thread::spawn(move || {
+            for job in rx {
+                run_screen_job(job);
+            }
+        });
+        std::sync::Mutex::new(tx)
     });
+    let job = ScreenJob { template, level, cwd: s.cwd.clone() };
+    let _ = queue.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+}
+
+struct ScreenJob {
+    template: String,
+    level: Option<u8>,
+    cwd: std::path::PathBuf,
+}
+
+fn run_screen_job(job: ScreenJob) {
+    let mut ctx = paneld_ui::Context::new();
+    if let Some(l) = job.level {
+        ctx.insert("level".into(), paneld_ui::Value::Int(l.into()));
+    }
+    let file = paneld_config::source::FileId::default();
+    let result = runner::command_argv(&job.template, |t| paneld_ui::interpolate(t, file, 0, &ctx)).and_then(|argv| {
+        runner::exec(
+            &argv,
+            runner::Opts {
+                timeout: std::time::Duration::from_secs(10),
+                max_bytes: 64 * 1024,
+                kind: runner::Kind::Other,
+                name: "screen",
+                cwd: Some(&job.cwd),
+                env: &[],
+            },
+        )
+    });
+    match result {
+        Ok(r) if r.succeeded() => {}
+        Ok(r) => eprintln!("paneld: screen command failed: exit {:?} {}", r.exit_code, r.stderr.trim()),
+        Err(e) => eprintln!("paneld: screen command: {e}"),
+    }
 }
 
 /// Hand a call that passed its gates to the worker and mark the
@@ -1456,10 +1487,14 @@ fn reload(
 ) -> Result<(), Vec<ctl::CtlError>> {
     // Write pending alert and reminder state first: the new state
     // reads the file, and an ack from a moment ago must be in it.
+    // A ctl request in this same pass (`reminder done`, `alert ack`)
+    // is not noted yet: note it now.
+    live.alerts.note_resolved(std::time::SystemTime::now());
+    live.state.note(live.alerts.active_alerts(), live.reminders.dates(), live.alerts.history());
     live.state.force_flush();
-    let state_path = live.state.path().to_path_buf();
+    let state_override = live.state_override.clone();
     let previous_sources = live.source_values.lock().unwrap().clone();
-    match setup_live_state(config, screen, Some(&state_path), Some(&previous_sources)) {
+    match setup_live_state(config, screen, state_override.as_deref(), Some(&previous_sources)) {
         Ok(mut fresh) => {
             fresh.pin_gate.carry_from(&live.pin_gate);
             fresh.screen.carry_from(&live.screen);
@@ -1470,11 +1505,9 @@ fn reload(
             fresh.histories.carry_from(&mut live.histories);
             fresh.running = std::mem::take(&mut live.running);
             fresh.stale_events = std::mem::take(&mut live.stale_events);
-            if !fresh.running.is_empty() {
-                let (tx, rx) = std::sync::mpsc::channel();
-                drop(tx);
-                fresh.stale_events.push(std::mem::replace(&mut live.event_rx, rx));
-            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            drop(tx);
+            fresh.stale_events.push(std::mem::replace(&mut live.event_rx, rx));
             // Stop the old poll / stream workers; the new state runs
             // its own.
             live.sources_shutdown.stop();

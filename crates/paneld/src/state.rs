@@ -135,10 +135,6 @@ impl Store {
     /// What the daemon loaded at startup. The alert engine replays
     /// these timestamps onto freshly fired alerts so `since` survives
     /// a restart.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn snapshot(&self) -> &StateData {
         &self.on_disk
     }

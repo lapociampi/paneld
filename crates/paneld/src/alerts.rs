@@ -181,7 +181,8 @@ pub struct Carry {
     pub since: SystemTime,
     pub acked: bool,
     pub snoozed_until: Option<SystemTime>,
-    /// [`severity_rank`] it had when acked or snoozed.
+    /// [`severity_rank`] of the alert as it was last seen: a fire
+    /// worse than that clears the ack and snooze.
     pub rank: u8,
 }
 
@@ -214,6 +215,9 @@ pub struct Engine {
     history_keep: Duration,
     /// The active set at the last [`Engine::note_resolved`].
     last_active: BTreeMap<String, Alert>,
+    /// Condition rules whose `when` gave no answer at the last tick
+    /// (a source without a value yet): their state is unknown.
+    undecided: std::collections::BTreeSet<String>,
 }
 
 /// An alert that is no longer active, for `alerts.history` and the
@@ -257,6 +261,7 @@ impl Engine {
             history: Vec::new(),
             history_keep: parse_history_keep(doc),
             last_active: BTreeMap::new(),
+            undecided: std::collections::BTreeSet::new(),
         }
     }
 
@@ -336,11 +341,17 @@ impl Engine {
     /// Event rules keep theirs until the source's next event for that
     /// alert, since their state only arrives with events.
     pub fn forget_unfired(&mut self) {
-        let (rules, pending) = (&self.rules, &self.pending);
+        let (rules, pending, undecided) = (&self.rules, &self.pending, &self.undecided);
         self.restored.retain(|k, _| {
             let rule = k.split_once(':').map_or(k.as_str(), |(r, _)| r);
-            // Still waiting out its `for`: the same incident, maybe.
-            pending.contains_key(k) || rules.iter().any(|r| r.name == rule && r.from.is_some())
+            // Still waiting out its `for`, or not decided yet (its
+            // source has no value): maybe the same incident.
+            pending.contains_key(k)
+                || undecided.contains(rule)
+                // The watchdog cannot have fired this early; an event
+                // from the source drops it (`ingest_event`).
+                || rule == "source_down"
+                || rules.iter().any(|r| r.name == rule && r.from.is_some())
         });
     }
 
@@ -480,6 +491,7 @@ impl Engine {
         if self.source_last.contains_key(source_name) {
             self.source_last.insert(source_name.to_string(), Instant::now());
             let down_key = format!("source_down:{source_name}");
+            self.restored.remove(&down_key);
             if self.active.remove(&down_key).is_some() {
                 changed = true;
             }
@@ -544,6 +556,7 @@ impl Engine {
     pub fn tick(&mut self, ctx: &Context, now: Instant, wall: SystemTime) -> bool {
         let mut changed = false;
         let mut seen: BTreeMap<String, ()> = BTreeMap::new();
+        self.undecided.clear();
 
         for rule in &self.rules {
             // Event-mode rules do not fire from `tick`; they will be
@@ -556,7 +569,10 @@ impl Engine {
             };
             let truthy = match paneld_ui::resolve_value(when_raw, rule.when_span, ctx) {
                 Some(Value::Bool(b)) => b,
-                Some(_) | None => continue,
+                Some(_) | None => {
+                    self.undecided.insert(rule.name.clone());
+                    continue;
+                }
             };
             let instance = resolve_string(ctx, rule.id_raw.as_deref(), rule.id_span)
                 .unwrap_or_else(|| rule.name.clone());
@@ -1328,6 +1344,20 @@ mod tests {
         eng.tick(&ctx_with_temp(80.0), Instant::now(), wall);
         eng.forget_unfired();
         assert!(eng.restored.contains_key("slow:slow"));
+
+        // A rule that cannot be decided yet (no source value at the
+        // first tick) keeps its saved ack: review round 7.
+        let mut eng = Engine::new(&doc);
+        eng.restore(["pi_hot:pi_hot", "source_down:ev"].into_iter().map(saved).collect());
+        eng.tick(&Context::new(), Instant::now(), wall);
+        eng.forget_unfired();
+        assert!(eng.restored.contains_key("pi_hot:pi_hot"), "undecided rule lost its ack");
+        assert!(eng.restored.contains_key("source_down:ev"));
+        eng.tick(&ctx_with_temp(80.0), Instant::now(), wall);
+        assert!(eng.active_alerts()["pi_hot:pi_hot"].acked);
+        // The source is alive again: its watchdog ack goes.
+        eng.ingest_event("ev", &Value::Null, &Context::new(), wall);
+        assert!(!eng.restored.contains_key("source_down:ev"));
 
         // A resolved event drops the event rule's saved ack.
         let mut eng = Engine::new(&doc);
