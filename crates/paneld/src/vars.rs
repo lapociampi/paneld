@@ -59,7 +59,13 @@ fn parse_default(ty: &str, raw: &str) -> Value {
 /// nonsensical (e.g. assigning a list to an `int`), which the worker
 /// reports and then leaves the var alone.
 pub fn coerce(ty: &str, v: Value) -> Option<Value> {
+    use paneld_config::value::{parse_bool, parse_int, parse_number};
     match (ty, v) {
+        // A literal RHS (`set { on = true }`, `set { tab = 2 }`) comes
+        // through as text; parse it as the declared type.
+        ("int", Value::String(s)) => parse_int(&s).map(Value::Int),
+        ("number", Value::String(s)) => parse_number(&s).map(Value::Double),
+        ("bool", Value::String(s)) => parse_bool(&s).map(Value::Bool),
         ("int", Value::Int(n)) => Some(Value::Int(n)),
         ("int", Value::Double(d)) => Some(Value::Int(d as i64)),
         ("int", Value::Bool(b)) => Some(Value::Int(if b { 1 } else { 0 })),
@@ -128,6 +134,16 @@ mod tests {
         assert_eq!(coerce("int", Value::Bool(true)), Some(Value::Int(1)));
         assert_eq!(coerce("int", Value::Double(2.9)), Some(Value::Int(2)));
         assert_eq!(coerce("int", Value::String("x".into())), None);
+    }
+
+    #[test]
+    fn coerce_parses_literal_text_as_the_declared_type() {
+        let s = |t: &str| Value::String(t.into());
+        assert_eq!(coerce("bool", s("true")), Some(Value::Bool(true)));
+        assert_eq!(coerce("int", s("2")), Some(Value::Int(2)));
+        assert_eq!(coerce("number", s("2.5")), Some(Value::Double(2.5)));
+        assert_eq!(coerce("bool", s("maybe")), None);
+        assert_eq!(coerce("string", s("true")), Some(s("true")));
     }
 
     #[test]

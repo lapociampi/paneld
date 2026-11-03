@@ -27,7 +27,7 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
 use crate::expr::{eval, Context, Value};
-use crate::ui::{ActionArg, InlineSetItem, Obj, Size, UiEvent};
+use crate::ui::{ActionArg, InlineSetItem, Obj, Size, Trigger, UiEvent};
 
 /// Children of a component call plus the outer context they should
 /// resolve against. Threaded through [`render_node`] so a `slot { }`
@@ -191,23 +191,17 @@ fn render_node(
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "grid" => {
+            // A grid fills its parent's width (its columns are
+            // fractions of it) and grows with its rows; `width` /
+            // `height` props override.
             let obj = parent.new_container();
-            obj.set_size(Size::Content, Size::Content);
-            // Count the direct UI children up front so a sensible
-            // `rows` default (ceil(children / columns)) is applied
-            // when the user doesn't say.
-            let child_count = node
-                .items
-                .iter()
-                .filter(|it| matches!(it, Item::Block(_) | Item::Repeat(_)))
-                .count() as i32;
-            let cols = resolve_num(node, "columns", ctx).unwrap_or(2.0) as i32;
-            let rows = resolve_num(node, "rows", ctx).unwrap_or_else(|| {
-                (child_count.max(1) + cols.max(1) - 1) as f64 / cols.max(1) as f64
-            }) as i32;
-            obj.set_grid(cols.max(1), rows.max(1));
+            obj.set_size(Size::Percent(100), Size::Content);
             apply_props(node, ctx, sink, &obj);
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
+            // Lay out after rendering so `repeat` output counts.
+            let cols = resolve_num(node, "columns", ctx).unwrap_or(2.0) as i32;
+            let rows = resolve_num(node, "rows", ctx).map(|r| r as i32);
+            obj.layout_grid(cols, rows);
         }
         "text" => {
             let text = resolve_text(node, "value", ctx).unwrap_or_default();
@@ -414,19 +408,52 @@ fn expand_component(
         } else {
             Value::Null
         };
-        inner_ctx.insert(p.name.text.clone(), bound);
+        inner_ctx.insert(p.name.text.clone(), typed_param(&p.ty.text, bound));
     }
     // Children of the call that aren't args become the slot's
     // content. The schema check already enforced "exactly one slot"
     // and "no children unless a slot exists".
+    // Handler blocks (`on_hold vm_stop { ... }`) belong to the call,
+    // not to the slot.
     let child_items: Vec<Item> = call
         .items
         .iter()
-        .filter(|it| matches!(it, Item::Block(_) | Item::Repeat(_)))
+        .filter(|it| match it {
+            Item::Block(b) => !is_event_handler_block(&b.kind.text),
+            Item::Repeat(_) => true,
+            _ => false,
+        })
         .cloned()
         .collect();
     let slot = SlotCtx { children: &child_items, outer_ctx };
+    let before = parent.child_count();
     render_item_list(&comp.items, doc, &inner_ctx, Some(&slot), sink, parent);
+    // The call's own `on_tap` / `on_hold` act on the component's root
+    // object, with args evaluated in the caller's scope (`item`, ...).
+    if let Some(root) = parent.child(before) {
+        bind_handlers(call, outer_ctx, sink, &root);
+    }
+}
+
+/// Give a component arg its declared type. A literal arg (`warn = 70`)
+/// or default (`= 1e9`) arrives as text; without this `value > warn`
+/// compares a number with a string and the expression yields nothing.
+/// A value that does not convert is passed through unchanged.
+pub(crate) fn typed_param(ty: &str, v: Value) -> Value {
+    use paneld_config::value::{parse_bool, parse_int, parse_number};
+    let Value::String(s) = &v else {
+        return match (ty, v) {
+            ("number", Value::Int(n)) => Value::Double(n as f64),
+            (_, v) => v,
+        };
+    };
+    let t = s.trim();
+    match ty {
+        "number" => parse_number(t).map(Value::Double).unwrap_or(v),
+        "int" => parse_int(t).map(Value::Int).unwrap_or(v),
+        "bool" => parse_bool(t).map(Value::Bool).unwrap_or(v),
+        _ => v,
+    }
 }
 
 /// Interpolate every `{{ ... }}` fragment in `raw` against `ctx`,
@@ -683,37 +710,78 @@ fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_
     //   `on_tap vm_stop { vm = {{ item.id }} }`
     // Only one gets wired per tap: the first form found wins,
     // matching schema semantics (one action per handler).
-    for item in &node.items {
-        let Item::Block(child) = item else { continue };
-        if child.kind.text != "on_tap" {
-            continue;
+    bind_handlers(node, ctx, sink, obj);
+    apply_plain_props(node, ctx, obj);
+}
+
+/// Wire `node`'s `on_tap` / `on_hold` handlers (block and `= name`
+/// forms) to `obj`. Action-call args are evaluated against `ctx` now.
+fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_>) {
+    // A node with an `on_hold` gets short taps only for `on_tap`, so a
+    // long press does not fire both.
+    let has_hold = node.items.iter().any(|it| match it {
+        Item::Block(b) => b.kind.text == "on_hold",
+        Item::Assign(a) => {
+            matches!(&a.target, AssignTarget::Simple { key } if key.text == "on_hold")
         }
-        // Named action-call shortcut: eval args NOW against the
-        // current render ctx so the stored binding captures the row
-        // (`item`, `vars.*`, ...) the user is tapping on.
-        if let Some(name) = &child.name {
-            let args = collect_action_args(child, ctx);
-            obj.set_clickable();
-            obj.on_tap_with_args(sink.clone(), &name.text, args);
-            break;
-        }
-        if let Some(page) = find_simple(child, "goto") {
-            let page = page.trim();
-            if is_bare_ident(page) {
+        _ => false,
+    });
+    let tap = if has_hold { Trigger::ShortTap } else { Trigger::Tap };
+    for (handler, trigger) in [("on_tap", tap), ("on_hold", Trigger::Hold)] {
+        for item in &node.items {
+            let Item::Block(child) = item else { continue };
+            if child.kind.text != handler {
+                continue;
+            }
+            // Named action-call shortcut: eval args NOW against the
+            // current render ctx so the stored binding captures the
+            // row (`item`, `vars.*`, ...) the user is touching.
+            if let Some(name) = &child.name {
+                let args = collect_action_args(child, ctx);
                 obj.set_clickable();
-                obj.on_tap_goto(sink.clone(), page);
+                obj.bind_action(trigger, sink.clone(), &name.text, args);
                 break;
             }
-        }
-        if let Some(set_block) = find_block(child, "set") {
-            let assigns = collect_inline_set(set_block);
-            if !assigns.is_empty() {
-                obj.set_clickable();
-                obj.on_tap_inline_set(sink.clone(), assigns);
-                break;
+            if let Some(page) = find_simple(child, "goto") {
+                let page = page.trim();
+                if is_bare_ident(page) {
+                    obj.set_clickable();
+                    obj.bind_goto(trigger, sink.clone(), page);
+                    break;
+                }
+            }
+            if let Some(set_block) = find_block(child, "set") {
+                let assigns = collect_inline_set(set_block);
+                if !assigns.is_empty() {
+                    obj.set_clickable();
+                    obj.bind_inline_set(trigger, sink.clone(), assigns);
+                    break;
+                }
             }
         }
     }
+    // `on_tap = <action>` / `on_hold = <action>`.
+    for item in &node.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key } = &a.target else {
+            continue;
+        };
+        let trigger = match key.text.as_str() {
+            "on_tap" => tap,
+            "on_hold" => Trigger::Hold,
+            _ => continue,
+        };
+        let name = a.value.text.trim();
+        if name != "none" && is_bare_ident(name) {
+            obj.set_clickable();
+            obj.bind_action(trigger, sink.clone(), name, Vec::new());
+        }
+    }
+}
+
+/// Apply `node`'s plain properties (size, spacing, colors, font,
+/// visibility, ...) to `obj`.
+fn apply_plain_props(node: &Block, ctx: &Context, obj: &Obj<'_>) {
     for item in &node.items {
         let Item::Assign(a) = item else { continue };
         let AssignTarget::Simple { key } = &a.target else {
@@ -722,22 +790,22 @@ fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_
         let value = a.value.text.trim();
         match key.text.as_str() {
             "width" => {
-                if let Some(s) = parse_size(value) {
-                    obj.set_size(s, Size::Content);
+                if let Some(s) = parse_size(&resolve_scalar(value, a.value.span, ctx)) {
+                    obj.set_width(s);
                 }
             }
             "height" => {
-                if let Some(s) = parse_size(value) {
-                    obj.set_size(Size::Content, s);
+                if let Some(s) = parse_size(&resolve_scalar(value, a.value.span, ctx)) {
+                    obj.set_height(s);
                 }
             }
             "padding" => {
-                if let Ok(px) = value.parse::<i32>() {
+                if let Ok(px) = resolve_scalar(value, a.value.span, ctx).trim().parse::<i32>() {
                     obj.set_padding(px);
                 }
             }
             "gap" => {
-                if let Ok(px) = value.parse::<i32>() {
+                if let Ok(px) = resolve_scalar(value, a.value.span, ctx).trim().parse::<i32>() {
                     obj.set_gap(px);
                 }
             }
@@ -784,25 +852,9 @@ fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_
                     .unwrap_or(true);
                 obj.set_enabled(flag);
             }
-            "on_tap" => {
-                // Simple-assign form only: `on_tap = <action-name>`.
-                // The `on_tap action { ... }` block form (named
-                // action with args) and the inline `on_tap { ... }`
-                // form come in a later phase.
-                let name = value;
-                if name == "none" || name.is_empty() {
-                    continue;
-                }
-                if is_bare_ident(name) {
-                    obj.set_clickable();
-                    obj.on_tap(sink.clone(), name);
-                }
-            }
             _ => {
-                // Not yet wired; silently ignore so the daemon
-                // doesn't crash on properties that are legal
-                // schema-wise but need engine work (theme resolution,
-                // event bindings beyond `on_tap`).
+                // Handlers are bound by `bind_handlers`; other keys
+                // are legal schema-wise but not wired yet.
             }
         }
     }
@@ -987,6 +1039,17 @@ fn find_raw<'a>(
     None
 }
 
+/// A property value as text: a literal as written, or the result of a
+/// `{{ ... }}` expression (so `padding = {{ theme.padding }}` works).
+fn resolve_scalar(value: &str, span: paneld_config::source::Span, ctx: &Context) -> String {
+    match classify(value) {
+        ValueShape::Literal(t) => t.to_string(),
+        _ => resolve_expr_value(value, span, ctx)
+            .map(|v| v.to_display_string())
+            .unwrap_or_default(),
+    }
+}
+
 fn parse_size(s: &str) -> Option<Size> {
     let s = s.trim();
     if s == "content" {
@@ -1045,4 +1108,23 @@ fn parse_hex_color(s: &str) -> Option<u32> {
         _ => return None,
     };
     Some(((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_args_take_their_declared_type() {
+        let s = |t: &str| Value::String(t.into());
+        assert_eq!(typed_param("number", s("70")), Value::Double(70.0));
+        assert_eq!(typed_param("number", s("1e9")), Value::Double(1e9));
+        assert_eq!(typed_param("number", Value::Int(3)), Value::Double(3.0));
+        assert_eq!(typed_param("int", s(" 4 ")), Value::Int(4));
+        assert_eq!(typed_param("bool", s("true")), Value::Bool(true));
+        assert_eq!(typed_param("string", s("70")), s("70"));
+        // Not convertible: passed through unchanged.
+        assert_eq!(typed_param("number", s("abc")), s("abc"));
+        assert_eq!(typed_param("number", Value::Null), Value::Null);
+    }
 }

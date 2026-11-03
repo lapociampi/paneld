@@ -22,11 +22,46 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_ui::Value;
 
 pub fn resolve(doc: &Document) -> BTreeMap<String, Value> {
-    let Some(active) = active_theme_name(doc) else {
-        return BTreeMap::new();
-    };
-    let mut seen = Vec::new();
-    merge_theme(doc, &active, &mut seen)
+    // themes.md, "Precedence": built-in defaults first, then the
+    // active theme chain on top. So every required token exists even
+    // with no theme configured.
+    let mut out = builtin_tokens();
+    if let Some(active) = active_theme_name(doc) {
+        let mut seen = Vec::new();
+        out.extend(merge_theme(doc, &active, &mut seen));
+    }
+    out
+}
+
+/// The built-in token set: every token schema section 11 requires.
+/// Light, matching LVGL's default theme so widgets that are not
+/// themed yet still fit in. Fonts are the compiled Montserrat sizes.
+fn builtin_tokens() -> BTreeMap<String, Value> {
+    [
+        ("background", "#f5f5f5"),
+        ("surface", "#ffffff"),
+        ("text", "#212121"),
+        ("muted", "#757575"),
+        ("accent", "#2196f3"),
+        ("ok", "#2e7d32"),
+        ("info", "#1976d2"),
+        ("warning", "#ef6c00"),
+        ("critical", "#d32f2f"),
+        ("font_small", "montserrat 12"),
+        ("font", "montserrat 16"),
+        ("font_big", "montserrat 24"),
+        ("font_huge", "montserrat 32"),
+        ("gap", "8"),
+        ("padding", "12"),
+        ("radius", "8"),
+        ("tap_min", "48"),
+        ("shadow", "none"),
+        ("icons", "builtin"),
+        ("motion", "reduced"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+    .collect()
 }
 
 fn active_theme_name(doc: &Document) -> Option<String> {
@@ -113,4 +148,51 @@ fn find_simple<'a>(node: &'a Block, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(src: &str) -> Document {
+        use paneld_config::lex::tokenize;
+        use paneld_config::source::SourceMap;
+        let mut map = SourceMap::new();
+        let id = map.add(std::path::PathBuf::from("t.conf"), src.to_string());
+        let (toks, _) = tokenize(id, src);
+        let (d, diags) = paneld_config::parse(&toks, &map);
+        assert!(diags.is_empty(), "{diags:?}");
+        d
+    }
+
+    fn tok(m: &BTreeMap<String, Value>, k: &str) -> String {
+        match m.get(k) {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("token {k}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_theme_still_has_every_required_token() {
+        let m = resolve(&doc("page home { }\n"));
+        for k in [
+            "background", "surface", "text", "muted", "accent", "ok", "info", "warning",
+            "critical", "font_small", "font", "font_big", "font_huge", "gap", "padding",
+            "radius", "tap_min", "shadow", "icons", "motion",
+        ] {
+            assert!(m.contains_key(k), "missing built-in token `{k}`");
+        }
+    }
+
+    #[test]
+    fn theme_chain_overrides_builtins_child_last() {
+        let m = resolve(&doc(
+            "theme base { accent = #111111; surface = #222222 }\n\
+             theme mine { extends = base; accent = #333333 }\n\
+             screen { theme = mine }\n",
+        ));
+        assert_eq!(tok(&m, "accent"), "#333333");
+        assert_eq!(tok(&m, "surface"), "#222222");
+        assert_eq!(tok(&m, "warning"), "#ef6c00");
+    }
 }

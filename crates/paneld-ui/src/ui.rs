@@ -291,6 +291,18 @@ const LV_SIZE_CONTENT_LOCAL: i32 = LV_COORD_MAX_LOCAL | LV_COORD_TYPE_SPEC;
 pub(crate) fn grid_fr(x: i32) -> i32 {
     LV_COORD_MAX_LOCAL - 100 + x
 }
+/// Mirrors `#define LV_GRID_CONTENT (LV_COORD_MAX - 101)`: a track
+/// sized to its content.
+pub(crate) const GRID_CONTENT: i32 = LV_COORD_MAX_LOCAL - 101;
+
+thread_local! {
+    /// Grid track arrays of the current render. LVGL stores the
+    /// pointers, so they must outlive their grid objects; freed by
+    /// [`Obj::clear_children`] on the screen.
+    static LAYOUT_MEM: std::cell::RefCell<Vec<Box<[i32]>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Sentinel ending a grid dsc array; matches `LV_GRID_TEMPLATE_LAST`.
 pub(crate) const GRID_TEMPLATE_LAST: i32 = sys::LV_GRID_TEMPLATE_LAST as i32;
 
@@ -939,6 +951,14 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_size(self.raw, w.to_lvgl(), h.to_lvgl()) };
     }
 
+    pub fn set_width(&self, w: Size) {
+        unsafe { sys::lv_obj_set_width(self.raw, w.to_lvgl()) };
+    }
+
+    pub fn set_height(&self, h: Size) {
+        unsafe { sys::lv_obj_set_height(self.raw, h.to_lvgl()) };
+    }
+
     pub fn set_flex_row(&self) {
         unsafe { sys::lv_obj_set_flex_flow(self.raw, sys::lv_flex_flow_t_LV_FLEX_FLOW_ROW) };
     }
@@ -1015,30 +1035,63 @@ impl<'ui> Obj<'ui> {
     /// Remove every child of this object but keep the object itself,
     /// so a caller can rebuild the tree in place. Used by the live
     /// re-render path when a source value changes.
-    pub fn clear_children(&self) {
-        unsafe { sys::lv_obj_clean(self.raw) };
+    pub fn child_count(&self) -> u32 {
+        unsafe { sys::lv_obj_get_child_count(self.raw) }
     }
 
-    /// Make this object a grid container with `cols` equal fractional
-    /// columns and `rows` equal fractional rows. The row and column
-    /// descriptor arrays leak intentionally (they must outlive the
-    /// LVGL object) -- children on a reload re-create the arrays and
-    /// the old ones are collected by the OS at exit. The descriptor
-    /// stays stable across the object's lifetime.
-    pub fn set_grid(&self, cols: i32, rows: i32) {
+    /// The `i`th child, if there is one.
+    pub fn child(&self, i: u32) -> Option<Obj<'ui>> {
+        let raw = unsafe { sys::lv_obj_get_child(self.raw, i as i32) };
+        (!raw.is_null()).then_some(Obj { raw, _ui: PhantomData })
+    }
+
+    pub fn clear_children(&self) {
+        unsafe { sys::lv_obj_clean(self.raw) };
+        // With the whole screen cleared no grid is left that could
+        // point at the track arrays.
+        if self.raw == unsafe { sys::lv_screen_active() } {
+            LAYOUT_MEM.with(|m| m.borrow_mut().clear());
+        }
+    }
+
+    /// Lay this object's current children out as a grid: `cols` equal
+    /// columns, rows sized to their content, children placed row by
+    /// row. Call it after the children exist (so `repeat` output is
+    /// counted). `rows` can ask for more rows than the children need.
+    pub fn layout_grid(&self, cols: i32, rows: Option<i32>) {
         let cols = cols.max(1);
-        let rows = rows.max(1);
+        let n = unsafe { sys::lv_obj_get_child_count(self.raw) } as i32;
+        let needed = (n + cols - 1) / cols;
+        let rows = rows.unwrap_or(needed).max(needed).max(1);
         let mut col_dsc: Vec<i32> = (0..cols).map(|_| grid_fr(1)).collect();
         col_dsc.push(GRID_TEMPLATE_LAST);
-        let mut row_dsc: Vec<i32> = (0..rows).map(|_| grid_fr(1)).collect();
+        let mut row_dsc: Vec<i32> = (0..rows).map(|_| GRID_CONTENT).collect();
         row_dsc.push(GRID_TEMPLATE_LAST);
-        // Leak so the pointers stay valid for the LVGL object's
-        // lifetime; see doc comment above.
-        let col_ptr = Box::leak(col_dsc.into_boxed_slice()).as_ptr();
-        let row_ptr = Box::leak(row_dsc.into_boxed_slice()).as_ptr();
+        // LVGL keeps these pointers, so they live in LAYOUT_MEM until
+        // the screen is cleared.
+        let col_dsc = col_dsc.into_boxed_slice();
+        let row_dsc = row_dsc.into_boxed_slice();
+        let (col_ptr, row_ptr) = (col_dsc.as_ptr(), row_dsc.as_ptr());
+        LAYOUT_MEM.with(|m| {
+            let mut m = m.borrow_mut();
+            m.push(col_dsc);
+            m.push(row_dsc);
+        });
         unsafe {
             sys::lv_obj_set_layout(self.raw, sys::lv_layout_t_LV_LAYOUT_GRID);
             sys::lv_obj_set_grid_dsc_array(self.raw, col_ptr, row_ptr);
+            for i in 0..n {
+                let child = sys::lv_obj_get_child(self.raw, i);
+                sys::lv_obj_set_grid_cell(
+                    child,
+                    sys::lv_grid_align_t_LV_GRID_ALIGN_STRETCH,
+                    i % cols,
+                    1,
+                    sys::lv_grid_align_t_LV_GRID_ALIGN_STRETCH,
+                    i / cols,
+                    1,
+                );
+            }
         }
     }
 
@@ -1058,39 +1111,35 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_clickable(self.raw, enabled) };
     }
 
-    /// Register an LVGL CLICKED callback that pushes a
-    /// [`UiEvent::Action`] with no args on `sink` when tapped.
-    pub fn on_tap(&self, sink: Sender<UiEvent>, action_name: &str) {
-        self.on_tap_with_args(sink, action_name, Vec::new());
-    }
-
-    /// Same as [`Self::on_tap`] but carries already-evaluated args
-    /// for an action-call shortcut (`on_tap vm_stop { vm = ... }`).
-    pub fn on_tap_with_args(
+    /// On `trigger`, push a [`UiEvent::Action`] carrying `args`
+    /// (already evaluated at render time; empty for `on_tap = name`).
+    pub fn bind_action(
         &self,
+        trigger: Trigger,
         sink: Sender<UiEvent>,
         action_name: &str,
         args: Vec<ActionArg>,
     ) {
-        self.register_binding(Binding::Action {
-            name: action_name.to_string(),
-            args,
-            sink,
-        });
+        self.register_binding(
+            trigger,
+            Binding::Action { name: action_name.to_string(), args, sink },
+        );
     }
 
-    /// Register an LVGL CLICKED callback that pushes a
-    /// [`UiEvent::Goto`] on `sink` when the object is tapped.
-    pub fn on_tap_goto(&self, sink: Sender<UiEvent>, page: &str) {
-        self.register_binding(Binding::Goto { page: page.to_string(), sink });
+    /// On `trigger`, push a [`UiEvent::Goto`].
+    pub fn bind_goto(&self, trigger: Trigger, sink: Sender<UiEvent>, page: &str) {
+        self.register_binding(trigger, Binding::Goto { page: page.to_string(), sink });
     }
 
-    /// Register an LVGL CLICKED callback that pushes a
-    /// [`UiEvent::InlineSet`] on `sink` when the object is tapped.
-    /// The `assigns` are evaluated and applied by the main loop so
-    /// the UI thread stays free of CEL work on tap.
-    pub fn on_tap_inline_set(&self, sink: Sender<UiEvent>, assigns: Vec<InlineSetItem>) {
-        self.register_binding(Binding::InlineSet { assigns, sink });
+    /// On `trigger`, push a [`UiEvent::InlineSet`]. The `assigns` are
+    /// evaluated by the main loop, so the UI thread does no CEL work.
+    pub fn bind_inline_set(
+        &self,
+        trigger: Trigger,
+        sink: Sender<UiEvent>,
+        assigns: Vec<InlineSetItem>,
+    ) {
+        self.register_binding(trigger, Binding::InlineSet { assigns, sink });
     }
 
     /// Register an LVGL VALUE_CHANGED callback on a toggle (switch)
@@ -1193,7 +1242,7 @@ impl<'ui> Obj<'ui> {
         }
     }
 
-    fn register_binding(&self, binding: Binding) {
+    fn register_binding(&self, trigger: Trigger, binding: Binding) {
         let idx = {
             let mut g = bindings().lock().unwrap();
             g.push(binding);
@@ -1203,9 +1252,32 @@ impl<'ui> Obj<'ui> {
             sys::lv_obj_add_event_cb(
                 self.raw,
                 Some(on_tap_trampoline),
-                sys::lv_event_code_t_LV_EVENT_CLICKED,
+                trigger.code(),
                 idx as *mut std::ffi::c_void,
             );
+        }
+    }
+}
+
+/// Which pointer gesture fires a handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    /// Any click, however long the press (`on_tap` on an object
+    /// without `on_hold`).
+    Tap,
+    /// A click that was not a long press (`on_tap` next to `on_hold`;
+    /// LVGL's CLICKED would also fire after a hold).
+    ShortTap,
+    /// A long press (`on_hold`).
+    Hold,
+}
+
+impl Trigger {
+    fn code(self) -> sys::lv_event_code_t {
+        match self {
+            Trigger::Tap => sys::lv_event_code_t_LV_EVENT_CLICKED,
+            Trigger::ShortTap => sys::lv_event_code_t_LV_EVENT_SHORT_CLICKED,
+            Trigger::Hold => sys::lv_event_code_t_LV_EVENT_LONG_PRESSED,
         }
     }
 }

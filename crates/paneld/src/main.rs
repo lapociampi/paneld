@@ -67,7 +67,8 @@ struct ShotOpts {
     out: PathBuf,
     page: Option<String>,
     size: (i32, i32),
-    taps: Vec<(i32, i32)>,
+    /// (x, y, how long the press lasts in ms), in order.
+    taps: Vec<(i32, i32, u32)>,
     settle_ms: u32,
 }
 
@@ -102,12 +103,13 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
                     return Err("`--size` must be within 1x1..4096x4096".into());
                 }
             }
-            "--tap" => {
+            "--tap" | "--hold" => {
                 let v = val(&mut i, a)?;
-                let (x, y) = v.split_once(',').ok_or("`--tap` is X,Y")?;
+                let (x, y) = v.split_once(',').ok_or(format!("`{a}` is X,Y"))?;
                 o.taps.push((
-                    x.trim().parse().map_err(|_| "bad `--tap` x")?,
-                    y.trim().parse().map_err(|_| "bad `--tap` y")?,
+                    x.trim().parse().map_err(|_| format!("bad `{a}` x"))?,
+                    y.trim().parse().map_err(|_| format!("bad `{a}` y"))?,
+                    if a == "--hold" { 1000 } else { 100 },
                 ));
             }
             "--settle" => {
@@ -200,10 +202,11 @@ Usage:
   paneld ctl SUBCOMMAND [ARGS...]     Talk to a running daemon
   paneld hash-pin                     Read a PIN on stdin, print its
                                       argon2 hash for security.pin
-  paneld shot -o FILE.png [--page P] [--size WxH] [--tap X,Y]... [--settle MS]
+  paneld shot -o FILE.png [--page P] [--size WxH] [--tap X,Y]...
+              [--hold X,Y]... [--settle MS]
                                       Render the config headless to a PNG,
-                                      after the given taps (runs sources
-                                      and tapped actions for real)
+                                      after the given taps and holds (runs
+                                      sources and touched actions for real)
 
 Flags:
   -c, --config PATH   Config file (default: {DEFAULT_CONFIG})
@@ -778,13 +781,18 @@ fn route_call(
         return;
     }
     if let Some(cp) = def.confirm {
-        let ctx = build_ctx(
+        let mut ctx = build_ctx(
             &live.source_values,
             &live.theme,
             &live.secrets,
             &live.vars,
             Some(&live.alerts),
         );
+        // The message can name the call's args (`Stop VM {{ vm }}?`),
+        // bound the same way the worker binds them for `run`.
+        for a in &call.args {
+            ctx.insert(a.name.clone(), a.value.clone());
+        }
         let message = paneld_ui::interpolate(&cp.raw, cp.span.file, cp.span.start, &ctx);
         show_confirm_modal(screen, &call.name, &message, &live.event_tx);
         live.pending = Some(Pending { call, stage: Stage::Confirm });
@@ -941,9 +949,9 @@ fn run_shot(o: ShotOpts) -> ExitCode {
         let _ = live.event_tx.send(paneld_ui::UiEvent::Goto { page: page.clone() });
     }
     settle(&mut live, o.settle_ms);
-    for &(x, y) in &o.taps {
+    for &(x, y, press_ms) in &o.taps {
         mem.set_pointer(x, y, true);
-        settle(&mut live, 100);
+        settle(&mut live, press_ms);
         mem.set_pointer(x, y, false);
         settle(&mut live, o.settle_ms);
     }
@@ -1125,7 +1133,7 @@ mod tests {
     fn shot_parses_its_options() {
         let Ok(Cmd::Shot(o)) = parse(&[
             "-c", "a.conf", "shot", "-o", "x.png", "--page", "p", "--size", "320x240",
-            "--tap", "10,20", "--tap", "30, 40", "--settle", "50",
+            "--tap", "10,20", "--hold", "30, 40", "--settle", "50",
         ]) else {
             panic!("expected shot");
         };
@@ -1133,7 +1141,7 @@ mod tests {
         assert_eq!(o.out, PathBuf::from("x.png"));
         assert_eq!(o.page.as_deref(), Some("p"));
         assert_eq!(o.size, (320, 240));
-        assert_eq!(o.taps, vec![(10, 20), (30, 40)]);
+        assert_eq!(o.taps, vec![(10, 20, 100), (30, 40, 1000)]);
         assert_eq!(o.settle_ms, 50);
         assert!(parse(&["shot"]).unwrap_err().contains("-o"));
         assert!(parse(&["shot", "-o", "x.png", "--size", "0x10"]).is_err());
