@@ -57,6 +57,7 @@ pub fn load(root: &Path) -> Result<(SourceMap, Document, Vec<Diagnostic>), LoadE
     let items = load_file(root, &mut source, &mut diagnostics, &mut stack, None)?;
     let mut doc = Document { items };
     substitute_vars(&mut doc, &mut diagnostics);
+    crate::library::merge(&mut doc, &mut source, &mut diagnostics);
     Ok((source, doc, diagnostics))
 }
 
@@ -432,7 +433,7 @@ mod tests {
         let _ = d.write("child.conf", "k = v\n");
         let (_, doc, diags) = load(&root).unwrap();
         assert!(diags.is_empty(), "{diags:?}");
-        assert_eq!(doc.items.len(), 1);
+        assert_eq!(doc.items.len(), 1 + crate::library::item_count());
         let Item::Assign(a) = &doc.items[0] else {
             panic!()
         };
@@ -454,7 +455,7 @@ mod tests {
         let root = d.write("root.conf", "include = *.nothing\n");
         let (_, doc, diags) = load(&root).unwrap();
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(doc.items.is_empty());
+        assert_eq!(doc.items.len(), crate::library::item_count());
     }
 
     #[test]
@@ -465,7 +466,7 @@ mod tests {
         let _ = d.write("pages/a.conf", "k = first\n");
         let (_, doc, diags) = load(&root).unwrap();
         assert!(diags.is_empty(), "{diags:?}");
-        assert_eq!(doc.items.len(), 2);
+        assert_eq!(doc.items.len(), 2 + crate::library::item_count());
         let Item::Assign(a0) = &doc.items[0] else {
             panic!()
         };

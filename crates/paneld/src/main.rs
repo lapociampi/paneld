@@ -11,7 +11,6 @@ mod actions;
 mod alerts;
 mod ctl;
 mod display;
-mod library;
 mod pin;
 mod png;
 mod runner;
@@ -207,6 +206,7 @@ Usage:
       goto <page>                     Show a page (`back` = previous)
       alert fire <id> [severity=..] [title=..] [text=..] [link=..]
       alert resolve <id>
+      alert ack <id> | alert snooze <id> [duration]
   paneld hash-pin                     Read a PIN on stdin, print its
                                       argon2 hash for security.pin
   paneld shot -o FILE.png [--page P] [--size WxH] [--tap X,Y]...
@@ -668,9 +668,6 @@ fn setup_live_state(
     // consumer below reads one form (and `action[x]:pin = true` is
     // honored).
     paneld_config::apply_overrides(&mut doc);
-    // Shipped components (the page `shell`, ...) the config does not
-    // define itself.
-    library::merge(&mut doc);
 
     // Pull the ADR 0013 defaults out once (10s timeout, 1 MiB
     // max_output unless `app:timeout` / `app:max_output` say
@@ -740,7 +737,15 @@ fn setup_live_state(
         state_store
             .snapshot()
             .iter()
-            .map(|(k, v)| (k.clone(), std::time::UNIX_EPOCH + std::time::Duration::from_secs(v.since)))
+            .map(|(k, v)| {
+                let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+                let carry = alerts::Carry {
+                    since: at(v.since),
+                    acked: v.acked,
+                    snoozed_until: v.snoozed_until.map(at),
+                };
+                (k.clone(), carry)
+            })
             .collect(),
     );
     // Alerts raised over ctl have no rule to raise them again: bring
@@ -820,6 +825,13 @@ fn route_call(
     call: actions::Call,
     pin_done: bool,
 ) {
+    // ADR 0016: built-in actions act on the alert engine here.
+    if paneld_config::library::BUILTIN_ACTIONS.contains(&call.name.as_str()) {
+        if let Err(e) = run_builtin(live, &call) {
+            eprintln!("paneld: action `{}`: {}", call.name, e.message);
+        }
+        return;
+    }
     let Some(def) = live.actions.get(&call.name).cloned() else {
         // Unknown action: let the worker log it.
         let _ = live.action_tx.send(call);
@@ -878,6 +890,34 @@ fn route_call(
     let mut call = call;
     call.cleared = true;
     dispatch(live, call);
+}
+
+/// `alert_ack { id }` / `alert_snooze { id; for }` (ADR 0016).
+fn run_builtin(live: &mut LiveState, call: &actions::Call) -> Result<(), ctl::CtlError> {
+    let arg = |name: &str| {
+        call.args
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| a.value.to_display_string())
+    };
+    let id = arg("id").ok_or_else(|| ctl::CtlError::msg("needs `id`"))?;
+    let found = match call.name.as_str() {
+        "alert_ack" => live.alerts.ack(&id),
+        "alert_snooze" => {
+            let d = match arg("for") {
+                Some(t) => paneld_config::value::parse_duration(&t)
+                    .ok_or_else(|| ctl::CtlError::msg(format!("`for = {t}` is not a duration")))?,
+                None => live.alerts.snooze_choices()[0].1,
+            };
+            live.alerts.snooze(&id, std::time::SystemTime::now() + d)
+        }
+        other => return Err(ctl::CtlError::msg(format!("no built-in `{other}`"))),
+    };
+    if !found {
+        return Err(ctl::CtlError::msg(format!("no active alert `{id}`")));
+    }
+    live.redraw = true;
+    Ok(())
 }
 
 /// Hand a call that passed its gates to the worker and mark the
@@ -1338,6 +1378,20 @@ fn handle_request(
                 live.redraw = true;
             }
             Ok(Value::String(format!("{}:{id}", alerts::CTL_RULE)))
+        }
+        "alert_ack" | "alert_snooze" => {
+            // Accept the full `<rule>:<instance>` id, or a bare ctl id.
+            let mut args = req.args.clone();
+            if let Some(Value::String(id)) = args.get("id") {
+                if !id.contains(':') {
+                    args.insert("id".into(), Value::String(format!("{}:{id}", alerts::CTL_RULE)));
+                }
+            }
+            let call = actions::Call::new(
+                req.cmd.clone(),
+                args.into_iter().map(|(name, value)| paneld_ui::ActionArg { name, value }).collect(),
+            );
+            run_builtin(live, &call).map(|()| Value::String("ok".into()))
         }
         "alert_resolve" => {
             let id = req.arg("id")?;

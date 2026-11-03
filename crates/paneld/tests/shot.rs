@@ -291,3 +291,25 @@ fn inline_handler_confirm_gates_its_set() {
     let done = shot(&conf, &["--tap", "100,95", "--tap", "463,282", "--settle", "200"]);
     assert!(done.any(green), "set did not run after OK");
 }
+
+#[test]
+fn acknowledging_takes_an_alert_off_the_banner() {
+    let d = tmp("ack");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "alert hot { when = {{ true }}; severity = critical; title = Hot }\n\
+         page home { text { value = body } }\n",
+    )
+    .unwrap();
+    let critical = |p| close(p, [0xd3, 0x2f, 0x2f], 16);
+    // The banner (just under the header) opens the alerts page; its
+    // first card's first button is Acknowledge.
+    let before = shot(&conf, &["--tap", "400,72", "--settle", "100"]);
+    assert!(before.any(critical), "no critical alert drawn");
+    let after = shot(&conf, &["--tap", "400,72", "--tap", "100,145", "--settle", "100"]);
+    // The title text stays critical-colored; the full-width banner must
+    // be gone: check a pixel in the banner row away from any text.
+    assert!(close(before.px(700, 72), [0xd3, 0x2f, 0x2f], 16), "no banner before the ack");
+    assert!(!close(after.px(700, 72), [0xd3, 0x2f, 0x2f], 16), "banner still shown after ack");
+}

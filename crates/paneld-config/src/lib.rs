@@ -6,6 +6,7 @@
 
 pub mod cel;
 pub mod lex;
+pub mod library;
 pub mod load;
 pub mod overrides;
 pub mod parse;

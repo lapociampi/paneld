@@ -290,7 +290,7 @@ pub fn parse_cli(args: &[String]) -> Result<(String, BTreeMap<String, Value>), S
         "alert" => {
             let (verb, id, extra) = match rest {
                 [verb, id, extra @ ..] => (verb.as_str(), id, extra),
-                _ => return Err("`alert fire|resolve <id> [severity=..] [title=..] [text=..] [link=..]`".into()),
+                _ => return Err("`alert fire|resolve|ack|snooze <id> ...`".into()),
             };
             a.insert("id".into(), s(id));
             match verb {
@@ -306,7 +306,18 @@ pub fn parse_cli(args: &[String]) -> Result<(String, BTreeMap<String, Value>), S
                 }
                 "resolve" if extra.is_empty() => "alert_resolve".into(),
                 "resolve" => return Err("`alert resolve` takes only the id".into()),
-                other => return Err(format!("unknown alert verb `{other}` (fire, resolve)")),
+                "ack" if extra.is_empty() => "alert_ack".into(),
+                "snooze" => {
+                    match extra {
+                        [] => {}
+                        [d] => {
+                            a.insert("for".into(), s(d));
+                        }
+                        _ => return Err("`alert snooze <id> [duration]`".into()),
+                    }
+                    "alert_snooze".into()
+                }
+                other => return Err(format!("unknown alert verb `{other}` (fire, resolve, ack, snooze)")),
             }
         }
         other => return Err(format!("unknown command `{other}`")),

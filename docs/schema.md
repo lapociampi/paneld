@@ -326,7 +326,9 @@ alert pi_hot {
 
 `alerts { }` category: `history = 30d`, `snooze = [1d, 1w]`, `source_down = 2m` (after this long a failing source used by an alert raises `source_down:<name>`, [ADR 0013](decisions/0013-command-runner.md)).
 
-In expressions, `alerts`: `active` (list), `count`, `worst` (severity), each alert with `id`, `rule`, `severity`, `title`, `text`, `link`, `since`, `acked`, `snoozed_until`. `ctl alert fire|resolve` creates the same alerts.
+In expressions, `alerts`: `active` (list, worst first), `count`, `worst` (severity), `shown` (active and neither acknowledged nor snoozed: what the banner shows), `snooze` (the `alerts:snooze` choices), each alert with `id`, `rule`, `severity`, `title`, `text`, `link`, `since` and `snoozed_until` (Unix seconds), `acked`, `snoozed`. `ctl alert fire|resolve` creates the same alerts.
+
+Acknowledge and snooze are the built-in actions `alert_ack { id }` and `alert_snooze { id; for }` ([ADR 0016](decisions/0016-builtin-alert-actions.md)). The shipped page `alerts` lists every alert with both buttons; the shell's banner and alert count open it.
 
 ## 10. Reminders
 

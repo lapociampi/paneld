@@ -104,11 +104,11 @@ page home {
         "expected no diagnostics, got:\n  {}",
         msgs.join("\n  ")
     );
-    // Six top-level items: $pve, secret, 2 sources, action, component, page.
-    // (The `$pve` definition is itself one Assign item at the top.)
+    // Seven top-level items of its own ($pve, secret, 2 sources,
+    // action, component, page), plus the shipped library.
     assert_eq!(
         doc.items.len(),
-        7,
+        7 + paneld_config::library::item_count(),
         "unexpected item count: {}",
         doc.items.len()
     );

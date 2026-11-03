@@ -87,9 +87,12 @@ impl Alert {
         m.insert("text".into(), Value::String(self.text.clone()));
         m.insert("link".into(), Value::String(self.link.clone()));
         m.insert("acked".into(), Value::Bool(self.acked));
+        m.insert("snoozed".into(), Value::Bool(self.snoozed_until.is_some()));
+        // Schema 9: `since` and `snoozed_until`, as Unix seconds.
+        m.insert("since".into(), Value::Int(unix_secs(self.since)));
         m.insert(
-            "snoozed".into(),
-            Value::Bool(self.snoozed_until.is_some()),
+            "snoozed_until".into(),
+            self.snoozed_until.map(|t| Value::Int(unix_secs(t))).unwrap_or(Value::Null),
         );
         Value::Map(m)
     }
@@ -99,6 +102,68 @@ impl Alert {
     pub fn full_id(&self) -> String {
         format!("{}:{}", self.rule, self.instance)
     }
+}
+
+/// See [`Engine::carry`]; a free function so the rule loops, which
+/// borrow `rules`, can use it.
+fn carry_of(
+    active: &BTreeMap<String, Alert>,
+    restored: &mut BTreeMap<String, Carry>,
+    key: &str,
+    wall: SystemTime,
+) -> (Carry, Instant) {
+    if let Some(a) = active.get(key) {
+        let c = Carry { since: a.since, acked: a.acked, snoozed_until: a.snoozed_until };
+        return (c, a.fired_at);
+    }
+    let c = restored.remove(key).unwrap_or(Carry { since: wall, acked: false, snoozed_until: None });
+    (c, Instant::now())
+}
+
+/// `alerts:snooze = [1d, 1w]` (schema 9), default `1d`, `1w`.
+fn parse_snooze(doc: &Document) -> Vec<(String, Duration)> {
+    let mut raw: Option<String> = None;
+    for item in &doc.items {
+        if let Item::Block(b) = item {
+            if b.kind.text == "alerts" && b.name.is_none() {
+                for inner in &b.items {
+                    if let Item::Assign(a) = inner {
+                        if matches!(&a.target, AssignTarget::Simple { key } if key.text == "snooze") {
+                            raw = Some(a.value.text.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let parsed: Vec<(String, Duration)> = raw
+        .as_deref()
+        .and_then(paneld_config::value::split_list)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| {
+            let t = t.trim().to_string();
+            parse_duration(&t).map(|d| (t, d))
+        })
+        .collect();
+    if parsed.is_empty() {
+        vec![("1d".into(), Duration::from_secs(86_400)), ("1w".into(), Duration::from_secs(7 * 86_400))]
+    } else {
+        parsed
+    }
+}
+
+fn unix_secs(t: SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// What a firing alert keeps across a repeat (event, re-fire, restart):
+/// when it first fired, and whether it was acknowledged or snoozed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Carry {
+    pub since: SystemTime,
+    pub acked: bool,
+    pub snoozed_until: Option<SystemTime>,
 }
 
 /// Rule name for alerts raised over `paneld ctl`.
@@ -113,10 +178,12 @@ pub struct Engine {
     /// Condition-mode rules whose `when` is true but which have not
     /// held long enough yet. Same key as `active`.
     pending: BTreeMap<String, Instant>,
-    /// `since` timestamps replayed from the state file, consumed the
-    /// first time a matching key fires so a daemon restart during a
-    /// long incident doesn't reset the alert's clock.
-    restored: BTreeMap<String, SystemTime>,
+    /// First-fire time, ack and snooze replayed from the state file,
+    /// consumed the first time a matching key fires, so a restart
+    /// during a long incident keeps the alert's clock and its ack.
+    restored: BTreeMap<String, Carry>,
+    /// `alerts:snooze` choices, as written (default `1d`, `1w`).
+    snooze: Vec<(String, Duration)>,
     /// Monotonic timestamp of the last event we saw per source that
     /// feeds at least one event-mode alert. ADR 0013's `source_down`
     /// watchdog raises a built-in warning when one goes silent for
@@ -144,6 +211,7 @@ impl Engine {
             active: BTreeMap::new(),
             pending: BTreeMap::new(),
             restored: BTreeMap::new(),
+            snooze: parse_snooze(doc),
             source_last,
             source_down_after: parse_source_down(doc),
         }
@@ -153,8 +221,44 @@ impl Engine {
     /// (ADR 0014). Each matching alert, on its first fire after
     /// startup, picks up the saved wall-clock time instead of the
     /// current one.
-    pub fn restore(&mut self, saved: BTreeMap<String, SystemTime>) {
+    pub fn restore(&mut self, saved: BTreeMap<String, Carry>) {
         self.restored = saved;
+    }
+
+    /// What `key` carries if it fires now: from the active alert, else
+    /// from the state file, else fresh.
+    fn carry(&mut self, key: &str, wall: SystemTime) -> (Carry, Instant) {
+        carry_of(&self.active, &mut self.restored, key, wall)
+    }
+
+    /// Built-in action `alert_ack` (ADR 0016): keep it listed, take it
+    /// off the banner. `id` is the full `<rule>:<instance>`. Returns
+    /// false if no such alert is active.
+    pub fn ack(&mut self, id: &str) -> bool {
+        match self.active.get_mut(id) {
+            Some(a) => {
+                a.acked = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Built-in action `alert_snooze` (ADR 0016): hide it until `until`.
+    pub fn snooze(&mut self, id: &str, until: SystemTime) -> bool {
+        match self.active.get_mut(id) {
+            Some(a) => {
+                a.snoozed_until = Some(until);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The `alerts:snooze` choices; the first is `alert_snooze`'s
+    /// default.
+    pub fn snooze_choices(&self) -> &[(String, Duration)] {
+        &self.snooze
     }
 
     /// Snapshot of the currently firing alerts, for state-file
@@ -177,11 +281,7 @@ impl Engine {
         wall: SystemTime,
     ) -> bool {
         let key = format!("{CTL_RULE}:{id}");
-        let (since, fired_at) = self
-            .active
-            .get(&key)
-            .map(|a| (a.since, a.fired_at))
-            .unwrap_or_else(|| (self.restored.remove(&key).unwrap_or(wall), Instant::now()));
+        let (c, fired_at) = self.carry(&key, wall);
         let alert = Alert {
             rule: CTL_RULE.to_string(),
             instance: id.to_string(),
@@ -189,10 +289,10 @@ impl Engine {
             title: title.to_string(),
             text: text.to_string(),
             link: link.to_string(),
-            since,
+            since: c.since,
             fired_at,
-            acked: false,
-            snoozed_until: None,
+            acked: c.acked,
+            snoozed_until: c.snoozed_until,
         };
         self.active.insert(key, alert.clone()) != Some(alert)
     }
@@ -261,26 +361,14 @@ impl Engine {
                     }
                 }
                 _ => {
-                    // `since` and `fired_at` are the first-fire
-                    // timestamps, so an already-active instance keeps
-                    // its originals. Only a fresh fire pulls from the
-                    // state-file replay slot for `since`, then falls
-                    // back to the current wall time. `fired_at` is a
-                    // monotonic Instant that we always refresh on a
-                    // fresh fire; this is what makes same-severity
-                    // sort stable across NTP steps.
-                    let (since, fired_at) = self
-                        .active
-                        .get(&key)
-                        .map(|a| (a.since, a.fired_at))
-                        .unwrap_or_else(|| {
-                            (
-                                self.restored.remove(&key).unwrap_or(wall),
-                                Instant::now(),
-                            )
-                        });
-                    let mut alert = evaluate(rule, &instance, &ctx, since);
+                    // An already-active instance keeps its first-fire
+                    // times and its ack / snooze; a fresh fire takes
+                    // them from the state file, else starts clean.
+                    let (c, fired_at) = carry_of(&self.active, &mut self.restored, &key, wall);
+                    let mut alert = evaluate(rule, &instance, &ctx, c.since);
                     alert.fired_at = fired_at;
+                    alert.acked = c.acked;
+                    alert.snoozed_until = c.snoozed_until;
                     // An event stream can carry updates to a firing
                     // alert (severity escalation, text change). Only
                     // mark the frame dirty when something a user can
@@ -338,8 +426,11 @@ impl Engine {
                 };
                 if ready {
                     self.pending.remove(&key);
-                    let since = self.restored.remove(&key).unwrap_or(wall);
-                    let alert = evaluate(rule, &instance, ctx, since);
+                    let (c, fired_at) = carry_of(&self.active, &mut self.restored, &key, wall);
+                    let mut alert = evaluate(rule, &instance, ctx, c.since);
+                    alert.fired_at = fired_at;
+                    alert.acked = c.acked;
+                    alert.snoozed_until = c.snoozed_until;
                     self.active.insert(key, alert);
                     changed = true;
                 }
@@ -368,6 +459,14 @@ impl Engine {
             .retain(|k, _| !is_condition_key(k) || seen.contains_key(k));
         self.pending
             .retain(|k, _| !is_condition_key(k) || seen.contains_key(k));
+
+        // A snooze that ran out puts the alert back on the banner.
+        for a in self.active.values_mut() {
+            if a.snoozed_until.is_some_and(|t| t <= wall) {
+                a.snoozed_until = None;
+                changed = true;
+            }
+        }
 
         // Watchdog pass (ADR 0013). For every source feeding an
         // event-mode alert: if silent longer than `source_down`,
@@ -422,10 +521,23 @@ impl Engine {
             .map(|a| a.severity.clone())
             .unwrap_or_else(|| "none".into());
 
+        // Not acknowledged and not snoozed: what the banner shows.
+        let now = SystemTime::now();
+        let shown: Vec<Value> = sorted
+            .iter()
+            .filter(|a| !a.acked && a.snoozed_until.map_or(true, |t| t <= now))
+            .map(|a| a.to_value())
+            .collect();
+
         let mut m = BTreeMap::new();
         m.insert("count".into(), Value::Int(active.len() as i64));
         m.insert("worst".into(), Value::String(worst));
         m.insert("active".into(), Value::List(active));
+        m.insert("shown".into(), Value::List(shown));
+        m.insert(
+            "snooze".into(),
+            Value::List(self.snooze.iter().map(|(t, _)| Value::String(t.clone())).collect()),
+        );
         Value::Map(m)
     }
 
@@ -916,6 +1028,62 @@ mod tests {
         assert_eq!(eng.active_count(), 0);
     }
 
+    fn shown_titles(eng: &Engine) -> Vec<String> {
+        let Value::Map(m) = eng.context_value() else { panic!() };
+        let Some(Value::List(l)) = m.get("shown") else { panic!() };
+        l.iter()
+            .map(|a| match a {
+                Value::Map(a) => a["title"].to_display_string(),
+                _ => panic!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ack_keeps_the_alert_listed_but_off_the_shown_list() {
+        let doc = parse_doc(
+            "source s { run = /bin/true }\n\
+             alert a { from = s; id = {{ event.title }}; severity = critical; title = {{ event.title }} }\n",
+        );
+        let mut eng = Engine::new(&doc);
+        let wall = SystemTime::now();
+        eng.ingest_event("s", &event_map("disk", 5), &Context::new(), wall);
+        assert_eq!(shown_titles(&eng), vec!["disk"]);
+        assert!(eng.ack("a:disk"));
+        assert!(shown_titles(&eng).is_empty());
+        assert_eq!(eng.active_count(), 1);
+        // A repeat event for the same alert must not clear the ack.
+        eng.ingest_event("s", &event_map("disk", 5), &Context::new(), wall);
+        assert!(shown_titles(&eng).is_empty(), "repeat event reset the ack");
+        assert!(!eng.ack("a:nope"));
+    }
+
+    #[test]
+    fn snooze_hides_until_it_runs_out() {
+        let doc = parse_doc("alert a { when = {{ true }}; severity = warning; title = A }\n");
+        let mut eng = Engine::new(&doc);
+        let t0 = SystemTime::now();
+        eng.tick(&Context::new(), Instant::now(), t0);
+        assert!(eng.snooze("a:a", t0 + Duration::from_secs(60)));
+        assert!(shown_titles(&eng).is_empty());
+        // Before the end: still hidden; after: back, and the snooze
+        // is cleared.
+        eng.tick(&Context::new(), Instant::now(), t0 + Duration::from_secs(30));
+        assert!(shown_titles(&eng).is_empty());
+        assert!(eng.tick(&Context::new(), Instant::now(), t0 + Duration::from_secs(61)));
+        assert_eq!(shown_titles(&eng), vec!["A"]);
+    }
+
+    #[test]
+    fn snooze_choices_come_from_the_alerts_block() {
+        let eng = Engine::new(&parse_doc("alerts { snooze = [2h, 3d] }\n"));
+        let c: Vec<&str> = eng.snooze_choices().iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(c, vec!["2h", "3d"]);
+        assert_eq!(eng.snooze_choices()[0].1, Duration::from_secs(7200));
+        let eng = Engine::new(&parse_doc("page p { }\n"));
+        assert_eq!(eng.snooze_choices()[1].0, "1w");
+    }
+
     #[test]
     fn restore_replays_since_timestamps() {
         let doc = parse_doc(
@@ -925,7 +1093,10 @@ mod tests {
         let mut eng = Engine::new(&doc);
         let saved_since = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let mut saved = BTreeMap::new();
-        saved.insert("pi_hot:pi_hot".to_string(), saved_since);
+        saved.insert(
+            "pi_hot:pi_hot".to_string(),
+            Carry { since: saved_since, acked: true, snoozed_until: None },
+        );
         eng.restore(saved);
 
         // Fire the alert with a "now" that's clearly later than the
@@ -934,6 +1105,8 @@ mod tests {
         eng.tick(&ctx_with_temp(80.0), Instant::now(), wall);
         let active = eng.active_alerts();
         assert_eq!(active["pi_hot:pi_hot"].since, saved_since);
+        // The ack survives the restart too.
+        assert!(active["pi_hot:pi_hot"].acked);
 
         // After resolve + re-fire, the saved slot has been consumed:
         // a second fire uses the fresh `wall`.
