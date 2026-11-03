@@ -79,7 +79,7 @@ source cpu_temp {
 | `parse` | `text`, `number`, `json`, `lines` | `text` | How stdout becomes `out` (for a stream: each line) |
 | `value` | expr | `out` | Turns `out` into the value |
 | `timeout` | duration | `app:timeout` | Not for streams |
-| `history` | duration | none | Keep past values in memory for charts |
+| `history` | duration | none | Keep past values in memory for charts: numbers, bools and text up to 64 bytes (pick one with `value`); at most 2000 |
 | `active` | `always`, `visible` | `always` | `visible`: poll only while a page using it is on screen (never for sources used by alerts) |
 | `env { }` | block | | `KEY = value` pairs passed to the command |
 | `cwd` | path | config folder | Working directory ([ADR 0013](decisions/0013-command-runner.md)) |
@@ -441,6 +441,8 @@ screen {
 | `result` | in `then` / `else` |
 | `level` | in `screen:dim` |
 
-Secret values (4 characters or more) are replaced with `****` in everything commands print before it is logged, shown, or put in `result` or a source's value. Prefer `env { TOKEN = {{ secrets.token }} }` over putting a secret in `run`: argv items are visible to every local user in `/proc/<pid>/cmdline`, the environment is not.
+Secret values (4 characters or more) are replaced with `****` in everything commands print before it is logged, shown, or put in `result` or a source's value: in parsed output each string, and each number whose digits hold a secret, then once more in the source's `value` (a masked number becomes the text `****`). Shorter secrets, and encoded forms (base64, URL escapes), are not caught. Prefer `env { TOKEN = {{ secrets.token }} }` over putting a secret in `run`: argv items are visible to every local user in `/proc/<pid>/cmdline`, the environment is not.
+
+`ago(t)` is worked out when the page is drawn; an idle screen is not redrawn, so the text can lag until something changes.
 
 Extra functions on top of CEL: `round(x, n)`, `format(x, unit)`, `duration(x)` and `ago(t)` for display, `clamp(x, a, b)`, `color(token or hex)`, `mix(color, color, t)`.

@@ -36,12 +36,15 @@ Every build also includes the fbdev + evdev drivers; they have no external depen
 ## Cross-compile for the Pi
 
 ```
-# From the workspace root. Produces a stripped, about 1.8 MB static binary.
+# From the workspace root. Produces a stripped, about 2.1 MB static binary.
 cargo zigbuild --target aarch64-unknown-linux-musl \
     -p paneld --no-default-features --release
 ```
 
-If the Pi has `libdrm` installed system-wide (Raspberry Pi OS Lite does), add `--features device` to turn on the DRM/KMS backend. The build needs a cross-sysroot that carries `libdrm`'s headers (e.g. a Pi root tarball under `--sysroot`); the default zig toolchain does not include them.
+Add `--features device` for the DRM/KMS backend. It needs libdrm, in one of two ways:
+
+- **Vendored** (the default; static, nothing to install on the Pi): `vendor/libdrm` is a submodule at `libdrm-2.4.134` ([ADR 0017](decisions/0017-vendored-libdrm.md)); `git submodule update --init --recursive` fetches it, and `lvgl-sys` compiles libdrm's core into the binary (about 80 KB more). `PANELD_LIBDRM_SRC` points at another checkout instead.
+- **From the system**: a cross-sysroot that carries `libdrm`'s headers and library (e.g. a Pi root tarball under `--sysroot`); the default zig toolchain has neither.
 
 The resulting binary lives at `target/aarch64-unknown-linux-musl/release/paneld`.
 

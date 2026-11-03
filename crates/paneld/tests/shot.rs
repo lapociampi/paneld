@@ -478,6 +478,25 @@ fn image_reads_a_png_next_to_the_config_and_line_draws() {
     let magenta = |p| close(p, [0xff, 0, 0xff], 40);
     assert!((60..230).any(|y| (0..260).any(|x| magenta(img.px(x, y)))), "image not drawn");
     assert!(img.any(|p| close(p, [0, 0xff, 0], 40)), "line not drawn");
+
+    // Review round 8: a screen-sized PNG decodes past the old 1 MiB
+    // cache and was not drawn; a huge one must be refused unread.
+    shot(&src, &["--size", "800x480"]);
+    let mut huge = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    huge.extend(8000u32.to_be_bytes());
+    huge.extend(8000u32.to_be_bytes());
+    std::fs::write(d.join("huge.png"), huge).unwrap();
+    let conf = d.join("q.conf");
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             image { src = src.png; width = 100%; height = 200; fit = fill }\n\
+             image { src = huge.png; width = 100; height = 100 }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &[]);
+    assert!((60..260).any(|y| magenta(img.px(400, y))), "screen-sized image not drawn");
 }
 
 #[test]
@@ -516,6 +535,35 @@ fn a_param_is_asked_for_and_checked() {
         "--tap", "399,269", "--settle", "150",
     ]);
     assert!(refused.any(blue), "a value above max was set");
+}
+
+#[test]
+fn an_empty_keypad_is_asked_again() {
+    // Review round 9: OK on an empty keypad ran the action with "".
+    let d = tmp("askkeypad");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var m: int = 0\n\
+         action setn { param n: int { ask = keypad }; set { m = {{ n }} } }\n\
+         page home {\n\
+             button { label = Set; on_tap = setn }\n\
+             rect { width = 100; height = 20\n\
+                    background = {{ vars.m == 4 ? '#00ff00' : '#0000ff' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    let blue = |p| close(p, [0, 0, 0xff], 16);
+    // Keyboard OK (bottom right) with nothing typed: still asking.
+    let empty = shot(&conf, &["--tap", "40,85", "--settle", "150", "--tap", "662,445", "--settle", "200"]);
+    assert!(!empty.any(blue) && !empty.any(green), "the dialog went away on an empty OK");
+    // Then 4 and OK.
+    let four = shot(&conf, &[
+        "--tap", "40,85", "--settle", "150", "--tap", "662,445", "--settle", "200",
+        "--tap", "136,331", "--tap", "662,445", "--settle", "200",
+    ]);
+    assert!(four.any(green), "4 was not set after asking again");
 }
 
 #[test]

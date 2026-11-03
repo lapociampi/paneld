@@ -2,3 +2,6 @@
 	path = vendor/lvgl
 	url = https://github.com/lvgl/lvgl.git
 	branch = release/v9.6
+[submodule "vendor/libdrm"]
+	path = vendor/libdrm
+	url = https://gitlab.freedesktop.org/mesa/drm.git

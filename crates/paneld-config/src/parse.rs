@@ -902,6 +902,11 @@ mod tests {
         assert_eq!(p.default.as_ref().unwrap().text, "fast");
         assert_eq!(p.options.as_ref().unwrap().items.len(), 1);
         assert_eq!(doc.items.len(), 2);
+        // Review round 9: a default that starts with a brace.
+        let doc = parse_ok("param body: string = {\"k\": 1}\n");
+        let Item::Param(p) = &doc.items[0] else { panic!() };
+        assert_eq!(p.default.as_ref().unwrap().text, "{\"k\": 1}");
+        assert!(p.options.is_none());
     }
 
     #[test]

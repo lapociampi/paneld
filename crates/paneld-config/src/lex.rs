@@ -523,6 +523,9 @@ impl<'src> Lexer<'src> {
                 Some(b'{')
                     if self.param_line
                         && brace_depth == 0
+                        // Some default read already: `= {"k": 1}` is
+                        // a default that starts with a brace.
+                        && end > start
                         && matches!(self.src.get(self.pos.wrapping_sub(1)), Some(b' ') | Some(b'\t')) =>
                 {
                     // The param's options block, not part of the default.

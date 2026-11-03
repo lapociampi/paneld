@@ -88,15 +88,19 @@ impl Mask {
         }
     }
 
-    /// `value` with every string in it (map keys too) masked; numbers
-    /// and the shape stay as they are. Used on parsed output, where a
-    /// secret is in its unescaped form.
+    /// `value` with every string in it (map keys too) masked, and a
+    /// number whose digits hold a secret replaced with `"****"`; the
+    /// rest of the shape stays. Used on parsed output, where a secret
+    /// is in its unescaped form.
     pub fn apply_value(&self, value: Value) -> Value {
         if self.0.is_empty() {
             return value;
         }
         match value {
             Value::String(s) => Value::String(self.apply(&s)),
+            Value::Int(_) | Value::Double(_) if self.apply(&value.to_display_string()) != value.to_display_string() => {
+                Value::String("****".into())
+            }
             Value::List(l) => Value::List(l.into_iter().map(|v| self.apply_value(v)).collect()),
             Value::Map(m) => Value::Map(m.into_iter().map(|(k, v)| (self.apply(&k), self.apply_value(v))).collect()),
             other => other,
@@ -133,7 +137,11 @@ mod tests {
         let mask = Mask::new(&m2);
         let v = crate::sources::parse_json(r#"{"ts": 1762341234, "user": "a 1234 b", "1234": true}"#).unwrap();
         let Value::Map(out) = mask.apply_value(v) else { panic!() };
-        assert_eq!(out["ts"], Value::Int(1_762_341_234));
+        // Numbers: masked only when their digits hold a secret.
+        assert_eq!(out["ts"], Value::String("****".into()));
+        let v = crate::sources::parse_json(r#"{"n": 17623}"#).unwrap();
+        let Value::Map(n) = mask.apply_value(v) else { panic!() };
+        assert_eq!(n["n"], Value::Int(17623));
         assert_eq!(out["user"], Value::String("a **** b".into()));
         assert!(out.contains_key("****"));
     }

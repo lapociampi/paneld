@@ -211,6 +211,15 @@ unsafe extern "C" fn on_cover_pressed(_e: *mut sys::lv_event_t) {
     }
 }
 
+/// Point a sleep cover that is up at `sink`: after a reload the old
+/// queue is no longer read, and a touch must still wake the screen.
+pub fn set_wake_sink(sink: Sender<UiEvent>) {
+    let mut g = wake_sink().lock().unwrap();
+    if g.is_some() {
+        *g = Some(sink);
+    }
+}
+
 /// Black out the screen while it sleeps: a full-screen black object on
 /// LVGL's system layer, above pages, modals and toasts. With `absorb`
 /// it takes the touch that wakes the screen (`first_tap = wake`) and
@@ -364,8 +373,10 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
             *ASK_VALUE.lock().unwrap_or_else(|e| e.into_inner()) = v;
         }
         Some(Binding::AskButton { sink, .. }) => {
-            // A keypad's keyboard OK: submit what was typed.
-            let value = widget_value(ChangeKind::Keypad, target);
+            // A keypad's keyboard OK: submit what was typed; nothing
+            // typed is no answer (the dialog asks again).
+            let value = widget_value(ChangeKind::Keypad, target)
+                .filter(|v| !matches!(v, EventValue::String(t) if t.is_empty()));
             let _ = sink.send(UiEvent::AskReply { accept: true, value });
         }
         Some(Binding::Change { kind: ChangeKind::PinEntry, sink, .. }) => {
@@ -448,6 +459,20 @@ thread_local! {
 /// file's, like commands' working directory (ADR 0013).
 pub fn set_asset_dir(dir: &std::path::Path) {
     ASSET_DIR.with(|d| *d.borrow_mut() = dir.to_path_buf());
+}
+
+/// Width and height from a PNG's header; `None` (with a log line) for
+/// a file that is missing or not a PNG.
+fn png_size(path: &std::path::Path) -> Option<(u32, u32)> {
+    use std::io::Read;
+    let mut head = [0u8; 24];
+    let read = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head));
+    if read.is_err() || &head[..8] != b"\x89PNG\r\n\x1a\n" || &head[12..16] != b"IHDR" {
+        eprintln!("paneld: image {}: not a readable PNG; not shown", path.display());
+        return None;
+    }
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    Some((be(&head[16..20]), be(&head[20..24])))
 }
 
 /// How an image fills its box (schema 7 `fit`).
@@ -917,6 +942,21 @@ impl<'ui> Obj<'ui> {
     /// take (an interior NUL).
     pub fn new_image(&self, path: &str, fit: ImageFit) -> Option<Obj<'ui>> {
         let full = ASSET_DIR.with(|d| d.borrow().join(path));
+        // Decoded, an image takes 4 bytes a pixel whatever its file
+        // size: a small PNG of 8000x8000 would take 250 MB. Up to twice
+        // the screen's pixels is allowed.
+        let (w, h) = png_size(&full)?;
+        let screen = unsafe {
+            let d = sys::lv_display_get_default();
+            (sys::lv_display_get_horizontal_resolution(d) as u64) * (sys::lv_display_get_vertical_resolution(d) as u64)
+        };
+        // And no larger than the decoded-image cache (4 bytes a pixel):
+        // a bigger one is decoded again on every redraw, or not drawn.
+        let cap = (2 * screen.max(800 * 480)).min(sys::LV_CACHE_DEF_SIZE as u64 / 4);
+        if (w as u64) * (h as u64) > cap {
+            eprintln!("paneld: image {}: {w}x{h} is too large for this screen; not shown", full.display());
+            return None;
+        }
         // `A:` is the POSIX file driver (lv_conf.h); the rest is the
         // path as is.
         let src = CString::new(format!("A:{}", full.display())).ok()?;

@@ -5,7 +5,8 @@
 //! with POSIX-style single and double quotes so secrets and other
 //! interpolated values reach the command as argv items, never as
 //! shell syntax. At most `app:max_running` commands run at once
-//! (see [`Slot`]); stream sources, which never end, are not counted.
+//! (see [`Slot`]); stream sources, which never end, and the screen's
+//! own commands are not counted.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -368,7 +369,9 @@ impl Drop for Slot {
 }
 
 pub fn exec(argv: &[String], opts: Opts<'_>) -> Result<RunResult, RunError> {
-    let _slot = POOL.acquire(opts.kind);
+    // The screen's own on / off / dim run outside the cap: a long
+    // action must not keep the backlight off after a wake.
+    let _slot = (!matches!(opts.kind, Kind::Other)).then(|| POOL.acquire(opts.kind));
     let program = &argv[0];
     let args = &argv[1..];
     let mut command = Command::new(program);

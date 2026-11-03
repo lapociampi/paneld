@@ -399,7 +399,8 @@ fn stream_loop(
                 continue;
             };
             let parsed = mask.apply_value(parsed);
-            let value = finish_stream_value(&block, &ctx, parsed);
+            // `value` can put masked pieces back together: mask it too.
+            let value = mask.apply_value(finish_stream_value(&block, &ctx, parsed));
             if tx.send(SourceUpdate { name: name.clone(), value }).is_err() {
                 // Receiver dropped: daemon is going down.
                 runner::kill_group(pid, runner::Signal::SIGTERM);
@@ -619,9 +620,11 @@ pub fn resolve_one(
     // If the source has `value = {{ ... }}`, evaluate it with `out`
     // in scope and use the result as the public value. Otherwise
     // `out` is the value itself.
+    // `value` can put masked pieces back together: mask it too.
     let value = if let Some((raw, span)) = find_raw(b, "value") {
-        eval_value_transform(raw, span, &out)
-            .unwrap_or_else(|e| Value::String(format!("[eval error: {e}]")))
+        mask.apply_value(
+            eval_value_transform(raw, span, &out).unwrap_or_else(|e| Value::String(format!("[eval error: {e}]"))),
+        )
     } else {
         out.clone()
     };
@@ -959,9 +962,11 @@ mod tests {
         // so masking it missed the secret, and masking `1234` inside a
         // number broke the JSON.
         let doc = parse_doc(
-            "source s { run = /bin/echo '{\"user\": \"a\\/b-tok\", \"ts\": 1762341234}'\n parse = json }\n",
+            "source s { run = /bin/echo '{\"user\": \"a\\/b-tok\", \"ts\": 1762341234}'\n parse = json }\n\
+             source j { run = /bin/echo '{\"a\": \"98765\", \"b\": \"432\"}'\n parse = json\n value = {{ out.a + out.b }} }\n",
         );
-        let block = collect_blocks(&doc).remove("s").unwrap();
+        let mut blocks = collect_blocks(&doc);
+        let block = blocks.remove("s").unwrap();
         let mut ctx = Context::new();
         let secrets = BTreeMap::from([
             ("t".to_string(), Value::String("a/b-tok".into())),
@@ -972,7 +977,13 @@ mod tests {
         let Value::Map(m) = v else { panic!() };
         let Value::Map(value) = &m["value"] else { panic!("{:?}", m["value"]) };
         assert_eq!(value["user"], Value::String("****".into()));
-        assert_eq!(value["ts"], Value::Int(1_762_341_234));
+        assert_eq!(value["ts"], Value::String("****".into()), "a number holding the secret's digits");
+        // Pieces joined back by `value` are masked again.
+        let mut ctx2 = Context::new();
+        ctx2.insert("secrets".into(), Value::Map(BTreeMap::from([("t".to_string(), Value::String("98765432".into()))])));
+        let j = resolve_one(&blocks.remove("j").unwrap(), &ctx2, std::path::Path::new("/"), runner::AppDefaults::default()).unwrap();
+        let Value::Map(m) = j else { panic!() };
+        assert_eq!(m["value"], Value::String("****".into()));
     }
 
     #[test]

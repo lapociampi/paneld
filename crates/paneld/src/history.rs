@@ -14,11 +14,26 @@ use paneld_ui::Value;
 /// poll over a long window must not eat the Pi's memory.
 const MAX_SAMPLES: usize = 2000;
 
+/// Only small values are kept (what a chart draws): numbers, bools
+/// and strings up to this many bytes. A source returning a big map
+/// would otherwise keep thousands of copies of it.
+const MAX_SAMPLE_TEXT: usize = 64;
+
+fn small(v: &Value) -> bool {
+    match v {
+        Value::Int(_) | Value::Double(_) | Value::Bool(_) | Value::Null => true,
+        Value::String(s) => s.len() <= MAX_SAMPLE_TEXT,
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 pub struct Histories {
     /// How long each source with `history` keeps its samples.
     keep: BTreeMap<String, Duration>,
     samples: BTreeMap<String, VecDeque<(i64, Value)>>,
+    /// Sources already warned about values too big to keep.
+    warned: std::collections::BTreeSet<String>,
 }
 
 impl Histories {
@@ -40,7 +55,7 @@ impl Histories {
                 }
             }
         }
-        Self { keep, samples: BTreeMap::new() }
+        Self { keep, samples: BTreeMap::new(), warned: Default::default() }
     }
 
     /// After a reload: keep the samples of sources that still have
@@ -62,8 +77,12 @@ impl Histories {
         m.insert("at".into(), Value::Int(at));
         let Some(keep) = self.keep.get(name) else { return };
         let samples = self.samples.entry(name.to_string()).or_default();
-        if let Some(v) = m.get("value") {
-            samples.push_back((at, v.clone()));
+        match m.get("value") {
+            Some(v) if small(v) => samples.push_back((at, v.clone())),
+            Some(_) if self.warned.insert(name.to_string()) => {
+                eprintln!("paneld: source `{name}`: `history` keeps numbers and short text only; use `value` to pick one");
+            }
+            _ => {}
         }
         let oldest = at.saturating_sub(keep.as_secs() as i64);
         while samples.front().is_some_and(|(t, _)| *t < oldest) || samples.len() > MAX_SAMPLES {
@@ -133,11 +152,20 @@ mod tests {
         let Value::Map(m) = &u else { panic!() };
         assert_eq!(m["at"], Value::Int(1_000));
 
+        // Big values are not kept.
+        let mut big = Value::Map(BTreeMap::from([(
+            "value".to_string(),
+            Value::Map(BTreeMap::from([("k".to_string(), Value::Int(1))])),
+        )]));
+        h.record("t", &mut big, t0 + Duration::from_secs(95));
+        // (1030 has left the window by 1095.)
+        assert_eq!(history_of(&big), [(1060, 2), (1090, 3)]);
+
         // A reload keeps the samples of sources that still keep them.
         let mut fresh = Histories::from_doc(&doc("source t { run = x\n history = 1h }\n"));
         fresh.carry_from(&mut h);
         let mut next = sample(4);
         fresh.record("t", &mut next, t0 + Duration::from_secs(120));
-        assert_eq!(history_of(&next).len(), 4);
+        assert_eq!(history_of(&next).len(), 3);
     }
 }

@@ -100,7 +100,7 @@ impl ParamDef {
                 "max" => def.max = paneld_config::value::parse_number(text),
                 "options" => def.options = Some(ConfirmPrompt { raw: a.value.text.clone(), span: a.value.span }),
                 "ask" => def.ask = Some(text.to_string()),
-                "label" => def.label = Some(text.to_string()),
+                "label" => def.label = Some(text.trim_matches('"').to_string()),
                 _ => {}
             }
         }
@@ -135,6 +135,13 @@ pub enum Prepared {
 /// A value as param type `ty`; `None` if it is not one.
 fn param_value(ty: &str, v: Value) -> Option<Value> {
     use paneld_config::value::{parse_color, parse_duration, parse_size};
+    match (ty, &v) {
+        // Strict for params: `10.9` is not an int (truncating it would
+        // slip past `max`), and a bool is not a number.
+        ("int", Value::Double(d)) if d.fract() != 0.0 => return None,
+        ("int" | "number", Value::Bool(_)) => return None,
+        _ => {}
+    }
     match ty {
         "duration" => parse_duration(&v.to_display_string()).map(|_| Value::String(v.to_display_string())),
         "color" => parse_color(&v.to_display_string()).map(|_| Value::String(v.to_display_string())),
@@ -167,7 +174,8 @@ pub fn prepare_args(def: &ActionDef, mut args: Vec<ActionArg>, ctx: &Context, de
             },
         };
         let Some(v) = param_value(&p.ty, raw.clone()) else {
-            return Prepared::Refused(format!("`{}` = {} is not a {}", p.name, raw.to_display_string(), p.ty));
+            let article = if p.ty.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            return Prepared::Refused(format!("`{}` = {} is not {article} {}", p.name, raw.to_display_string(), p.ty));
         };
         let num = match &v {
             Value::Int(n) => Some(*n as f64),
@@ -510,7 +518,7 @@ pub fn set_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// What makes two calls "the same" for schema 5's "while an action
 /// runs, further calls of it are ignored": the action and its args,
-/// so each row of a `repeat` runs on its own.
+/// so another row of a `repeat` is queued, not ignored.
 pub fn run_key(name: &str, args: &[ActionArg]) -> String {
     let mut parts: Vec<String> = args
         .iter()
@@ -1007,7 +1015,10 @@ mod tests {
             Prepared::Ready(a) => panic!("should be refused: {why}; ready {a:?}; options {:?}", def.params[1].option_values(&ctx)),
             Prepared::Ask(p) => panic!("should be refused: {why}; asks {}", p.name),
         };
-        refused(vec![arg("n", s("x7")), arg("m", Value::Int(5))], "is not a int");
+        refused(vec![arg("n", s("x7")), arg("m", Value::Int(5))], "is not an int");
+        // Review round 9: 10.9 must not become 10 and slip under max.
+        refused(vec![arg("n", Value::Double(9.5)), arg("m", Value::Int(5))], "is not an int");
+        refused(vec![arg("n", Value::Bool(true)), arg("m", Value::Int(5))], "is not an int");
         refused(vec![arg("n", Value::Int(11)), arg("m", Value::Int(5))], "above 10");
         refused(vec![arg("n", Value::Int(0)), arg("m", Value::Int(5))], "below 1");
         refused(vec![arg("n", Value::Int(2)), arg("mode", s("turbo")), arg("m", Value::Int(5))], "not one of");

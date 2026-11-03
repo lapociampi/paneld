@@ -26,3 +26,4 @@ order: 7
 | [0014](0014-ctl-protocol-state-file.md) | JSON lines for ctl, one JSON file for state |
 | [0015](0015-fonts.md) | Built-in fonts |
 | [0016](0016-builtin-alert-actions.md) | Built-in actions for acknowledge and snooze |
+| [0017](0017-vendored-libdrm.md) | libdrm built from a vendored copy |

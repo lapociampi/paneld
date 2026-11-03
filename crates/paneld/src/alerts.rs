@@ -218,6 +218,9 @@ pub struct Engine {
     /// Condition rules whose `when` gave no answer at the last tick
     /// (a source without a value yet): their state is unknown.
     undecided: std::collections::BTreeSet<String>,
+    /// Saved alerts of rules not decided at startup, written to the
+    /// history if their rule later turns out false.
+    maybe_resolved: BTreeMap<String, Resolved>,
 }
 
 /// An alert that is no longer active, for `alerts.history` and the
@@ -262,6 +265,7 @@ impl Engine {
             history_keep: parse_history_keep(doc),
             last_active: BTreeMap::new(),
             undecided: std::collections::BTreeSet::new(),
+            maybe_resolved: BTreeMap::new(),
         }
     }
 
@@ -319,15 +323,22 @@ impl Engine {
     pub fn note_resolved_while_down(&mut self, saved: &BTreeMap<String, crate::state::SavedAlert>, wall: SystemTime) {
         let now = unix_secs(wall).max(0) as u64;
         for (id, a) in saved {
-            if !self.active.contains_key(id) && !self.restored.contains_key(id) {
-                self.history.push(Resolved {
-                    id: id.clone(),
-                    severity: a.severity.clone(),
-                    title: a.title.clone(),
-                    text: a.text.clone(),
-                    since: a.since,
-                    ended: now,
-                });
+            if self.active.contains_key(id) {
+                continue;
+            }
+            let r = Resolved {
+                id: id.clone(),
+                severity: a.severity.clone(),
+                title: a.title.clone(),
+                text: a.text.clone(),
+                since: a.since,
+                ended: now,
+            };
+            if self.restored.contains_key(id) {
+                // Not known yet: see `tick`.
+                self.maybe_resolved.insert(id.clone(), r);
+            } else {
+                self.history.push(r);
             }
         }
         self.last_active = self.active.clone();
@@ -341,7 +352,7 @@ impl Engine {
     /// Event rules keep theirs until the source's next event for that
     /// alert, since their state only arrives with events.
     pub fn forget_unfired(&mut self) {
-        let (rules, pending, undecided) = (&self.rules, &self.pending, &self.undecided);
+        let (rules, pending, undecided, sources) = (&self.rules, &self.pending, &self.undecided, &self.source_last);
         self.restored.retain(|k, _| {
             let rule = k.split_once(':').map_or(k.as_str(), |(r, _)| r);
             // Still waiting out its `for`, or not decided yet (its
@@ -350,7 +361,7 @@ impl Engine {
                 || undecided.contains(rule)
                 // The watchdog cannot have fired this early; an event
                 // from the source drops it (`ingest_event`).
-                || rule == "source_down"
+                || (rule == "source_down" && k.split_once(':').is_some_and(|(_, s)| sources.contains_key(s)))
                 || rules.iter().any(|r| r.name == rule && r.from.is_some())
         });
     }
@@ -492,6 +503,11 @@ impl Engine {
             self.source_last.insert(source_name.to_string(), Instant::now());
             let down_key = format!("source_down:{source_name}");
             self.restored.remove(&down_key);
+            if let Some(mut r) = self.maybe_resolved.remove(&down_key) {
+                r.ended = unix_secs(wall).max(0) as u64;
+                self.history.push(r);
+                changed = true;
+            }
             if self.active.remove(&down_key).is_some() {
                 changed = true;
             }
@@ -521,6 +537,11 @@ impl Engine {
             match state.as_str() {
                 "resolved" => {
                     self.restored.remove(&key);
+                    if let Some(mut r) = self.maybe_resolved.remove(&key) {
+                        r.ended = unix_secs(wall).max(0) as u64;
+                        self.history.push(r);
+                        changed = true;
+                    }
                     if self.active.remove(&key).is_some() {
                         changed = true;
                     }
@@ -529,6 +550,7 @@ impl Engine {
                     // An already-active instance keeps its first-fire
                     // times and its ack / snooze; a fresh fire takes
                     // them from the state file, else starts clean.
+                    self.maybe_resolved.remove(&key);
                     let (c, fired_at) = carry_of(&self.active, &mut self.restored, &key, wall);
                     let mut alert = evaluate(rule, &instance, &ctx, c.since);
                     apply_carry(&mut alert, c, fired_at);
@@ -593,6 +615,8 @@ impl Engine {
                 };
                 if ready {
                     self.pending.remove(&key);
+                    // Still the same incident after all.
+                    self.maybe_resolved.remove(&key);
                     let (c, fired_at) = carry_of(&self.active, &mut self.restored, &key, wall);
                     let mut alert = evaluate(rule, &instance, ctx, c.since);
                     apply_carry(&mut alert, c, fired_at);
@@ -602,6 +626,11 @@ impl Engine {
             } else {
                 // Resolved: a later fire is a new incident.
                 self.restored.remove(&key);
+                if let Some(mut r) = self.maybe_resolved.remove(&key) {
+                    r.ended = unix_secs(wall).max(0) as u64;
+                    self.history.push(r);
+                    changed = true;
+                }
                 if self.pending.remove(&key).is_some() {
                     // was pending, never fired: no visible change.
                 }
@@ -1358,6 +1387,32 @@ mod tests {
         // The source is alive again: its watchdog ack goes.
         eng.ingest_event("ev", &Value::Null, &Context::new(), wall);
         assert!(!eng.restored.contains_key("source_down:ev"));
+
+        // Review round 8: an undecided alert that turns out resolved
+        // still reaches the history.
+        let on_disk: BTreeMap<String, crate::state::SavedAlert> = [(
+            "pi_hot:pi_hot".to_string(),
+            crate::state::SavedAlert {
+                rule: "pi_hot".into(),
+                instance: "pi_hot".into(),
+                severity: "warning".into(),
+                title: "Hot".into(),
+                text: String::new(),
+                link: String::new(),
+                since: 7,
+                acked: true,
+                snoozed_until: None,
+            },
+        )]
+        .into();
+        let mut eng = Engine::new(&doc);
+        eng.restore(["pi_hot:pi_hot"].into_iter().map(saved).collect());
+        eng.tick(&Context::new(), Instant::now(), wall);
+        eng.forget_unfired();
+        eng.note_resolved_while_down(&on_disk, wall);
+        assert!(eng.history().is_empty(), "not known yet");
+        eng.tick(&ctx_with_temp(60.0), Instant::now(), wall);
+        assert_eq!(eng.history().len(), 1);
 
         // A resolved event drops the event rule's saved ack.
         let mut eng = Engine::new(&doc);

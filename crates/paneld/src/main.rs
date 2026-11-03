@@ -350,16 +350,15 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             Ok(paneld_ui::UiEvent::Chained { name, args }) => {
                 live.deferred.push_back(actions::Call::new(name, args));
             }
+            Ok(paneld_ui::UiEvent::Wake) => live.touched = true,
             Ok(_) => {}
             Err(std::sync::mpsc::TryRecvError::Empty) => break true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break false,
         }
     });
-    // Kept until the old worker has gone (its queue disconnects); a
-    // few reloads in a row keep at most the newest four.
-    if stale.len() > 4 {
-        stale.drain(..stale.len() - 4);
-    }
+    // Kept until the old worker has gone and its queue disconnects:
+    // a run that outlasts several reloads must still report back, or
+    // its action would count as running for good.
     live.stale_events = stale;
     while let Ok(ev) = live.event_rx.try_recv() {
         match ev {
@@ -434,13 +433,14 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 }
             }
             paneld_ui::UiEvent::AskReply { accept, value } => {
-                if let Some(Pending { mut call, stage: Stage::Ask(param) }) = live.pending.take() {
+                // Only an ask dialog answers; anything else stays pending.
+                let asking = matches!(live.pending, Some(Pending { stage: Stage::Ask(_), .. }));
+                if let Some(Pending { mut call, stage: Stage::Ask(asked) }) = live.pending.take().filter(|_| asking) {
                     match value.filter(|_| accept) {
                         Some(v) => {
-                            let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
                             call.args.push(paneld_ui::ActionArg {
-                                name: param.name.clone(),
-                                value: asked_value(&param, v, &ctx),
+                                name: asked.param.name.clone(),
+                                value: asked_value(&asked, v),
                             });
                             // Checks it, asks the next one or goes on to
                             // the PIN and confirm.
@@ -448,9 +448,8 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                         }
                         None if accept => {
                             // OK on an empty keypad: ask again.
-                            let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
-                            show_ask_modal(screen, &call.name, &param, &ctx, &live.event_tx);
-                            live.pending = Some(Pending { call, stage: Stage::Ask(param) });
+                            show_ask_modal(screen, &call.name, &asked.param, &asked.options, &live.event_tx);
+                            live.pending = Some(Pending { call, stage: Stage::Ask(asked) });
                         }
                         None => {}
                     }
@@ -698,12 +697,20 @@ struct Pending {
 
 enum Stage {
     /// A dialog asks for this param (schema 6 `ask`).
-    Ask(Box<actions::ParamDef>),
+    Ask(Box<Asking>),
     Pin,
     Confirm,
     /// A message with only OK (lockout, PIN not configured). The
     /// parked call is dropped on dismiss.
     Notice,
+}
+
+/// The param a dialog asks for, with the options as the dialog shows
+/// them: a dropdown answers with an index into these, whatever the
+/// options are by the time OK is pressed.
+struct Asking {
+    param: actions::ParamDef,
+    options: Vec<paneld_ui::Value>,
 }
 
 /// Load and check the config; the issues, with locations, if any.
@@ -975,6 +982,12 @@ fn route_call(
         let _ = live.action_tx.send(call);
         return;
     };
+    // Schema 5: while an action runs, further calls of it are ignored
+    // (checked first, so nobody fills in a dialog for nothing).
+    if live.running.contains_key(&actions::run_key(&call.name, &call.args)) {
+        eprintln!("paneld: action `{}` is still running; call ignored", call.name);
+        return;
+    }
     // Schema 5 order: params (typed, checked, asked), then PIN, then
     // confirm. Built-in actions choose their own defaults.
     let builtin = paneld_config::library::BUILTIN_ACTIONS.contains(&call.name.as_str());
@@ -982,8 +995,9 @@ fn route_call(
     match actions::prepare_args(&def, std::mem::take(&mut call.args), &ctx, !builtin) {
         actions::Prepared::Ready(args) => call.args = args,
         actions::Prepared::Ask(param) => {
-            show_ask_modal(screen, &call.name, &param, &ctx, &live.event_tx);
-            live.pending = Some(Pending { call, stage: Stage::Ask(Box::new(param)) });
+            let options = param.option_values(&ctx);
+            show_ask_modal(screen, &call.name, &param, &options, &live.event_tx);
+            live.pending = Some(Pending { call, stage: Stage::Ask(Box::new(Asking { param, options })) });
             return;
         }
         actions::Prepared::Refused(why) => {
@@ -1131,7 +1145,7 @@ fn screen_command(s: &screen::Screen, template: Option<String>, level: Option<u8
     let Some(template) = template else { return };
     // One thread runs them all, in order: an `on` must not overtake
     // the `off` before it.
-    static QUEUE: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<ScreenJob>>> = std::sync::OnceLock::new();
+    static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<ScreenJob>> = std::sync::OnceLock::new();
     let queue = QUEUE.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<ScreenJob>();
         std::thread::spawn(move || {
@@ -1139,10 +1153,9 @@ fn screen_command(s: &screen::Screen, template: Option<String>, level: Option<u8
                 run_screen_job(job);
             }
         });
-        std::sync::Mutex::new(tx)
+        tx
     });
-    let job = ScreenJob { template, level, cwd: s.cwd.clone() };
-    let _ = queue.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+    let _ = queue.send(ScreenJob { template, level, cwd: s.cwd.clone() });
 }
 
 struct ScreenJob {
@@ -1316,7 +1329,7 @@ fn show_ask_modal(
     screen: &paneld_ui::ui::Obj<'_>,
     action_name: &str,
     param: &actions::ParamDef,
-    ctx: &paneld_ui::Context,
+    options: &[paneld_ui::Value],
     sink: &std::sync::mpsc::Sender<paneld_ui::UiEvent>,
 ) {
     use paneld_ui::ui::{Size, ValueWidget};
@@ -1358,7 +1371,8 @@ fn show_ask_modal(
         }
         // `select`, and anything else: pick from the options.
         _ => {
-            let options: Vec<String> = param.option_values(ctx).iter().map(|v| v.to_display_string()).collect();
+            // One row per option, even one whose text has a newline.
+            let options: Vec<String> = options.iter().map(|v| v.to_display_string().replace('\n', " ")).collect();
             let d = content.new_dropdown();
             d.set_dropdown_options(&options.join("\n"));
             d.set_size(Size::Percent(100), Size::Content);
@@ -1372,16 +1386,16 @@ fn show_ask_modal(
 
 /// The arg an ask dialog's widget value stands for: a dropdown gives
 /// the index of the chosen option.
-fn asked_value(param: &actions::ParamDef, v: paneld_ui::EventValue, ctx: &paneld_ui::Context) -> paneld_ui::Value {
+fn asked_value(asked: &Asking, v: paneld_ui::EventValue) -> paneld_ui::Value {
     use paneld_ui::{EventValue, Value};
-    match (param.ask.as_deref(), v) {
+    match (asked.param.ask.as_deref(), v) {
         (Some("slider" | "toggle" | "keypad"), v) | (_, v @ (EventValue::Bool(_) | EventValue::String(_) | EventValue::Double(_))) => match v {
             EventValue::Bool(b) => Value::Bool(b),
             EventValue::Int(n) => Value::Int(n),
             EventValue::Double(d) => Value::Double(d),
             EventValue::String(s) => Value::String(s),
         },
-        (_, EventValue::Int(i)) => param.option_values(ctx).get(i.max(0) as usize).cloned().unwrap_or(Value::Null),
+        (_, EventValue::Int(i)) => asked.options.get(i.max(0) as usize).cloned().unwrap_or(Value::Null),
     }
 }
 
@@ -1623,6 +1637,8 @@ fn reload(
             // queue for them, so a run is not started twice meanwhile
             // and its toast still shows.
             fresh.histories.carry_from(&mut live.histories);
+            // A sleeping screen's cover must wake through the new queue.
+            paneld_ui::set_wake_sink(fresh.event_tx.clone());
             fresh.running = std::mem::take(&mut live.running);
             fresh.stale_events = std::mem::take(&mut live.stale_events);
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1706,6 +1722,8 @@ fn handle_request(
                 start: 0,
                 end: 0,
             };
+            // Same lock as every other `set`: read, evaluate, write.
+            let _set = actions::set_lock();
             let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
             let value = paneld_ui::resolve_value(&raw, span, &ctx)
                 .and_then(|v| vars::coerce(&ty, v))
@@ -1784,6 +1802,9 @@ fn handle_request(
             let names: std::collections::BTreeSet<&String> = live.running.values().collect();
             let running: Vec<Value> = names.into_iter().map(|n| Value::String(n.clone())).collect();
             m.insert("running".to_string(), Value::List(running));
+            // Event queues of replaced configs still waiting for their
+            // worker to finish.
+            m.insert("old_queues".to_string(), Value::Int(live.stale_events.len() as i64));
             Ok(Value::Map(m))
         }
         other => Err(ctl::CtlError::msg(format!("unknown command `{other}`"))),

@@ -1276,39 +1276,85 @@ fn check_override_targets(doc: &Document, diags: &mut Vec<Diagnostic>) {
 /// `{{ }}`. Values must reach commands as argv items or env vars,
 /// never as code (requirements, "Inputs").
 fn shell_script_interpolates(cmd: &str) -> bool {
-    // Program -> the option that takes the script.
-    const RUNNERS: &[(&str, char)] = &[
-        ("sh", 'c'), ("bash", 'c'), ("dash", 'c'), ("ash", 'c'), ("zsh", 'c'), ("ksh", 'c'),
-        ("python", 'c'), ("python3", 'c'), ("perl", 'e'), ("ruby", 'e'), ("node", 'e'), ("php", 'r'),
+    /// A program that takes a script inline: its script options (any
+    /// of these letters in a cluster like `-ec`), the options that
+    /// take the next word as their argument, and whether other
+    /// arguments may come before the script option (`su user -c`).
+    struct Runner {
+        name: &'static str,
+        script: &'static str,
+        takes_arg: &'static [&'static str],
+        args_first: bool,
+    }
+    const SHELL_ARGS: &[&str] = &["-o", "+o", "-O", "+O", "--rcfile", "--init-file"];
+    const RUNNERS: &[Runner] = &[
+        Runner { name: "sh", script: "c", takes_arg: SHELL_ARGS, args_first: false },
+        Runner { name: "bash", script: "c", takes_arg: SHELL_ARGS, args_first: false },
+        Runner { name: "dash", script: "c", takes_arg: SHELL_ARGS, args_first: false },
+        Runner { name: "ash", script: "c", takes_arg: SHELL_ARGS, args_first: false },
+        Runner { name: "zsh", script: "c", takes_arg: SHELL_ARGS, args_first: false },
+        Runner { name: "ksh", script: "c", takes_arg: SHELL_ARGS, args_first: false },
+        Runner { name: "python", script: "c", takes_arg: &["-W", "-X"], args_first: false },
+        Runner { name: "python3", script: "c", takes_arg: &["-W", "-X"], args_first: false },
+        Runner { name: "perl", script: "eE", takes_arg: &[], args_first: false },
+        Runner { name: "ruby", script: "e", takes_arg: &["-I", "-r"], args_first: false },
+        Runner { name: "node", script: "ep", takes_arg: &["-r", "--require"], args_first: false },
+        Runner { name: "php", script: "r", takes_arg: &["-d", "-c"], args_first: false },
+        Runner { name: "su", script: "c", takes_arg: &["-s", "-g", "-G", "-w"], args_first: true },
     ];
     const WRAPPERS: &[&str] = &[
         "env", "sudo", "doas", "nice", "ionice", "timeout", "nohup", "stdbuf", "chrt", "setsid", "busybox", "exec",
-        "flock",
+        "flock", "xargs", "docker", "podman", "kubectl", "chroot", "runuser", "systemd-run",
     ];
     let words = split_words(cmd);
     let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
+    // By its name, or an absolute path to it (`deploy/python`, a
+    // kubectl target, is neither).
+    let runner_of = |w: &str| RUNNERS.iter().find(|r| w == r.name || (w.starts_with('/') && base(w) == r.name));
     let mut i = 0;
     // Past wrappers and their own options and arguments, up to the
     // first word that names a runner.
     while i < words.len() && WRAPPERS.contains(&base(&words[i]).as_str()) {
+        let env = base(&words[i]) == "env";
         i += 1;
-        while i < words.len() && !RUNNERS.iter().any(|(r, _)| *r == base(&words[i])) {
-            if !(words[i].starts_with('-') || words[i].contains('=') || words[i].chars().all(|c| c.is_ascii_digit() || c == '.' || c.is_ascii_alphabetic())) {
+        while i < words.len() && runner_of(&words[i]).is_none() {
+            let w = &words[i];
+            // `env -S "sh -c '...'"`: the command is one word.
+            if env && (w == "-S" || w == "--split-string") {
+                return words.get(i + 1).is_some_and(|line| shell_script_interpolates(line));
+            }
+            let skippable = w.starts_with('-')
+                || w.contains('=')
+                || w.contains("{{")
+                || w.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/' | '@'));
+            if !skippable {
                 break;
             }
             i += 1;
         }
     }
-    let Some(&(_, flag)) = words.get(i).and_then(|w| RUNNERS.iter().find(|(r, _)| *r == base(w))) else {
+    let Some(runner) = words.get(i).and_then(|w| runner_of(w)) else {
         return false;
     };
     let mut j = i + 1;
-    while j < words.len() && words[j].starts_with('-') && words[j] != "--" {
+    while j < words.len() && words[j] != "--" {
         let w = &words[j];
         j += 1;
-        // `-c`, `-ec`, `-lc` (not a long `--option`).
-        if !w.starts_with("--") && w[1..].contains(flag) {
+        if !(w.starts_with('-') || w.starts_with('+')) {
+            if runner.args_first {
+                continue;
+            }
+            break;
+        }
+        // `-c`, `-ec`, `-lc`: a cluster of letters (not `--long`, not
+        // `-dfoo=bar`).
+        let cluster = !w.starts_with("--") && w.len() > 1 && w[1..].chars().all(|c| c.is_ascii_alphabetic());
+        if cluster && w[1..].chars().any(|c| runner.script.contains(c)) {
             return words.get(j).is_some_and(|script| script.contains("{{"));
+        }
+        if runner.takes_arg.contains(&w.as_str()) {
+            // `-o pipefail`, `-W ignore`: skip the option's argument.
+            j += 1;
         }
     }
     false
@@ -1794,6 +1840,38 @@ fn validate_param_in_body(p: &Param, parent_kind: &str, diags: &mut Vec<Diagnost
     if let Some(opts) = &p.options {
         validate_param_options(opts, diags);
     }
+    // What the daemon refuses at run time (schema 6), caught here.
+    let ty = match p.ty.text.as_str() {
+        "int" => Some(ExpectedType::Int),
+        "number" => Some(ExpectedType::Number),
+        "bool" => Some(ExpectedType::Bool),
+        "duration" => Some(ExpectedType::Dur),
+        "color" => Some(ExpectedType::Color),
+        "size" => Some(ExpectedType::Size),
+        _ => None,
+    };
+    let option = |name: &str| {
+        p.options.iter().flat_map(|o| &o.items).find_map(|it| match it {
+            Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == name) => Some(a),
+            _ => None,
+        })
+    };
+    if let (Some(d), Some(ty)) = (&p.default, ty) {
+        check_value_type(&d.text, d.span, ty, true, diags);
+    }
+    if let Some(d) = p.default.as_ref().and_then(|d| crate::value::parse_number(d.text.trim()).map(|n| (n, d.span))) {
+        let bound = |k: &str| option(k).and_then(|a| crate::value::parse_number(a.value.text.trim()));
+        if bound("min").is_some_and(|m| d.0 < m) || bound("max").is_some_and(|m| d.0 > m) {
+            diags.push(Diagnostic::new(d.1, format!("the default of `{}` is outside its `min` / `max`", p.name.text)));
+        }
+    }
+    if let Some(ask) = option("ask") {
+        if parent_kind != "action" {
+            diags.push(Diagnostic::new(ask.span, "`ask` is for action params only"));
+        } else if ask.value.text.trim() == "select" && option("options").is_none() {
+            diags.push(Diagnostic::new(ask.span, format!("`ask = select` needs `options` for `{}`", p.name.text)));
+        }
+    }
 }
 
 /// Validate the options block of a `param`. Keys are per
@@ -1862,8 +1940,11 @@ fn check_value_type(
     // (`run = curl /{{ vm }}/stop`). Treat those as implicitly
     // expression-tolerant, except inside a shell script.
     let implicit_expr_ok = matches!(ty, ExpectedType::Command | ExpectedType::Str);
-    match classify(raw) {
-        ValueShape::Interp(_) if matches!(ty, ExpectedType::Command) && shell_script_interpolates(raw) => {
+    // Not by `classify`: it reads `"..."` as a quoted literal, but the
+    // runner interpolates inside double quotes too (review round 8).
+    let shape = classify(raw);
+    match shape {
+        _ if matches!(ty, ExpectedType::Command) && raw.contains("{{") && shell_script_interpolates(raw) => {
             diags.push(Diagnostic::new(
                 span,
                 "`{{ }}` inside an inline script (`sh -c`, `python -c`, `perl -e`, ...) pastes the value \
@@ -3868,6 +3949,15 @@ reminder restore_test {
     }
 
     #[test]
+    fn param_defaults_and_ask_are_checked() {
+        assert_msg(&check_text("action a { param m: int = abc }\n"), "expected an integer");
+        assert_msg(&check_text("action a { param m: int = 20 { max = 10 } }\n"), "outside its `min` / `max`");
+        assert_msg(&check_text("action a { param m: int { ask = select } }\n"), "needs `options`");
+        assert_msg(&check_text("component c { param m: int { ask = slider }\n text { value = x } }\n"), "action params only");
+        assert!(check_text("action a { param m: int = 5 { min = 1; max = 10; ask = select; options = [5, 10] } }\n").is_empty());
+    }
+
+    #[test]
     fn interpolating_into_a_shell_script_is_flagged() {
         assert_msg(&check_text("action a { run = sh -c 'echo {{ vars.x }} > /tmp/f' }\n"), "pastes the value");
         assert_msg(&check_text("screen { dim = /bin/bash -c 'echo {{ level }}' }\n"), "pastes the value");
@@ -3887,6 +3977,35 @@ reminder restore_test {
         ] {
             assert_msg(&check_text(&format!("action a {{ run = {cmd} }}\n")), "pastes the value");
         }
+        // Review round 8: double quotes, option arguments, `{{ }}` in a
+        // wrapper's args, more wrappers.
+        for cmd in [
+            "sh -c \"echo {{ vars.x }} > /tmp/out\"",
+            "sh -o pipefail -c 'echo {{ vars.x }}'",
+            "python3 -W ignore -c 'print({{ vars.x }})'",
+            "sudo -u {{ vars.x }} sh -c 'echo {{ vars.x }}'",
+            "docker exec web sh -c 'echo {{ vars.x }}'",
+            "su -c 'echo {{ vars.x }}'",
+            "xargs sh -c 'echo {{ vars.x }}'",
+        ] {
+            assert_msg(&check_text(&format!("action a {{ run = {cmd} }}\n")), "pastes the value");
+        }
+        // Review round 9: options without an argument, more script
+        // options, `env -S`, and no runner by a relative basename.
+        for cmd in [
+            "python3 -I -c 'print({{ vars.x }})'",
+            "python3 -O -c 'print({{ vars.x }})'",
+            "perl -E 'say {{ vars.x }}'",
+            "node -p '{{ vars.x }}'",
+            "bash --rcfile /dev/null -c 'echo {{ vars.x }}'",
+            "su - pi -c 'echo {{ vars.x }}'",
+            "env -S \"sh -c 'echo {{ vars.x }}'\"",
+        ] {
+            assert_msg(&check_text(&format!("action a {{ run = {cmd} }}\n")), "pastes the value");
+        }
+        assert!(check_text("action a { run = kubectl exec deploy/python -c {{ vars.x }} -- ls }\n").is_empty());
+        assert!(check_text("action a { run = php -dfoo=bar {{ vars.x }} }\n").is_empty());
+        assert!(check_text("action a { run = env FOO=1 mycmd {{ vars.x }} }\n").is_empty());
         assert!(check_text("action a { run = sudo systemctl restart {{ vars.x }} }\n").is_empty());
         assert!(check_text("action a { run = python3 /opt/x.py {{ vars.x }} }\n").is_empty());
         assert!(check_text("action a { run = curl -H {{ vars.x }} http://x }\n").is_empty());
