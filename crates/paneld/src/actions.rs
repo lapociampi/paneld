@@ -164,7 +164,15 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                 let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.vars, &call.args);
                 let file = paneld_config::source::FileId::default();
                 let cmd = paneld_ui::interpolate(&raw, file, 0, &ctx);
-                match runner::exec(&cmd, DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES) {
+                let opts = runner::Opts {
+                    timeout: DEFAULT_TIMEOUT,
+                    max_bytes: DEFAULT_MAX_BYTES,
+                    kind: runner::Kind::Action,
+                    name: &name,
+                    cwd: None,
+                    env: &[],
+                };
+                match runner::exec(&cmd, opts) {
                     Ok(r) => {
                         eprintln!(
                             "paneld: action `{name}`: exit {:?}, timed_out {}",

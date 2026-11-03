@@ -107,10 +107,13 @@ fn poll_loop(
     tx: Sender<SourceUpdate>,
     ctx: Context,
 ) {
+    let max_delay = backoff_ceiling(interval);
+    let mut delay = interval;
     loop {
-        thread::sleep(interval);
+        thread::sleep(delay);
         match resolve_one(&block, &ctx) {
             Ok(v) => {
+                delay = interval;
                 if tx.send(SourceUpdate { name: name.clone(), value: v }).is_err() {
                     // Receiver dropped; the daemon is shutting down.
                     return;
@@ -118,9 +121,20 @@ fn poll_loop(
             }
             Err(e) => {
                 eprintln!("paneld: source `{name}`: {e}");
+                delay = next_backoff(delay, max_delay);
             }
         }
     }
+}
+
+/// ADR 0013: on failure, the next run waits `interval`, then
+/// `2*interval`, then `4*interval`, up to `max(interval, 5m)`.
+fn next_backoff(current: Duration, ceiling: Duration) -> Duration {
+    std::cmp::min(current.saturating_mul(2), ceiling)
+}
+
+fn backoff_ceiling(interval: Duration) -> Duration {
+    std::cmp::max(interval, Duration::from_secs(5 * 60))
 }
 
 /// Collect all top-level `source` blocks keyed by name, so the
@@ -152,8 +166,16 @@ pub fn resolve_one(b: &Block, ctx: &Context) -> Result<Value, String> {
     // Interpolate secrets, theme tokens and other context values into
     // the shell command before executing.
     let run = paneld_ui::interpolate(run_raw, run_span.file, run_span.start, ctx);
-    let r = runner::exec(&run, DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)
-        .map_err(|e| format!("run: {e}"))?;
+    let name = b.name.as_ref().map(|n| n.text.as_str()).unwrap_or("");
+    let opts = runner::Opts {
+        timeout: DEFAULT_TIMEOUT,
+        max_bytes: DEFAULT_MAX_BYTES,
+        kind: runner::Kind::Source,
+        name,
+        cwd: None,
+        env: &[],
+    };
+    let r = runner::exec(&run, opts).map_err(|e| format!("run: {e}"))?;
     if r.timed_out {
         return Err("timed out".into());
     }
@@ -445,6 +467,30 @@ impl<'a> JsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_backoff_doubles_until_ceiling() {
+        let interval = Duration::from_secs(5);
+        let ceiling = backoff_ceiling(interval);
+        assert_eq!(ceiling, Duration::from_secs(300));
+        let mut d = interval;
+        d = next_backoff(d, ceiling);
+        assert_eq!(d, Duration::from_secs(10));
+        d = next_backoff(d, ceiling);
+        assert_eq!(d, Duration::from_secs(20));
+        for _ in 0..20 {
+            d = next_backoff(d, ceiling);
+        }
+        assert_eq!(d, ceiling);
+    }
+
+    #[test]
+    fn poll_backoff_ceiling_is_at_least_interval() {
+        // An interval of 10m is already its own ceiling (the schema
+        // says `max(interval, 5m)`).
+        let interval = Duration::from_secs(600);
+        assert_eq!(backoff_ceiling(interval), interval);
+    }
 
     #[test]
     fn parse_output_number() {

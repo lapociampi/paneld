@@ -13,6 +13,10 @@ path = "src/main.rs"
 [dependencies]
 paneld-config.workspace = true
 paneld-ui = { path = "../paneld-ui", default-features = false }
+# nix provides safe wrappers for the two POSIX syscalls the runner
+# needs (killpg + kill(_, 0) for liveness) so the whole crate stays
+# on the workspace's `unsafe_code = "forbid"` lint.
+nix = { version = "0.29", default-features = false, features = ["signal"] }
 
 [features]
 default = ["sdl"]

@@ -8,6 +8,7 @@
 //! See `docs/architecture.md` and ADR 0007.
 
 mod actions;
+mod alerts;
 mod ctl;
 mod display;
 mod runner;
@@ -220,6 +221,7 @@ fn run_daemon(config: PathBuf) -> ExitCode {
                         &live.theme,
                         &live.secrets,
                         &live.vars,
+                        Some(&live.alerts),
                     );
                     if actions::apply_inline_set(
                         &assigns,
@@ -236,6 +238,7 @@ fn run_daemon(config: PathBuf) -> ExitCode {
                         &live.theme,
                         &live.secrets,
                         &live.vars,
+                        Some(&live.alerts),
                     );
                     let v = match event_value {
                         paneld_ui::EventValue::Bool(b) => paneld_ui::Value::Bool(b),
@@ -265,12 +268,32 @@ fn run_daemon(config: PathBuf) -> ExitCode {
             live.source_values.insert(update.name, update.value);
             dirty = true;
         }
+
+        // Tick the alert engine against the latest sources + vars. A
+        // transition (fire or resolve) marks the frame dirty so the
+        // header badge and overview reflect it right away.
+        let alerts_ctx = build_ctx(
+            &live.source_values,
+            &live.theme,
+            &live.secrets,
+            &live.vars,
+            None,
+        );
+        if live.alerts.tick(
+            &alerts_ctx,
+            std::time::Instant::now(),
+            std::time::SystemTime::now(),
+        ) {
+            dirty = true;
+        }
+
         if dirty {
             let ctx = build_ctx(
                 &live.source_values,
                 &live.theme,
                 &live.secrets,
                 &live.vars,
+                Some(&live.alerts),
             );
             screen.clear_children();
             paneld_ui::reset_action_bindings();
@@ -303,6 +326,7 @@ struct LiveState {
     event_rx: std::sync::mpsc::Receiver<paneld_ui::UiEvent>,
     action_tx: std::sync::mpsc::Sender<actions::Call>,
     current_page: String,
+    alerts: alerts::Engine,
 }
 
 fn setup_live_state(
@@ -339,7 +363,8 @@ fn setup_live_state(
     let vars_map = vars::initial_values(&doc);
     let var_types = vars::types(&doc);
     let vars_shared = std::sync::Arc::new(std::sync::Mutex::new(vars_map));
-    let base_ctx = build_ctx(&Default::default(), &theme, &secret_values, &vars_shared);
+    let base_ctx =
+        build_ctx(&Default::default(), &theme, &secret_values, &vars_shared, None);
     let source_values = sources::resolve_all(&doc, &base_ctx);
     let (source_tx, source_rx) =
         std::sync::mpsc::channel::<sources::SourceUpdate>();
@@ -366,7 +391,21 @@ fn setup_live_state(
     );
 
     let current_page = find_start_page(&doc).unwrap_or_else(|| "home".to_string());
-    let ctx = build_ctx(&source_values, &theme, &secret_values, &vars_shared);
+    let mut alerts_engine = alerts::Engine::new(&doc);
+    let ctx_no_alerts =
+        build_ctx(&source_values, &theme, &secret_values, &vars_shared, None);
+    alerts_engine.tick(
+        &ctx_no_alerts,
+        std::time::Instant::now(),
+        std::time::SystemTime::now(),
+    );
+    let ctx = build_ctx(
+        &source_values,
+        &theme,
+        &secret_values,
+        &vars_shared,
+        Some(&alerts_engine),
+    );
     screen.clear_children();
     paneld_ui::reset_action_bindings();
     paneld_ui::render_page(&doc, &current_page, &ctx, &event_tx, screen);
@@ -383,6 +422,7 @@ fn setup_live_state(
         event_rx,
         action_tx,
         current_page,
+        alerts: alerts_engine,
     })
 }
 
@@ -457,6 +497,7 @@ fn build_ctx(
     theme: &std::collections::BTreeMap<String, paneld_ui::Value>,
     secret_values: &std::collections::BTreeMap<String, paneld_ui::Value>,
     vars: &std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
+    alerts: Option<&alerts::Engine>,
 ) -> paneld_ui::Context {
     let mut ctx = paneld_ui::Context::new();
     ctx.insert("sources".into(), paneld_ui::Value::Map(source_values.clone()));
@@ -464,6 +505,9 @@ fn build_ctx(
     ctx.insert("secrets".into(), paneld_ui::Value::Map(secret_values.clone()));
     let snapshot = vars.lock().unwrap().clone();
     ctx.insert("vars".into(), paneld_ui::Value::Map(snapshot));
+    if let Some(engine) = alerts {
+        ctx.insert("alerts".into(), engine.context_value());
+    }
     ctx
 }
 
