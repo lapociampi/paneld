@@ -27,7 +27,7 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
 use crate::expr::{eval, Context, Value};
-use crate::ui::{ActionArg, InlineSetItem, Obj, Size, Trigger, UiEvent};
+use crate::ui::{ActionArg, FlexAlign, InlineSetItem, Obj, Size, Trigger, UiEvent};
 
 /// Children of a component call plus the outer context they should
 /// resolve against. Threaded through [`render_node`] so a `slot { }`
@@ -40,6 +40,26 @@ struct SlotCtx<'a> {
 /// Render the page named `page_name` from `doc` into `screen`. If no
 /// such page exists, draws a plain "page not found" label as a
 /// diagnostic.
+/// Show `text` as a toast on `layer` (the top layer), replacing any
+/// earlier one: a pill near the bottom in `background` (a hex color,
+/// e.g. a theme token) with white text. The caller removes it with
+/// `layer.clear_children()` when it expires.
+pub fn render_toast(layer: &Obj<'_>, text: &str, background: &str) {
+    layer.clear_children();
+    let pill = layer.new_container();
+    pill.set_size(Size::Content, Size::Content);
+    pill.set_padding(12);
+    pill.set_radius(8);
+    pill.set_border(0, None);
+    if let Some(rgb) = parse_hex_color(background) {
+        pill.set_background_hex(rgb);
+    }
+    let label = pill.new_label(text);
+    label.set_text_color_hex(0xffffff);
+    // Above the shell's nav bar.
+    pill.align_bottom_mid(-72);
+}
+
 pub fn render_page(
     doc: &Document,
     page_name: &str,
@@ -67,13 +87,70 @@ fn render_page_body(
     sink: &Sender<UiEvent>,
     screen: &Obj<'_>,
 ) {
+    // `page` and `nav` are visible to the shell and to the page body.
+    let mut pctx = ctx.clone();
+    pctx.insert("page".into(), page_info(page, ctx));
+    pctx.insert("nav".into(), nav_entries(doc, page, ctx));
+
     let page_root = screen.new_container();
     page_root.set_size(Size::Percent(100), Size::Percent(100));
     page_root.set_flex_column();
-    page_root.set_padding(16);
-    page_root.set_gap(8);
+    page_root.set_border(0, None);
+    page_root.set_radius(0);
 
-    render_item_list(&page.items, doc, ctx, None, sink, &page_root);
+    match find_component(doc, "shell") {
+        // Schema 8: the `shell` component wraps every page; the page's
+        // nodes fill its `slot`.
+        Some(shell) => {
+            page_root.set_padding(0);
+            page_root.set_gap(0);
+            let slot = SlotCtx { children: &page.items, outer_ctx: &pctx };
+            render_item_list(&shell.items, doc, &pctx, Some(&slot), sink, &page_root);
+        }
+        None => {
+            page_root.set_padding(16);
+            page_root.set_gap(8);
+            render_item_list(&page.items, doc, &pctx, None, sink, &page_root);
+        }
+    }
+}
+
+/// `{ name, title, icon }` of a page; `title` defaults to the name.
+fn page_info(page: &Block, ctx: &Context) -> Value {
+    let name = page.name.as_ref().map(|n| n.text.clone()).unwrap_or_default();
+    let title = find_raw(page, "title")
+        .map(|(raw, span)| resolve_scalar(raw, span, ctx))
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| name.clone());
+    let icon = find_simple(page, "icon").unwrap_or("").trim().to_string();
+    let mut m = std::collections::BTreeMap::new();
+    m.insert("name".to_string(), Value::String(name));
+    m.insert("title".to_string(), Value::String(title));
+    m.insert("icon".to_string(), Value::String(icon));
+    Value::Map(m)
+}
+
+/// Pages that have `nav = <n>`, ordered by `n` (schema 8), each as
+/// `page_info` plus `current` (the page being shown).
+fn nav_entries(doc: &Document, current: &Block, ctx: &Context) -> Value {
+    let mut entries: Vec<(i64, Value)> = Vec::new();
+    for item in &doc.items {
+        let Item::Block(b) = item else { continue };
+        if b.kind.text != "page" {
+            continue;
+        }
+        let Some(pos) = find_simple(b, "nav").and_then(|v| v.trim().parse::<i64>().ok()) else {
+            continue;
+        };
+        let mut info = page_info(b, ctx);
+        if let Value::Map(m) = &mut info {
+            let is_current = b.name.as_ref().map(|n| &n.text) == current.name.as_ref().map(|n| &n.text);
+            m.insert("current".to_string(), Value::Bool(is_current));
+        }
+        entries.push((pos, info));
+    }
+    entries.sort_by_key(|(pos, _)| *pos);
+    Value::List(entries.into_iter().map(|(_, v)| v).collect())
 }
 
 /// Walk a slice of `Item`s inside a UI container, dispatching each
@@ -170,18 +247,24 @@ fn render_node(
     parent: &Obj<'_>,
 ) {
     match node.kind.text.as_str() {
-        "column" => {
+        "column" | "row" => {
             let obj = parent.new_container();
             obj.set_size(Size::Content, Size::Content);
-            obj.set_flex_column();
+            if node.kind.text == "row" {
+                obj.set_flex_row();
+            } else {
+                obj.set_flex_column();
+            }
             apply_props(node, ctx, sink, &obj);
-            render_item_list(&node.items, doc, ctx, slot, sink, &obj);
-        }
-        "row" => {
-            let obj = parent.new_container();
-            obj.set_size(Size::Content, Size::Content);
-            obj.set_flex_row();
-            apply_props(node, ctx, sink, &obj);
+            // Schema 8.2: `justify` on the main axis, `align` across.
+            let justify = find_simple(node, "justify").and_then(FlexAlign::parse);
+            let align = find_simple(node, "align").and_then(FlexAlign::parse);
+            if justify.is_some() || align.is_some() {
+                obj.set_flex_align(
+                    justify.unwrap_or(FlexAlign::Start),
+                    align.unwrap_or(FlexAlign::Start),
+                );
+            }
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "stack" => {
@@ -742,7 +825,10 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
                 obj.bind_action(trigger, sink.clone(), &name.text, args);
                 break;
             }
-            if let Some(page) = find_simple(child, "goto") {
+            // `goto = page` or `goto = {{ expr }}` (e.g. a nav entry
+            // in a `repeat`), resolved now against the render ctx.
+            if let Some((raw, span)) = find_raw(child, "goto") {
+                let page = resolve_scalar(raw, span, ctx);
                 let page = page.trim();
                 if is_bare_ident(page) {
                     obj.set_clickable();
@@ -832,12 +918,37 @@ fn apply_plain_props(node: &Block, ctx: &Context, obj: &Obj<'_>) {
                     obj.set_font_size(size);
                 }
             }
-            "align" => {
+            // On `row` / `column` (and `scroll`) `align` places the
+            // children; it is handled where those are built.
+            "align" if !matches!(node.kind.text.as_str(), "row" | "column" | "scroll") => {
                 match value {
                     "left" => obj.set_text_align_left(),
                     "center" => obj.set_text_align_center(),
                     "right" => obj.set_text_align_right(),
                     _ => {}
+                }
+            }
+            "radius" => {
+                if let Some(Size::Px(px)) = parse_size(&resolve_scalar(value, a.value.span, ctx)) {
+                    obj.set_radius(px);
+                }
+            }
+            "border" => {
+                // `<width> [<color>]`, e.g. `border = 1 #cccccc`, `border = 0`.
+                let text = resolve_scalar(value, a.value.span, ctx);
+                let mut parts = text.split_whitespace();
+                if let Some(Ok(w)) = parts.next().map(|w| w.trim_end_matches("px").parse::<i32>()) {
+                    obj.set_border(w, parts.next().and_then(parse_hex_color));
+                }
+            }
+            "opacity" => {
+                if let Ok(o) = resolve_scalar(value, a.value.span, ctx).trim().parse::<f64>() {
+                    obj.set_opacity(o);
+                }
+            }
+            "grow" => {
+                if let Ok(g) = resolve_scalar(value, a.value.span, ctx).trim().parse::<f64>() {
+                    obj.set_flex_grow(g.clamp(0.0, 255.0) as u8);
                 }
             }
             "visible" => {

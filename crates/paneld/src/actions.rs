@@ -54,10 +54,16 @@ pub struct ActionDef {
     /// `pin = true`: ask the PIN (schema section 14) before
     /// `confirm` and `run`.
     pub pin: bool,
+    /// `goto = <page> | back`, after a successful run.
+    pub goto: Option<String>,
+    /// `done = <text>`: shown briefly on success (`output` = stdout).
+    pub done: Option<ConfirmPrompt>,
+    /// `failed = <text>`: shown on failure; default stderr.
+    pub failed: Option<ConfirmPrompt>,
 }
 
-/// Raw text + span for a `confirm = <message>`, held so the main
-/// loop can interpolate it at prompt time against the eval ctx.
+/// Raw text + span of a message property (`confirm`, `done`,
+/// `failed`), interpolated by the main loop when it is shown.
 #[derive(Clone, Debug)]
 pub struct ConfirmPrompt {
     pub raw: String,
@@ -133,6 +139,18 @@ pub fn collect(doc: &Document) -> HashMap<String, ActionDef> {
         }
         if let Some(raw) = find_simple(b, "pin") {
             def.pin = paneld_config::value::parse_bool(raw.trim()).unwrap_or(false);
+        }
+        if let Some(raw) = find_simple(b, "goto") {
+            let t = raw.trim();
+            if !t.is_empty() {
+                def.goto = Some(t.to_string());
+            }
+        }
+        if let Some((raw, span)) = find_simple_with_span(b, "done") {
+            def.done = Some(ConfirmPrompt { raw: raw.to_string(), span });
+        }
+        if let Some((raw, span)) = find_simple_with_span(b, "failed") {
+            def.failed = Some(ConfirmPrompt { raw: raw.to_string(), span });
         }
         out.insert(name.text.clone(), def);
     }
@@ -273,6 +291,10 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
             let name = call.name;
             let had_run = def.run.is_some();
             let mut ok = true;
+            // Schema 5: `result` = {ok, code, stdout, stderr}.
+            let mut code: Option<i32> = None;
+            let mut stdout = String::new();
+            let mut stderr = String::new();
 
             if let Some(raw) = def.run {
                 let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
@@ -316,10 +338,20 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                             eprintln!("paneld: action `{name}` stderr: {}", r.stderr.trim());
                         }
                         ok = r.succeeded();
+                        code = r.exit_code;
+                        stdout = r.stdout;
+                        stderr = if r.too_large {
+                            "output too large".to_string()
+                        } else if r.timed_out {
+                            "timed out".to_string()
+                        } else {
+                            r.stderr
+                        };
                     }
                     Err(e) => {
                         eprintln!("paneld: action `{name}`: {e}");
                         ok = false;
+                        stderr = e.to_string();
                     }
                 }
             }
@@ -340,25 +372,6 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                 );
             }
 
-            // `then` / `else` chain to another action on success /
-            // failure. Chained actions start with empty args; the
-            // `result.*` identifier they can read, and the block
-            // form `then foo { arg = ... }` come in a later phase.
-            // They go back through the main loop as a fresh call, so
-            // the chained action's own PIN and confirm still apply.
-            let next = if had_run && ok {
-                def.then.as_ref()
-            } else if had_run {
-                def.else_.as_ref()
-            } else {
-                None
-            };
-            if let Some(next) = next {
-                let _ = wctx.event_tx.send(UiEvent::Action {
-                    name: next.clone(),
-                    args: Vec::new(),
-                });
-            }
 
             // `refresh` runs after a successful `run` on the same
             // basis as `set`. Each named source is re-executed and
@@ -395,8 +408,49 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                     }
                 }
             }
+
+            let result = result_value(ok, code, stdout, stderr);
+
+            // The main loop does `goto` and the `done` / `failed`
+            // message, and frees the action for its next call. Sent
+            // before the chain: schema 5 order is goto, then `then`.
+            let _ = wctx.event_tx.send(UiEvent::ActionDone {
+                name,
+                ok,
+                result: result.clone(),
+            });
+
+            // `then` / `else` chain to another action on success /
+            // failure, with `result` bound for it. They go back through
+            // the main loop as a fresh call, so the chained action's
+            // own PIN and confirm still apply.
+            let next = if had_run && ok {
+                def.then.as_ref()
+            } else if had_run {
+                def.else_.as_ref()
+            } else {
+                None
+            };
+            if let Some(next) = next {
+                let _ = wctx.event_tx.send(UiEvent::Action {
+                    name: next.clone(),
+                    args: vec![ActionArg { name: "result".into(), value: result }],
+                });
+            }
         }
     });
+}
+
+/// Schema 5's `result`: `{ok, code, stdout, stderr}`. `code` is -1
+/// when the command did not exit on its own (timeout, killed, failed
+/// to start) or there was no `run`.
+fn result_value(ok: bool, code: Option<i32>, stdout: String, stderr: String) -> Value {
+    let mut m = BTreeMap::new();
+    m.insert("ok".to_string(), Value::Bool(ok));
+    m.insert("code".to_string(), Value::Int(code.map(i64::from).unwrap_or(-1)));
+    m.insert("stdout".to_string(), Value::String(stdout));
+    m.insert("stderr".to_string(), Value::String(stderr));
+    Value::Map(m)
 }
 
 /// Build an eval context from the worker-side pieces: the base ctx
@@ -688,9 +742,21 @@ mod tests {
         let doc = parse_doc(&src);
         let (tx, events) = worker_for(&doc);
 
+        // The next event that is not an `ActionDone`.
+        let next_action = || loop {
+            match events.recv_timeout(Duration::from_secs(5)) {
+                Ok(UiEvent::ActionDone { .. }) => continue,
+                other => return other,
+            }
+        };
+
         tx.send(Call::new("start".into(), Vec::new())).unwrap();
-        match events.recv_timeout(Duration::from_secs(5)) {
-            Ok(UiEvent::Action { name, .. }) => assert_eq!(name, "boom"),
+        match next_action() {
+            Ok(UiEvent::Action { name, args }) => {
+                assert_eq!(name, "boom");
+                // `then` passes the schema's `result` along.
+                assert!(args.iter().any(|a| a.name == "result"));
+            }
             other => panic!("expected the chain to come back as an Action, got {other:?}"),
         }
 
@@ -699,7 +765,7 @@ mod tests {
         // A cleared no-op afterwards proves the worker processed the
         // refused call before we look at the marker.
         tx.send(Call { name: "start".into(), args: Vec::new(), cleared: true }).unwrap();
-        let _ = events.recv_timeout(Duration::from_secs(5));
+        let _ = next_action();
         assert!(!marker.exists(), "gated action ran without passing its gate");
 
         // And a cleared call does run.

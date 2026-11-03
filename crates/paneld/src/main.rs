@@ -11,6 +11,7 @@ mod actions;
 mod alerts;
 mod ctl;
 mod display;
+mod library;
 mod pin;
 mod png;
 mod runner;
@@ -390,14 +391,19 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 if let Some(Pending { mut call, stage }) = live.pending.take() {
                     if accept && matches!(stage, Stage::Confirm) {
                         call.cleared = true;
-                        let _ = live.action_tx.send(call);
+                        dispatch(live, call);
                     }
                 }
                 dirty = true;
             }
             paneld_ui::UiEvent::Goto { page } => {
-                if page != live.current_page {
-                    live.current_page = page;
+                if go_to(live, &page) {
+                    dirty = true;
+                }
+            }
+            paneld_ui::UiEvent::ActionDone { name, ok, result } => {
+                live.running.remove(&name);
+                if action_done(live, screen, &name, ok, result) {
                     dirty = true;
                 }
             }
@@ -510,6 +516,11 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     live.state.note(live.alerts.active_alerts());
     live.state.flush_if_due(now_instant);
 
+    if live.toast_until.is_some_and(|t| std::time::Instant::now() >= t) {
+        screen.top_layer().clear_children();
+        live.toast_until = None;
+    }
+
     if dirty && live.pending.is_none() {
         let ctx = build_ctx(
             &live.source_values,
@@ -571,6 +582,12 @@ struct LiveState {
     pending: Option<Pending>,
     /// `then` / `else` calls that arrived while a modal was up.
     deferred: std::collections::VecDeque<actions::Call>,
+    /// Actions handed to the worker and not yet done.
+    running: std::collections::HashSet<String>,
+    /// The page before the last navigation, for `goto = back`.
+    previous_page: Option<String>,
+    /// When the current toast (top layer) is removed.
+    toast_until: Option<std::time::Instant>,
     pin_gate: pin::Gate,
 }
 
@@ -621,6 +638,9 @@ fn setup_live_state(
     // consumer below reads one form (and `action[x]:pin = true` is
     // honored).
     paneld_config::apply_overrides(&mut doc);
+    // Shipped components (the page `shell`, ...) the config does not
+    // define itself.
+    library::merge(&mut doc);
 
     // Pull the ADR 0013 defaults out once (10s timeout, 1 MiB
     // max_output unless `app:timeout` / `app:max_output` say
@@ -676,7 +696,7 @@ fn setup_live_state(
         action_rx,
     );
 
-    let current_page = find_start_page(&doc).unwrap_or_else(|| "home".to_string());
+    let current_page = find_start_page(&doc);
     let mut alerts_engine = alerts::Engine::new(&doc);
     let state_store = state::Store::open(state::config_path(&doc));
     alerts_engine.restore(
@@ -701,6 +721,8 @@ fn setup_live_state(
         Some(&alerts_engine),
     );
     screen.clear_children();
+    // A toast from before a reload belongs to the old state.
+    screen.top_layer().clear_children();
     paneld_ui::reset_action_bindings();
     paneld_ui::render_page(&doc, &current_page, &ctx, &event_tx, screen);
 
@@ -723,6 +745,9 @@ fn setup_live_state(
         actions: action_table_for_main,
         pending: None,
         deferred: std::collections::VecDeque::new(),
+        running: std::collections::HashSet::new(),
+        previous_page: None,
+        toast_until: None,
         pin_gate,
     })
 }
@@ -752,6 +777,11 @@ fn route_call(
         let _ = live.action_tx.send(call);
         return;
     };
+    // Schema 5: while an action runs, further calls of it are ignored.
+    if live.running.contains(&call.name) {
+        eprintln!("paneld: action `{}` is still running; call ignored", call.name);
+        return;
+    }
     let now = std::time::Instant::now();
     if def.pin && !pin_done && !live.pin_gate.is_unlocked(now) {
         if !live.pin_gate.configured() {
@@ -800,8 +830,97 @@ fn route_call(
     }
     let mut call = call;
     call.cleared = true;
+    dispatch(live, call);
+}
+
+/// Hand a call that passed its gates to the worker and mark the
+/// action running until its `ActionDone` arrives.
+fn dispatch(live: &mut LiveState, call: actions::Call) {
+    if !live.running.insert(call.name.clone()) {
+        eprintln!("paneld: action `{}` is still running; call ignored", call.name);
+        return;
+    }
     let _ = live.action_tx.send(call);
 }
+
+/// Switch to `page` (`back` = the previous one). Returns true when the
+/// page changed.
+fn go_to(live: &mut LiveState, page: &str) -> bool {
+    let target = if page == "back" {
+        match live.previous_page.clone() {
+            Some(p) => p,
+            None => return false,
+        }
+    } else {
+        page.to_string()
+    };
+    if target == live.current_page {
+        return false;
+    }
+    live.previous_page = Some(std::mem::replace(&mut live.current_page, target));
+    true
+}
+
+/// Finish an action call (schema 5): `goto` on success, and the
+/// `done` / `failed` message as a toast. Returns true when the page
+/// changed.
+fn action_done(
+    live: &mut LiveState,
+    screen: &paneld_ui::ui::Obj<'_>,
+    name: &str,
+    ok: bool,
+    result: paneld_ui::Value,
+) -> bool {
+    let Some(def) = live.actions.get(name).cloned() else {
+        return false;
+    };
+    let field = |k: &str| match &result {
+        paneld_ui::Value::Map(m) => m.get(k).map(|v| v.to_display_string()).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let message = if ok {
+        def.done.as_ref().map(|d| {
+            let mut ctx = build_ctx(&live.source_values, &live.theme, &live.secrets, &live.vars, Some(&live.alerts));
+            ctx.insert("output".into(), paneld_ui::Value::String(field("stdout").trim().to_string()));
+            ctx.insert("result".into(), result.clone());
+            paneld_ui::interpolate(&d.raw, d.span.file, d.span.start, &ctx)
+        })
+    } else {
+        Some(match &def.failed {
+            Some(f) => {
+                let mut ctx = build_ctx(&live.source_values, &live.theme, &live.secrets, &live.vars, Some(&live.alerts));
+                ctx.insert("result".into(), result.clone());
+                paneld_ui::interpolate(&f.raw, f.span.file, f.span.start, &ctx)
+            }
+            None => {
+                let err = field("stderr");
+                let err = err.trim();
+                if err.is_empty() {
+                    format!("{name} failed")
+                } else {
+                    // One line is enough for a toast.
+                    err.lines().next().unwrap_or(err).to_string()
+                }
+            }
+        })
+    };
+    if let Some(text) = message.filter(|t| !t.trim().is_empty()) {
+        let token = if ok { "ok" } else { "critical" };
+        let bg = match live.theme.get(token) {
+            Some(paneld_ui::Value::String(c)) => c.clone(),
+            _ => String::new(),
+        };
+        paneld_ui::render_toast(&screen.top_layer(), &text, &bg);
+        live.toast_until = Some(std::time::Instant::now() + TOAST_FOR);
+    }
+    match (ok, def.goto.as_deref()) {
+        (true, Some(page)) => go_to(live, page),
+        _ => false,
+    }
+}
+
+/// How long a `done` / `failed` toast stays up.
+const TOAST_FOR: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// PIN entry modal: masked textarea in a msgbox plus a numeric
 /// keyboard. The keyboard's OK sends `PinEntered`; Cancel sends a
@@ -861,31 +980,55 @@ fn show_confirm_modal(
     box_.msgbox_add_confirm_button("OK", true, sink.clone());
 }
 
-fn find_start_page(doc: &paneld_config::parse::Document) -> Option<String> {
+/// Schema 15: `app:start_page`, else the first page in `nav` order,
+/// else the first page defined (else `home`, which then shows "not
+/// found").
+fn find_start_page(doc: &paneld_config::parse::Document) -> String {
     use paneld_config::parse::{AssignTarget, Item};
+    // After `apply_overrides` all `app` options sit in one `app` block.
     for item in &doc.items {
-        if let Item::Block(b) = item {
-            if b.kind.text == "app" {
-                for inner in &b.items {
-                    if let Item::Assign(a) = inner {
-                        if let AssignTarget::Simple { key } = &a.target {
-                            if key.text == "start_page" {
-                                return Some(a.value.text.trim().to_string());
-                            }
-                        }
-                    }
-                }
-            }
+        let Item::Block(b) = item else { continue };
+        if b.kind.text != "app" || b.name.is_some() {
+            continue;
         }
-        if let Item::Assign(a) = item {
-            if let AssignTarget::Qualified { category, key } = &a.target {
-                if category.text == "app" && key.text == "start_page" {
-                    return Some(a.value.text.trim().to_string());
+        for inner in &b.items {
+            if let Item::Assign(a) = inner {
+                if matches!(&a.target, AssignTarget::Simple { key } if key.text == "start_page") {
+                    return a.value.text.trim().to_string();
                 }
             }
         }
     }
-    None
+    let pages = doc.items.iter().filter_map(|item| match item {
+        Item::Block(b) if b.kind.text == "page" => b.name.as_ref().map(|n| (b, n.text.clone())),
+        _ => None,
+    });
+    let nav_pos = |b: &paneld_config::parse::Block| {
+        b.items.iter().find_map(|it| match it {
+            Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "nav") => {
+                a.value.text.trim().parse::<i64>().ok()
+            }
+            _ => None,
+        })
+    };
+    let mut first_defined = None;
+    let mut first_nav: Option<(i64, String)> = None;
+    for (b, name) in pages {
+        first_defined.get_or_insert_with(|| name.clone());
+        if let Some(pos) = nav_pos(b) {
+            let earlier = match &first_nav {
+                Some((p, _)) => pos < *p,
+                None => true,
+            };
+            if earlier {
+                first_nav = Some((pos, name));
+            }
+        }
+    }
+    first_nav
+        .map(|(_, n)| n)
+        .or(first_defined)
+        .unwrap_or_else(|| "home".to_string())
 }
 
 fn run_check(config: PathBuf) -> ExitCode {
@@ -1118,6 +1261,32 @@ mod tests {
             parse(&["ctl", "set", "foo=1", "bar=2"]),
             Ok(Cmd::Ctl { args: vec!["set".into(), "foo=1".into(), "bar=2".into()] })
         );
+    }
+
+    fn doc_of(src: &str) -> paneld_config::parse::Document {
+        use paneld_config::lex::tokenize;
+        use paneld_config::source::SourceMap;
+        let mut map = SourceMap::new();
+        let id = map.add(PathBuf::from("t.conf"), src.to_string());
+        let (toks, _) = tokenize(id, src);
+        let (mut doc, diags) = paneld_config::parse(&toks, &map);
+        assert!(diags.is_empty(), "{diags:?}");
+        paneld_config::apply_overrides(&mut doc);
+        doc
+    }
+
+    #[test]
+    fn start_page_follows_schema_defaults() {
+        assert_eq!(find_start_page(&doc_of("page a { }\npage b { }\n")), "a");
+        assert_eq!(
+            find_start_page(&doc_of("page a { }\npage b { nav = 2 }\npage c { nav = 1 }\n")),
+            "c"
+        );
+        assert_eq!(
+            find_start_page(&doc_of("page a { nav = 1 }\npage b { }\napp:start_page = b\n")),
+            "b"
+        );
+        assert_eq!(find_start_page(&doc_of("source s { run = x }\n")), "home");
     }
 
     #[test]

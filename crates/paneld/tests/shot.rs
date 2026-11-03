@@ -175,7 +175,8 @@ fn a_tap_runs_the_inline_set_and_re_renders() {
     let green = |p| close(p, [0, 0xff, 0], 16);
     let before = shot(&conf, &["--settle", "50"]);
     assert!(!before.any(green), "green before the tap");
-    let after = shot(&conf, &["--tap", "100,60", "--settle", "100"]);
+    // The button sits below the shell header (about 50 px).
+    let after = shot(&conf, &["--tap", "100,120", "--settle", "100"]);
     assert!(after.any(green), "tap did not set the var and re-render");
 }
 
@@ -205,4 +206,62 @@ fn size_props_take_theme_tokens_and_expressions() {
     // Border and rounded corners eat a few pixels of the fill.
     assert!((40..=48).contains(&widest), "width {widest}");
     assert!((42..=50).contains(&tallest), "height {tallest}");
+}
+
+#[test]
+fn shell_shows_the_alert_banner_and_switches_pages() {
+    let d = tmp("shell");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "source cpu { poll = 30s; run = /bin/echo 90; parse = number }\n\
+         alert hot { when = {{ sources.cpu.value > 80 }}; severity = critical; title = Hot }\n\
+         page home { title = One; nav = 1\n\
+                     rect { width = 100; height = 40; background = #00ff00 } }\n\
+         page two { title = Two; nav = 2\n\
+                    rect { width = 100; height = 40; background = #0000ff } }\n",
+    )
+    .unwrap();
+    let critical = |p| close(p, [0xd3, 0x2f, 0x2f], 16);
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    let blue = |p| close(p, [0, 0, 0xff], 16);
+
+    let first = shot(&conf, &["--settle", "100"]);
+    assert!(first.any(critical), "no critical alert banner");
+    assert!(first.any(green) && !first.any(blue), "not on page one");
+
+    // Nav buttons sit evenly spaced in the bottom bar; the second is
+    // in the right half of the screen.
+    let second = shot(&conf, &["--tap", "546,450", "--settle", "100"]);
+    assert!(second.any(blue) && !second.any(green), "nav did not switch to page two");
+}
+
+#[test]
+fn action_goto_and_done_failed_toasts() {
+    let d = tmp("done");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "action good { run = /bin/true; done = ok; goto = two }\n\
+         action bad { run = /bin/false }\n\
+         page one {\n\
+             button { width = 200; height = 60; label = good; on_tap = good }\n\
+             button { width = 200; height = 60; label = bad; on_tap = bad }\n\
+         }\n\
+         page two { rect { width = 100; height = 40; background = #0000ff } }\n",
+    )
+    .unwrap();
+    let ok_green = |p| close(p, [0x2e, 0x7d, 0x32], 12);
+    let failed_red = |p| close(p, [0xd3, 0x2f, 0x2f], 12);
+    let blue = |p| close(p, [0, 0, 0xff], 16);
+
+    // Buttons stack below the shell header: good at y ~65..125,
+    // bad at y ~133..193.
+    let good = shot(&conf, &["--tap", "100,95", "--settle", "300"]);
+    assert!(good.any(blue), "goto did not switch to page two");
+    assert!(good.any(ok_green), "no success toast");
+
+    let bad = shot(&conf, &["--tap", "100,163", "--settle", "300"]);
+    assert!(bad.any(failed_red), "no failure toast");
+    assert!(!bad.any(blue), "a failed action must not goto");
 }

@@ -52,6 +52,9 @@ pub enum UiEvent {
     /// The PIN modal's keyboard OK was pressed. Carries the typed
     /// digits; the main loop verifies them and must never log them.
     PinEntered { digits: String },
+    /// The worker finished a call of action `name`; `result` is the
+    /// schema's `{ok, code, stdout, stderr}`.
+    ActionDone { name: String, ok: bool, result: crate::expr::Value },
 }
 
 /// The scalar an input widget's `on_change` handler sees as
@@ -794,6 +797,18 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_align(self.raw, sys::lv_align_t_LV_ALIGN_TOP_MID, 0, y) };
     }
 
+    pub fn align_bottom_mid(&self, y: i32) {
+        unsafe { sys::lv_obj_align(self.raw, sys::lv_align_t_LV_ALIGN_BOTTOM_MID, 0, y) };
+    }
+
+    /// LVGL's top layer: drawn above every screen and not touched
+    /// when the screen is cleared for a re-render. Used for toasts.
+    pub fn top_layer(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_layer_top() };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
     /// Register LV_EVENT_CANCEL (the number keyboard's close key) to
     /// send `ConfirmReply { accept: false }`.
     pub fn on_cancel_reply(&self, sink: Sender<UiEvent>) {
@@ -967,6 +982,19 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_flex_flow(self.raw, sys::lv_flex_flow_t_LV_FLEX_FLOW_COLUMN) };
     }
 
+    /// Share of the free space along the parent's flex axis.
+    pub fn set_flex_grow(&self, grow: u8) {
+        unsafe { sys::lv_obj_set_flex_grow(self.raw, grow) };
+    }
+
+    /// Main-axis placement (`justify`) and cross-axis placement
+    /// (`align`) of this flex container's children.
+    pub fn set_flex_align(&self, main: FlexAlign, cross: FlexAlign) {
+        unsafe {
+            sys::lv_obj_set_flex_align(self.raw, main.lvgl(), cross.lvgl(), cross.lvgl())
+        };
+    }
+
     pub fn set_padding(&self, px: i32) {
         unsafe { sys::lv_obj_set_style_pad_all(self.raw, px, 0) };
     }
@@ -978,6 +1006,26 @@ impl<'ui> Obj<'ui> {
     pub fn set_background_hex(&self, rgb: u32) {
         let color = unsafe { sys::lv_color_hex(rgb) };
         unsafe { sys::lv_obj_set_style_bg_color(self.raw, color, 0) };
+    }
+
+    pub fn set_radius(&self, px: i32) {
+        unsafe { sys::lv_obj_set_style_radius(self.raw, px, 0) };
+    }
+
+    /// `border = <width> [<color>]`; width 0 removes the border.
+    pub fn set_border(&self, width: i32, rgb: Option<u32>) {
+        unsafe {
+            sys::lv_obj_set_style_border_width(self.raw, width, 0);
+            if let Some(rgb) = rgb {
+                sys::lv_obj_set_style_border_color(self.raw, sys::lv_color_hex(rgb), 0);
+            }
+        }
+    }
+
+    /// 0.0 transparent .. 1.0 opaque.
+    pub fn set_opacity(&self, opacity: f64) {
+        let opa = (opacity.clamp(0.0, 1.0) * 255.0).round() as sys::lv_opa_t;
+        unsafe { sys::lv_obj_set_style_opa(self.raw, opa, 0) };
     }
 
     pub fn set_text_color_hex(&self, rgb: u32) {
@@ -1255,6 +1303,43 @@ impl<'ui> Obj<'ui> {
                 trigger.code(),
                 idx as *mut std::ffi::c_void,
             );
+        }
+    }
+}
+
+/// Flex placement, schema 8.2 `justify` / `align` values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlexAlign {
+    Start,
+    Center,
+    End,
+    Between,
+    Around,
+    Evenly,
+}
+
+impl FlexAlign {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            // LVGL flex has no cross-axis stretch; start is closest.
+            "start" | "stretch" => FlexAlign::Start,
+            "center" => FlexAlign::Center,
+            "end" => FlexAlign::End,
+            "between" => FlexAlign::Between,
+            "around" => FlexAlign::Around,
+            "evenly" => FlexAlign::Evenly,
+            _ => return None,
+        })
+    }
+
+    fn lvgl(self) -> sys::lv_flex_align_t {
+        match self {
+            FlexAlign::Start => sys::lv_flex_align_t_LV_FLEX_ALIGN_START,
+            FlexAlign::Center => sys::lv_flex_align_t_LV_FLEX_ALIGN_CENTER,
+            FlexAlign::End => sys::lv_flex_align_t_LV_FLEX_ALIGN_END,
+            FlexAlign::Between => sys::lv_flex_align_t_LV_FLEX_ALIGN_SPACE_BETWEEN,
+            FlexAlign::Around => sys::lv_flex_align_t_LV_FLEX_ALIGN_SPACE_AROUND,
+            FlexAlign::Evenly => sys::lv_flex_align_t_LV_FLEX_ALIGN_SPACE_EVENLY,
         }
     }
 }
