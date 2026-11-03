@@ -825,6 +825,15 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
                 obj.bind_action(trigger, sink.clone(), &name.text, args);
                 break;
             }
+            // An inline handler with action keys (`run`, `pin`,
+            // `confirm`, ...) is an anonymous action: call it like a
+            // named one so its gates apply. The local bindings
+            // (`item`, component params) go along as args.
+            if child.is_inline_action() {
+                obj.set_clickable();
+                obj.bind_action(trigger, sink.clone(), &child.inline_action_name(), local_args(ctx));
+                break;
+            }
             // `goto = page` or `goto = {{ expr }}` (e.g. a nav entry
             // in a `repeat`), resolved now against the render ctx.
             if let Some((raw, span)) = find_raw(child, "goto") {
@@ -1060,6 +1069,16 @@ fn inline_set_for_handler(node: &Block, handler: &str) -> Option<Vec<InlineSetIt
         }
     }
     None
+}
+
+/// The bindings in `ctx` that are local to where a node is rendered
+/// (`repeat` items, component params), as action args.
+fn local_args(ctx: &Context) -> Vec<ActionArg> {
+    const GLOBAL: &[&str] = &["sources", "vars", "alerts", "theme", "now", "page", "nav"];
+    ctx.iter()
+        .filter(|(k, _)| !GLOBAL.contains(&k.as_str()))
+        .map(|(k, v)| ActionArg { name: k.clone(), value: v.clone() })
+        .collect()
 }
 
 /// Evaluate every `arg = <raw>` in an action-call shortcut body

@@ -272,7 +272,9 @@ fn stream_loop(
                 return;
             }
         };
-        let run = paneld_ui::interpolate(run_raw, run_span.file, run_span.start, &ctx);
+        let run = runner::command_argv(run_raw, |t| {
+            paneld_ui::interpolate(t, run_span.file, run_span.start, &ctx)
+        });
         let env_pairs: Vec<(String, String)> = collect_env(&block)
             .into_iter()
             .map(|(k, raw, span)| (k, paneld_ui::interpolate(&raw, span.file, span.start, &ctx)))
@@ -285,7 +287,7 @@ fn stream_loop(
             cwd: Some(&cwd),
             env: &env_pairs,
         };
-        let mut command = match runner::prepared_command(&run, &opts) {
+        let mut command = match run.and_then(|argv| runner::prepared_command(&argv, &opts)) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("paneld: source `{name}`: {e}; retrying in {:?}", delay);
@@ -338,6 +340,7 @@ fn stream_loop(
         let started = Instant::now();
         let mut reader = BufReader::new(stdout);
         let mut sent_any = false;
+        let mut dropped: u64 = 0;
         loop {
             if shutdown.load(Ordering::SeqCst) {
                 break;
@@ -345,9 +348,15 @@ fn stream_loop(
             let line = match read_line_capped(&mut reader, STREAM_LINE_CAP) {
                 Ok(Line::Eof) => break,
                 Ok(Line::TooLong) => {
-                    eprintln!(
-                        "paneld: source `{name}`: dropped a line longer than {STREAM_LINE_CAP} bytes"
-                    );
+                    // The first one, then every 100th: a misbehaving
+                    // child must not flood the journal.
+                    dropped += 1;
+                    if dropped == 1 || dropped % 100 == 0 {
+                        eprintln!(
+                            "paneld: source `{name}`: dropped {dropped} line(s) longer than \
+                             {STREAM_LINE_CAP} bytes"
+                        );
+                    }
                     continue;
                 }
                 Ok(Line::Text(l)) => l,
@@ -420,20 +429,18 @@ fn read_line_capped(r: &mut impl BufRead, cap: usize) -> std::io::Result<Line> {
         };
         if avail.is_empty() {
             // EOF: a final unterminated line still counts.
-            return Ok(if too_long {
-                Line::TooLong
-            } else if buf.is_empty() {
-                Line::Eof
-            } else {
-                Line::Text(String::from_utf8_lossy(&buf).into_owned())
-            });
+            if buf.is_empty() && !too_long {
+                return Ok(Line::Eof);
+            }
+            return Ok(finish_line(buf, too_long, cap));
         }
         let (chunk, done) = match avail.iter().position(|&b| b == b'\n') {
             Some(i) => (&avail[..i], Some(i + 1)),
             None => (avail, None),
         };
+        // One spare byte for a `\r` that turns out to end the line.
         if !too_long {
-            if buf.len() + chunk.len() > cap {
+            if buf.len() + chunk.len() > cap + 1 {
                 too_long = true;
                 buf = Vec::new();
             } else {
@@ -443,14 +450,20 @@ fn read_line_capped(r: &mut impl BufRead, cap: usize) -> std::io::Result<Line> {
         let used = done.unwrap_or(avail.len());
         r.consume(used);
         if done.is_some() {
-            if too_long {
-                return Ok(Line::TooLong);
-            }
-            if buf.last() == Some(&b'\r') {
-                buf.pop();
-            }
-            return Ok(Line::Text(String::from_utf8_lossy(&buf).into_owned()));
+            return Ok(finish_line(buf, too_long, cap));
         }
+    }
+}
+
+/// Drop a `\r` before the line end, then apply the cap.
+fn finish_line(mut buf: Vec<u8>, too_long: bool, cap: usize) -> Line {
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    if too_long || buf.len() > cap {
+        Line::TooLong
+    } else {
+        Line::Text(String::from_utf8_lossy(&buf).into_owned())
     }
 }
 
@@ -529,7 +542,12 @@ pub fn resolve_one(
 
     // Interpolate secrets, theme tokens and other context values into
     // the shell command before executing.
-    let run = paneld_ui::interpolate(run_raw, run_span.file, run_span.start, ctx);
+    // Split first, then interpolate each argv item, so a value with
+    // spaces stays one argument.
+    let argv = runner::command_argv(run_raw, |t| {
+        paneld_ui::interpolate(t, run_span.file, run_span.start, ctx)
+    })
+    .map_err(|e| format!("run: {e}"))?;
     let name = b.name.as_ref().map(|n| n.text.as_str()).unwrap_or("");
     // `env { KEY = value }` on the source becomes extra env pairs on
     // top of the clean base env (ADR 0013). Each value is
@@ -550,7 +568,7 @@ pub fn resolve_one(
         cwd: Some(&cwd),
         env: &env_pairs,
     };
-    let r = runner::exec(&run, opts).map_err(|e| format!("run: {e}"))?;
+    let r = runner::exec(&argv, opts).map_err(|e| format!("run: {e}"))?;
     if r.timed_out {
         return Err("timed out".into());
     }
@@ -967,8 +985,12 @@ mod tests {
             lines(input.as_bytes(), 16),
             vec!["a", "<too long>", "bb", "last"]
         );
-        // Exactly at the cap is fine.
+        // Exactly at the cap is fine, also with CRLF; a final
+        // unterminated line loses its `\r` too.
         assert_eq!(lines(b"0123456789abcdef\n", 16), vec!["0123456789abcdef"]);
+        assert_eq!(lines(b"0123456789abcdef\r\n", 16), vec!["0123456789abcdef"]);
+        assert_eq!(lines(b"0123456789abcdefg\r\n", 16), vec!["<too long>"]);
+        assert_eq!(lines(b"end\r", 16), vec!["end"]);
         assert!(lines(b"", 16).is_empty());
     }
 

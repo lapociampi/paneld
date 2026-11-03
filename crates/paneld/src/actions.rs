@@ -94,10 +94,38 @@ pub fn collect(doc: &Document) -> HashMap<String, ActionDef> {
     let mut out = HashMap::new();
     for item in &doc.items {
         let Item::Block(b) = item else { continue };
-        if b.kind.text != "action" {
-            continue;
+        if b.kind.text == "action" {
+            if let Some(name) = &b.name {
+                out.insert(name.text.clone(), parse_def(b));
+            }
         }
-        let Some(name) = &b.name else { continue };
+    }
+    // Inline handlers with action keys (`on_tap { run = ...; pin = true }`)
+    // become anonymous actions, so they take the same path, gates
+    // included, as a named one.
+    collect_inline(&doc.items, &mut out);
+    out
+}
+
+fn collect_inline(items: &[Item], out: &mut HashMap<String, ActionDef>) {
+    for item in items {
+        match item {
+            Item::Block(b) => {
+                if matches!(b.kind.text.as_str(), "on_tap" | "on_hold") && b.is_inline_action() {
+                    out.insert(b.inline_action_name(), parse_def(b));
+                }
+                collect_inline(&b.items, out);
+            }
+            Item::Repeat(r) => collect_inline(&r.items, out),
+            _ => {}
+        }
+    }
+}
+
+/// The definition in an `action NAME { }` block, or in an inline
+/// handler block (same keys).
+fn parse_def(b: &Block) -> ActionDef {
+    {
         let mut def = ActionDef::default();
         if let Some(run) = find_simple(b, "run") {
             def.run = Some(run.to_string());
@@ -152,9 +180,8 @@ pub fn collect(doc: &Document) -> HashMap<String, ActionDef> {
         if let Some((raw, span)) = find_simple_with_span(b, "failed") {
             def.failed = Some(ConfirmPrompt { raw: raw.to_string(), span });
         }
-        out.insert(name.text.clone(), def);
+        def
     }
-    out
 }
 
 /// Pick an action's effective cwd per ADR 0013: an explicit `cwd =
@@ -227,7 +254,11 @@ fn collect_set(block: &Block) -> Vec<SetAssign> {
 /// re-run sources listed in `refresh`, and chain `then` / `else`.
 pub struct WorkerCtx {
     pub actions: HashMap<String, ActionDef>,
+    /// Without `secrets`; see `secrets`.
     pub base_ctx: Context,
+    /// Bound as `secrets` only where schema 16 allows it: an action's
+    /// `run` and `env`, and the commands of sources it refreshes.
+    pub secrets: BTreeMap<String, Value>,
     pub vars: Arc<Mutex<BTreeMap<String, Value>>>,
     /// Live-shared source values so a `run =` that references
     /// `sources.X.value` sees the current sample. Updated by the
@@ -297,9 +328,11 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
             let mut stderr = String::new();
 
             if let Some(raw) = def.run {
-                let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
+                let mut ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
+                ctx.insert("secrets".into(), Value::Map(wctx.secrets.clone()));
                 let file = paneld_config::source::FileId::default();
-                let cmd = paneld_ui::interpolate(&raw, file, 0, &ctx);
+                // Split first, then interpolate each argv item.
+                let argv = runner::command_argv(&raw, |t| paneld_ui::interpolate(t, file, 0, &ctx));
                 // Interpolate each env value against the same ctx so
                 // `env { TOKEN = {{ secrets.token }} }` reaches the
                 // child.
@@ -323,7 +356,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                     cwd: Some(&cwd),
                     env: &env_pairs,
                 };
-                match runner::exec(&cmd, opts) {
+                match argv.and_then(|argv| runner::exec(&argv, opts)) {
                     Ok(r) => {
                         eprintln!(
                             "paneld: action `{name}`: exit {:?}, timed_out {}{}",
@@ -380,7 +413,8 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
             // poll tick.
             let should_refresh = (had_run && ok) || !had_run;
             if should_refresh && !def.refresh.is_empty() {
-                let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
+                let mut ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
+                ctx.insert("secrets".into(), Value::Map(wctx.secrets.clone()));
                 for src_name in &def.refresh {
                     let Some(block) = wctx.source_blocks.get(src_name) else {
                         eprintln!(
@@ -432,7 +466,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                 None
             };
             if let Some(next) = next {
-                let _ = wctx.event_tx.send(UiEvent::Action {
+                let _ = wctx.event_tx.send(UiEvent::Chained {
                     name: next.clone(),
                     args: vec![ActionArg { name: "result".into(), value: result }],
                 });
@@ -707,6 +741,7 @@ mod tests {
             WorkerCtx {
                 actions: collect(doc),
                 base_ctx: Context::new(),
+                secrets: BTreeMap::new(),
                 vars: Arc::new(Mutex::new(BTreeMap::new())),
                 source_values: Arc::new(Mutex::new(BTreeMap::new())),
                 var_types: BTreeMap::new(),
@@ -752,12 +787,12 @@ mod tests {
 
         tx.send(Call::new("start".into(), Vec::new())).unwrap();
         match next_action() {
-            Ok(UiEvent::Action { name, args }) => {
+            Ok(UiEvent::Chained { name, args }) => {
                 assert_eq!(name, "boom");
                 // `then` passes the schema's `result` along.
                 assert!(args.iter().any(|a| a.name == "result"));
             }
-            other => panic!("expected the chain to come back as an Action, got {other:?}"),
+            other => panic!("expected the chain to come back as Chained, got {other:?}"),
         }
 
         // A direct uncleared call is refused too.
@@ -786,6 +821,27 @@ mod tests {
         assert_eq!(resolve_action_cwd(base, Some("  ")), PathBuf::from("/etc/paneld"));
         assert_eq!(resolve_action_cwd(base, Some("scripts")), PathBuf::from("/etc/paneld/scripts"));
         assert_eq!(resolve_action_cwd(base, Some("/srv")), PathBuf::from("/srv"));
+    }
+
+    #[test]
+    fn inline_handlers_with_action_keys_become_gated_actions() {
+        let doc = parse_doc(
+            "page home {\n\
+                 button { on_tap { set { x = 1 }; pin = true } }\n\
+                 button { on_tap { goto = home } }\n\
+                 repeat i in {{ [1] }} { button { on_hold { run = /bin/true } } }\n\
+             }\n",
+        );
+        let actions = collect(&doc);
+        let inline: Vec<&ActionDef> = actions
+            .iter()
+            .filter(|(k, _)| k.starts_with("@inline:"))
+            .map(|(_, v)| v)
+            .collect();
+        // The pure `goto` shortcut stays a shortcut.
+        assert_eq!(inline.len(), 2);
+        assert!(inline.iter().any(|d| d.pin && is_gated(d) && d.set.len() == 1));
+        assert!(inline.iter().any(|d| d.run.as_deref() == Some("/bin/true")));
     }
 
     #[test]

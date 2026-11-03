@@ -248,7 +248,11 @@ fn run_daemon(config: PathBuf) -> ExitCode {
     // Peek at the config just to pick the display backend. The
     // live state will reload the full config a moment later.
     let display_cfg = match paneld_config::load(&config) {
-        Ok((_, doc, _)) => display::DisplayConfig::from_doc(&doc),
+        Ok((_, mut doc, _)) => {
+            // Same last-one-wins view of `display` options as the rest.
+            paneld_config::apply_overrides(&mut doc);
+            display::DisplayConfig::from_doc(&doc)
+        }
         Err(_) => display::DisplayConfig::default(),
     };
     let _window = match display_cfg.open(&ui) {
@@ -264,7 +268,7 @@ fn run_daemon(config: PathBuf) -> ExitCode {
     let screen = ui.screen();
 
     // Initial live state. `reload` wipes and rebuilds this.
-    let mut live = match setup_live_state(&config, &screen) {
+    let mut live = match setup_live_state(&config, &screen, None) {
         Ok(l) => l,
         Err(code) => return code,
     };
@@ -275,7 +279,7 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         while let Ok(msg) = control_rx.try_recv() {
             match msg {
                 ctl::ControlMsg::Exit => break 'main,
-                ctl::ControlMsg::Reload => match setup_live_state(&config, &screen) {
+                ctl::ControlMsg::Reload => match setup_live_state(&config, &screen, None) {
                     Ok(mut fresh) => {
                         fresh.pin_gate.carry_from(&live.pin_gate);
                         // Flush any pending alert state before the
@@ -323,10 +327,15 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     while let Ok(ev) = live.event_rx.try_recv() {
         match ev {
             paneld_ui::UiEvent::Action { name, args } => {
-                // Taps cannot reach here while a modal is up (the
-                // page's bindings are gone); `then` / `else` chains
-                // from the worker can. Hold them until the modal
-                // closes so they get their own gates.
+                // A tap queued before a modal opened in this same drain
+                // is stale once the modal is up: drop it.
+                if live.pending.is_none() {
+                    route_call(live, screen, actions::Call::new(name, args), false);
+                }
+            }
+            paneld_ui::UiEvent::Chained { name, args } => {
+                // A `then` / `else` chain is kept until any modal
+                // closes, then gets its own gates.
                 let call = actions::Call::new(name, args);
                 if live.pending.is_some() {
                     live.deferred.push_back(call);
@@ -411,7 +420,6 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 let ctx = build_ctx(
                     &live.source_values,
                     &live.theme,
-                    &live.secrets,
                     &live.vars,
                     Some(&live.alerts),
                 );
@@ -428,7 +436,6 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 let mut ctx = build_ctx(
                     &live.source_values,
                     &live.theme,
-                    &live.secrets,
                     &live.vars,
                     Some(&live.alerts),
                 );
@@ -479,7 +486,6 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         let event_ctx = build_ctx(
             &live.source_values,
             &live.theme,
-            &live.secrets,
             &live.vars,
             Some(&live.alerts),
         );
@@ -498,7 +504,6 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     let alerts_ctx = build_ctx(
         &live.source_values,
         &live.theme,
-        &live.secrets,
         &live.vars,
         None,
     );
@@ -525,7 +530,6 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         let ctx = build_ctx(
             &live.source_values,
             &live.theme,
-            &live.secrets,
             &live.vars,
             Some(&live.alerts),
         );
@@ -560,7 +564,6 @@ struct LiveState {
     >,
     source_rx: std::sync::mpsc::Receiver<sources::SourceUpdate>,
     theme: std::collections::BTreeMap<String, paneld_ui::Value>,
-    secrets: std::collections::BTreeMap<String, paneld_ui::Value>,
     vars: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
     var_types: std::collections::BTreeMap<String, String>,
     event_tx: std::sync::mpsc::Sender<paneld_ui::UiEvent>,
@@ -605,9 +608,13 @@ enum Stage {
     Notice,
 }
 
+/// `state_path`: where the alert state file lives; `None` = the
+/// config's `app:state` (the daemon). `paneld shot` passes a scratch
+/// path so it never opens, and so never touches, the real one.
 fn setup_live_state(
     config: &std::path::Path,
     screen: &paneld_ui::ui::Obj<'_>,
+    state_path: Option<&std::path::Path>,
 ) -> Result<LiveState, ExitCode> {
     use paneld_config::{check, load};
     // ADR 0013: commands run with cwd set to the config file's
@@ -660,14 +667,17 @@ fn setup_live_state(
         std::collections::BTreeMap::<String, paneld_ui::Value>::new(),
     ));
     let base_ctx =
-        build_ctx(&source_values, &theme, &secret_values, &vars_shared, None);
-    let initial_sources = sources::resolve_all(&doc, &base_ctx, &config_dir, app_defaults);
+        build_ctx(&source_values, &theme, &vars_shared, None);
+    // Sources interpolate only their `run` and `env`, where secrets
+    // are allowed.
+    let command_ctx = with_secrets(base_ctx.clone(), &secret_values);
+    let initial_sources = sources::resolve_all(&doc, &command_ctx, &config_dir, app_defaults);
     *source_values.lock().unwrap() = initial_sources;
     let (source_tx, source_rx) =
         std::sync::mpsc::channel::<sources::SourceUpdate>();
     let sources_shutdown = sources::spawn_pollers(
         &doc,
-        &base_ctx,
+        &command_ctx,
         source_tx.clone(),
         &config_dir,
         app_defaults,
@@ -684,6 +694,7 @@ fn setup_live_state(
         actions::WorkerCtx {
             actions: action_table,
             base_ctx: base_ctx.clone(),
+            secrets: secret_values.clone(),
             vars: vars_shared.clone(),
             source_values: source_values.clone(),
             var_types: var_types.clone(),
@@ -698,7 +709,10 @@ fn setup_live_state(
 
     let current_page = find_start_page(&doc);
     let mut alerts_engine = alerts::Engine::new(&doc);
-    let state_store = state::Store::open(state::config_path(&doc));
+    let state_store = state::Store::open(match state_path {
+        Some(p) => p.to_path_buf(),
+        None => state::config_path(&doc),
+    });
     alerts_engine.restore(
         state_store
             .snapshot()
@@ -707,7 +721,7 @@ fn setup_live_state(
             .collect(),
     );
     let ctx_no_alerts =
-        build_ctx(&source_values, &theme, &secret_values, &vars_shared, None);
+        build_ctx(&source_values, &theme, &vars_shared, None);
     alerts_engine.tick(
         &ctx_no_alerts,
         std::time::Instant::now(),
@@ -716,7 +730,6 @@ fn setup_live_state(
     let ctx = build_ctx(
         &source_values,
         &theme,
-        &secret_values,
         &vars_shared,
         Some(&alerts_engine),
     );
@@ -731,7 +744,6 @@ fn setup_live_state(
         source_values,
         source_rx,
         theme,
-        secrets: secret_values,
         vars: vars_shared,
         var_types,
         event_tx,
@@ -814,7 +826,6 @@ fn route_call(
         let mut ctx = build_ctx(
             &live.source_values,
             &live.theme,
-            &live.secrets,
             &live.vars,
             Some(&live.alerts),
         );
@@ -880,7 +891,7 @@ fn action_done(
     };
     let message = if ok {
         def.done.as_ref().map(|d| {
-            let mut ctx = build_ctx(&live.source_values, &live.theme, &live.secrets, &live.vars, Some(&live.alerts));
+            let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
             ctx.insert("output".into(), paneld_ui::Value::String(field("stdout").trim().to_string()));
             ctx.insert("result".into(), result.clone());
             paneld_ui::interpolate(&d.raw, d.span.file, d.span.start, &ctx)
@@ -888,7 +899,7 @@ fn action_done(
     } else {
         Some(match &def.failed {
             Some(f) => {
-                let mut ctx = build_ctx(&live.source_values, &live.theme, &live.secrets, &live.vars, Some(&live.alerts));
+                let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
                 ctx.insert("result".into(), result.clone());
                 paneld_ui::interpolate(&f.raw, f.span.file, f.span.start, &ctx)
             }
@@ -896,7 +907,10 @@ fn action_done(
                 let err = field("stderr");
                 let err = err.trim();
                 if err.is_empty() {
-                    format!("{name} failed")
+                    match shown_name(name) {
+                        Some(n) => format!("{n} failed"),
+                        None => "Failed".to_string(),
+                    }
                 } else {
                     // One line is enough for a toast.
                     err.lines().next().unwrap_or(err).to_string()
@@ -934,7 +948,10 @@ fn show_pin_modal(
     paneld_ui::reset_action_bindings();
     screen.clear_children();
     let box_ = screen.new_msgbox();
-    box_.msgbox_add_title(&format!("PIN for {action_name}"));
+    box_.msgbox_add_title(&match shown_name(action_name) {
+        Some(n) => format!("PIN for {n}"),
+        None => "Enter PIN".to_string(),
+    });
     if let Some(e) = error {
         box_.msgbox_add_text(e);
     }
@@ -947,7 +964,6 @@ fn show_pin_modal(
     let kb = screen.new_number_keyboard();
     kb.attach_keyboard_to(&ta);
     kb.on_submit_pin(sink.clone());
-    kb.on_cancel_reply(sink.clone());
 }
 
 /// A message with a single OK that dismisses it.
@@ -963,6 +979,12 @@ fn show_notice(
     box_.msgbox_add_confirm_button("OK", false, sink.clone());
 }
 
+/// An action's name as shown on screen; `None` for an inline
+/// handler's internal `@inline:...` name.
+fn shown_name(name: &str) -> Option<&str> {
+    (!name.starts_with('@')).then_some(name)
+}
+
 /// Pop an action-confirm modal on `screen`, replacing the page so
 /// the modal is the only live binding target until the user replies.
 fn show_confirm_modal(
@@ -974,7 +996,10 @@ fn show_confirm_modal(
     paneld_ui::reset_action_bindings();
     screen.clear_children();
     let box_ = screen.new_msgbox();
-    box_.msgbox_add_title(&format!("Run {action_name}?"));
+    box_.msgbox_add_title(&match shown_name(action_name) {
+        Some(n) => format!("Run {n}?"),
+        None => "Are you sure?".to_string(),
+    });
     box_.msgbox_add_text(message);
     box_.msgbox_add_confirm_button("Cancel", false, sink.clone());
     box_.msgbox_add_confirm_button("OK", true, sink.clone());
@@ -1070,13 +1095,12 @@ fn run_shot(o: ShotOpts) -> ExitCode {
     };
     let mut mem = ui.open_memory_display(o.size.0, o.size.1);
     let screen = ui.screen();
-    let mut live = match setup_live_state(&o.config, &screen) {
+    // A snapshot must never touch the real alert state file.
+    let scratch_state = std::env::temp_dir().join(format!("paneld-shot-{}.state", std::process::id()));
+    let mut live = match setup_live_state(&o.config, &screen, Some(&scratch_state)) {
         Ok(l) => l,
         Err(code) => return code,
     };
-    // A snapshot must never write the real alert state file.
-    let scratch_state = std::env::temp_dir().join(format!("paneld-shot-{}.state", std::process::id()));
-    live.state = state::Store::open(scratch_state.clone());
 
     // Run the UI for `ms`, in real time so action and source threads
     // get to finish what a tap started.
@@ -1151,20 +1175,31 @@ fn run_ctl(args: &[String]) -> ExitCode {
     ExitCode::from(code as u8)
 }
 
+/// `ctx` plus `secrets`, for interpolating commands (`run`, `env`).
+fn with_secrets(
+    mut ctx: paneld_ui::Context,
+    secrets: &std::collections::BTreeMap<String, paneld_ui::Value>,
+) -> paneld_ui::Context {
+    ctx.insert("secrets".into(), paneld_ui::Value::Map(secrets.clone()));
+    ctx
+}
+
 fn build_ctx(
     source_values: &std::sync::Arc<
         std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>,
     >,
     theme: &std::collections::BTreeMap<String, paneld_ui::Value>,
-    secret_values: &std::collections::BTreeMap<String, paneld_ui::Value>,
     vars: &std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
     alerts: Option<&alerts::Engine>,
 ) -> paneld_ui::Context {
+    // No `secrets` here: schema 16 allows them only in `run` and `env`,
+    // and this context feeds pages, messages and alert texts (which
+    // reach the screen and the state file). Command interpolation adds
+    // them, see `with_secrets`.
     let mut ctx = paneld_ui::Context::new();
     let sources_snapshot = source_values.lock().unwrap().clone();
     ctx.insert("sources".into(), paneld_ui::Value::Map(sources_snapshot));
     ctx.insert("theme".into(), paneld_ui::Value::Map(theme.clone()));
-    ctx.insert("secrets".into(), paneld_ui::Value::Map(secret_values.clone()));
     let snapshot = vars.lock().unwrap().clone();
     ctx.insert("vars".into(), paneld_ui::Value::Map(snapshot));
     if let Some(engine) = alerts {

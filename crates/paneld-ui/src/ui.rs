@@ -52,6 +52,9 @@ pub enum UiEvent {
     /// The PIN modal's keyboard OK was pressed. Carries the typed
     /// digits; the main loop verifies them and must never log them.
     PinEntered { digits: String },
+    /// A `then` / `else` call from the worker. Unlike a tap it is
+    /// kept, and run after any modal that is up closes.
+    Chained { name: String, args: Vec<ActionArg> },
     /// The worker finished a call of action `name`; `result` is the
     /// schema's `{ok, code, stdout, stderr}`.
     ActionDone { name: String, ok: bool, result: crate::expr::Value },
@@ -183,6 +186,11 @@ pub fn snapshot_inputs() -> Vec<String> {
 /// was re-rendered.
 pub fn restore_inputs(texts: &[String]) {
     INPUTS.with(|v| {
+        // Position is the only key, so only restore onto the same set
+        // of inputs; otherwise digits could land in another keypad.
+        if v.borrow().len() != texts.len() {
+            return;
+        }
         for (&ta, text) in v.borrow().iter().zip(texts) {
             if text.is_empty() {
                 continue;
@@ -412,7 +420,11 @@ impl Ui {
         // One full-size buffer in DIRECT mode: after a refresh it holds
         // the whole frame. u32 elements keep it 4-byte aligned and big
         // enough for any color format up to 32 bits.
-        let mut buf = vec![0u32; (width * height) as usize].into_boxed_slice();
+        // Leaked on purpose: LVGL keeps this pointer for the display's
+        // whole life and displays are never deleted, so the buffer must
+        // never be freed (one per `paneld shot` run).
+        let buf: &'static mut [u32] =
+            Box::leak(vec![0u32; (width * height) as usize].into_boxed_slice());
         unsafe {
             sys::lv_display_set_flush_cb(display, Some(mem_flush));
             sys::lv_display_set_buffers(
@@ -541,7 +553,7 @@ static DIGIT_CTRL: [sys::lv_buttonmatrix_ctrl_t; 12] = {
 /// See [`Ui::open_memory_display`].
 pub struct MemDisplay {
     display: *mut sys::lv_display_t,
-    buf: Box<[u32]>,
+    buf: &'static mut [u32],
     width: i32,
     height: i32,
 }
@@ -809,24 +821,6 @@ impl<'ui> Obj<'ui> {
         Obj { raw, _ui: PhantomData }
     }
 
-    /// Register LV_EVENT_CANCEL (the number keyboard's close key) to
-    /// send `ConfirmReply { accept: false }`.
-    pub fn on_cancel_reply(&self, sink: Sender<UiEvent>) {
-        let idx = {
-            let mut g = bindings().lock().unwrap();
-            g.push(Binding::Confirm { accept: false, sink });
-            g.len() - 1
-        };
-        unsafe {
-            sys::lv_obj_add_event_cb(
-                self.raw,
-                Some(on_tap_trampoline),
-                sys::lv_event_code_t_LV_EVENT_CANCEL,
-                idx as *mut std::ffi::c_void,
-            );
-        }
-    }
-
     /// Keypad `on_submit = <action>`: on the keyboard's OK, call the
     /// action with the digits bound as `value`.
     pub fn on_submit_action(&self, sink: Sender<UiEvent>, action: String) {
@@ -1080,9 +1074,6 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_align(self.raw, sys::lv_align_t_LV_ALIGN_CENTER, 0, 0) };
     }
 
-    /// Remove every child of this object but keep the object itself,
-    /// so a caller can rebuild the tree in place. Used by the live
-    /// re-render path when a source value changes.
     pub fn child_count(&self) -> u32 {
         unsafe { sys::lv_obj_get_child_count(self.raw) }
     }
@@ -1093,6 +1084,9 @@ impl<'ui> Obj<'ui> {
         (!raw.is_null()).then_some(Obj { raw, _ui: PhantomData })
     }
 
+    /// Remove every child of this object but keep the object itself,
+    /// so a caller can rebuild the tree in place. Used by the live
+    /// re-render path when a source value changes.
     pub fn clear_children(&self) {
         unsafe { sys::lv_obj_clean(self.raw) };
         // With the whole screen cleared no grid is left that could
@@ -1107,10 +1101,17 @@ impl<'ui> Obj<'ui> {
     /// row. Call it after the children exist (so `repeat` output is
     /// counted). `rows` can ask for more rows than the children need.
     pub fn layout_grid(&self, cols: i32, rows: Option<i32>) {
-        let cols = cols.max(1);
-        let n = unsafe { sys::lv_obj_get_child_count(self.raw) } as i32;
+        // Bounded: `columns` / `rows` can come from a source.
+        let cols = cols.clamp(1, 64);
+        // LVGL skips hidden children in a grid; place only the shown
+        // ones so `visible = false` leaves no hole.
+        let shown: Vec<*mut sys::lv_obj_t> = (0..unsafe { sys::lv_obj_get_child_count(self.raw) })
+            .map(|i| unsafe { sys::lv_obj_get_child(self.raw, i as i32) })
+            .filter(|&c| !c.is_null() && !unsafe { sys::lv_obj_is_hidden(c) })
+            .collect();
+        let n = shown.len() as i32;
         let needed = (n + cols - 1) / cols;
-        let rows = rows.unwrap_or(needed).max(needed).max(1);
+        let rows = rows.unwrap_or(needed).clamp(1, 1024).max(needed);
         let mut col_dsc: Vec<i32> = (0..cols).map(|_| grid_fr(1)).collect();
         col_dsc.push(GRID_TEMPLATE_LAST);
         let mut row_dsc: Vec<i32> = (0..rows).map(|_| GRID_CONTENT).collect();
@@ -1128,8 +1129,8 @@ impl<'ui> Obj<'ui> {
         unsafe {
             sys::lv_obj_set_layout(self.raw, sys::lv_layout_t_LV_LAYOUT_GRID);
             sys::lv_obj_set_grid_dsc_array(self.raw, col_ptr, row_ptr);
-            for i in 0..n {
-                let child = sys::lv_obj_get_child(self.raw, i);
+            for (i, &child) in shown.iter().enumerate() {
+                let i = i as i32;
                 sys::lv_obj_set_grid_cell(
                     child,
                     sys::lv_grid_align_t_LV_GRID_ALIGN_STRETCH,

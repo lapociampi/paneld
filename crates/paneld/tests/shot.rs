@@ -265,3 +265,29 @@ fn action_goto_and_done_failed_toasts() {
     assert!(bad.any(failed_red), "no failure toast");
     assert!(!bad.any(blue), "a failed action must not goto");
 }
+
+#[test]
+fn inline_handler_confirm_gates_its_set() {
+    // Review round 5: `on_tap { set { ... }; confirm = ... }` ran the
+    // set without asking.
+    let d = tmp("inline");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var on: bool = false\n\
+         page home {\n\
+             button { width = 200; height = 60; label = go\n\
+                      on_tap { set { on = true }; confirm = Sure? } }\n\
+             rect { width = 100; height = 40\n\
+                    background = {{ vars.on ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    // Tap only: the confirm modal is up, nothing set yet.
+    let asked = shot(&conf, &["--tap", "100,95", "--settle", "100"]);
+    assert!(!asked.any(green), "set ran before the confirm");
+    // Tap, then OK (right footer button of the centered modal).
+    let done = shot(&conf, &["--tap", "100,95", "--tap", "463,282", "--settle", "200"]);
+    assert!(done.any(green), "set did not run after OK");
+}

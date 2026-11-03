@@ -3163,16 +3163,22 @@ fn check_source_list(
 
 fn check_cel_in_doc(doc: &Document, names: &Names, diags: &mut Vec<Diagnostic>) {
     for item in &doc.items {
-        check_cel_in_item(item, names, diags);
+        check_cel_in_item(item, names, false, diags);
     }
 }
 
-fn check_cel_in_item(item: &Item, names: &Names, diags: &mut Vec<Diagnostic>) {
+/// `in_env`: inside an `env { }` block, where (like in `run`) schema
+/// 16 allows `secrets`.
+fn check_cel_in_item(item: &Item, names: &Names, in_env: bool, diags: &mut Vec<Diagnostic>) {
     match item {
-        Item::Assign(a) => check_cel_in_raw_value(&a.value, names, diags),
+        Item::Assign(a) => {
+            let is_run = matches!(&a.target, AssignTarget::Simple { key } if key.text == "run");
+            check_cel_in_raw_value(&a.value, names, in_env || is_run, diags)
+        }
         Item::Block(b) => {
+            let in_env = in_env || b.kind.text == "env";
             for child in &b.items {
-                check_cel_in_item(child, names, diags);
+                check_cel_in_item(child, names, in_env, diags);
             }
         }
         Item::Repeat(r) => {
@@ -3183,28 +3189,30 @@ fn check_cel_in_item(item: &Item, names: &Names, diags: &mut Vec<Diagnostic>) {
             diags.append(&mut ds);
             if let Some(e) = &expr {
                 crate::cel::walk_source_refs(e, &names.sources, diags);
+                flag_secrets(e, false, diags);
             }
             for inner in &r.items {
-                check_cel_in_item(inner, names, diags);
+                check_cel_in_item(inner, names, in_env, diags);
             }
         }
         Item::Param(p) => {
             if let Some(default) = &p.default {
-                check_cel_in_raw_value(default, names, diags);
+                check_cel_in_raw_value(default, names, false, diags);
             }
             if let Some(opts) = &p.options {
                 for inner in &opts.items {
-                    check_cel_in_item(inner, names, diags);
+                    check_cel_in_item(inner, names, false, diags);
                 }
             }
         }
-        Item::Var(v) => check_cel_in_raw_value(&v.default, names, diags),
+        Item::Var(v) => check_cel_in_raw_value(&v.default, names, false, diags),
     }
 }
 
 fn check_cel_in_raw_value(
     v: &crate::parse::RawValue,
     names: &Names,
+    secrets_ok: bool,
     diags: &mut Vec<Diagnostic>,
 ) {
     match classify(&v.text) {
@@ -3227,6 +3235,7 @@ fn check_cel_in_raw_value(
             diags.append(&mut ds);
             if let Some(e) = expr {
                 crate::cel::walk_source_refs(&e, &names.sources, diags);
+                flag_secrets(&e, secrets_ok, diags);
             }
         }
         ValueShape::Interp(_) => {
@@ -3239,8 +3248,23 @@ fn check_cel_in_raw_value(
             diags.append(&mut ds);
             for e in &exprs {
                 crate::cel::walk_source_refs(e, &names.sources, diags);
+                flag_secrets(e, secrets_ok, diags);
             }
         }
+    }
+}
+
+/// Schema 16: `secrets` only in `run` and `env`. Anywhere else a
+/// secret could end up on screen, in a message or in the state file.
+fn flag_secrets(e: &crate::cel::Expr, secrets_ok: bool, diags: &mut Vec<Diagnostic>) {
+    if secrets_ok {
+        return;
+    }
+    if let Some(span) = crate::cel::find_ident(e, "secrets") {
+        diags.push(Diagnostic::new(
+            span,
+            "`secrets` can only be used in `run` and `env`",
+        ));
     }
 }
 
@@ -4152,6 +4176,25 @@ page home { text { on_tap = {{ some_expr }} } }
     fn indexed_top_level_alert_from_ref_is_resolved() {
         let diags = check_text("alert[a]:from = ghost\n");
         assert_msg(&diags, "unknown source `ghost`");
+    }
+
+    #[test]
+    fn secrets_only_allowed_in_run_and_env() {
+        let ok = check_text(
+            "secret tok { env = T }\n\
+             source s { run = curl -H {{ secrets.tok }} x\n env { K = {{ secrets.tok }} } }\n\
+             action a { run = curl {{ secrets.tok }}\n env { K = {{ secrets.tok }} } }\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+
+        for bad in [
+            "secret tok { env = T }\npage home { text { value = {{ secrets.tok }} } }\n",
+            "secret tok { env = T }\nalert a { when = {{ true }}; title = x {{ secrets.tok }} }\n",
+            "secret tok { env = T }\naction a { confirm = {{ secrets.tok }} }\n",
+            "secret tok { env = T }\nvar v: string = {{ secrets.tok }}\n",
+        ] {
+            assert_msg(&check_text(bad), "`secrets` can only be used in `run` and `env`");
+        }
     }
 
     #[test]

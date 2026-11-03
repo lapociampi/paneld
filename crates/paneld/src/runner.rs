@@ -179,17 +179,36 @@ pub struct Opts<'a> {
 }
 
 
-/// Tokenise `cmd` into an argv list using POSIX-ish single/double
-/// quote rules: single quotes are literal, double quotes allow `\`
-/// escaping of `"`, `\\` and `$`, and whitespace outside quotes
-/// splits tokens. No variable expansion, no globbing, no backticks:
-/// the caller already interpolated everything it wanted interpolated.
+/// Tokenise a command template into an argv list using POSIX-ish
+/// single/double quote rules: single quotes are literal, double quotes
+/// allow `\` escaping of `"`, `\\` and `$`, and whitespace outside
+/// quotes splits tokens. No variable expansion, no globbing, no
+/// backticks. A `{{ ... }}` expression is copied into its token whole,
+/// even across spaces or quotes, so it can be interpolated per argv
+/// item afterwards (see [`command_argv`]).
 pub fn tokenize(cmd: &str) -> Result<Vec<String>, RunError> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_tok = false;
     let mut chars = cmd.chars().peekable();
+    // Copy a `{{ ... }}` (the first `{` already consumed) verbatim.
+    fn take_expr(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, cur: &mut String) {
+        cur.push('{');
+        let mut prev = '\0';
+        for c in chars.by_ref() {
+            cur.push(c);
+            if prev == '}' && c == '}' {
+                return;
+            }
+            prev = c;
+        }
+    }
     while let Some(c) = chars.next() {
+        if c == '{' && chars.peek() == Some(&'{') {
+            in_tok = true;
+            take_expr(&mut chars, &mut cur);
+            continue;
+        }
         match c {
             ' ' | '\t' | '\n' | '\r' if !in_tok => {}
             ' ' | '\t' | '\n' | '\r' => {
@@ -199,7 +218,11 @@ pub fn tokenize(cmd: &str) -> Result<Vec<String>, RunError> {
             '\'' => {
                 in_tok = true;
                 let mut closed = false;
-                for c2 in chars.by_ref() {
+                while let Some(c2) = chars.next() {
+                    if c2 == '{' && chars.peek() == Some(&'{') {
+                        take_expr(&mut chars, &mut cur);
+                        continue;
+                    }
                     if c2 == '\'' {
                         closed = true;
                         break;
@@ -216,6 +239,10 @@ pub fn tokenize(cmd: &str) -> Result<Vec<String>, RunError> {
                 in_tok = true;
                 let mut closed = false;
                 while let Some(c2) = chars.next() {
+                    if c2 == '{' && chars.peek() == Some(&'{') {
+                        take_expr(&mut chars, &mut cur);
+                        continue;
+                    }
                     if c2 == '"' {
                         closed = true;
                         break;
@@ -264,16 +291,27 @@ pub fn tokenize(cmd: &str) -> Result<Vec<String>, RunError> {
     Ok(out)
 }
 
-/// Run `cmd` as argv (parsed with [`tokenize`]). The child gets a
-/// clean environment, its own process group, stdin from `/dev/null`,
-/// stdout and stderr captured up to `opts.max_bytes`, and is killed
-/// as a group once `opts.timeout` elapses.
-pub fn exec(cmd: &str, opts: Opts<'_>) -> Result<RunResult, RunError> {
-    let argv = tokenize(cmd)?;
-    exec_argv(&argv, opts)
+/// Split a `run` template into argv and interpolate each item on its
+/// own with `interp`, so a value with spaces or quotes stays one argv
+/// item (the "inputs reach commands as argv items" rule).
+pub fn command_argv(
+    template: &str,
+    interp: impl Fn(&str) -> String,
+) -> Result<Vec<String>, RunError> {
+    let argv: Vec<String> = tokenize(template)?
+        .into_iter()
+        .map(|t| if t.contains("{{") { interp(&t) } else { t })
+        .collect();
+    if argv[0].is_empty() {
+        return Err(RunError { message: "the command name is empty".into() });
+    }
+    Ok(argv)
 }
 
-fn exec_argv(argv: &[String], opts: Opts<'_>) -> Result<RunResult, RunError> {
+/// Run `argv`. The child gets a clean environment, its own process
+/// group, stdin from `/dev/null`, stdout and stderr captured up to
+/// their caps, and is killed as a group once `opts.timeout` elapses.
+pub fn exec(argv: &[String], opts: Opts<'_>) -> Result<RunResult, RunError> {
     let program = &argv[0];
     let args = &argv[1..];
     let mut command = Command::new(program);
@@ -379,8 +417,7 @@ pub fn kill_group(pid: Pid, sig: Signal) {
 /// its own process group. The caller spawns, drains output, and
 /// kills on their own terms -- used by [`exec`] for one-shots and by
 /// `sources.rs` for long-lived stream children.
-pub fn prepared_command(cmd: &str, opts: &Opts<'_>) -> Result<Command, RunError> {
-    let argv = tokenize(cmd)?;
+pub fn prepared_command(argv: &[String], opts: &Opts<'_>) -> Result<Command, RunError> {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -422,6 +459,26 @@ fn clean_env(opts: &Opts<'_>) -> Vec<(OsString, OsString)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tokenize a literal command (no `{{ }}`) and run it.
+    fn exec(cmd: &str, o: Opts<'_>) -> Result<RunResult, RunError> {
+        super::exec(&tokenize(cmd)?, o)
+    }
+
+    #[test]
+    fn expressions_stay_one_token_and_interpolate_per_item() {
+        assert_eq!(
+            tokenize("curl -H 'X: {{ a }}' {{ b == 'x y' ? 1 : 2 }} --n={{ c }}").unwrap(),
+            vec!["curl", "-H", "X: {{ a }}", "{{ b == 'x y' ? 1 : 2 }}", "--n={{ c }}"]
+        );
+        // A value with spaces and quotes is one argv item.
+        let argv = command_argv("/bin/echo {{ name }} --tag={{ name }}", |t| {
+            t.replace("{{ name }}", "web 1; rm -rf /")
+        })
+        .unwrap();
+        assert_eq!(argv, vec!["/bin/echo", "web 1; rm -rf /", "--tag=web 1; rm -rf /"]);
+        assert!(command_argv("{{ x }} a", |_| String::new()).is_err());
+    }
 
     fn opts(timeout_ms: u64, max_bytes: usize) -> Opts<'static> {
         Opts {

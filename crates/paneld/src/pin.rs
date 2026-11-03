@@ -18,6 +18,9 @@ use paneld_ui::Value;
 /// Largest argon2 memory cost (KiB) a stored hash may ask for. The
 /// default `hash-pin` cost is 19 MiB.
 const MAX_MEMORY_KIB: u32 = 64 * 1024;
+/// Iterations and lanes caps; `hash-pin` uses t=2, p=1.
+const MAX_ITERATIONS: u32 = 8;
+const MAX_LANES: u32 = 4;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Check {
@@ -155,16 +158,16 @@ impl Gate {
                 return Check::NotConfigured;
             }
         };
-        // Verification uses the cost stored in the hash. Refuse one
-        // that would need more memory than a 1 GB Pi can spare.
-        if let Some(m) = parsed.params.get_decimal("m") {
-            if m > MAX_MEMORY_KIB {
-                eprintln!(
-                    "paneld: security.pin hash asks for {m} KiB of memory (max {MAX_MEMORY_KIB}); \
-                     re-create it with `paneld hash-pin`"
-                );
-                return Check::NotConfigured;
-            }
+        // Verification uses the cost stored in the hash, on the UI
+        // thread. Refuse one that would need more memory than a 1 GB Pi
+        // can spare, or would freeze the screen for seconds.
+        let over = |k: &str, max: u32| parsed.params.get_decimal(k).is_some_and(|v| v > max);
+        if over("m", MAX_MEMORY_KIB) || over("t", MAX_ITERATIONS) || over("p", MAX_LANES) {
+            eprintln!(
+                "paneld: security.pin hash is too costly (max m={MAX_MEMORY_KIB} KiB, \
+                 t={MAX_ITERATIONS}, p={MAX_LANES}); re-create it with `paneld hash-pin`"
+            );
+            return Check::NotConfigured;
         }
         if Argon2::default()
             .verify_password(digits.as_bytes(), &parsed)
@@ -266,6 +269,14 @@ mod tests {
     fn hash_with_excessive_memory_cost_is_refused() {
         // Valid PHC shape, but m = 1 GiB.
         let h = "$argon2id$v=19$m=1048576,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$\
+                 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut g = gate(h, 5);
+        assert_eq!(g.check("1234", Instant::now()), Check::NotConfigured);
+    }
+
+    #[test]
+    fn hash_with_excessive_time_cost_is_refused() {
+        let h = "$argon2id$v=19$m=19456,t=1000,p=1$c29tZXNhbHRzb21lc2FsdA$\
                  AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let mut g = gate(h, 5);
         assert_eq!(g.check("1234", Instant::now()), Check::NotConfigured);

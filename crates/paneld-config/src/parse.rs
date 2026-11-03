@@ -619,6 +619,31 @@ fn describe(k: TokenKind) -> &'static str {
     }
 }
 
+/// Keys that make a nameless `on_tap { }` / `on_hold { }` an action
+/// of its own (schema 5, "Calling an action", inline form) rather
+/// than a plain `goto` / `set` shortcut.
+pub const INLINE_ACTION_ONLY_KEYS: &[&str] = &["run", "pin", "confirm", "then", "else", "refresh"];
+
+impl Block {
+    /// `true` for a nameless handler block that must run as an action
+    /// (and so through the PIN / confirm gates).
+    pub fn is_inline_action(&self) -> bool {
+        self.name.is_none()
+            && self.items.iter().any(|it| {
+                matches!(it, Item::Assign(a)
+                    if matches!(&a.target, AssignTarget::Simple { key }
+                        if INLINE_ACTION_ONLY_KEYS.contains(&key.text.as_str())))
+            })
+    }
+
+    /// The action name an inline handler block runs under. Unique per
+    /// block position; the `@` keeps it out of the config's own
+    /// identifier space.
+    pub fn inline_action_name(&self) -> String {
+        format!("@inline:{}:{}", self.span.file.0, self.span.start)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

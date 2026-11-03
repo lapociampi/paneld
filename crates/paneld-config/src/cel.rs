@@ -945,6 +945,34 @@ fn unescape(s: &str) -> String {
 /// identifier roots are left alone -- they may be component / action
 /// params, `item` from a `repeat`, or `theme` tokens that a theme
 /// adds freely.
+/// The span of the first bare identifier `name` in `expr`, if any.
+pub fn find_ident(expr: &Expr, name: &str) -> Option<Span> {
+    match &expr.kind {
+        ExprKind::Ident(n) if n == name => Some(expr.span),
+        ExprKind::Ident(_)
+        | ExprKind::IntLit(_)
+        | ExprKind::DoubleLit(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Null => None,
+        ExprKind::Field(inner, _) | ExprKind::Unary(_, inner) => find_ident(inner, name),
+        ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) => {
+            find_ident(a, name).or_else(|| find_ident(b, name))
+        }
+        ExprKind::Conditional(a, b, c) => find_ident(a, name)
+            .or_else(|| find_ident(b, name))
+            .or_else(|| find_ident(c, name)),
+        ExprKind::Call(_, args) | ExprKind::List(args) => {
+            args.iter().find_map(|a| find_ident(a, name))
+        }
+        ExprKind::Method(inner, _, args) => find_ident(inner, name)
+            .or_else(|| args.iter().find_map(|a| find_ident(a, name))),
+        ExprKind::Map(pairs) => pairs
+            .iter()
+            .find_map(|(k, v)| find_ident(k, name).or_else(|| find_ident(v, name))),
+    }
+}
+
 pub fn walk_source_refs(
     expr: &Expr,
     known_sources: &std::collections::HashSet<String>,
