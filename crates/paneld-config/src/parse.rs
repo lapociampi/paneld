@@ -896,6 +896,15 @@ mod tests {
     }
 
     #[test]
+    fn param_with_default_and_options() {
+        let doc = parse_ok("param mode: string = fast { options = [fast, slow] }\nx = 1\n");
+        let Item::Param(p) = &doc.items[0] else { panic!() };
+        assert_eq!(p.default.as_ref().unwrap().text, "fast");
+        assert_eq!(p.options.as_ref().unwrap().items.len(), 1);
+        assert_eq!(doc.items.len(), 2);
+    }
+
+    #[test]
     fn param_options_span_covers_only_the_braces() {
         let src = "param minutes: int { ask = select }\n";
         let (doc, _, map) = parse_str(src);

@@ -60,6 +60,143 @@ pub struct ActionDef {
     pub done: Option<ConfirmPrompt>,
     /// `failed = <text>`: shown on failure; default stderr.
     pub failed: Option<ConfirmPrompt>,
+    /// `param name: type [= default] [{ options }]` (schema 6).
+    pub params: Vec<ParamDef>,
+}
+
+/// One declared action parameter (schema 6).
+#[derive(Clone, Debug)]
+pub struct ParamDef {
+    pub name: String,
+    pub ty: String,
+    pub default: Option<ConfirmPrompt>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    /// `options = [...]` (an expression or a list literal).
+    pub options: Option<ConfirmPrompt>,
+    /// `ask = select | slider | keypad | toggle`.
+    pub ask: Option<String>,
+    pub label: Option<String>,
+}
+
+impl ParamDef {
+    fn from_ast(p: &paneld_config::parse::Param) -> Self {
+        let mut def = ParamDef {
+            name: p.name.text.clone(),
+            ty: p.ty.text.clone(),
+            default: p.default.as_ref().map(|d| ConfirmPrompt { raw: d.text.clone(), span: d.span }),
+            min: None,
+            max: None,
+            options: None,
+            ask: None,
+            label: None,
+        };
+        for item in p.options.iter().flat_map(|o| &o.items) {
+            let Item::Assign(a) = item else { continue };
+            let AssignTarget::Simple { key } = &a.target else { continue };
+            let text = a.value.text.trim();
+            match key.text.as_str() {
+                "min" => def.min = paneld_config::value::parse_number(text),
+                "max" => def.max = paneld_config::value::parse_number(text),
+                "options" => def.options = Some(ConfirmPrompt { raw: a.value.text.clone(), span: a.value.span }),
+                "ask" => def.ask = Some(text.to_string()),
+                "label" => def.label = Some(text.to_string()),
+                _ => {}
+            }
+        }
+        def
+    }
+
+    /// The `options` list, evaluated against `ctx`.
+    pub fn option_values(&self, ctx: &Context) -> Vec<Value> {
+        let Some(o) = &self.options else { return Vec::new() };
+        match paneld_ui::resolve_value(&o.raw, o.span, ctx) {
+            Some(Value::List(l)) => l,
+            Some(Value::String(s)) => paneld_config::value::split_list(&s)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| Value::String(t.trim().to_string()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// What [`prepare_args`] makes of a call's args.
+pub enum Prepared {
+    /// Typed, checked, defaults filled in.
+    Ready(Vec<ActionArg>),
+    /// This param was not passed and has `ask`: show a dialog.
+    Ask(ParamDef),
+    /// Refused before anything runs, with the reason.
+    Refused(String),
+}
+
+/// A value as param type `ty`; `None` if it is not one.
+fn param_value(ty: &str, v: Value) -> Option<Value> {
+    use paneld_config::value::{parse_color, parse_duration, parse_size};
+    match ty {
+        "duration" => parse_duration(&v.to_display_string()).map(|_| Value::String(v.to_display_string())),
+        "color" => parse_color(&v.to_display_string()).map(|_| Value::String(v.to_display_string())),
+        "size" => parse_size(&v.to_display_string()).map(|_| Value::String(v.to_display_string())),
+        "action" | "source" => Some(Value::String(v.to_display_string())),
+        _ => vars::coerce(ty, v),
+    }
+}
+
+/// Schema 6 and section 5's order ("params asked, PIN, confirm,
+/// run"): type each passed arg and check it against `min`, `max` and
+/// `options`, fill in defaults, and say which missing param to ask
+/// for. Args no param declares (a `repeat` item, component params)
+/// pass through. `defaults = false` leaves missing params out (the
+/// built-in actions pick their own).
+pub fn prepare_args(def: &ActionDef, mut args: Vec<ActionArg>, ctx: &Context, defaults: bool) -> Prepared {
+    for p in &def.params {
+        let given = args.iter().position(|a| a.name == p.name);
+        let raw = match given {
+            Some(i) => args[i].value.clone(),
+            None if !defaults => continue,
+            // Not passed: ask for it, else take the default.
+            None if p.ask.is_some() => return Prepared::Ask(p.clone()),
+            None => match &p.default {
+                Some(d) => match paneld_ui::resolve_value(&d.raw, d.span, ctx) {
+                    Some(v) => v,
+                    None => return Prepared::Refused(format!("the default of `{}` did not evaluate", p.name)),
+                },
+                None => return Prepared::Refused(format!("`{}` was not given", p.name)),
+            },
+        };
+        let Some(v) = param_value(&p.ty, raw.clone()) else {
+            return Prepared::Refused(format!("`{}` = {} is not a {}", p.name, raw.to_display_string(), p.ty));
+        };
+        let num = match &v {
+            Value::Int(n) => Some(*n as f64),
+            Value::Double(d) => Some(*d),
+            _ => None,
+        };
+        if let (Some(n), Some(min)) = (num, p.min) {
+            if n < min {
+                return Prepared::Refused(format!("`{}` = {} is below {min}", p.name, v.to_display_string()));
+            }
+        }
+        if let (Some(n), Some(max)) = (num, p.max) {
+            if n > max {
+                return Prepared::Refused(format!("`{}` = {} is above {max}", p.name, v.to_display_string()));
+            }
+        }
+        if p.options.is_some() {
+            let shown = v.to_display_string();
+            let options = p.option_values(ctx);
+            if !options.iter().any(|o| o.to_display_string() == shown) {
+                return Prepared::Refused(format!("`{}` = {shown} is not one of its options", p.name));
+            }
+        }
+        match given {
+            Some(i) => args[i].value = v,
+            None => args.push(ActionArg { name: p.name.clone(), value: v }),
+        }
+    }
+    Prepared::Ready(args)
 }
 
 /// Raw text + span of a message property (`confirm`, `done`,
@@ -128,7 +265,17 @@ fn collect_inline(items: &[Item], out: &mut HashMap<String, ActionDef>) {
 /// handler block (same keys).
 fn parse_def(b: &Block) -> ActionDef {
     {
-        let mut def = ActionDef::default();
+        let mut def = ActionDef {
+            params: b
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Param(p) => Some(ParamDef::from_ast(p)),
+                    _ => None,
+                })
+                .collect(),
+            ..ActionDef::default()
+        };
         if let Some(run) = find_simple(b, "run") {
             def.run = Some(run.to_string());
         }
@@ -830,6 +977,52 @@ mod tests {
             rx,
         );
         (tx, event_rx, vars)
+    }
+
+    #[test]
+    fn params_are_typed_checked_defaulted_or_asked() {
+        let doc = parse_doc(
+            "action a {\n\
+                 param n: int { min = 1; max = 10 }\n\
+                 param mode: string = fast { options = [fast, slow] }\n\
+                 param m: int { ask = select; options = [5, 30] }\n\
+                 run = /bin/true\n}\n",
+        );
+        let def = collect(&doc).remove("a").unwrap();
+        let ctx = Context::new();
+        let arg = |k: &str, v: Value| ActionArg { name: k.into(), value: v };
+        let prep = |args: Vec<ActionArg>| prepare_args(&def, args, &ctx, true);
+        let s = |t: &str| Value::String(t.into());
+
+        // All given: typed (the keypad's "7" is an int) and checked.
+        match prep(vec![arg("n", s("7")), arg("mode", s("slow")), arg("m", Value::Int(30)), arg("item", s("x"))]) {
+            Prepared::Ready(a) => {
+                assert_eq!(a.iter().find(|a| a.name == "n").unwrap().value, Value::Int(7));
+                assert!(a.iter().any(|a| a.name == "item"), "undeclared args pass through");
+            }
+            _ => panic!("should be ready"),
+        }
+        let refused = |args: Vec<ActionArg>, why: &str| match prep(args) {
+            Prepared::Refused(m) => assert!(m.contains(why), "{m}"),
+            Prepared::Ready(a) => panic!("should be refused: {why}; ready {a:?}; options {:?}", def.params[1].option_values(&ctx)),
+            Prepared::Ask(p) => panic!("should be refused: {why}; asks {}", p.name),
+        };
+        refused(vec![arg("n", s("x7")), arg("m", Value::Int(5))], "is not a int");
+        refused(vec![arg("n", Value::Int(11)), arg("m", Value::Int(5))], "above 10");
+        refused(vec![arg("n", Value::Int(0)), arg("m", Value::Int(5))], "below 1");
+        refused(vec![arg("n", Value::Int(2)), arg("mode", s("turbo")), arg("m", Value::Int(5))], "not one of");
+        refused(vec![arg("m", Value::Int(5))], "`n` was not given");
+        // `mode` defaults; `m` is asked.
+        match prep(vec![arg("n", Value::Int(2))]) {
+            Prepared::Ask(p) => assert_eq!(p.name, "m"),
+            _ => panic!("should ask for m"),
+        }
+        match prep(vec![arg("n", Value::Int(2)), arg("m", Value::Int(5))]) {
+            Prepared::Ready(a) => assert_eq!(a.iter().find(|a| a.name == "mode").unwrap().value, s("fast")),
+            _ => panic!("should be ready"),
+        }
+        // Built-ins: missing params stay missing.
+        assert!(matches!(prepare_args(&def, Vec::new(), &ctx, false), Prepared::Ready(a) if a.is_empty()));
     }
 
     #[test]

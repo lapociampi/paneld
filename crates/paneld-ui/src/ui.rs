@@ -49,6 +49,9 @@ pub enum UiEvent {
     /// uses this to resolve the `pending_confirm` state and either
     /// forward the pending action or drop it.
     ConfirmReply { accept: bool },
+    /// OK or Cancel on a dialog asking for an action param, with the
+    /// value the dialog's widget holds (schema 6 `ask`).
+    AskReply { accept: bool, value: Option<EventValue> },
     /// The PIN modal's keyboard OK was pressed. Carries the typed
     /// digits; the main loop verifies them and must never log them.
     PinEntered { digits: String },
@@ -123,6 +126,11 @@ enum Binding {
     /// inline handler with action keys); sends [`UiEvent::Action`]
     /// with `args` plus the widget's value as `value` and
     /// `event.value`.
+    /// The widget of an ask dialog: keeps [`ASK_VALUE`] current.
+    AskValue { kind: ChangeKind },
+    /// An ask dialog's OK / Cancel: sends [`UiEvent::AskReply`] with
+    /// [`ASK_VALUE`]. A keypad's own OK sends it too.
+    AskButton { accept: bool, sink: Sender<UiEvent> },
     ChangeAction {
         kind: ChangeKind,
         action: String,
@@ -312,8 +320,21 @@ unsafe extern "C" fn on_tap_trampoline(e: *mut sys::lv_event_t) {
         Some(Binding::Confirm { accept, sink }) => {
             let _ = sink.send(UiEvent::ConfirmReply { accept });
         }
+        Some(Binding::AskButton { accept, sink }) => {
+            let value = ASK_VALUE.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let _ = sink.send(UiEvent::AskReply { accept, value });
+        }
         _ => {}
     }
+}
+
+/// What the open ask dialog's widget holds; see [`set_ask_value`].
+static ASK_VALUE: Mutex<Option<EventValue>> = Mutex::new(None);
+
+/// Seed the ask dialog's value (what OK sends if the widget is left
+/// as it is).
+pub fn set_ask_value(v: Option<EventValue>) {
+    *ASK_VALUE.lock().unwrap_or_else(|e| e.into_inner()) = v;
 }
 
 unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
@@ -337,6 +358,15 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
             args.push(ActionArg { name: "value".into(), value });
             args.push(ActionArg { name: "event".into(), value: Value::Map(event) });
             let _ = sink.send(UiEvent::Action { name: action, args });
+        }
+        Some(Binding::AskValue { kind }) => {
+            let v = widget_value(kind, target);
+            *ASK_VALUE.lock().unwrap_or_else(|e| e.into_inner()) = v;
+        }
+        Some(Binding::AskButton { sink, .. }) => {
+            // A keypad's keyboard OK: submit what was typed.
+            let value = widget_value(ChangeKind::Keypad, target);
+            let _ = sink.send(UiEvent::AskReply { accept: true, value });
         }
         Some(Binding::Change { kind: ChangeKind::PinEntry, sink, .. }) => {
             let digits = keyboard_text(target);
@@ -1033,6 +1063,41 @@ impl<'ui> Obj<'ui> {
     pub fn top_layer(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_layer_top() };
         assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// Make this toggle, slider or dropdown the widget of an ask
+    /// dialog; for a keypad's keyboard, its OK submits the dialog.
+    pub fn on_change_ask(&self, widget: ValueWidget, sink: Sender<UiEvent>) {
+        let (binding, code) = match widget {
+            ValueWidget::Toggle => (Binding::AskValue { kind: ChangeKind::Toggle }, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Slider => (Binding::AskValue { kind: ChangeKind::Slider }, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Dropdown => (Binding::AskValue { kind: ChangeKind::Dropdown }, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Keypad => (Binding::AskButton { accept: true, sink }, sys::lv_event_code_t_LV_EVENT_READY),
+        };
+        let idx = {
+            let mut g = bindings().lock().unwrap();
+            g.push(binding);
+            g.len() - 1
+        };
+        unsafe {
+            sys::lv_obj_add_event_cb(self.raw, Some(on_change_trampoline), code, idx as *mut std::ffi::c_void);
+        }
+    }
+
+    /// An ask dialog's footer button (OK / Cancel).
+    pub fn msgbox_add_ask_button(&self, label: &str, accept: bool, sink: Sender<UiEvent>) -> Obj<'ui> {
+        let c = CString::new(label).unwrap_or_else(|_| CString::new("").unwrap());
+        let raw = unsafe { sys::lv_msgbox_add_footer_button(self.raw, c.as_ptr()) };
+        assert!(!raw.is_null());
+        let idx = {
+            let mut g = bindings().lock().unwrap();
+            g.push(Binding::AskButton { accept, sink });
+            g.len() - 1
+        };
+        unsafe {
+            sys::lv_obj_add_event_cb(raw, Some(on_tap_trampoline), sys::lv_event_code_t_LV_EVENT_CLICKED, idx as *mut std::ffi::c_void);
+        }
         Obj { raw, _ui: PhantomData }
     }
 

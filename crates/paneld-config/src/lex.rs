@@ -112,6 +112,9 @@ pub struct Lexer<'src> {
     file: FileId,
     pos: usize,
     mode: Mode,
+    /// On a `param` line: its default value ends before a ` {` that
+    /// opens the options block (`param m: int = 5 { min = 1 }`).
+    param_line: bool,
 }
 
 impl<'src> Lexer<'src> {
@@ -121,6 +124,7 @@ impl<'src> Lexer<'src> {
             file,
             pos: 0,
             mode: Mode::Normal,
+            param_line: false,
         }
     }
 
@@ -259,6 +263,7 @@ impl<'src> Lexer<'src> {
         match b {
             b'\n' => {
                 self.pos += 1;
+                self.param_line = false;
                 Ok(Token {
                     kind: TokenKind::Newline,
                     span: self.make_span(start, self.pos),
@@ -276,6 +281,7 @@ impl<'src> Lexer<'src> {
             }
             b'{' => {
                 self.pos += 1;
+                self.param_line = false;
                 Ok(Token {
                     kind: TokenKind::LBrace,
                     span: self.make_span(start, self.pos),
@@ -311,6 +317,7 @@ impl<'src> Lexer<'src> {
             }
             b';' => {
                 self.pos += 1;
+                self.param_line = false;
                 Ok(Token {
                     kind: TokenKind::Semi,
                     span: self.make_span(start, self.pos),
@@ -354,6 +361,9 @@ impl<'src> Lexer<'src> {
                     }
                 }
                 let span = self.make_span(start, self.pos);
+                if &self.src[start..self.pos] == b"param" {
+                    self.param_line = true;
+                }
                 // Contextual trigger: the `style` keyword inside a theme
                 // body introduces a selector-headed sub-block
                 // (`style .card { ... }`, `style button:pressed { ... }`).
@@ -509,6 +519,14 @@ impl<'src> Lexer<'src> {
                 Some(b'{') if self.peek_at(1) == Some(b'{') => {
                     self.scan_expression()?;
                     end = self.pos;
+                }
+                Some(b'{')
+                    if self.param_line
+                        && brace_depth == 0
+                        && matches!(self.src.get(self.pos.wrapping_sub(1)), Some(b' ') | Some(b'\t')) =>
+                {
+                    // The param's options block, not part of the default.
+                    break;
                 }
                 Some(b'{') => {
                     brace_depth = brace_depth.saturating_add(1);

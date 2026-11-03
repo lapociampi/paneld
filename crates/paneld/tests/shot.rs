@@ -481,6 +481,44 @@ fn image_reads_a_png_next_to_the_config_and_line_draws() {
 }
 
 #[test]
+fn a_param_is_asked_for_and_checked() {
+    let d = tmp("ask");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var m: int = 0\n\
+         action pause {\n\
+             param minutes: int { ask = select; options = [5, 30]; max = 10 }\n\
+             set { m = {{ minutes }} }\n\
+         }\n\
+         page home {\n\
+             button { label = Pause; on_tap = pause }\n\
+             rect { width = 100; height = 20\n\
+                    background = {{ vars.m == 5 ? '#00ff00' : vars.m == 0 ? '#0000ff' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    let blue = |p| close(p, [0, 0, 0xff], 16);
+    // The dialog is up: nothing set yet.
+    let asked = shot(&conf, &["--tap", "50,85", "--settle", "150"]);
+    assert!(!asked.any(green) && !asked.any(blue), "no dialog over the page");
+    // OK takes the first option, 5.
+    let ok = shot(&conf, &["--tap", "50,85", "--settle", "150", "--tap", "463,295", "--settle", "200"]);
+    assert!(ok.any(green), "5 was not set");
+    // Cancel: nothing.
+    let cancelled = shot(&conf, &["--tap", "50,85", "--settle", "150", "--tap", "351,295", "--settle", "200"]);
+    assert!(cancelled.any(blue), "cancel changed the var");
+    // 30 is an option but above `max`: refused, the notice says so.
+    let refused = shot(&conf, &[
+        "--tap", "50,85", "--settle", "150", "--tap", "400,240", "--settle", "150",
+        "--tap", "400,327", "--settle", "150", "--tap", "463,295", "--settle", "200",
+        "--tap", "399,269", "--settle", "150",
+    ]);
+    assert!(refused.any(blue), "a value above max was set");
+}
+
+#[test]
 fn idle_screen_goes_black_and_the_waking_tap_does_nothing_else() {
     let d = tmp("sleep");
     let conf = d.join("p.conf");

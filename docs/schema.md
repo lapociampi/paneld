@@ -172,12 +172,12 @@ Options:
 | Key | Notes |
 | --- | --- |
 | `min`, `max` | numbers |
-| `pattern` | regex for strings |
+| `pattern` | regex for strings (not enforced yet) |
 | `options` | allowed values (list, expr) |
 | `ask` | `select`, `slider`, `keypad`, `toggle`: if the caller did not pass it, a dialog asks for it (actions only) |
 | `label` | dialog label |
 
-A value outside its type or options is refused before anything runs.
+A value outside its type, `min` / `max` or `options` is refused before anything runs, with a notice on screen. A param that is not passed takes its default; with `ask`, a dialog asks for it instead (Cancel drops the call).
 
 ## 7. Components
 

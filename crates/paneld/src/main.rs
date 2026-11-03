@@ -433,6 +433,30 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                     dirty = live.pending.is_none();
                 }
             }
+            paneld_ui::UiEvent::AskReply { accept, value } => {
+                if let Some(Pending { mut call, stage: Stage::Ask(param) }) = live.pending.take() {
+                    match value.filter(|_| accept) {
+                        Some(v) => {
+                            let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+                            call.args.push(paneld_ui::ActionArg {
+                                name: param.name.clone(),
+                                value: asked_value(&param, v, &ctx),
+                            });
+                            // Checks it, asks the next one or goes on to
+                            // the PIN and confirm.
+                            route_call(live, screen, call, false);
+                        }
+                        None if accept => {
+                            // OK on an empty keypad: ask again.
+                            let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+                            show_ask_modal(screen, &call.name, &param, &ctx, &live.event_tx);
+                            live.pending = Some(Pending { call, stage: Stage::Ask(param) });
+                        }
+                        None => {}
+                    }
+                    dirty = live.pending.is_none();
+                }
+            }
             paneld_ui::UiEvent::ConfirmReply { accept } => {
                 if let Some(Pending { mut call, stage }) = live.pending.take() {
                     if accept && matches!(stage, Stage::Confirm) {
@@ -673,6 +697,8 @@ struct Pending {
 }
 
 enum Stage {
+    /// A dialog asks for this param (schema 6 `ask`).
+    Ask(Box<actions::ParamDef>),
     Pin,
     Confirm,
     /// A message with only OK (lockout, PIN not configured). The
@@ -941,7 +967,7 @@ fn config_dir_of(config: &std::path::Path) -> std::path::PathBuf {
 fn route_call(
     live: &mut LiveState,
     screen: &paneld_ui::ui::Obj<'_>,
-    call: actions::Call,
+    mut call: actions::Call,
     pin_done: bool,
 ) {
     let Some(def) = live.actions.get(&call.name).cloned() else {
@@ -949,6 +975,24 @@ fn route_call(
         let _ = live.action_tx.send(call);
         return;
     };
+    // Schema 5 order: params (typed, checked, asked), then PIN, then
+    // confirm. Built-in actions choose their own defaults.
+    let builtin = paneld_config::library::BUILTIN_ACTIONS.contains(&call.name.as_str());
+    let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+    match actions::prepare_args(&def, std::mem::take(&mut call.args), &ctx, !builtin) {
+        actions::Prepared::Ready(args) => call.args = args,
+        actions::Prepared::Ask(param) => {
+            show_ask_modal(screen, &call.name, &param, &ctx, &live.event_tx);
+            live.pending = Some(Pending { call, stage: Stage::Ask(Box::new(param)) });
+            return;
+        }
+        actions::Prepared::Refused(why) => {
+            eprintln!("paneld: action `{}` refused: {why}", call.name);
+            show_notice(screen, &format!("Not run: {}.", why.replace('`', "")), &live.event_tx);
+            live.pending = Some(Pending { call, stage: Stage::Notice });
+            return;
+        }
+    }
     // Schema 5: while an action runs, further calls of it are ignored.
     if live.running.contains_key(&actions::run_key(&call.name, &call.args)) {
         eprintln!("paneld: action `{}` is still running; call ignored", call.name);
@@ -1263,6 +1307,82 @@ fn show_pin_modal(
     let kb = screen.new_number_keyboard();
     kb.attach_keyboard_to(&ta);
     kb.on_submit_pin(sink.clone());
+}
+
+/// A dialog asking for `param` of `action_name` (schema 6 `ask`):
+/// a dropdown of its `options`, a slider over `min`..`max`, a toggle,
+/// or a digit keypad, with Cancel and OK.
+fn show_ask_modal(
+    screen: &paneld_ui::ui::Obj<'_>,
+    action_name: &str,
+    param: &actions::ParamDef,
+    ctx: &paneld_ui::Context,
+    sink: &std::sync::mpsc::Sender<paneld_ui::UiEvent>,
+) {
+    use paneld_ui::ui::{Size, ValueWidget};
+    use paneld_ui::EventValue;
+    paneld_ui::reset_action_bindings();
+    screen.clear_children();
+    let box_ = screen.new_msgbox();
+    let label = param.label.clone().unwrap_or_else(|| param.name.clone());
+    box_.msgbox_add_title(&match shown_name(action_name) {
+        Some(n) => format!("{n}: {label}"),
+        None => label,
+    });
+    let content = box_.msgbox_content();
+    match param.ask.as_deref() {
+        Some("slider") => {
+            let (min, max) = (param.min.unwrap_or(0.0) as i32, param.max.unwrap_or(100.0) as i32);
+            let s = content.new_slider();
+            s.set_slider_range(min, max);
+            s.set_slider_value(min);
+            s.set_size(Size::Percent(100), Size::Content);
+            s.on_change_ask(ValueWidget::Slider, sink.clone());
+            paneld_ui::set_ask_value(Some(EventValue::Int(min.into())));
+        }
+        Some("toggle") => {
+            let t = content.new_toggle();
+            t.on_change_ask(ValueWidget::Toggle, sink.clone());
+            paneld_ui::set_ask_value(Some(EventValue::Bool(false)));
+        }
+        Some("keypad") => {
+            let ta = content.new_textarea(false, 12);
+            ta.set_size(Size::Percent(100), Size::Content);
+            box_.msgbox_add_ask_button("Cancel", false, sink.clone());
+            box_.align_top_mid(8);
+            let kb = screen.new_number_keyboard();
+            kb.attach_keyboard_to(&ta);
+            kb.on_change_ask(ValueWidget::Keypad, sink.clone());
+            paneld_ui::set_ask_value(None);
+            return;
+        }
+        // `select`, and anything else: pick from the options.
+        _ => {
+            let options: Vec<String> = param.option_values(ctx).iter().map(|v| v.to_display_string()).collect();
+            let d = content.new_dropdown();
+            d.set_dropdown_options(&options.join("\n"));
+            d.set_size(Size::Percent(100), Size::Content);
+            d.on_change_ask(ValueWidget::Dropdown, sink.clone());
+            paneld_ui::set_ask_value(Some(EventValue::Int(0)));
+        }
+    }
+    box_.msgbox_add_ask_button("Cancel", false, sink.clone());
+    box_.msgbox_add_ask_button("OK", true, sink.clone());
+}
+
+/// The arg an ask dialog's widget value stands for: a dropdown gives
+/// the index of the chosen option.
+fn asked_value(param: &actions::ParamDef, v: paneld_ui::EventValue, ctx: &paneld_ui::Context) -> paneld_ui::Value {
+    use paneld_ui::{EventValue, Value};
+    match (param.ask.as_deref(), v) {
+        (Some("slider" | "toggle" | "keypad"), v) | (_, v @ (EventValue::Bool(_) | EventValue::String(_) | EventValue::Double(_))) => match v {
+            EventValue::Bool(b) => Value::Bool(b),
+            EventValue::Int(n) => Value::Int(n),
+            EventValue::Double(d) => Value::Double(d),
+            EventValue::String(s) => Value::String(s),
+        },
+        (_, EventValue::Int(i)) => param.option_values(ctx).get(i.max(0) as usize).cloned().unwrap_or(Value::Null),
+    }
 }
 
 /// A message with a single OK that dismisses it.
