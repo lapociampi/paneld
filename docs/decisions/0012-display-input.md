@@ -12,7 +12,7 @@ order: 19
 
 ## Context
 
-On the device there is no X or Wayland: the program draws straight to the screen and reads touch from the kernel ([Requirements](../requirements.md), section 13). The first target is a Raspberry Pi 4 on Raspberry Pi OS Lite with the KMS driver (`vc4-kms-v3d`) and a DSI touchscreen whose touch controller shows up as an input device. LVGL 9 ships drivers for DRM, fbdev, evdev and libinput. The binary should stay static (musl).
+On the device there is no X or Wayland: the program draws straight to the screen and reads touch from the kernel ([Requirements](../requirements.md), section 13). The first target is a Raspberry Pi 3B+ (first planned: a Pi 4, same drivers) on Raspberry Pi OS Lite with the KMS driver (`vc4-kms-v3d`) and a DSI touchscreen whose touch controller shows up as an input device. LVGL 9 ships drivers for DRM, fbdev, evdev and libinput. The binary should stay static (musl).
 
 ## Options
 

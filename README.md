@@ -4,7 +4,7 @@ A generic touch panel: "Grafana for actions". The program draws widgets, runs co
 
 ## Status
 
-Design done. No code yet. Next step: the first code.
+A working daemon lives in `crates/`: Rust + LVGL 9 workspace, SDL window on desktop and framebuffer on the Pi, config parser with 285 unit tests, sources (poll/once), actions (run / set / refresh / then / else) with argv-safe exec, widgets (label, button, toggle, slider, qr, bar, image placeholder), pages with `repeat` and `visible`, components, themes, hot reload and a `paneld ctl` Unix socket. Open gaps are alerts (ADR 0014), DRM output, and the full command runner (process group, env scrubbing, backoff) from ADR 0013.
 
 ## Design in short
 
@@ -34,4 +34,4 @@ For deployment set `SITE` (full URL) and, if it is served under a path, `BASE` (
 
 ## First target
 
-The touchscreen of a home server rack: Raspberry Pi 4 (arm64, 2GB RAM shared with other services), Waveshare 5" DSI touchscreen, 800x480, Raspberry Pi OS Lite with no desktop.
+The touchscreen of a home server rack: Raspberry Pi 3B+ (arm64, 1GB RAM shared with other services), Waveshare 5" DSI touchscreen, 800x480, Raspberry Pi OS Lite with no desktop. The binary draws through `/dev/fb0` today; a DRM/KMS output path lands when the aarch64 libdrm sysroot is in place.

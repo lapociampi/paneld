@@ -161,7 +161,7 @@ Sources are commands. Components and alerts bind to a source and optionally a fi
 ## 13. Runtime and platform
 
 - As light as possible: one native process ([ADR 0001](decisions/0001-single-process.md)), Rust + LVGL ([ADR 0002](decisions/0002-rust-lvgl.md)). Aim: a binary of a few MB, tens of MB of RAM, near zero CPU when idle.
-- First target: Raspberry Pi 4 (arm64, Raspberry Pi OS Lite, no desktop), 800x480 DSI touchscreen, ~2GB RAM shared with other services.
+- First target: Raspberry Pi 3B+ (arm64, Raspberry Pi OS Lite, no desktop), 800x480 DSI touchscreen, 1GB RAM shared with other services. The Pi 4 and 5 use the same drivers.
 - Builds for arm64, armv7 and x86_64 as static binaries, cross-compiled from a PC.
 - Draws directly on the screen (DRM/KMS or framebuffer), touch from the input devices; no X, Wayland or browser.
 - Starts at boot as a systemd service; recovers by itself after a crash.

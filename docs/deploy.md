@@ -7,7 +7,7 @@ series: paneld
 order: 7
 ---
 
-v1. The first target is a Raspberry Pi 4 (arm64) running Raspberry Pi OS Lite ([Requirements](requirements.md)), but the same build runs on any Linux board that has `/dev/dri/card*` (DRM/KMS) or `/dev/fb0` (fbdev) and a touchscreen on `/dev/input/event*`.
+v1. The first target is a Raspberry Pi 3B+ (arm64) running Raspberry Pi OS Lite ([Requirements](requirements.md)), but the same build runs on any Linux board that has `/dev/dri/card*` (DRM/KMS) or `/dev/fb0` (fbdev) and a touchscreen on `/dev/input/event*`.
 
 ## Build toolchain
 
@@ -62,6 +62,15 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now paneld
 ```
 
+## The text console
+
+Raspberry Pi OS Lite shows a login prompt (`getty@tty1`) and the kernel console on the screen. While paneld runs it owns the display, so neither is visible; when paneld exits, the kernel puts the console back. On a panel that has no keyboard that console is only noise, so the device setup:
+
+- disables the login prompt: `sudo systemctl disable --now getty@tty1` (log in over SSH; `systemctl start getty@tty1` brings it back for a local session);
+- adds `vt.global_cursor_default=0 logo.nologo quiet` to the kernel command line (`/boot/firmware/cmdline.txt` on the Pi, one line): no blinking cursor, no boot logo, fewer boot messages.
+
+While paneld restarts after a crash (`Restart=on-failure`, 5s) the screen is black, or shows the last kernel messages. paneld's unit does not touch the console itself: the setup belongs to the device, not to the program.
+
 ## Config block for the device
 
 ```
@@ -74,7 +83,7 @@ display {
 }
 ```
 
-Device paths vary: `card0` on some boards, `card1` on the Pi. The touch controller shows up under `/dev/input/`; `evtest` lists the available devices.
+Device paths vary: `card0` on the Pi 3B+ (one GPU device), `card1` on the Pi 4 and 5 (`card0` is the 3D-only V3D there). `ls /sys/class/drm/` shows which card has the connector (e.g. `card0-DSI-1`). The touch controller shows up under `/dev/input/`; `evtest` lists the available devices.
 
 ## Diagnostics
 

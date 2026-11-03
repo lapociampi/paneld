@@ -27,6 +27,11 @@ pkg-config = "0.3"
 # This crate is only ever consumed by `paneld-ui`; a separate rlib
 # keeps the generated FFI out of the paneld binary's symbol surface.
 name = "lvgl_sys"
+# Bindgen reproduces LVGL header comments on the generated items.
+# Rust parses triple-slash doc comments as doctests, which breaks on
+# the C examples embedded in those headers. Nothing in this crate is
+# hand-written documentation that needs testing.
+doctest = false
 
 # The crate exposes `unsafe` extern "C" declarations; the workspace
 # lint forbids `unsafe_code`, so this crate opts back in for its

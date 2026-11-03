@@ -33,4 +33,4 @@ Status: design done, no code yet.
 
 ## First target
 
-The touchscreen of a home server rack: Raspberry Pi 4 (arm64, 2GB RAM shared with other services), Waveshare 5" DSI touchscreen, 800x480, Raspberry Pi OS Lite with no desktop.
+The touchscreen of a home server rack: Raspberry Pi 3B+ (arm64, 1GB RAM shared with other services), Waveshare 5" DSI touchscreen, 800x480, Raspberry Pi OS Lite with no desktop.

@@ -46,5 +46,5 @@ A font value is `<family> <size> [bold]`:
 ## Consequences
 
 - One binary, five families, any size, for a fraction of the size the bitmaps would take.
-- TinyTTF renders each glyph once per size, then serves it from the cache; on a Pi 4 that is not noticeable.
+- TinyTTF renders each glyph once per size, then serves it from the cache; on a Pi 3B+ that is not noticeable.
 - Inter and Poppins, next in popularity, are not built in; a theme can ship them as TTF.
