@@ -415,6 +415,72 @@ fn builtin_actions_take_the_gates_of_an_override() {
 }
 
 #[test]
+fn a_resolved_alert_is_listed_under_resolved() {
+    let d = tmp("history");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var hot: bool = true\n\
+         alert hot { when = {{ vars.hot }}; severity = warning; title = Hot }\n\
+         action cool { set { hot = false }; goto = alerts }\n\
+         page home { button { label = cool; on_tap = cool } }\n",
+    )
+    .unwrap();
+    let warning = |p| close(p, [0xef, 0x6c, 0x00], 16);
+    // Banner opens the alerts page while it fires.
+    let firing = shot(&conf, &["--tap", "400,72", "--settle", "150"]);
+    assert!(firing.any(warning), "no firing alert");
+    // Cool down (the button sits under the banner); the action then
+    // opens the alerts page.
+    let resolved = shot(&conf, &["--tap", "40,125", "--settle", "200"]);
+    assert!(!resolved.any(warning), "alert still drawn as firing");
+    let text = |p: [u8; 3]| p[0] < 0x40 && p[1] < 0x40 && p[2] < 0x40;
+    // The `Resolved` list draws text below the empty-state line.
+    assert!((100..200).any(|y| (0..300).any(|x| text(resolved.px(x, y)))), "no resolved entry drawn");
+}
+
+#[test]
+fn chart_draws_each_series_in_its_color() {
+    let d = tmp("chart");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home { chart { width = 100%; height = 200\n\
+             series { values = {{ [1, 3, 2, 5] }}; color = #00ff00 }\n\
+             series { values = {{ [{'value': 4}, {'value': 1}] }}; color = #ff0000 } } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &[]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 40)), "no green series");
+    assert!(img.any(|p| close(p, [0xff, 0, 0], 40)), "no red series from {{value}} maps");
+    // The red one has 2 of 4 points: drawn against the right edge only.
+    let red_x: Vec<usize> = (0..img.w).filter(|&x| (60..270).any(|y| close(img.px(x, y), [0xff, 0, 0], 40))).collect();
+    assert!(red_x.first().is_some_and(|&x| x > img.w / 3), "red series starts at x {:?}", red_x.first());
+}
+
+#[test]
+fn image_reads_a_png_next_to_the_config_and_line_draws() {
+    let d = tmp("image");
+    // A PNG of our own: a shot of a magenta page.
+    let src = d.join("src.conf");
+    std::fs::write(&src, "page home { rect { width = 100%; height = 100%; background = #ff00ff } }\n").unwrap();
+    shot(&src, &["--size", "120x80"]);
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             image { src = src.png; width = 240; height = 160; fit = fill }\n\
+             line { points = {{ [[0, 0], [200, 30]] }}; thickness = 6; color = #00ff00; width = 210; height = 40 }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &[]);
+    let magenta = |p| close(p, [0xff, 0, 0xff], 40);
+    assert!((60..230).any(|y| (0..260).any(|x| magenta(img.px(x, y)))), "image not drawn");
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 40)), "line not drawn");
+}
+
+#[test]
 fn idle_screen_goes_black_and_the_waking_tap_does_nothing_else() {
     let d = tmp("sleep");
     let conf = d.join("p.conf");

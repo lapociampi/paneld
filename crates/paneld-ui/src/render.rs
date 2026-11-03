@@ -27,7 +27,7 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
 use crate::expr::{eval, Context, Value};
-use crate::ui::{ActionArg, FlexAlign, InlineSetItem, Obj, Size, Trigger, UiEvent, ValueWidget};
+use crate::ui::{ActionArg, FlexAlign, ImageFit, InlineSetItem, Obj, Size, Trigger, UiEvent, ValueWidget};
 
 /// Children of a component call plus the outer context they should
 /// resolve against. Threaded through [`render_node`] so a `slot { }`
@@ -328,6 +328,57 @@ fn render_node(
             if let Some(v) = resolve_num(node, "value", ctx) {
                 obj.set_arc_value(v as i32);
             }
+            apply_props(node, ctx, sink, &obj);
+        }
+        "line" => {
+            // `points`: a list of `[x, y]` pairs, in px.
+            let num = |v: &Value| match v {
+                Value::Int(n) => Some(*n as i32),
+                Value::Double(d) if d.is_finite() => Some(*d as i32),
+                _ => None,
+            };
+            let points: Vec<(i32, i32)> = match resolve_assign_value(node, "points", ctx) {
+                Some(Value::List(l)) => l
+                    .iter()
+                    .filter_map(|p| match p {
+                        Value::List(xy) if xy.len() == 2 => Some((num(&xy[0])?, num(&xy[1])?)),
+                        _ => None,
+                    })
+                    .take(1000)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let obj = parent.new_line(&points);
+            let width = resolve_num(node, "thickness", ctx).unwrap_or(2.0) as i32;
+            let rounded = resolve_assign_value(node, "rounded", ctx).is_some_and(|v| value_truthy(&v));
+            let color = resolve_text(node, "color", ctx).and_then(|c| parse_hex_color(&c)).or_else(|| match ctx.get("theme") {
+                Some(Value::Map(t)) => t.get("text").and_then(|c| parse_hex_color(&c.to_display_string())),
+                _ => None,
+            });
+            obj.set_line_style(width.clamp(1, 64), rounded, color);
+            apply_props(node, ctx, sink, &obj);
+        }
+        "image" => {
+            let fit = match find_simple(node, "fit").map(str::trim) {
+                Some("cover") => ImageFit::Cover,
+                Some("fill") => ImageFit::Fill,
+                Some("none") => ImageFit::None,
+                _ => ImageFit::Contain,
+            };
+            let src = resolve_text(node, "src", ctx).unwrap_or_default();
+            let src = src.trim();
+            if src.is_empty() {
+                return;
+            }
+            let Some(obj) = parent.new_image(src, fit) else { return };
+            if let Some(rgb) = resolve_text(node, "recolor", ctx).and_then(|c| parse_hex_color(&c)) {
+                obj.set_image_recolor(rgb);
+            }
+            apply_props(node, ctx, sink, &obj);
+        }
+        "chart" => {
+            let obj = parent.new_chart();
+            render_chart(node, ctx, &obj);
             apply_props(node, ctx, sink, &obj);
         }
         "spinner" => {
@@ -918,6 +969,81 @@ fn find_simple<'a>(node: &'a Block, key: &str) -> Option<&'a str> {
 
 /// Resolve `key = <raw>` in `node` through [`resolve_expr_value`],
 /// using the real value span so a CEL error points at the right place.
+/// Chart values are integers in LVGL: keep two decimals.
+const CHART_SCALE: f64 = 100.0;
+
+/// Schema 7 `chart`: `type`, `min`, `max`, `points`, `divisions`, and
+/// one `series { values; color }` per line or bar set. `values` is a
+/// list of numbers, or of `{value}` maps such as a source's
+/// `history`. With fewer values than `points` the series is drawn
+/// against the right edge, newest last; with more, the newest
+/// `points` are shown. `min` / `max` default to the data's range.
+fn render_chart(node: &Block, ctx: &Context, obj: &Obj<'_>) {
+    let number = |v: &Value| match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Double(d) if d.is_finite() => Some(*d),
+        Value::Map(m) => match m.get("value") {
+            Some(Value::Int(n)) => Some(*n as f64),
+            Some(Value::Double(d)) if d.is_finite() => Some(*d),
+            _ => None,
+        },
+        _ => None,
+    };
+    let accent = match ctx.get("theme") {
+        Some(Value::Map(t)) => t.get("accent").and_then(|c| parse_hex_color(&c.to_display_string())),
+        _ => None,
+    }
+    .unwrap_or(0x2196f3);
+    let series: Vec<(Vec<Option<f64>>, u32)> = node
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Block(b) if b.kind.text == "series" => Some(b),
+            _ => None,
+        })
+        .map(|b| {
+            let values = match resolve_assign_value(b, "values", ctx) {
+                Some(Value::List(l)) => l.iter().map(number).collect(),
+                _ => Vec::new(),
+            };
+            let color = resolve_text(b, "color", ctx).and_then(|c| parse_hex_color(&c)).unwrap_or(accent);
+            (values, color)
+        })
+        .collect();
+    let longest = series.iter().map(|(v, _)| v.len()).max().unwrap_or(0);
+    let points = resolve_num(node, "points", ctx)
+        .map(|p| p.max(1.0) as usize)
+        .unwrap_or(longest.max(2))
+        .min(1000);
+    let shown = |v: &[Option<f64>]| v[v.len().saturating_sub(points)..].to_vec();
+    let all: Vec<f64> = series.iter().flat_map(|(v, _)| shown(v)).flatten().collect();
+    let lo = all.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = all.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let (mut min, mut max) = if lo.is_finite() { (lo, hi) } else { (0.0, 100.0) };
+    if (max - min).abs() < f64::EPSILON {
+        // A flat line in the middle rather than on an edge.
+        min -= 1.0;
+        max += 1.0;
+    }
+    let min = resolve_num(node, "min", ctx).unwrap_or(min);
+    let max = resolve_num(node, "max", ctx).unwrap_or(max);
+    let (hdiv, vdiv) = find_simple(node, "divisions")
+        .and_then(|d| {
+            let mut it = d.split_whitespace().map(|n| n.parse::<u32>().ok());
+            Some((it.next()??, it.next()??))
+        })
+        .unwrap_or((3, 0));
+    let scaled = |x: f64| (x * CHART_SCALE).round().clamp(i32::MIN as f64 + 1.0, i32::MAX as f64 - 1.0) as i32;
+    let bars = find_simple(node, "type").map(str::trim) == Some("bar");
+    obj.chart_setup(bars, points as u32, scaled(min), scaled(max), hdiv.min(20), vdiv.min(20));
+    for (values, color) in &series {
+        let tail = shown(values);
+        let mut padded: Vec<Option<i32>> = vec![None; points - tail.len()];
+        padded.extend(tail.iter().map(|v| v.map(scaled)));
+        obj.chart_add_series(*color, &padded);
+    }
+}
+
 fn resolve_assign_value(node: &Block, key: &str, ctx: &Context) -> Option<Value> {
     for item in &node.items {
         let Item::Assign(a) = item else { continue };

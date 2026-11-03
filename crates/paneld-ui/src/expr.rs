@@ -13,7 +13,7 @@
 //! - Unary `-` and `!`.
 //! - Ternary `a ? b : c`.
 //! - A handful of builtin functions: `string`, `int`, `number`,
-//!   `round`, `len`, `has`.
+//!   `round`, `len`, `has`, `ago`.
 //!
 //! - Map literals with string keys.
 //!
@@ -379,6 +379,18 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
                 type_name(&other)
             ))),
         },
+        // Schema 16: `ago(t)`, Unix seconds as "5m ago" for display.
+        "ago" if argc == 1 => {
+            let t = match eval(&args[0], ctx)? {
+                Value::Int(n) => n,
+                Value::Double(d) => d as i64,
+                other => return Err(EvalError::new(format!("ago({}) is not supported", type_name(&other)))),
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            Ok(Value::String(ago_text(now.saturating_sub(t))))
+        }
         "has" if argc == 1 => {
             // `has(a.b)` in CEL tests field presence without erroring
             // on absence. Our Field eval returns Err on missing, so
@@ -391,6 +403,17 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
         _ => Err(EvalError::new(format!(
             "unknown function `{name}` with {argc} args"
         ))),
+    }
+}
+
+/// `secs` ago in the largest whole unit: `just now`, `5m ago`,
+/// `3h ago`, `2d ago`.
+fn ago_text(secs: i64) -> String {
+    match secs {
+        s if s < 60 => "just now".to_string(),
+        s if s < 3_600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3_600),
+        s => format!("{}d ago", s / 86_400),
     }
 }
 
@@ -412,6 +435,15 @@ mod tests {
     use paneld_config::cel;
     use paneld_config::source::{FileId, SourceMap};
     use std::path::PathBuf;
+
+    #[test]
+    fn ago_picks_the_largest_unit() {
+        assert_eq!(ago_text(-5), "just now");
+        assert_eq!(ago_text(59), "just now");
+        assert_eq!(ago_text(61), "1m ago");
+        assert_eq!(ago_text(3 * 3_600 + 5), "3h ago");
+        assert_eq!(ago_text(2 * 86_400), "2d ago");
+    }
 
     fn fid() -> FileId {
         let mut map = SourceMap::new();

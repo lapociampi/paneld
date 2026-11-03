@@ -134,4 +134,15 @@
 
 #define LV_USE_EVDEV            1
 
+/* `image` (schema 7): files through POSIX calls under the drive
+ * letter `A:` (the path after it is a normal absolute path), PNG
+ * through the bundled lodepng. Decoded images are cached, at most
+ * 1 MiB, so a redraw does not decode them again. */
+#define LV_USE_FS_POSIX         1
+#define LV_FS_POSIX_LETTER      'A'
+#define LV_FS_POSIX_PATH        ""
+#define LV_FS_POSIX_CACHE_SIZE  0
+#define LV_USE_LODEPNG          1
+#define LV_CACHE_DEF_SIZE       (1024 * 1024)
+
 #endif /*LV_CONF_H*/

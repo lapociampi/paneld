@@ -11,6 +11,7 @@ mod actions;
 mod alerts;
 mod ctl;
 mod display;
+mod history;
 mod pin;
 mod png;
 mod reminders;
@@ -509,10 +510,12 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // the render-side ctx.
     while let Ok(update) = live.source_rx.try_recv() {
         let event_value = update.value.clone();
+        let mut value = update.value;
+        live.histories.record(&update.name, &mut value, std::time::SystemTime::now());
         live.source_values
             .lock()
             .unwrap()
-            .insert(update.name.clone(), update.value);
+            .insert(update.name.clone(), value);
         let event_ctx = build_ctx(
             &live.source_values,
             &live.theme,
@@ -548,7 +551,10 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // Keep the state file (ADR 0014) in sync. `note` is cheap:
     // it only flags a pending write when the set actually
     // changed. `flush_if_due` writes at most once per 10s.
-    live.state.note(live.alerts.active_alerts(), live.reminders.dates());
+    if live.alerts.note_resolved(now_wall) {
+        dirty = true;
+    }
+    live.state.note(live.alerts.active_alerts(), live.reminders.dates(), live.alerts.history());
     live.state.flush_if_due(now_instant);
 
     if live.toast_until.is_some_and(|t| std::time::Instant::now() >= t) {
@@ -615,6 +621,8 @@ struct LiveState {
     /// so nothing carries across one.)
     rendered_page: String,
     alerts: alerts::Engine,
+    /// Past source values (schema 4, `history`).
+    histories: history::Histories,
     /// Schema 10; due reminders are alerts in `alerts`.
     reminders: reminders::Book,
     state: state::Store,
@@ -705,6 +713,7 @@ fn setup_live_state(
     // directory by default, so `run = ./scripts/x.sh` works. A
     // per-source / per-action `cwd` overrides on top.
     let config_dir = config_dir_of(config);
+    paneld_ui::set_asset_dir(&config_dir);
     let mut doc = match load_checked(config) {
         Ok(doc) => doc,
         Err(issues) => {
@@ -749,6 +758,7 @@ fn setup_live_state(
     let command_ctx = with_secrets(base_ctx.clone(), &secret_values);
     let (source_tx, source_rx) =
         std::sync::mpsc::channel::<sources::SourceUpdate>();
+    let mut histories = history::Histories::from_doc(&doc);
     match previous_sources {
         // A reload: show the values we have and refresh them behind
         // the screen, so a slow source does not freeze the UI.
@@ -765,8 +775,12 @@ fn setup_live_state(
             );
         }
         None => {
-            *source_values.lock().unwrap() =
-                sources::resolve_all(&doc, &command_ctx, &config_dir, app_defaults);
+            let mut values = sources::resolve_all(&doc, &command_ctx, &config_dir, app_defaults);
+            let now = std::time::SystemTime::now();
+            for (name, v) in values.iter_mut() {
+                histories.record(name, v, now);
+            }
+            *source_values.lock().unwrap() = values;
         }
     }
     let sources_shutdown = sources::spawn_pollers(
@@ -851,6 +865,8 @@ fn setup_live_state(
     );
     reminder_book.tick(&mut alerts_engine, &ctx_no_alerts, std::time::SystemTime::now());
     alerts_engine.forget_unfired();
+    alerts_engine.restore_history(state_store.snapshot().history.clone());
+    alerts_engine.note_resolved_while_down(&state_store.snapshot().alerts, std::time::SystemTime::now());
     let ctx = build_ctx(
         &source_values,
         &theme,
@@ -878,6 +894,7 @@ fn setup_live_state(
         rendered_page: current_page.clone(),
         current_page,
         alerts: alerts_engine,
+        histories,
         reminders: reminder_book,
         state: state_store,
         sources_shutdown,
@@ -1450,6 +1467,7 @@ fn reload(
             // which reports to the old event queue: keep reading that
             // queue for them, so a run is not started twice meanwhile
             // and its toast still shows.
+            fresh.histories.carry_from(&mut live.histories);
             fresh.running = std::mem::take(&mut live.running);
             fresh.stale_events = std::mem::take(&mut live.stale_events);
             if !fresh.running.is_empty() {

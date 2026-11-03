@@ -7,8 +7,8 @@
 //! changed. A corrupt file is quarantined as `state.bad` and the
 //! engine starts fresh.
 //!
-//! Scope today: `alerts { ... }`. The schema's `history` list and
-//! `reminders` dict land in later phases.
+//! Holds the active alerts, the resolved ones (`history`, pruned by
+//! the engine to `alerts:history`) and reminder dates.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,7 +17,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::alerts::Alert;
+use crate::alerts::{Alert, Resolved};
 
 const VERSION: u32 = 1;
 const WRITE_INTERVAL: Duration = Duration::from_secs(10);
@@ -69,6 +69,8 @@ pub struct SavedReminder {
 pub struct StateData {
     pub alerts: BTreeMap<String, SavedAlert>,
     pub reminders: BTreeMap<String, SavedReminder>,
+    /// Oldest first.
+    pub history: Vec<Resolved>,
 }
 
 /// Rate-limited state file writer. Owns the state path, remembers
@@ -148,6 +150,7 @@ impl Store {
         &mut self,
         alerts: &BTreeMap<String, Alert>,
         reminders: &BTreeMap<String, SavedReminder>,
+        history: &[Resolved],
     ) {
         let snapshot = StateData {
             alerts: alerts
@@ -155,6 +158,7 @@ impl Store {
                 .map(|(k, v)| (k.clone(), SavedAlert::from_alert(v)))
                 .collect(),
             reminders: reminders.clone(),
+            history: history.to_vec(),
         };
         if snapshot != self.on_disk {
             self.pending = Some(snapshot);
@@ -294,7 +298,25 @@ fn render(data: &StateData) -> String {
     if !data.reminders.is_empty() {
         out.push_str("\n  ");
     }
-    out.push_str("}\n}\n");
+    out.push_str("},\n  \"history\": [");
+    for (i, r) in data.history.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "\n    {{ \"id\": {}, \"severity\": {}, \"title\": {}, \"text\": {}, \"since\": {}, \"ended\": {} }}",
+            json_string(&r.id),
+            json_string(&r.severity),
+            json_string(&r.title),
+            json_string(&r.text),
+            r.since,
+            r.ended
+        ));
+    }
+    if !data.history.is_empty() {
+        out.push_str("\n  ");
+    }
+    out.push_str("]\n}\n");
     out
 }
 
@@ -339,6 +361,7 @@ fn parse(src: &str) -> Result<StateData, ParseError> {
     let mut version: Option<u64> = None;
     let mut alerts: Option<BTreeMap<String, SavedAlert>> = None;
     let mut reminders: BTreeMap<String, SavedReminder> = BTreeMap::new();
+    let mut history: Vec<Resolved> = Vec::new();
     loop {
         p.skip_ws();
         if p.peek() == Some(b'}') {
@@ -352,6 +375,7 @@ fn parse(src: &str) -> Result<StateData, ParseError> {
             "version" => version = Some(p.unsigned()?),
             "alerts" => alerts = Some(parse_alerts_map(&mut p)?),
             "reminders" => reminders = parse_reminders_map(&mut p)?,
+            "history" => history = parse_history(&mut p)?,
             _ => p.skip_value()?,
         }
         p.skip_ws();
@@ -365,7 +389,57 @@ fn parse(src: &str) -> Result<StateData, ParseError> {
             "unsupported state file version {version}"
         )));
     }
-    Ok(StateData { alerts: alerts.unwrap_or_default(), reminders })
+    Ok(StateData { alerts: alerts.unwrap_or_default(), reminders, history })
+}
+
+fn parse_history(p: &mut Parser) -> Result<Vec<Resolved>, ParseError> {
+    p.expect(b'[')?;
+    let mut out = Vec::new();
+    loop {
+        p.skip_ws();
+        if p.peek() == Some(b']') {
+            p.i += 1;
+            return Ok(out);
+        }
+        p.expect(b'{')?;
+        let mut r = Resolved {
+            id: String::new(),
+            severity: String::new(),
+            title: String::new(),
+            text: String::new(),
+            since: 0,
+            ended: 0,
+        };
+        loop {
+            p.skip_ws();
+            if p.peek() == Some(b'}') {
+                p.i += 1;
+                break;
+            }
+            let key = p.string()?;
+            p.skip_ws();
+            p.expect(b':')?;
+            p.skip_ws();
+            match key.as_str() {
+                "id" => r.id = p.string()?,
+                "severity" => r.severity = p.string()?,
+                "title" => r.title = p.string()?,
+                "text" => r.text = p.string()?,
+                "since" => r.since = p.unsigned()?,
+                "ended" => r.ended = p.unsigned()?,
+                _ => p.skip_value()?,
+            }
+            p.skip_ws();
+            if p.peek() == Some(b',') {
+                p.i += 1;
+            }
+        }
+        out.push(r);
+        p.skip_ws();
+        if p.peek() == Some(b',') {
+            p.i += 1;
+        }
+    }
 }
 
 fn parse_reminders_map(p: &mut Parser) -> Result<BTreeMap<String, SavedReminder>, ParseError> {
@@ -728,7 +802,7 @@ mod tests {
     use super::*;
 
     fn data(alerts: BTreeMap<String, SavedAlert>) -> StateData {
-        StateData { alerts, reminders: BTreeMap::new() }
+        StateData { alerts, reminders: BTreeMap::new(), history: Vec::new() }
     }
 
     #[test]
@@ -736,6 +810,16 @@ mod tests {
         let mut d = StateData::default();
         d.reminders.insert("a".into(), SavedReminder { first_seen: 100, done: None });
         d.reminders.insert("b \"x\"".into(), SavedReminder { first_seen: 1, done: Some(2) });
+        assert_eq!(parse(&render(&d)).expect("parse"), d);
+        let r = |id: &str| Resolved {
+            id: id.into(),
+            severity: "warning".into(),
+            title: "T \"q\" \u{e9}".into(),
+            text: String::new(),
+            since: 5,
+            ended: 9,
+        };
+        d.history = vec![r("a:a"), r("b:b")];
         assert_eq!(parse(&render(&d)).expect("parse"), d);
     }
 
@@ -852,21 +936,21 @@ mod tests {
 
         let mut set = BTreeMap::new();
         set.insert("a".into(), sample_alert());
-        store.note(&set, &BTreeMap::new());
+        store.note(&set, &BTreeMap::new(), &[]);
 
         // First flush: eligible (last_write was pushed back).
         assert!(store.flush_if_due(Instant::now()));
         assert!(path.exists());
 
         // Note the same set again: no diff, no pending, so no write.
-        store.note(&set, &BTreeMap::new());
+        store.note(&set, &BTreeMap::new(), &[]);
         assert!(!store.flush_if_due(Instant::now()));
 
         // Change the set but try to flush immediately: suppressed by
         // the 10s interval.
         let mut set2 = set.clone();
         set2.get_mut("a").unwrap().text = "new".into();
-        store.note(&set2, &BTreeMap::new());
+        store.note(&set2, &BTreeMap::new(), &[]);
         assert!(!store.flush_if_due(Instant::now()));
 
         // force_flush bypasses the interval.
@@ -877,7 +961,7 @@ mod tests {
         // A reminder date change is a change too.
         let mut r = BTreeMap::new();
         r.insert("restore".to_string(), SavedReminder { first_seen: 5, done: Some(9) });
-        store.note(&set2, &r);
+        store.note(&set2, &r, &[]);
         assert!(store.force_flush());
         let on_disk = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(on_disk.reminders, r);
@@ -903,7 +987,7 @@ mod tests {
 
         let mut set = BTreeMap::new();
         set.insert("a".into(), sample_alert());
-        store.note(&set, &BTreeMap::new());
+        store.note(&set, &BTreeMap::new(), &[]);
 
         let t0 = Instant::now();
         assert!(!store.flush_if_due(t0), "write should fail");

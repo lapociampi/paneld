@@ -267,12 +267,12 @@ The theme's `shell` component wraps every page: header, navigation, alert banner
 | --- | --- |
 | `text` | `value` (string, expr), `align` (`left`, `center`, `right`), `overflow` (`wrap`, `clip`, `dots`, `scroll`) |
 | `icon` | `name` (theme icon or built-in symbol, expr), `size` |
-| `image` | `src` (path, expr), `fit` (`contain`, `cover`, `fill`, `none`), `recolor` (color) |
+| `image` | `src` (path to a PNG, expr; relative to the config folder), `fit` (`contain`, `cover`, `fill`, `none`), `recolor` (color) |
 | `rect` | none beyond the common ones: a shape |
 | `arc` | `value`, `min` = 0, `max` = 100 (expr), `start` = 135, `end` = 45 (degrees), `thickness`, `track` (color), `rounded` (bool) |
 | `bar` | `value`, `min`, `max` (expr), `direction` (`horizontal`, `vertical`), `track` (color) |
-| `line` | `points` (list of `[x, y]`, expr), `thickness`, `rounded` |
-| `chart` | `type` (`line`, `bar`, `area`), `min`, `max`, `points` (count), `divisions` (`<h> <v>`), `series { values = {{ }}; color = ... }` repeatable |
+| `line` | `points` (list of `[x, y]` in px, expr), `thickness` (default 2), `rounded`, `color` (default the theme's `text`) |
+| `chart` | `type` (`line`, `bar`; `area` draws as `line` for now), `min`, `max` (default: the data's range), `points` (count, default: the longest series), `divisions` (`<h> <v>`, default `3 0`), `series { values = {{ }}; color = ... }` repeatable. `values` is a list of numbers or of `{value}` maps, such as a source's `history`; the newest `points` are shown, against the right edge |
 | `qr` | `data` (string, expr), `size` |
 | `spinner` | `size` |
 
@@ -328,9 +328,9 @@ alert pi_hot {
 
 `alerts { }` category: `history = 30d`, `snooze = [1d, 1w]`, `source_down = 2m` (after this long a failing source used by an alert raises `source_down:<name>`, [ADR 0013](decisions/0013-command-runner.md)).
 
-In expressions, `alerts`: `active` (list, worst first), `count`, `worst` (severity), `shown` (active and neither acknowledged nor snoozed: what the banner shows), `snooze` (the `alerts:snooze` choices), each alert with `id`, `rule`, `severity`, `title`, `text`, `link`, `since` and `snoozed_until` (Unix seconds), `acked`, `snoozed`. `ctl alert fire|resolve` creates the same alerts.
+In expressions, `alerts`: `active` (list, worst first), `count`, `worst` (severity), `shown` (active and neither acknowledged nor snoozed: what the banner shows), `snooze` (the `alerts:snooze` choices), `history` (resolved alerts, newest first, kept for `alerts:history`, default 30d, at most 200; each with `id`, `severity`, `title`, `text`, `since`, `ended`), `recent` (the newest 10 of `history`), each alert with `id`, `rule`, `severity`, `title`, `text`, `link`, `since` and `snoozed_until` (Unix seconds), `acked`, `snoozed`. `ctl alert fire|resolve` creates the same alerts.
 
-Acknowledge and snooze are the built-in actions `alert_ack { id }` and `alert_snooze { id; for }` ([ADR 0016](decisions/0016-builtin-alert-actions.md)). The shipped page `alerts` lists every alert with both buttons; the shell's banner and alert count open it.
+Acknowledge and snooze are the built-in actions `alert_ack { id }` and `alert_snooze { id; for }` ([ADR 0016](decisions/0016-builtin-alert-actions.md)). The shipped page `alerts` lists every alert with both buttons, then the `recent` resolved ones; the shell's banner and alert count open it.
 
 ## 10. Reminders
 

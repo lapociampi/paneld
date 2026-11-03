@@ -406,6 +406,27 @@ thread_local! {
     /// [`Obj::clear_children`] on the screen.
     static LAYOUT_MEM: std::cell::RefCell<Vec<Box<[i32]>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Point arrays of the current render's `line`s; same lifetime.
+    static LINE_MEM: std::cell::RefCell<Vec<Box<[sys::lv_point_precise_t]>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Folder relative `image` paths are read from (the config's).
+    static ASSET_DIR: std::cell::RefCell<std::path::PathBuf> =
+        std::cell::RefCell::new(std::path::PathBuf::from("."));
+}
+
+/// Folder that a relative `image { src }` is read from: the config
+/// file's, like commands' working directory (ADR 0013).
+pub fn set_asset_dir(dir: &std::path::Path) {
+    ASSET_DIR.with(|d| *d.borrow_mut() = dir.to_path_buf());
+}
+
+/// How an image fills its box (schema 7 `fit`).
+#[derive(Clone, Copy, Debug)]
+pub enum ImageFit {
+    Contain,
+    Cover,
+    Fill,
+    None,
 }
 
 /// Sentinel ending a grid dsc array; matches `LV_GRID_TEMPLATE_LAST`.
@@ -791,6 +812,106 @@ impl<'ui> Obj<'ui> {
         let raw = unsafe { sys::lv_bar_create(self.raw) };
         assert!(!raw.is_null());
         Obj { raw, _ui: PhantomData }
+    }
+
+    /// A chart (`lv_chart`); set it up with [`Obj::chart_setup`] and
+    /// [`Obj::chart_add_series`].
+    pub fn new_chart(&self) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_chart_create(self.raw) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// Kind, point count, value range of the primary y axis, and the
+    /// number of horizontal / vertical division lines.
+    pub fn chart_setup(&self, bars: bool, points: u32, min: i32, max: i32, hdiv: u32, vdiv: u32) {
+        let ty = if bars {
+            sys::lv_chart_type_t_LV_CHART_TYPE_BAR
+        } else {
+            sys::lv_chart_type_t_LV_CHART_TYPE_LINE
+        };
+        unsafe {
+            sys::lv_chart_set_type(self.raw, ty);
+            sys::lv_chart_set_point_count(self.raw, points.max(1));
+            sys::lv_chart_set_axis_range(self.raw, sys::lv_chart_axis_t_LV_CHART_AXIS_PRIMARY_Y, min, max);
+            sys::lv_chart_set_div_line_count(self.raw, hdiv, vdiv);
+        }
+    }
+
+    /// Add a series in `rgb`. `None` values are gaps. The chart owns
+    /// the series and copies the values.
+    pub fn chart_add_series(&self, rgb: u32, values: &[Option<i32>]) {
+        let points: Vec<i32> = values.iter().map(|v| v.unwrap_or(sys::LV_CHART_POINT_NONE as i32)).collect();
+        unsafe {
+            let ser = sys::lv_chart_add_series(
+                self.raw,
+                sys::lv_color_hex(rgb),
+                sys::lv_chart_axis_t_LV_CHART_AXIS_PRIMARY_Y,
+            );
+            if ser.is_null() {
+                return;
+            }
+            sys::lv_chart_set_all_values(self.raw, ser, sys::LV_CHART_POINT_NONE as i32);
+            sys::lv_chart_set_series_values(self.raw, ser, points.as_ptr(), points.len());
+            sys::lv_chart_refresh(self.raw);
+        }
+    }
+
+    /// A polyline through `points` (px, relative to the object).
+    pub fn new_line(&self, points: &[(i32, i32)]) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_line_create(self.raw) };
+        assert!(!raw.is_null());
+        let pts: Box<[sys::lv_point_precise_t]> =
+            points.iter().map(|&(x, y)| sys::lv_point_precise_t { x, y }).collect();
+        let (ptr, len) = (pts.as_ptr(), pts.len() as u32);
+        // LVGL keeps the pointer: the array lives until the screen is
+        // cleared, like the grid tracks.
+        LINE_MEM.with(|m| m.borrow_mut().push(pts));
+        unsafe { sys::lv_line_set_points(raw, ptr, len) };
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// Line width and rounded ends of a `line`, in `rgb`.
+    pub fn set_line_style(&self, width: i32, rounded: bool, rgb: Option<u32>) {
+        unsafe {
+            sys::lv_obj_set_style_line_width(self.raw, width, 0);
+            sys::lv_obj_set_style_line_rounded(self.raw, rounded, 0);
+            if let Some(rgb) = rgb {
+                sys::lv_obj_set_style_line_color(self.raw, sys::lv_color_hex(rgb), 0);
+            }
+        }
+    }
+
+    /// An image read from `path` (PNG); relative to the asset folder
+    /// (see [`set_asset_dir`]). Returns `None` for a path LVGL cannot
+    /// take (an interior NUL).
+    pub fn new_image(&self, path: &str, fit: ImageFit) -> Option<Obj<'ui>> {
+        let full = ASSET_DIR.with(|d| d.borrow().join(path));
+        // `A:` is the POSIX file driver (lv_conf.h); the rest is the
+        // path as is.
+        let src = CString::new(format!("A:{}", full.display())).ok()?;
+        let raw = unsafe { sys::lv_image_create(self.raw) };
+        assert!(!raw.is_null());
+        let align = match fit {
+            ImageFit::Contain => sys::lv_image_align_t_LV_IMAGE_ALIGN_CONTAIN,
+            ImageFit::Cover => sys::lv_image_align_t_LV_IMAGE_ALIGN_COVER,
+            ImageFit::Fill => sys::lv_image_align_t_LV_IMAGE_ALIGN_STRETCH,
+            ImageFit::None => sys::lv_image_align_t_LV_IMAGE_ALIGN_CENTER,
+        };
+        unsafe {
+            // LVGL copies a file path.
+            sys::lv_image_set_src(raw, src.as_ptr().cast());
+            sys::lv_image_set_inner_align(raw, align);
+        }
+        Some(Obj { raw, _ui: PhantomData })
+    }
+
+    /// Tint an image with `rgb` (icons drawn in one color).
+    pub fn set_image_recolor(&self, rgb: u32) {
+        unsafe {
+            sys::lv_obj_set_style_image_recolor(self.raw, sys::lv_color_hex(rgb), 0);
+            sys::lv_obj_set_style_image_recolor_opa(self.raw, 255, 0);
+        }
     }
 
     /// A circular arc gauge (dial).
@@ -1196,6 +1317,7 @@ impl<'ui> Obj<'ui> {
         // point at the track arrays.
         if self.raw == unsafe { sys::lv_screen_active() } {
             LAYOUT_MEM.with(|m| m.borrow_mut().clear());
+            LINE_MEM.with(|m| m.borrow_mut().clear());
         }
     }
 

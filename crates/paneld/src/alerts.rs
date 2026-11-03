@@ -209,7 +209,28 @@ pub struct Engine {
     /// too long.
     source_last: BTreeMap<String, Instant>,
     source_down_after: Duration,
+    /// Resolved alerts, oldest first; see [`Engine::note_resolved`].
+    history: Vec<Resolved>,
+    history_keep: Duration,
+    /// The active set at the last [`Engine::note_resolved`].
+    last_active: BTreeMap<String, Alert>,
 }
+
+/// An alert that is no longer active, for `alerts.history` and the
+/// state file (ADR 0014). Times are Unix seconds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Resolved {
+    pub id: String,
+    pub severity: String,
+    pub title: String,
+    pub text: String,
+    pub since: u64,
+    pub ended: u64,
+}
+
+/// Most entries kept, whatever `alerts:history` says: the list is in
+/// memory and written to the SD card.
+const MAX_HISTORY: usize = 200;
 
 impl Engine {
     pub fn new(doc: &Document) -> Self {
@@ -233,6 +254,9 @@ impl Engine {
             snooze: parse_snooze(doc),
             source_last,
             source_down_after: parse_source_down(doc),
+            history: Vec::new(),
+            history_keep: parse_history_keep(doc),
+            last_active: BTreeMap::new(),
         }
     }
 
@@ -242,6 +266,67 @@ impl Engine {
     /// current one.
     pub fn restore(&mut self, saved: BTreeMap<String, Carry>) {
         self.restored = saved;
+    }
+
+    /// History from the state file (oldest first).
+    pub fn restore_history(&mut self, h: Vec<Resolved>) {
+        self.history = h;
+    }
+
+    pub fn history(&self) -> &[Resolved] {
+        &self.history
+    }
+
+    /// Record every alert that left the active set since the last
+    /// call as resolved at `wall`, and prune the history to
+    /// `alerts:history` and [`MAX_HISTORY`]. Returns true if the
+    /// history changed.
+    pub fn note_resolved(&mut self, wall: SystemTime) -> bool {
+        let now = unix_secs(wall).max(0) as u64;
+        let before = self.history.len();
+        let mut changed = false;
+        for (k, a) in &self.last_active {
+            if !self.active.contains_key(k) {
+                self.history.push(Resolved {
+                    id: k.clone(),
+                    severity: a.severity.clone(),
+                    title: a.title.clone(),
+                    text: a.text.clone(),
+                    since: unix_secs(a.since).max(0) as u64,
+                    ended: now,
+                });
+                changed = true;
+            }
+        }
+        self.last_active.clone_from(&self.active);
+        let oldest = now.saturating_sub(self.history_keep.as_secs());
+        self.history.retain(|r| r.ended >= oldest);
+        if self.history.len() > MAX_HISTORY {
+            self.history.drain(..self.history.len() - MAX_HISTORY);
+        }
+        changed || self.history.len() != before
+    }
+
+    /// At startup: alerts in the state file that are neither active
+    /// nor waiting for their next event resolved while the daemon was
+    /// down; record them as ended at `wall`. Call after
+    /// [`Engine::forget_unfired`].
+    pub fn note_resolved_while_down(&mut self, saved: &BTreeMap<String, crate::state::SavedAlert>, wall: SystemTime) {
+        let now = unix_secs(wall).max(0) as u64;
+        for (id, a) in saved {
+            if !self.active.contains_key(id) && !self.restored.contains_key(id) {
+                self.history.push(Resolved {
+                    id: id.clone(),
+                    severity: a.severity.clone(),
+                    title: a.title.clone(),
+                    text: a.text.clone(),
+                    since: a.since,
+                    ended: now,
+                });
+            }
+        }
+        self.last_active = self.active.clone();
+        self.note_resolved(wall);
     }
 
     /// Call once after the first tick of a (re)start. A condition
@@ -600,6 +685,26 @@ impl Engine {
         m.insert("worst".into(), Value::String(worst));
         m.insert("active".into(), Value::List(active));
         m.insert("shown".into(), Value::List(shown));
+        // Newest first, like `active` is worst first.
+        let history: Vec<Value> = self
+            .history
+            .iter()
+            .rev()
+            .map(|r| {
+                let mut h = BTreeMap::new();
+                h.insert("id".into(), Value::String(r.id.clone()));
+                h.insert("severity".into(), Value::String(r.severity.clone()));
+                h.insert("title".into(), Value::String(r.title.clone()));
+                h.insert("text".into(), Value::String(r.text.clone()));
+                h.insert("since".into(), Value::Int(r.since as i64));
+                h.insert("ended".into(), Value::Int(r.ended as i64));
+                Value::Map(h)
+            })
+            .collect();
+        let recent: Vec<Value> = history.iter().take(10).cloned().collect();
+        m.insert("history".into(), Value::List(history));
+        // The newest 10, for a list on a page.
+        m.insert("recent".into(), Value::List(recent));
         m.insert(
             "snooze".into(),
             Value::List(self.snooze.iter().map(|(t, _)| Value::String(t.clone())).collect()),
@@ -747,34 +852,47 @@ fn collect(doc: &Document) -> Vec<AlertRule> {
     out
 }
 
-/// Parse `alerts:source_down` out of the config, falling back to
-/// ADR 0013's default of 2 minutes. Accepts both the `category:key`
-/// qualified form and the `alerts { source_down = ... }` block form.
-fn parse_source_down(doc: &Document) -> Duration {
-    let default = Duration::from_secs(120);
+/// The last `alerts:<key>` or `alerts { <key> = ... }` in `doc`
+/// (options: last one wins).
+fn alerts_setting(doc: &Document, wanted: &str) -> Option<String> {
+    let mut out = None;
     for item in &doc.items {
-        if let Item::Assign(a) = item {
-            if let AssignTarget::Qualified { category, key } = &a.target {
-                if category.text == "alerts" && key.text == "source_down" {
-                    return parse_duration(&a.value.text).unwrap_or(default);
+        match item {
+            Item::Assign(a) => {
+                if let AssignTarget::Qualified { category, key } = &a.target {
+                    if category.text == "alerts" && key.text == wanted {
+                        out = Some(a.value.text.clone());
+                    }
                 }
             }
-        }
-        if let Item::Block(b) = item {
-            if b.kind.text == "alerts" {
+            Item::Block(b) if b.kind.text == "alerts" && b.name.is_none() => {
                 for inner in &b.items {
                     if let Item::Assign(a) = inner {
-                        if let AssignTarget::Simple { key } = &a.target {
-                            if key.text == "source_down" {
-                                return parse_duration(&a.value.text).unwrap_or(default);
-                            }
+                        if matches!(&a.target, AssignTarget::Simple { key } if key.text == wanted) {
+                            out = Some(a.value.text.clone());
                         }
                     }
                 }
             }
+            _ => {}
         }
     }
-    default
+    out
+}
+
+/// `alerts:source_down`, default 2 minutes (ADR 0013).
+fn parse_source_down(doc: &Document) -> Duration {
+    alerts_setting(doc, "source_down")
+        .and_then(|t| parse_duration(&t))
+        .unwrap_or(Duration::from_secs(120))
+}
+
+/// `alerts:history`: how long resolved alerts are kept, default 30
+/// days (requirements, section 7).
+fn parse_history_keep(doc: &Document) -> Duration {
+    alerts_setting(doc, "history")
+        .and_then(|t| parse_duration(&t))
+        .unwrap_or(Duration::from_secs(30 * 86_400))
 }
 
 fn zero_span() -> paneld_config::source::Span {
@@ -1220,6 +1338,72 @@ mod tests {
         m.insert("state".to_string(), Value::String("firing".into()));
         eng.ingest_event("ev", &Value::Map(m), &Context::new(), wall);
         assert!(!eng.active_alerts()["ev:ev"].acked);
+    }
+
+    #[test]
+    fn resolved_alerts_go_to_the_history_and_age_out() {
+        let doc = parse_doc("alerts { history = 1d }\nalert a { when = {{ true }}; title = A }\n");
+        let mut eng = Engine::new(&doc);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        eng.fire_rule("ctl", "x", "warning", "X", "", "", t0);
+        assert!(!eng.note_resolved(t0), "nothing resolved yet");
+        assert!(eng.resolve_rule("ctl", "x"));
+        let t1 = t0 + Duration::from_secs(60);
+        assert!(eng.note_resolved(t1));
+        assert_eq!(eng.history().len(), 1);
+        let h = &eng.history()[0];
+        assert_eq!((h.id.as_str(), h.title.as_str(), h.since, h.ended), ("ctl:x", "X", 1_800_000_000, 1_800_000_060));
+        let Value::Map(ctx) = eng.context_value() else { panic!() };
+        assert!(matches!(&ctx["history"], Value::List(l) if l.len() == 1));
+        // A day and a bit later it is gone.
+        assert!(eng.note_resolved(t1 + Duration::from_secs(86_401)));
+        assert!(eng.history().is_empty());
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut eng = Engine::new(&parse_doc(""));
+        let t = SystemTime::now();
+        for i in 0..(MAX_HISTORY + 5) {
+            eng.fire_rule("ctl", &i.to_string(), "info", "x", "", "", t);
+            eng.note_resolved(t);
+            eng.resolve_rule("ctl", &i.to_string());
+            eng.note_resolved(t);
+        }
+        assert_eq!(eng.history().len(), MAX_HISTORY);
+        assert_eq!(eng.history()[0].id, "ctl:5", "the oldest go first");
+    }
+
+    #[test]
+    fn alerts_that_resolved_while_down_are_recorded() {
+        let doc = parse_doc(
+            "alert hot { when = {{ sources.cpu_temp.value > 70 }}; title = Hot }\n\
+             source ev { run = /bin/true }\n\
+             alert ev { from = ev; title = E }\n",
+        );
+        let saved = |rule: &str| crate::state::SavedAlert {
+            rule: rule.into(),
+            instance: rule.into(),
+            severity: "warning".into(),
+            title: rule.into(),
+            text: String::new(),
+            link: String::new(),
+            since: 7,
+            acked: false,
+            snoozed_until: None,
+        };
+        let on_disk: BTreeMap<String, crate::state::SavedAlert> =
+            [("hot:hot".to_string(), saved("hot")), ("ev:ev".to_string(), saved("ev"))].into();
+        let mut eng = Engine::new(&doc);
+        let carry = Carry { since: SystemTime::UNIX_EPOCH, acked: false, snoozed_until: None, rank: 0 };
+        eng.restore(on_disk.keys().map(|k| (k.clone(), carry)).collect());
+        let wall = SystemTime::now();
+        eng.tick(&ctx_with_temp(60.0), Instant::now(), wall);
+        eng.forget_unfired();
+        eng.note_resolved_while_down(&on_disk, wall);
+        // `hot` is not firing: resolved. `ev` waits for its next event.
+        let ids: Vec<&str> = eng.history().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["hot:hot"]);
     }
 
     #[test]
