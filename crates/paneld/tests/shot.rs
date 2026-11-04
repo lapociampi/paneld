@@ -591,3 +591,44 @@ fn idle_screen_goes_black_and_the_waking_tap_does_nothing_else() {
     assert!(!black(woke.px(400, 240)), "did not wake");
     assert!(woke.any(green), "the waking tap was not absorbed (or the second was lost)");
 }
+
+#[test]
+fn theme_classes_call_props_min_height_and_scroll() {
+    let d = tmp("styles");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t {\n\
+             style .card { background = #3355aa; radius = 12; padding = 10 }\n\
+             style .wide { width = 300 }\n\
+         }\n\
+         screen { theme = t }\n\
+         component tile {\n\
+             param label: string\n\
+             column { class = card; text { value = {{ label }}; color = #ffffff } }\n\
+         }\n\
+         page home {\n\
+             title = Home\n\
+             row {\n\
+                 gap = 8\n\
+                 tile { label = plain }\n\
+                 tile { label = called; class = wide; min_height = 120; background = #aa3333 }\n\
+             }\n\
+             scroll {\n\
+                 height = 150\n\
+                 repeat i in {{ [1,2,3,4,5,6,7,8,9,10] }} { rect { width = 200; height = 30; background = #44aa44 } }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    // `.card` from the theme.
+    assert!(close(img.px(45, 110), [0x33, 0x55, 0xaa], 8), "{:?}", img.px(45, 110));
+    // The call's `class`, `min_height` and `background` reach the root.
+    assert!(close(img.px(380, 190), [0xaa, 0x33, 0x33], 8), "{:?}", img.px(380, 190));
+    // The row itself is transparent: the page background shows.
+    assert!(close(img.px(500, 110), [0xf5, 0xf5, 0xf5], 4), "{:?}", img.px(500, 110));
+    // The scroll keeps its height: the rows past it are clipped.
+    assert!(img.any(|p| close(p, [0x44, 0xaa, 0x44], 8)));
+    assert!(!(0..800).any(|x| close(img.px(x, 440), [0x44, 0xaa, 0x44], 8)), "scroll overflowed");
+}

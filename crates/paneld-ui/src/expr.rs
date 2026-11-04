@@ -261,6 +261,9 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
 
         (In, needle, List(items)) => Ok(Bool(items.iter().any(|v| value_eq(v, &needle)))),
         (In, String(s), String(hay)) => Ok(Bool(hay.contains(&s))),
+        // CEL: `k in map` tests the keys.
+        (In, String(k), Map(m)) => Ok(Bool(m.contains_key(&k))),
+        (In, _, Map(_)) => Ok(Bool(false)),
 
         (op, l, r) => Err(EvalError::new(format!(
             "operator {op:?} does not accept {} and {}",
@@ -471,6 +474,14 @@ mod tests {
         assert_eq!(ev("10 / 3"), Value::Int(3));
         assert_eq!(ev("10.0 / 4.0"), Value::Double(2.5));
         assert_eq!(ev("1 + 2.5"), Value::Double(3.5));
+    }
+
+    #[test]
+    fn in_tests_list_items_and_map_keys() {
+        assert_eq!(ev("2 in [1, 2]"), Value::Bool(true));
+        assert_eq!(ev("'x' in {'x': 1}"), Value::Bool(true));
+        assert_eq!(ev("'y' in {'x': 1}"), Value::Bool(false));
+        assert_eq!(ev("1 in {'x': 1}"), Value::Bool(false));
     }
 
     #[test]

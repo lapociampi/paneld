@@ -2,7 +2,7 @@
 title: "Deploy"
 description: "Cross-compile paneld for an arm64 Linux board and run it as a systemd service."
 date: 2026-10-30
-updated: 2026-11-03
+updated: 2026-11-04
 tags: [paneld, deploy, pi, systemd]
 series: paneld
 order: 7
@@ -59,7 +59,7 @@ scp packaging/paneld.service pi@panel:/tmp/paneld.service
 sudo install -m 0755 /tmp/paneld /usr/local/bin/paneld
 sudo install -m 0644 /tmp/paneld.service /etc/systemd/system/paneld.service
 sudo useradd --system --no-create-home --groups video,input paneld
-sudo install -d -o paneld -g paneld /etc/paneld /var/lib/paneld
+sudo install -d -m 0750 -o paneld -g paneld /etc/paneld /var/lib/paneld
 sudo cp paneld.conf /etc/paneld/paneld.conf
 
 sudo systemctl daemon-reload

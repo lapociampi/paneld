@@ -42,8 +42,7 @@ pub struct SourceUpdate {
 /// map that lives under `sources` in a [`Context`].
 ///
 /// Writes a one-line warning to stderr for each source that failed to
-/// run; the UI still renders, with that source missing from the
-/// context.
+/// run; that source gets a [`not_ok`] value with the reason.
 pub fn resolve_all(
     doc: &Document,
     ctx: &Context,
@@ -76,12 +75,38 @@ pub fn resolve_all(
                 Ok(Ok(v)) => {
                     out.insert(name.to_string(), v);
                 }
-                Ok(Err(e)) => eprintln!("paneld: source `{name}`: {e}"),
-                Err(_) => eprintln!("paneld: source `{name}`: the run panicked"),
+                Ok(Err(e)) => {
+                    eprintln!("paneld: source `{name}`: {e}");
+                    out.insert(name.to_string(), not_ok(&e));
+                }
+                Err(_) => {
+                    eprintln!("paneld: source `{name}`: the run panicked");
+                    out.insert(name.to_string(), not_ok("the run panicked"));
+                }
             }
         }
         out
     })
+}
+
+/// The value of a source that has no result (yet): `ok = false`,
+/// `value = null` and the reason in `error`, so pages and alerts can
+/// test `ok` for every declared source.
+pub fn not_ok(error: &str) -> Value {
+    Value::Map(BTreeMap::from([
+        ("value".to_string(), Value::Null),
+        ("ok".to_string(), Value::Bool(false)),
+        ("error".to_string(), Value::String(error.to_string())),
+    ]))
+}
+
+/// Give every source of `doc` missing from `values` a [`not_ok`]
+/// value: stream sources before their first line, and sources added
+/// by a reload before their first run.
+pub fn fill_not_run(doc: &Document, values: &mut BTreeMap<String, Value>) {
+    for name in collect_blocks(doc).into_keys() {
+        values.entry(name).or_insert_with(|| not_ok("not run yet"));
+    }
 }
 
 /// [`resolve_all`] on a thread of its own, each value sent on `tx` as
@@ -954,6 +979,25 @@ mod tests {
         let (doc, diags) = paneld_config::parse(&toks, &map);
         assert!(diags.is_empty(), "parse errors: {diags:?}");
         doc
+    }
+
+    #[test]
+    fn sources_without_a_result_are_not_ok() {
+        let doc = parse_doc(
+            "source good { run = /bin/echo 1 }\nsource gone { run = /nonexistent/x }\nsource s { run = /bin/cat\n stream = true }\n",
+        );
+        let mut values = resolve_all(&doc, &Context::new(), std::path::Path::new("/"), runner::AppDefaults::default());
+        fill_not_run(&doc, &mut values);
+        let field = |n: &str, k: &str| match &values[n] {
+            Value::Map(m) => m.get(k).cloned(),
+            _ => panic!(),
+        };
+        assert_eq!(field("good", "ok"), Some(Value::Bool(true)));
+        assert_eq!(field("gone", "ok"), Some(Value::Bool(false)));
+        assert!(matches!(field("gone", "error"), Some(Value::String(e)) if e.starts_with("run:")));
+        assert_eq!(field("s", "ok"), Some(Value::Bool(false)));
+        assert_eq!(field("s", "error"), Some(Value::String("not run yet".into())));
+        assert_eq!(field("s", "value"), Some(Value::Null));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 title: "Schema"
 description: "Every item, category, building block and property the config can hold."
 date: 2026-10-29
-updated: 2026-11-03
+updated: 2026-11-04
 tags: [paneld, config, reference]
 series: paneld
 order: 4
@@ -89,7 +89,7 @@ In expressions, `sources.<name>`:
 | Field | Type |
 | --- | --- |
 | `value` | the value's type |
-| `ok` | bool, last run succeeded |
+| `ok` | bool, last run succeeded; `false` (with `value` null) before the first result |
 | `error` | string, stderr or the reason |
 | `at` | timestamp of the last value |
 | `age` | duration since `at` |
@@ -252,12 +252,14 @@ The theme's `shell` component wraps every page: header, navigation, alert banner
 
 ### 8.2 Layout
 
+Layout blocks are transparent and borderless: only a `background`, `border` or theme style draws them.
+
 | Block | Keys | Notes |
 | --- | --- | --- |
 | `row`, `column` | `gap`, `justify` (`start`, `center`, `end`, `between`, `around`, `evenly`), `align` (`start`, `center`, `end`, `stretch`), `wrap` (bool) | Flex |
 | `grid` | `columns`, `rows` (count, or list of tracks: px, `1fr`, `content`), `gap`, `row_gap`, `column_gap` | |
 | `stack` | | Children on top of each other, placed with `x`, `y`, `anchor` |
-| `scroll` | `direction` (`vertical`, `horizontal`), `snap` (`none`, `start`, `center`), `gap` | Children laid out as a column or row, scrollable |
+| `scroll` | `direction` (`vertical`, `horizontal`), `snap` (`none`, `start`, `center`), `gap`, `align` | Children laid out as a column or row, scrollable along it. Fills the parent's width and, in a column, the space left, unless `height` or `grow` is set |
 | `slot` | | Inside components only |
 | `repeat <name> in {{ list }} { }` | | Body once per item |
 

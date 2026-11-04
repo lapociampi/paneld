@@ -19,6 +19,9 @@ SupplementaryGroups=video input
 RuntimeDirectory=paneld
 StateDirectory=paneld
 ConfigurationDirectory=paneld
+# The config folder can hold secret files (pin.hash, tokens): not
+# readable by other users. deploy.md creates it owned by paneld.
+ConfigurationDirectoryMode=0750
 Environment=PANELD_SOCK=/run/paneld/paneld.sock
 
 # Harden what the daemon can see: it reads only its config directory
@@ -37,6 +40,10 @@ DeviceAllow=/dev/fb0 rwm
 DeviceAllow=/dev/input/event0 rwm
 DeviceAllow=/dev/input/event1 rwm
 DeviceAllow=/dev/input/event2 rwm
+# The Pi firmware mailbox (group `video`): `vcgencmd measure_temp`,
+# `vcgencmd display_power` and friends in sources and actions run
+# inside this unit's device policy too.
+DeviceAllow=/dev/vcio rw
 
 [Install]
 WantedBy=multi-user.target

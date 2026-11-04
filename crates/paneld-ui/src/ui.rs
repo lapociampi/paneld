@@ -844,6 +844,18 @@ impl<'ui> Obj<'ui> {
         Obj { raw, _ui: PhantomData }
     }
 
+    /// A layout container (`row`, `column`, `stack`, `grid`,
+    /// `scroll`): transparent and borderless, so only what the config
+    /// (or a theme style) sets shows.
+    pub fn new_layout(&self) -> Obj<'ui> {
+        let obj = self.new_container();
+        unsafe {
+            sys::lv_obj_set_style_bg_opa(obj.raw, sys::_lv_opacity_level_t_LV_OPA_TRANSP as sys::lv_opa_t, 0);
+            sys::lv_obj_set_style_border_width(obj.raw, 0, 0);
+        }
+        obj
+    }
+
     /// A text label. The text is copied by LVGL; the Rust string
     /// does not need to outlive the call.
     pub fn new_label(&self, text: &str) -> Obj<'ui> {
@@ -1291,6 +1303,41 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_height(self.raw, h.to_lvgl()) };
     }
 
+    pub fn set_min_width(&self, w: Size) {
+        unsafe { sys::lv_obj_set_style_min_width(self.raw, w.to_lvgl(), 0) };
+    }
+
+    pub fn set_max_width(&self, w: Size) {
+        unsafe { sys::lv_obj_set_style_max_width(self.raw, w.to_lvgl(), 0) };
+    }
+
+    pub fn set_min_height(&self, h: Size) {
+        unsafe { sys::lv_obj_set_style_min_height(self.raw, h.to_lvgl(), 0) };
+    }
+
+    pub fn set_max_height(&self, h: Size) {
+        unsafe { sys::lv_obj_set_style_max_height(self.raw, h.to_lvgl(), 0) };
+    }
+
+    /// Scroll only along one axis (`scroll`), snapping children to
+    /// `snap` when a scroll ends.
+    pub fn set_scroll(&self, horizontal: bool, snap: ScrollSnap) {
+        let snap = match snap {
+            ScrollSnap::None => sys::lv_scroll_snap_t_LV_SCROLL_SNAP_NONE,
+            ScrollSnap::Start => sys::lv_scroll_snap_t_LV_SCROLL_SNAP_START,
+            ScrollSnap::Center => sys::lv_scroll_snap_t_LV_SCROLL_SNAP_CENTER,
+        };
+        unsafe {
+            if horizontal {
+                sys::lv_obj_set_scroll_dir(self.raw, sys::lv_dir_t_LV_DIR_HOR as sys::lv_dir_t);
+                sys::lv_obj_set_scroll_snap_x(self.raw, snap);
+            } else {
+                sys::lv_obj_set_scroll_dir(self.raw, sys::lv_dir_t_LV_DIR_VER as sys::lv_dir_t);
+                sys::lv_obj_set_scroll_snap_y(self.raw, snap);
+            }
+        }
+    }
+
     pub fn set_flex_row(&self) {
         unsafe { sys::lv_obj_set_flex_flow(self.raw, sys::lv_flex_flow_t_LV_FLEX_FLOW_ROW) };
     }
@@ -1328,7 +1375,11 @@ impl<'ui> Obj<'ui> {
 
     pub fn set_background_hex(&self, rgb: u32) {
         let color = unsafe { sys::lv_color_hex(rgb) };
-        unsafe { sys::lv_obj_set_style_bg_color(self.raw, color, 0) };
+        unsafe {
+            sys::lv_obj_set_style_bg_color(self.raw, color, 0);
+            // Layout containers start transparent.
+            sys::lv_obj_set_style_bg_opa(self.raw, sys::_lv_opacity_level_t_LV_OPA_COVER as sys::lv_opa_t, 0);
+        }
     }
 
     pub fn set_radius(&self, px: i32) {
@@ -1705,6 +1756,14 @@ pub enum Size {
     Px(i32),
     Percent(u16),
     Content,
+}
+
+/// `scroll { snap = ... }`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollSnap {
+    None,
+    Start,
+    Center,
 }
 
 impl Size {

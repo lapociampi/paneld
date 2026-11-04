@@ -1,10 +1,9 @@
 //! Resolve the active theme's token map and splice it into the eval
 //! context under the key `theme`.
 //!
-//! Scope for v1: tokens only (colors, fonts, sizes, free extras).
-//! `style <selector> { }` sub-blocks and theme-local replacement
-//! `component NAME { }` blocks are deferred -- the renderer still
-//! runs; selectors and overrides just don't take effect yet.
+//! Tokens (colors, fonts, sizes, free extras) and, through
+//! [`styles`], the `style <selector> { }` bodies. Theme-local
+//! replacement `component NAME { }` blocks are deferred.
 //!
 //! Resolution order:
 //!
@@ -35,6 +34,38 @@ pub fn resolve_with(doc: &Document, theme: Option<&str>) -> BTreeMap<String, Val
     if let Some(active) = theme.map(str::to_string).or_else(|| active_theme_name(doc)) {
         let mut seen = Vec::new();
         out.extend(merge_theme(doc, &active, &mut seen));
+    }
+    out
+}
+
+/// The `style <selector> { }` bodies of the active theme (or `theme`)
+/// and the themes it extends, parents first: per selector, a key the
+/// child sets replaces the parent's.
+pub fn styles(doc: &Document, theme: Option<&str>) -> BTreeMap<String, Vec<Item>> {
+    let mut chain = Vec::new();
+    let mut name = theme.map(str::to_string).or_else(|| active_theme_name(doc));
+    while let Some(n) = name.take() {
+        if chain.contains(&n) {
+            break;
+        }
+        let Some(t) = find_theme(doc, &n) else { break };
+        chain.push(n);
+        name = find_simple(t, "extends").map(|p| p.trim().to_string());
+    }
+    let mut out: BTreeMap<String, Vec<Item>> = BTreeMap::new();
+    for n in chain.iter().rev() {
+        let Some(t) = find_theme(doc, n) else { continue };
+        for item in &t.items {
+            let Item::Block(b) = item else { continue };
+            let (true, Some(sel)) = (b.kind.text == "style", &b.name) else { continue };
+            let body = out.entry(sel.text.trim().to_string()).or_default();
+            for it in &b.items {
+                let Item::Assign(a) = it else { continue };
+                let AssignTarget::Simple { key } = &a.target else { continue };
+                body.retain(|old| !matches!(old, Item::Assign(o) if matches!(&o.target, AssignTarget::Simple { key: k } if k.text == key.text)));
+                body.push(it.clone());
+            }
+        }
     }
     out
 }
@@ -200,5 +231,28 @@ mod tests {
         assert_eq!(tok(&m, "accent"), "#333333");
         assert_eq!(tok(&m, "surface"), "#222222");
         assert_eq!(tok(&m, "warning"), "#ef6c00");
+    }
+
+    #[test]
+    fn styles_merge_down_the_chain() {
+        let d = doc("theme base { style .card { radius = 4; padding = 2 }\n style button:pressed { radius = 1 } }\n\
+             theme mine { extends = base\n style .card { radius = 16 } }\n\
+             screen { theme = mine }\n");
+        let st = styles(&d, None);
+        let keys = |sel: &str| -> Vec<(String, String)> {
+            st[sel]
+                .iter()
+                .map(|it| match it {
+                    Item::Assign(a) => match &a.target {
+                        AssignTarget::Simple { key } => (key.text.clone(), a.value.text.trim().to_string()),
+                        _ => panic!(),
+                    },
+                    _ => panic!(),
+                })
+                .collect()
+        };
+        assert_eq!(keys(".card"), [("padding".into(), "2".into()), ("radius".into(), "16".into())]);
+        assert!(st.contains_key("button:pressed"));
+        assert!(styles(&d, Some("base"))[".card"].len() == 2);
     }
 }

@@ -27,7 +27,7 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
 use crate::expr::{eval, Context, Value};
-use crate::ui::{ActionArg, FlexAlign, ImageFit, InlineSetItem, Obj, Size, Trigger, UiEvent, ValueWidget};
+use crate::ui::{ActionArg, FlexAlign, ImageFit, InlineSetItem, Obj, ScrollSnap, Size, Trigger, UiEvent, ValueWidget};
 
 /// Children of a component call plus the outer context they should
 /// resolve against. Threaded through [`render_node`] so a `slot { }`
@@ -250,7 +250,7 @@ fn render_node(
 ) {
     match node.kind.text.as_str() {
         "column" | "row" => {
-            let obj = parent.new_container();
+            let obj = parent.new_layout();
             obj.set_size(Size::Content, Size::Content);
             if node.kind.text == "row" {
                 obj.set_flex_row();
@@ -270,7 +270,7 @@ fn render_node(
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "stack" => {
-            let obj = parent.new_container();
+            let obj = parent.new_layout();
             obj.set_size(Size::Content, Size::Content);
             apply_props(node, ctx, sink, &obj);
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
@@ -279,7 +279,7 @@ fn render_node(
             // A grid fills its parent's width (its columns are
             // fractions of it) and grows with its rows; `width` /
             // `height` props override.
-            let obj = parent.new_container();
+            let obj = parent.new_layout();
             obj.set_size(Size::Percent(100), Size::Content);
             apply_props(node, ctx, sink, &obj);
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
@@ -287,6 +287,35 @@ fn render_node(
             let cols = resolve_num(node, "columns", ctx).unwrap_or(2.0) as i32;
             let rows = resolve_num(node, "rows", ctx).map(|r| r as i32);
             obj.layout_grid(cols, rows);
+        }
+        "scroll" => {
+            // Schema 8.2: children as a column (or a row with
+            // `direction = horizontal`) that scrolls along that axis.
+            // By default it fills the parent's width and the space
+            // left in a column; `width` / `height` / `grow` override.
+            let horizontal = find_simple(node, "direction").map(str::trim) == Some("horizontal");
+            let snap = match find_simple(node, "snap").map(str::trim) {
+                Some("start") => ScrollSnap::Start,
+                Some("center") => ScrollSnap::Center,
+                _ => ScrollSnap::None,
+            };
+            let obj = parent.new_layout();
+            obj.set_size(Size::Percent(100), Size::Content);
+            // `grow` would override a `height` along a column.
+            if find_simple(node, "height").is_none() && find_simple(node, "grow").is_none() {
+                obj.set_flex_grow(1);
+            }
+            if horizontal {
+                obj.set_flex_row();
+            } else {
+                obj.set_flex_column();
+            }
+            obj.set_scroll(horizontal, snap);
+            apply_props(node, ctx, sink, &obj);
+            if let Some(align) = find_simple(node, "align").and_then(FlexAlign::parse) {
+                obj.set_flex_align(FlexAlign::Start, align);
+            }
+            render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "text" => {
             let text = resolve_text(node, "value", ctx).unwrap_or_default();
@@ -558,8 +587,39 @@ fn expand_component(
     render_item_list(&comp.items, doc, &inner_ctx, Some(&slot), sink, parent);
     // The call's own `on_tap` / `on_hold` act on the component's root
     // object, with args evaluated in the caller's scope (`item`, ...).
+    // So do its common properties (schema 7), over the component's
+    // own: everything on the call that is not one of its params.
     if let Some(root) = parent.child(before) {
         bind_handlers(call, outer_ctx, sink, &root);
+        let params: Vec<&str> = comp
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Param(p) => Some(p.name.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let props: Vec<Item> = call
+            .items
+            .iter()
+            .filter(|it| match it {
+                Item::Assign(a) => match &a.target {
+                    AssignTarget::Simple { key } => !params.contains(&key.text.as_str()),
+                    _ => false,
+                },
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        let root_kind = comp.items.iter().find_map(|it| match it {
+            Item::Block(b) => Some(b.kind.text.as_str()),
+            _ => None,
+        });
+        let root_kind = root_kind.unwrap_or("");
+        // The root already has its `*` and kind styles; the call adds
+        // its classes only, so they do not undo the root's own props.
+        apply_styles(root_kind, &props, false, outer_ctx, &root);
+        apply_plain_props(root_kind, &props, outer_ctx, &root);
     }
 }
 
@@ -743,7 +803,66 @@ fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_
     // Only one gets wired per tap: the first form found wins,
     // matching schema semantics (one action per handler).
     bind_handlers(node, ctx, sink, obj);
-    apply_plain_props(node, ctx, obj);
+    apply_styles(&node.kind.text, &node.items, true, ctx, obj);
+    apply_plain_props(&node.kind.text, &node.items, ctx, obj);
+}
+
+thread_local! {
+    /// The active theme's `style <selector> { }` bodies, by selector
+    /// (see [`set_styles`]). Read on the UI thread while drawing.
+    static STYLES: std::cell::RefCell<std::collections::BTreeMap<String, Vec<Item>>> =
+        Default::default();
+}
+
+/// Install the active theme's styles: selector (`*`, `button`,
+/// `.card`) to its `key = value` items, parents merged in already.
+/// Applies from the next page drawn.
+pub fn set_styles(styles: std::collections::BTreeMap<String, Vec<Item>>) {
+    STYLES.with(|s| *s.borrow_mut() = styles);
+}
+
+/// The class names in `class = ...` (`card`, `card wide`, `[card,
+/// wide]`).
+fn class_names(items: &[Item]) -> Vec<String> {
+    let Some(raw) = items.iter().find_map(|it| match it {
+        Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "class") => {
+            Some(a.value.text.as_str())
+        }
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    raw.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Theme styles for a node of `kind` with `items` (themes.md,
+/// "Precedence": under what the node itself sets): `*`, then the
+/// kind, then each `class` in order, later winning. State selectors
+/// (`button:pressed`) are not applied yet. Without `by_kind`, only
+/// the classes.
+fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Context, obj: &Obj<'_>) {
+    let classes = class_names(items);
+    STYLES.with(|styles| {
+        let styles = styles.borrow();
+        if styles.is_empty() {
+            return;
+        }
+        let selectors = ["*".to_string(), kind.to_string()]
+            .into_iter()
+            .filter(|_| by_kind)
+            .chain(classes.iter().map(|c| format!(".{c}")));
+        for sel in selectors {
+            if let Some(body) = styles.get(&sel) {
+                apply_plain_props(kind, body, ctx, obj);
+            }
+        }
+    });
 }
 
 /// Wire `node`'s `on_tap` / `on_hold` handlers (block and `= name`
@@ -825,8 +944,8 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
 
 /// Apply `node`'s plain properties (size, spacing, colors, font,
 /// visibility, ...) to `obj`.
-fn apply_plain_props(node: &Block, ctx: &Context, obj: &Obj<'_>) {
-    for item in &node.items {
+fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
+    for item in items {
         let Item::Assign(a) = item else { continue };
         let AssignTarget::Simple { key } = &a.target else {
             continue;
@@ -841,6 +960,16 @@ fn apply_plain_props(node: &Block, ctx: &Context, obj: &Obj<'_>) {
             "height" => {
                 if let Some(s) = parse_size(&resolve_scalar(value, a.value.span, ctx)) {
                     obj.set_height(s);
+                }
+            }
+            "min_width" | "max_width" | "min_height" | "max_height" => {
+                if let Some(s) = parse_size(&resolve_scalar(value, a.value.span, ctx)) {
+                    match key.text.as_str() {
+                        "min_width" => obj.set_min_width(s),
+                        "max_width" => obj.set_max_width(s),
+                        "min_height" => obj.set_min_height(s),
+                        _ => obj.set_max_height(s),
+                    }
                 }
             }
             "padding" => {
@@ -878,7 +1007,7 @@ fn apply_plain_props(node: &Block, ctx: &Context, obj: &Obj<'_>) {
             }
             // On `row` / `column` (and `scroll`) `align` places the
             // children; it is handled where those are built.
-            "align" if !matches!(node.kind.text.as_str(), "row" | "column" | "scroll") => {
+            "align" if !matches!(kind, "row" | "column" | "scroll") => {
                 match value {
                     "left" => obj.set_text_align_left(),
                     "center" => obj.set_text_align_center(),

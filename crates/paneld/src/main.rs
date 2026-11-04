@@ -789,6 +789,7 @@ fn setup_live_state(
     let secret_values = secrets::resolve(&doc);
     let pin_gate = pin::Gate::from_doc(&doc, &secret_values);
     let theme = themes::resolve(&doc);
+    paneld_ui::set_styles(themes::styles(&doc, None));
     let vars_map = vars::initial_values(&doc);
     let var_types = vars::types(&doc);
     let vars_shared = std::sync::Arc::new(std::sync::Mutex::new(vars_map));
@@ -827,6 +828,7 @@ fn setup_live_state(
             *source_values.lock().unwrap() = values;
         }
     }
+    sources::fill_not_run(&doc, &mut source_values.lock().unwrap());
     let sources_shutdown = sources::spawn_pollers(
         &doc,
         &command_ctx,
@@ -1132,6 +1134,7 @@ fn screen_step(live: &mut LiveState) -> bool {
             }
             screen::Effect::Theme(name) => {
                 live.theme = themes::resolve_with(&live.doc, name.as_deref());
+                paneld_ui::set_styles(themes::styles(&live.doc, name.as_deref()));
                 redraw = true;
             }
         }
