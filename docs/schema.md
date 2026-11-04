@@ -46,7 +46,7 @@ secret pve     { file = /run/secrets/pve-token }
 | Key | Type | Notes |
 | --- | --- | --- |
 | `env` | string | Environment variable name |
-| `file` | path | File content, trailing newline stripped |
+| `file` | path | File content, trailing newline stripped; a relative path is from the main config file's folder |
 
 Exactly one of the two. Read at load and on reload. In expressions: `secrets.<name>`, only allowed inside `run` and `env` of sources and actions; masked in logs and `ctl` output.
 
@@ -59,7 +59,7 @@ var vm: string = ""
 var tab: int = 0
 ```
 
-In expressions: `vars.<name>`. Kept in memory; reset on restart.
+In expressions: `vars.<name>`. Kept in memory; reset on restart. A reload keeps a value the screen set while the var keeps its name and type; one still at its default takes the new default.
 
 ## 4. Sources
 

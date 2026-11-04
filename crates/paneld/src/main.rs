@@ -545,6 +545,14 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // ctx including the current `alerts` map for symmetry with
     // the render-side ctx.
     while let Ok(update) = live.source_rx.try_recv() {
+        // A run that started before the value on screen was taken is
+        // stale (a slow refresh overtaken by a poll).
+        match live.source_started.get(&update.name) {
+            Some(shown) if update.started < *shown => continue,
+            _ => {
+                live.source_started.insert(update.name.clone(), update.started);
+            }
+        }
         let mut value = update.value;
         if update.status {
             // Only `ok` / `error` change: the rest of the last result
@@ -665,6 +673,8 @@ struct LiveState {
     theme: std::collections::BTreeMap<String, paneld_ui::Value>,
     vars: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
     var_types: std::collections::BTreeMap<String, String>,
+    /// When the run behind each source's shown value started.
+    source_started: std::collections::HashMap<String, std::time::Instant>,
     event_tx: std::sync::mpsc::Sender<paneld_ui::UiEvent>,
     event_rx: std::sync::mpsc::Receiver<paneld_ui::UiEvent>,
     action_tx: std::sync::mpsc::Sender<actions::Call>,
@@ -772,8 +782,10 @@ fn setup_live_state(
     config: &std::path::Path,
     screen: &paneld_ui::ui::Obj<'_>,
     state_path: Option<&std::path::Path>,
-    previous_sources: Option<&std::collections::BTreeMap<String, paneld_ui::Value>>,
+    previous: Option<&LiveState>,
 ) -> Result<LiveState, Vec<ctl::CtlError>> {
+    let previous_sources = previous.map(|p| p.source_values.lock().unwrap().clone());
+    let previous_sources = previous_sources.as_ref();
     // ADR 0013: commands run with cwd set to the config file's
     // directory by default, so `run = ./scripts/x.sh` works. A
     // per-source / per-action `cwd` overrides on top.
@@ -828,13 +840,34 @@ fn setup_live_state(
     // Resolve secrets first so they're available for the first
     // source-run's interpolation. (Secrets never change at runtime
     // in v1; a reload re-reads them.)
-    let secret_values = secrets::resolve(&doc);
+    let secret_values = secrets::resolve(&doc, &config_dir);
     let pin_gate = pin::Gate::from_doc(&doc, &secret_values);
     let theme = themes::resolve(&doc);
     paneld_ui::set_styles(themes::styles(&doc, None));
     let vars_map = vars::initial_values(&doc);
     let var_types = vars::types(&doc);
-    let vars_shared = std::sync::Arc::new(std::sync::Mutex::new(vars_map));
+    let vars_shared = match previous {
+        // A reload keeps the same vars: a var still declared with the
+        // same type keeps a value the screen set (an edited default
+        // applies to one still at its old default), and a run started
+        // before the reload sets them in the map the screen reads.
+        Some(p) => {
+            let old_defaults = vars::initial_values(&p.doc);
+            let mut old = p.vars.lock().unwrap();
+            let kept = vars_map
+                .into_iter()
+                .map(|(k, v)| match (old.get(&k), p.var_types.get(&k)) {
+                    (Some(value), Some(ty)) if var_types.get(&k) == Some(ty) && old_defaults.get(&k) != Some(value) => {
+                        (k, value.clone())
+                    }
+                    _ => (k, v),
+                })
+                .collect();
+            *old = kept;
+            p.vars.clone()
+        }
+        None => std::sync::Arc::new(std::sync::Mutex::new(vars_map)),
+    };
     let source_values = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::BTreeMap::<String, paneld_ui::Value>::new(),
     ));
@@ -974,6 +1007,7 @@ fn setup_live_state(
         doc,
         source_values,
         source_rx,
+        source_started: Default::default(),
         theme,
         vars: vars_shared,
         var_types,
@@ -1682,8 +1716,7 @@ fn reload(
     live.state.note(live.alerts.active_alerts(), live.reminders.dates(), live.alerts.history());
     live.state.force_flush();
     let state_override = live.state_override.clone();
-    let previous_sources = live.source_values.lock().unwrap().clone();
-    match setup_live_state(config, screen, state_override.as_deref(), Some(&previous_sources)) {
+    match setup_live_state(config, screen, state_override.as_deref(), Some(live)) {
         Ok(mut fresh) => {
             fresh.pin_gate.carry_from(&live.pin_gate);
             fresh.screen.carry_from(&live.screen);

@@ -1376,6 +1376,46 @@ fn shell_script_interpolates(cmd: &str) -> bool {
     false
 }
 
+/// True if `cmd` runs `ssh` (also behind `sudo`, `timeout`, ...) and a
+/// `{{ }}` is in the remote command: ssh joins those words into one
+/// line for the remote shell, so the value would be code there.
+fn ssh_command_interpolates(cmd: &str) -> bool {
+    /// ssh options that take the next word.
+    const TAKES_ARG: &[&str] = &[
+        "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R",
+        "-S", "-W", "-w",
+    ];
+    const WRAPPERS: &[&str] = &["env", "sudo", "doas", "nice", "ionice", "timeout", "nohup", "stdbuf", "setsid", "exec", "flock"];
+    let words = split_words(cmd);
+    let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
+    let is_ssh = |w: &str| w == "ssh" || (w.starts_with('/') && base(w) == "ssh");
+    let Some(at) = words.iter().position(|w| is_ssh(w)) else { return false };
+    // It is the program, or follows a wrapper and its options.
+    let wrapped = at == 0
+        || (WRAPPERS.contains(&base(&words[0]).as_str())
+            && words[1..at].iter().all(|w| WRAPPERS.contains(&base(w).as_str()) || w.starts_with('-') || w.contains('=') || w.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))));
+    if !wrapped {
+        return false;
+    }
+    let mut j = at + 1;
+    // Options, then the host; what follows is the remote command.
+    while j < words.len() {
+        let w = &words[j];
+        j += 1;
+        if w == "--" {
+            j += 1; // the host
+            break;
+        }
+        if !w.starts_with('-') {
+            break; // the host
+        }
+        if TAKES_ARG.contains(&w.as_str()) {
+            j += 1;
+        }
+    }
+    words.get(j..).is_some_and(|rest| rest.iter().any(|w| w.contains("{{")))
+}
+
 /// `cmd` split into words the way the runner does (quotes removed,
 /// `{{ }}` kept whole); good enough to find a script argument.
 fn split_words(cmd: &str) -> Vec<String> {
@@ -1987,6 +2027,14 @@ fn check_value_type(
                 span,
                 "`{{ }}` inside an inline script (`sh -c`, `python -c`, `perl -e`, ...) pastes the value \
                  into code; pass it as an argument (`sh -c '... \"$$1\"' sh {{ x }}`) or in `env { }`"
+                    .to_string(),
+            ));
+        }
+        _ if matches!(ty, ExpectedType::Command) && raw.contains("{{") && ssh_command_interpolates(raw) => {
+            diags.push(Diagnostic::new(
+                span,
+                "`{{ }}` in the command of an `ssh` is shell code on the far side: ssh hands it to the remote \
+                 shell. Use a `remote_kind` with `via = ssh`, which quotes each argument (schema 17)"
                     .to_string(),
             ));
         }
@@ -3673,6 +3721,25 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "{}", missing.join("\n"));
+    }
+
+    #[test]
+    fn a_value_in_a_hand_written_ssh_command_is_refused() {
+        let flagged = |run: &str| {
+            let d = check_text(&format!("action a {{ param x: string\n run = {run} }}\n"));
+            d.iter().any(|m| m.contains("shell code on the far side"))
+        };
+        assert!(flagged("ssh host systemctl restart {{ x }}"));
+        assert!(flagged("ssh -p 22 -i /k -o BatchMode=yes admin@h echo {{ x }}"));
+        assert!(flagged("sudo -n ssh -- h rm {{ x }}"));
+        assert!(flagged("sudo -u panel timeout 5 ssh h rm {{ x }}"));
+        assert!(flagged("/usr/bin/ssh h {{ x }}"));
+        // The host or an option from a value is not pasted into a shell.
+        assert!(!flagged("ssh {{ x }} uptime"));
+        assert!(!flagged("ssh -l {{ x }} h uptime"));
+        assert!(!flagged("ssh h uptime"));
+        assert!(!flagged("echo ssh h {{ x }}"));
+        assert!(!flagged("scp {{ x }} h:/tmp"));
     }
 
     #[test]

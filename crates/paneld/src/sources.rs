@@ -40,6 +40,10 @@ pub struct SourceUpdate {
     /// stopped or came back): the main loop keeps the rest of the last
     /// value, records no history and sends no alert event.
     pub status: bool,
+    /// When the run that produced it started: the main loop drops an
+    /// update older than the one it shows (a slow run overtaken by a
+    /// newer one, as after a reload).
+    pub started: Instant,
 }
 
 /// Resolve every top-level `source` block in `doc`, producing the
@@ -131,8 +135,9 @@ pub fn resolve_all_in_background(
     tx: Sender<SourceUpdate>,
 ) {
     thread::spawn(move || {
+        let started = Instant::now();
         for (name, value) in resolve_all(&doc, &ctx, &base_cwd, app_defaults) {
-            if tx.send(SourceUpdate { status: is_failure(&value), name, value }).is_err() {
+            if tx.send(SourceUpdate { status: is_failure(&value), name, value, started }).is_err() {
                 return;
             }
         }
@@ -316,7 +321,7 @@ fn poll_loop(
             Ok(v) => {
                 delay = interval;
                 next = Instant::now() + delay;
-                if tx.send(SourceUpdate { name: name.clone(), value: v, status: false }).is_err() {
+                if tx.send(SourceUpdate { name: name.clone(), value: v, status: false, started: last_run }).is_err() {
                     // Receiver dropped; the daemon is shutting down.
                     return;
                 }
@@ -326,7 +331,7 @@ fn poll_loop(
                 delay = next_backoff(delay, max_delay);
                 next = Instant::now() + delay;
                 // `ok` turns false; the main loop keeps the last value.
-                if tx.send(SourceUpdate { name: name.clone(), value: not_ok(&e), status: true }).is_err() {
+                if tx.send(SourceUpdate { name: name.clone(), value: not_ok(&e), status: true, started: last_run }).is_err() {
                     return;
                 }
             }
@@ -384,7 +389,7 @@ fn stream_loop(
         let mut command = match request.and_then(|r| runner::prepared_command(&r.argv, &opts)) {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(SourceUpdate { name: name.clone(), value: not_ok(&mask.apply(&e.to_string())), status: true });
+                let _ = tx.send(SourceUpdate { name: name.clone(), value: not_ok(&mask.apply(&e.to_string())), status: true, started: Instant::now() });
                 eprintln!("paneld: source `{name}`: {}; retrying in {:?}", mask.apply(&e.to_string()), delay);
                 sleep_or_shutdown(delay, &shutdown);
                 delay = next_backoff(delay, RESTART_CEILING);
@@ -398,6 +403,7 @@ fn stream_loop(
                     name: name.clone(),
                     value: not_ok(&format!("spawn: {}", mask.apply(&e.to_string()))),
                     status: true,
+                    started: Instant::now(),
                 });
                 eprintln!("paneld: source `{name}`: spawn: {}; retrying in {:?}", mask.apply(&e.to_string()), delay);
                 sleep_or_shutdown(delay, &shutdown);
@@ -407,7 +413,7 @@ fn stream_loop(
         };
         // Running again: healthy until it says otherwise.
         let up = Value::Map(BTreeMap::from([("ok".to_string(), Value::Bool(true)), ("error".to_string(), Value::String(String::new()))]));
-        if tx.send(SourceUpdate { name: name.clone(), value: up, status: true }).is_err() {
+        if tx.send(SourceUpdate { name: name.clone(), value: up, status: true, started: Instant::now() }).is_err() {
             runner::kill_group(runner::Pid::from_raw(child.id() as i32), runner::Signal::SIGTERM);
             let _ = child.wait();
             return;
@@ -485,7 +491,7 @@ fn stream_loop(
             let parsed = mask.apply_value(parsed);
             // `value` can put masked pieces back together: mask it too.
             let value = mask.apply_value(finish_stream_value(&block, &ctx, parsed));
-            if tx.send(SourceUpdate { name: name.clone(), value, status: false }).is_err() {
+            if tx.send(SourceUpdate { name: name.clone(), value, status: false, started: Instant::now() }).is_err() {
                 // Receiver dropped: daemon is going down.
                 runner::kill_group(pid, runner::Signal::SIGTERM);
                 let _ = child.wait();
@@ -510,7 +516,7 @@ fn stream_loop(
         if sent_any && started.elapsed() >= RESET_AFTER {
             delay = RESTART_FLOOR;
         }
-        if tx.send(SourceUpdate { name: name.clone(), value: not_ok("the stream stopped; restarting"), status: true }).is_err() {
+        if tx.send(SourceUpdate { name: name.clone(), value: not_ok("the stream stopped; restarting"), status: true, started: Instant::now() }).is_err() {
             return;
         }
         eprintln!(

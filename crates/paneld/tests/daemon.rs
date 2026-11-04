@@ -484,3 +484,20 @@ fn a_visible_only_source_polls_while_its_page_is_on_screen() {
     std::thread::sleep(Duration::from_millis(1500));
     assert!(runs("shown") > hidden, "did not resume on its page");
 }
+
+#[test]
+fn reload_keeps_vars_the_screen_set_and_applies_new_defaults_to_the_rest() {
+    let dir = tmp("reload-vars");
+    let d = Daemon::start(&dir, "var tab: int = 0\nvar mode: string = \"a\"\nvar gone: int = 1\npage home { text { value = x } }\n");
+    d.ok(&["set", "vars.tab=3"]);
+    write_conf(&dir, "var tab: int = 0\nvar mode: string = \"b\"\nvar extra: bool = true\npage home { text { value = x } }\n");
+    assert_eq!(d.ok(&["reload"]), "reloaded");
+    assert_eq!(d.eval("vars.tab"), "3", "a value the screen set is kept");
+    assert_eq!(d.eval("vars.mode"), "b", "an untouched var takes its new default");
+    assert_eq!(d.eval("vars.extra"), "true");
+    assert!(d.refused(&["eval", "vars.gone"]).contains("gone"));
+    // A var whose type changed starts over.
+    write_conf(&dir, "var tab: string = \"x\"\npage home { text { value = x } }\n");
+    d.ok(&["reload"]);
+    assert_eq!(d.eval("vars.tab"), "x");
+}

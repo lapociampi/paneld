@@ -681,6 +681,7 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
                 );
                 continue;
             };
+            let started = std::time::Instant::now();
             match crate::sources::resolve_one(
                 block,
                 &ctx,
@@ -692,6 +693,7 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
                         name: src_name.clone(),
                         value: v,
                         status: false,
+                        started,
                     });
                 }
                 Err(e) => {
@@ -702,6 +704,7 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
                         name: src_name.clone(),
                         value: crate::sources::not_ok(&e),
                         status: true,
+                        started,
                     });
                 }
             }

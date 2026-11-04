@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_ui::Value;
 
-pub fn resolve(doc: &Document) -> BTreeMap<String, Value> {
+/// A relative `file` is read from `base`, the main config file's
+/// folder (as commands run there, ADR 0013).
+pub fn resolve(doc: &Document, base: &std::path::Path) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     for item in &doc.items {
         let Item::Block(b) = item else { continue };
@@ -22,20 +24,20 @@ pub fn resolve(doc: &Document) -> BTreeMap<String, Value> {
             continue;
         }
         let Some(name) = &b.name else { continue };
-        if let Some(v) = resolve_one(b) {
+        if let Some(v) = resolve_one(b, base) {
             out.insert(name.text.clone(), Value::String(v));
         }
     }
     out
 }
 
-fn resolve_one(b: &Block) -> Option<String> {
+fn resolve_one(b: &Block, base: &std::path::Path) -> Option<String> {
     if let Some(env_name) = find_simple(b, "env") {
         return std::env::var(paneld_config::value::parse_string(env_name)).ok();
     }
     if let Some(path) = find_simple(b, "file") {
         // A quoted path keeps its spaces, not its quotes.
-        return std::fs::read_to_string(paneld_config::value::parse_string(path))
+        return std::fs::read_to_string(base.join(paneld_config::value::parse_string(path)))
             .ok()
             .map(|s| s.trim().to_string());
     }
@@ -155,7 +157,7 @@ mod tests {
         std::fs::write(&file, "from-file\n").unwrap();
         // The test binary's own environment always has PATH.
         let src = format!(
-            "secret p {{ env = PATH }}\nsecret f {{ file = \"{}\" }}\nsecret gone {{ file = /nonexistent/x }}\nsecret unset {{ env = PANELD_TEST_UNSET_VAR }}\n",
+            "secret p {{ env = PATH }}\nsecret f {{ file = \"{}\" }}\nsecret gone {{ file = /nonexistent/x }}\nsecret unset {{ env = PANELD_TEST_UNSET_VAR }}\nsecret rel {{ file = \"a b/tok\" }}\n",
             file.display()
         );
         let mut map = paneld_config::SourceMap::new();
@@ -163,8 +165,9 @@ mod tests {
         let (toks, _) = paneld_config::lex::tokenize(id, &src);
         let (doc, d) = paneld_config::parse(&toks, &map);
         assert!(d.is_empty(), "{d:?}");
-        let s = resolve(&doc);
+        let s = resolve(&doc, &dir);
         assert_eq!(s["f"], Value::String("from-file".into()), "trailing newline stripped");
+        assert_eq!(s["rel"], Value::String("from-file".into()), "relative to the config folder");
         assert_eq!(s["p"], Value::String(std::env::var("PATH").unwrap()));
         assert!(!s.contains_key("gone") && !s.contains_key("unset"), "{:?}", s.keys());
         let _ = std::fs::remove_dir_all(&dir);

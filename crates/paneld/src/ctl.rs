@@ -11,13 +11,13 @@
 //! to the main loop as a [`Request`] and is answered from there.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use paneld_ui::Value;
 
@@ -197,8 +197,10 @@ pub fn serve(path: &Path, tx: Sender<ControlMsg>) -> std::io::Result<()> {
 const MAX_LINE: u64 = 64 * 1024;
 /// Clients served at once.
 const MAX_CLIENTS: usize = 16;
-/// A client silent this long is dropped.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A request line must arrive whole this long after the last reply
+/// (or the greeting): a client sending a byte now and then is dropped
+/// as surely as a silent one.
+const IDLE_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(800) } else { Duration::from_secs(60) };
 static CLIENTS: AtomicUsize = AtomicUsize::new(0);
 
 fn handle_client(stream: UnixStream, tx: Sender<ControlMsg>) {
@@ -216,7 +218,7 @@ fn handle_client(stream: UnixStream, tx: Sender<ControlMsg>) {
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.by_ref().take(MAX_LINE + 1).read_line(&mut line) {
+        match read_line_by(&mut reader, &stream, &mut line, Instant::now() + IDLE_TIMEOUT) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
@@ -232,6 +234,35 @@ fn handle_client(stream: UnixStream, tx: Sender<ControlMsg>) {
             return;
         }
     }
+}
+
+/// One line (up to [`MAX_LINE`] + 1 bytes) by `deadline`, however the
+/// bytes trickle in. `Ok(0)` at the end of the stream.
+fn read_line_by(reader: &mut BufReader<&UnixStream>, stream: &UnixStream, line: &mut String, deadline: Instant) -> std::io::Result<usize> {
+    let mut bytes = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        stream.set_read_timeout(Some(left))?;
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            break;
+        }
+        let room = (MAX_LINE + 1) as usize - bytes.len();
+        let (take, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) if i < room => (i + 1, true),
+            _ => (buf.len().min(room), buf.len() >= room),
+        };
+        bytes.extend_from_slice(&buf[..take]);
+        reader.consume(take);
+        if done {
+            break;
+        }
+    }
+    line.push_str(&String::from_utf8_lossy(&bytes));
+    Ok(bytes.len())
 }
 
 /// Turn one request line into its reply line.
@@ -577,6 +608,30 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel();
         assert_eq!(serve(&path, tx2).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
         assert!(talk(b"{\"id\":2,\"cmd\":\"ping\"}\n").contains("pong"), "first daemon lost its socket");
+        // A byte now and then does not keep a connection open past
+        // the deadline for its line.
+        let s = UnixStream::connect(&path).unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let mut greeting = String::new();
+        r.read_line(&mut greeting).unwrap();
+        let start = std::time::Instant::now();
+        let mut w = s.try_clone().unwrap();
+        let mut dropped = false;
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(200));
+            if w.write_all(b" ").is_err() {
+                dropped = true;
+                break;
+            }
+            let mut probe = String::new();
+            s.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+            if let Ok(0) = r.read_line(&mut probe) {
+                dropped = true;
+                break;
+            }
+        }
+        assert!(dropped, "a trickling client was kept");
+        assert!(start.elapsed() < Duration::from_secs(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
