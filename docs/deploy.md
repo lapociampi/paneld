@@ -36,7 +36,7 @@ Every build also includes the fbdev + evdev drivers; they have no external depen
 ## Cross-compile for the Pi
 
 ```
-# From the workspace root. Produces a stripped, about 2.1 MB static binary.
+# From the workspace root. Produces a stripped, about 2.5 MB static binary.
 cargo zigbuild --target aarch64-unknown-linux-musl \
     -p paneld --no-default-features --release
 ```

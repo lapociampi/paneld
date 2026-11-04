@@ -28,3 +28,4 @@ order: 7
 | [0016](0016-builtin-alert-actions.md) | Built-in actions for acknowledge and snooze |
 | [0017](0017-vendored-libdrm.md) | libdrm built from a vendored copy |
 | [0018](0018-remotes.md) | Remotes |
+| [0019](0019-param-patterns.md) | regex-lite for param patterns |

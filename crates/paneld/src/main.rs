@@ -404,7 +404,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                             );
                             show_pin_modal(
                                 screen,
-                                &call.name,
+                                &action_title(live, &call.name),
                                 Some(&format!(
                                     "Wrong PIN, {remaining} tr{} left",
                                     if remaining == 1 { "y" } else { "ies" }
@@ -450,7 +450,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                         }
                         None if accept => {
                             // OK on an empty keypad: ask again.
-                            show_ask_modal(screen, &call.name, &asked.param, &asked.options, &live.event_tx);
+                            show_ask_modal(screen, &action_title(live, &call.name), &asked.param, &asked.options, &live.event_tx);
                             live.pending = Some(Pending { call, stage: Stage::Ask(asked) });
                         }
                         None => {}
@@ -843,7 +843,7 @@ fn setup_live_state(
     let secret_values = secrets::resolve(&doc, &config_dir);
     let pin_gate = pin::Gate::from_doc(&doc, &secret_values);
     let theme = themes::resolve(&doc);
-    paneld_ui::set_styles(themes::styles(&doc, None));
+    apply_theme_ui(&doc, &theme, None);
     let vars_map = vars::initial_values(&doc);
     let var_types = vars::types(&doc);
     let vars_shared = match previous {
@@ -1076,8 +1076,8 @@ fn route_call(
         actions::Prepared::Ready(args) => call.args = args,
         actions::Prepared::Ask(param) => {
             let options = param.option_values(&ctx);
-            show_ask_modal(screen, &call.name, &param, &options, &live.event_tx);
-            live.pending = Some(Pending { call, stage: Stage::Ask(Box::new(Asking { param, options })) });
+            show_ask_modal(screen, &action_title(live, &call.name), &param, &options, &live.event_tx);
+            live.pending = Some(Pending { call, stage: Stage::Ask(Box::new(Asking { param: *param, options })) });
             return;
         }
         actions::Prepared::Refused(why) => {
@@ -1116,7 +1116,7 @@ fn route_call(
             live.pending = Some(Pending { call, stage: Stage::Notice });
             return;
         }
-        show_pin_modal(screen, &call.name, None, &live.event_tx);
+        show_pin_modal(screen, &action_title(live, &call.name), None, &live.event_tx);
         live.pending = Some(Pending { call, stage: Stage::Pin });
         return;
     }
@@ -1135,7 +1135,7 @@ fn route_call(
         }
         def.bind(&mut ctx);
         let message = paneld_ui::interpolate(&cp.raw, cp.span.file, cp.span.start, &ctx);
-        show_confirm_modal(screen, &call.name, &message, &live.event_tx);
+        show_confirm_modal(screen, &action_title(live, &call.name), &message, &live.event_tx);
         live.pending = Some(Pending { call, stage: Stage::Confirm });
         return;
     }
@@ -1217,7 +1217,7 @@ fn screen_step(live: &mut LiveState) -> bool {
             }
             screen::Effect::Theme(name) => {
                 live.theme = themes::resolve_with(&live.doc, name.as_deref());
-                paneld_ui::set_styles(themes::styles(&live.doc, name.as_deref()));
+                apply_theme_ui(&live.doc, &live.theme, name.as_deref());
                 redraw = true;
             }
         }
@@ -1352,9 +1352,9 @@ fn action_done(
                 let err = field("stderr");
                 let err = err.trim();
                 if err.is_empty() {
-                    match shown_name(name) {
-                        Some(n) => format!("{n} failed"),
-                        None => "Failed".to_string(),
+                    match action_title(live, name) {
+                        t if t.is_empty() => "Failed".to_string(),
+                        t => format!("{t} failed"),
                     }
                 } else {
                     // One line is enough for a toast.
@@ -1381,22 +1381,52 @@ fn action_done(
 /// How long a `done` / `failed` toast stays up.
 const TOAST_FOR: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// What a theme sets beyond its tokens: node and class styles, and
+/// the dialog backdrop (`dialog_backdrop`, default transparent).
+fn apply_theme_ui(
+    doc: &paneld_config::Document,
+    tokens: &std::collections::BTreeMap<String, paneld_ui::Value>,
+    theme: Option<&str>,
+) {
+    paneld_ui::set_styles(themes::styles(doc, theme));
+    let backdrop = tokens
+        .get("dialog_backdrop")
+        .and_then(|v| paneld_ui::Backdrop::parse(&v.to_display_string()))
+        .unwrap_or(paneld_ui::Backdrop::Transparent);
+    paneld_ui::set_dialog_backdrop(backdrop);
+}
+
+/// The action's `title` (schema 5), filled in against the current
+/// state; empty without one. Dialogs and messages never show the
+/// action's own name, which is for the config.
+fn action_title(live: &LiveState, name: &str) -> String {
+    let Some(def) = live.actions.get(name) else { return String::new() };
+    let Some(t) = &def.title else { return String::new() };
+    let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+    def.bind(&mut ctx);
+    paneld_ui::interpolate(&t.raw, t.span.file, t.span.start, &ctx).trim().to_string()
+}
+
+/// A dialog over the page: the page stays on screen, under a backdrop
+/// (theme `dialog_backdrop`) that takes the taps. The page's bindings
+/// are dropped, so only the dialog's own act.
+fn dialog_layer<'a>(screen: &paneld_ui::ui::Obj<'a>) -> paneld_ui::ui::Obj<'a> {
+    paneld_ui::reset_action_bindings();
+    screen.new_dialog_layer()
+}
+
 /// PIN entry modal: masked textarea in a msgbox plus a numeric
 /// keyboard. The keyboard's OK sends `PinEntered`; Cancel sends a
 /// `ConfirmReply { accept: false }` which drops the parked call.
 fn show_pin_modal(
     screen: &paneld_ui::ui::Obj<'_>,
-    action_name: &str,
+    title: &str,
     error: Option<&str>,
     sink: &std::sync::mpsc::Sender<paneld_ui::UiEvent>,
 ) {
-    paneld_ui::reset_action_bindings();
-    screen.clear_children();
-    let box_ = screen.new_msgbox();
-    box_.msgbox_add_title(&match shown_name(action_name) {
-        Some(n) => format!("PIN for {n}"),
-        None => "Enter PIN".to_string(),
-    });
+    let layer = dialog_layer(screen);
+    let box_ = layer.new_msgbox();
+    box_.msgbox_add_title(&if title.is_empty() { "Enter PIN".to_string() } else { format!("PIN for {title}") });
     if let Some(e) = error {
         box_.msgbox_add_text(e);
     }
@@ -1406,39 +1436,44 @@ fn show_pin_modal(
     // The keyboard takes the bottom half of the screen; keep the box
     // (and its Cancel) in the top half.
     box_.align_top_mid(8);
-    let kb = screen.new_number_keyboard();
+    let kb = layer.new_number_keyboard();
     kb.attach_keyboard_to(&ta);
     kb.on_submit_pin(sink.clone());
 }
 
-/// A dialog asking for `param` of `action_name` (schema 6 `ask`):
-/// a dropdown of its `options`, a slider over `min`..`max`, a toggle,
-/// or a digit keypad, with Cancel and OK.
+/// A dialog asking for `param` (schema 6 `ask`): a dropdown of its
+/// `options`, a slider over `min`..`max` with its value shown, a
+/// toggle, or a digit keypad, with Cancel and OK. The heading is the
+/// action's `title` when it has one, else the param's label.
 fn show_ask_modal(
     screen: &paneld_ui::ui::Obj<'_>,
-    action_name: &str,
+    title: &str,
     param: &actions::ParamDef,
     options: &[paneld_ui::Value],
     sink: &std::sync::mpsc::Sender<paneld_ui::UiEvent>,
 ) {
     use paneld_ui::ui::{Size, ValueWidget};
     use paneld_ui::EventValue;
-    paneld_ui::reset_action_bindings();
-    screen.clear_children();
-    let box_ = screen.new_msgbox();
+    let layer = dialog_layer(screen);
+    let box_ = layer.new_msgbox();
     let label = param.label.clone().unwrap_or_else(|| param.name.clone());
-    box_.msgbox_add_title(&match shown_name(action_name) {
-        Some(n) => format!("{n}: {label}"),
-        None => label,
-    });
+    if title.is_empty() {
+        box_.msgbox_add_title(&label);
+    } else {
+        box_.msgbox_add_title(title);
+        box_.msgbox_add_text(&label);
+    }
     let content = box_.msgbox_content();
     match param.ask.as_deref() {
         Some("slider") => {
             let (min, max) = (param.min.unwrap_or(0.0) as i32, param.max.unwrap_or(100.0) as i32);
+            let shown = content.new_label(&min.to_string());
             let s = content.new_slider();
             s.set_slider_range(min, max);
             s.set_slider_value(min);
-            s.set_size(Size::Percent(100), Size::Content);
+            // A fixed width: the dialog takes its contents' size.
+            s.set_size(Size::Px(260), Size::Content);
+            s.show_value_in(&shown);
             s.on_change_ask(ValueWidget::Slider, sink.clone());
             paneld_ui::set_ask_value(Some(EventValue::Int(min.into())));
         }
@@ -1452,7 +1487,7 @@ fn show_ask_modal(
             ta.set_size(Size::Percent(100), Size::Content);
             box_.msgbox_add_ask_button("Cancel", false, sink.clone());
             box_.align_top_mid(8);
-            let kb = screen.new_number_keyboard();
+            let kb = layer.new_number_keyboard();
             kb.attach_keyboard_to(&ta);
             kb.on_change_ask(ValueWidget::Keypad, sink.clone());
             paneld_ui::set_ask_value(None);
@@ -1494,34 +1529,23 @@ fn show_notice(
     message: &str,
     sink: &std::sync::mpsc::Sender<paneld_ui::UiEvent>,
 ) {
-    paneld_ui::reset_action_bindings();
-    screen.clear_children();
-    let box_ = screen.new_msgbox();
+    let layer = dialog_layer(screen);
+    let box_ = layer.new_msgbox();
     box_.msgbox_add_text(message);
     box_.msgbox_add_confirm_button("OK", false, sink.clone());
 }
 
-/// An action's name as shown on screen; `None` for an inline
-/// handler's internal `@inline:...` name.
-fn shown_name(name: &str) -> Option<&str> {
-    (!name.starts_with('@')).then_some(name)
-}
-
-/// Pop an action-confirm modal on `screen`, replacing the page so
-/// the modal is the only live binding target until the user replies.
+/// An action's `confirm` question over the page; the dialog is the
+/// only thing that reacts until the user answers.
 fn show_confirm_modal(
     screen: &paneld_ui::ui::Obj<'_>,
-    action_name: &str,
+    title: &str,
     message: &str,
     sink: &std::sync::mpsc::Sender<paneld_ui::UiEvent>,
 ) {
-    paneld_ui::reset_action_bindings();
-    screen.clear_children();
-    let box_ = screen.new_msgbox();
-    box_.msgbox_add_title(&match shown_name(action_name) {
-        Some(n) => format!("Run {n}?"),
-        None => "Are you sure?".to_string(),
-    });
+    let layer = dialog_layer(screen);
+    let box_ = layer.new_msgbox();
+    box_.msgbox_add_title(if title.is_empty() { "Confirm" } else { title });
     box_.msgbox_add_text(message);
     box_.msgbox_add_confirm_button("Cancel", false, sink.clone());
     box_.msgbox_add_confirm_button("OK", true, sink.clone());

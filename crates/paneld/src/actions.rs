@@ -51,6 +51,8 @@ pub struct ActionDef {
     /// Cancel before running. Interpolated against the eval ctx at
     /// prompt time so the message can mention the item.
     pub confirm: Option<ConfirmPrompt>,
+    /// `title = <text>`: the action's name in dialogs and messages.
+    pub title: Option<ConfirmPrompt>,
     /// `pin = true`: ask the PIN (schema section 14) before
     /// `confirm` and `run`.
     pub pin: bool,
@@ -97,6 +99,8 @@ pub struct ParamDef {
     pub options: Option<ConfirmPrompt>,
     /// `ask = select | slider | keypad | toggle`.
     pub ask: Option<String>,
+    /// `pattern = <regex>`: the whole text must match.
+    pub pattern: Option<String>,
     pub label: Option<String>,
 }
 
@@ -111,6 +115,7 @@ impl ParamDef {
             options: None,
             ask: None,
             label: None,
+            pattern: None,
         };
         for item in p.options.iter().flat_map(|o| &o.items) {
             let Item::Assign(a) = item else { continue };
@@ -121,6 +126,7 @@ impl ParamDef {
                 "max" => def.max = paneld_config::value::parse_number(text),
                 "options" => def.options = Some(ConfirmPrompt { raw: a.value.text.clone(), span: a.value.span }),
                 "ask" => def.ask = Some(text.to_string()),
+                "pattern" => def.pattern = Some(paneld_config::value::parse_string(&a.value.text)),
                 "label" => def.label = Some(text.trim_matches('"').to_string()),
                 _ => {}
             }
@@ -148,7 +154,7 @@ pub enum Prepared {
     /// Typed, checked, defaults filled in.
     Ready(Vec<ActionArg>),
     /// This param was not passed and has `ask`: show a dialog.
-    Ask(ParamDef),
+    Ask(Box<ParamDef>),
     /// Refused before anything runs, with the reason.
     Refused(String),
 }
@@ -185,7 +191,7 @@ pub fn prepare_args(def: &ActionDef, mut args: Vec<ActionArg>, ctx: &Context, de
             Some(i) => args[i].value.clone(),
             None if !defaults => continue,
             // Not passed: ask for it, else take the default.
-            None if p.ask.is_some() => return Prepared::Ask(p.clone()),
+            None if p.ask.is_some() => return Prepared::Ask(Box::new(p.clone())),
             None => match &p.default {
                 Some(d) => match paneld_ui::resolve_value(&d.raw, d.span, ctx) {
                     Some(v) => v,
@@ -211,6 +217,12 @@ pub fn prepare_args(def: &ActionDef, mut args: Vec<ActionArg>, ctx: &Context, de
         if let (Some(n), Some(max)) = (num, p.max) {
             if n > max {
                 return Prepared::Refused(format!("`{}` = {} is above {max}", p.name, v.to_display_string()));
+            }
+        }
+        if let Some(pattern) = &p.pattern {
+            let text = v.to_display_string();
+            if paneld_config::value::pattern_matches(pattern, &text) != Ok(true) {
+                return Prepared::Refused(format!("`{}` = {text} does not match its pattern", p.name));
             }
         }
         if p.options.is_some() {
@@ -344,6 +356,9 @@ fn parse_def(b: &Block) -> ActionDef {
         }
         if let Some((raw, span)) = find_simple_with_span(b, "confirm") {
             def.confirm = Some(ConfirmPrompt { raw: raw.to_string(), span });
+        }
+        if let Some((raw, span)) = find_simple_with_span(b, "title") {
+            def.title = Some(ConfirmPrompt { raw: raw.to_string(), span });
         }
         if let Some(raw) = find_simple(b, "pin") {
             def.pin = paneld_config::value::parse_bool(raw.trim()).unwrap_or(false);
@@ -1083,6 +1098,14 @@ mod tests {
         refused(vec![arg("n", Value::Bool(true)), arg("m", Value::Int(5))], "is not an int");
         refused(vec![arg("n", Value::Int(11)), arg("m", Value::Int(5))], "above 10");
         refused(vec![arg("n", Value::Int(0)), arg("m", Value::Int(5))], "below 1");
+        // `pattern`: the whole text.
+        let doc = parse_doc("action u { param unit: string { pattern = \"[a-z0-9][a-z0-9-]*\" }\n run = /bin/true }\n");
+        let def = collect(&doc).remove("u").unwrap();
+        let check = |v: &str| matches!(prepare_args(&def, vec![arg("unit", s(v))], &ctx, true), Prepared::Ready(_));
+        assert!(check("nginx"));
+        assert!(!check("--force"), "a leading option");
+        assert!(!check("nginx; reboot"));
+        assert!(!check(""));
         refused(vec![arg("n", Value::Int(2)), arg("mode", s("turbo")), arg("m", Value::Int(5))], "not one of");
         refused(vec![arg("m", Value::Int(5))], "`n` was not given");
         // `mode` defaults; `m` is asked.

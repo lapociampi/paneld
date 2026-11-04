@@ -1193,6 +1193,41 @@ impl<'ui> Obj<'ui> {
     /// A modal message box (schema's action `confirm`). Call
     /// `add_title`, `add_text` and `add_confirm_button` / `add_cancel_button`
     /// to flesh it out. `parent = screen` makes it an overlay.
+    /// A full-screen layer for a dialog, on top of what is drawn: it
+    /// takes every tap (the page under it stays as it is, inert), and
+    /// looks as the theme's `dialog_backdrop` says ([`set_dialog_backdrop`]).
+    /// The dialog goes inside it.
+    pub fn new_dialog_layer(&self) -> Obj<'ui> {
+        let layer = self.new_container();
+        layer.set_size(Size::Percent(100), Size::Percent(100));
+        layer.set_padding(0);
+        layer.set_radius(0);
+        unsafe {
+            sys::lv_obj_set_style_border_width(layer.raw, 0, 0);
+            sys::lv_obj_set_pos(layer.raw, 0, 0);
+            sys::lv_obj_set_clickable(layer.raw, true);
+            sys::lv_obj_set_scrollable(layer.raw, false);
+            match DIALOG_BACKDROP.with(|b| b.get()) {
+                Backdrop::Transparent => {
+                    sys::lv_obj_set_style_bg_opa(layer.raw, sys::_lv_opacity_level_t_LV_OPA_TRANSP as sys::lv_opa_t, 0);
+                }
+                Backdrop::Color(rgb, alpha) => {
+                    sys::lv_obj_set_style_bg_color(layer.raw, sys::lv_color_hex(rgb), 0);
+                    sys::lv_obj_set_style_bg_opa(layer.raw, alpha, 0);
+                }
+                Backdrop::Blur(radius) => {
+                    // The backdrop blur needs a part that is drawn but not
+                    // opaque.
+                    sys::lv_obj_set_style_bg_color(layer.raw, sys::lv_color_hex(0), 0);
+                    sys::lv_obj_set_style_bg_opa(layer.raw, 1, 0);
+                    sys::lv_obj_set_style_blur_backdrop(layer.raw, true, 0);
+                    sys::lv_obj_set_style_blur_radius(layer.raw, radius, 0);
+                }
+            }
+        }
+        layer
+    }
+
     pub fn new_msgbox(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_msgbox_create(self.raw) };
         assert!(!raw.is_null());
@@ -1276,6 +1311,23 @@ impl<'ui> Obj<'ui> {
         let raw = unsafe { sys::lv_slider_create(self.raw) };
         assert!(!raw.is_null());
         Obj { raw, _ui: PhantomData }
+    }
+
+    /// Keep `label` showing this slider's value as it moves.
+    pub fn show_value_in(&self, label: &Obj<'ui>) {
+        unsafe extern "C" fn update(e: *mut sys::lv_event_t) {
+            // SAFETY: registered below on a slider with its label (a
+            // sibling in the same dialog, deleted with it) as user data.
+            unsafe {
+                let slider = sys::lv_event_get_target(e) as *mut sys::lv_obj_t;
+                let label = sys::lv_event_get_user_data(e) as *mut sys::lv_obj_t;
+                let text = std::ffi::CString::new(sys::lv_slider_get_value(slider).to_string()).unwrap_or_default();
+                sys::lv_label_set_text(label, text.as_ptr());
+            }
+        }
+        unsafe {
+            sys::lv_obj_add_event_cb(self.raw, Some(update), sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED, label.raw as *mut std::ffi::c_void);
+        }
     }
 
     pub fn set_slider_range(&self, min: i32, max: i32) {
@@ -1772,6 +1824,51 @@ pub enum Size {
     Px(i32),
     Percent(u16),
     Content,
+}
+
+/// How a dialog's backdrop looks (theme token `dialog_backdrop`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backdrop {
+    /// The page shows through, unchanged.
+    Transparent,
+    /// RGB and opacity over the page.
+    Color(u32, u8),
+    /// The page blurred by this radius in px.
+    Blur(i32),
+}
+
+impl Backdrop {
+    /// `transparent`, `#rrggbb`, `#rrggbbaa` or `blur <px>`; `None` for
+    /// anything else.
+    pub fn parse(s: &str) -> Option<Backdrop> {
+        let s = s.trim();
+        if s == "transparent" || s.is_empty() {
+            return Some(Backdrop::Transparent);
+        }
+        if let Some(px) = s.strip_prefix("blur") {
+            let px: i32 = px.trim().trim_end_matches("px").parse().ok()?;
+            return (0..=64).contains(&px).then_some(Backdrop::Blur(px));
+        }
+        let hex = s.strip_prefix('#')?;
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        match hex.len() {
+            6 => Some(Backdrop::Color(u32::from_str_radix(hex, 16).ok()?, 255)),
+            8 => Some(Backdrop::Color(u32::from_str_radix(&hex[..6], 16).ok()?, byte(6)?)),
+            _ => None,
+        }
+    }
+}
+
+thread_local! {
+    static DIALOG_BACKDROP: std::cell::Cell<Backdrop> = const { std::cell::Cell::new(Backdrop::Transparent) };
+}
+
+/// The look of the next dialogs' backdrop, from the active theme.
+pub fn set_dialog_backdrop(b: Backdrop) {
+    DIALOG_BACKDROP.with(|c| c.set(b));
 }
 
 /// `scroll { snap = ... }`.

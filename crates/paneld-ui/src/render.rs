@@ -941,12 +941,25 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
             "on_hold" => Trigger::Hold,
             _ => continue,
         };
-        let name = a.value.text.trim();
-        if name != "none" && is_bare_ident(name) {
+        if let Some(name) = action_name(&a.value.text, a.value.span, ctx) {
             obj.set_clickable();
-            obj.bind_action(trigger, sink.clone(), name, Vec::new());
+            obj.bind_action(trigger, sink.clone(), &name, Vec::new());
         }
     }
+}
+
+/// The action an `on_tap = ...` names: a bare name, or an expression
+/// that gives one (`on_tap = {{ tap }}` with a component's `action`
+/// param). `none`, or anything that is not a name, binds nothing.
+fn action_name(raw: &str, span: paneld_config::source::Span, ctx: &Context) -> Option<String> {
+    let name = match classify(raw) {
+        ValueShape::Literal(t) => t.trim().to_string(),
+        _ => match resolve_expr_value(raw, span, ctx) {
+            Some(Value::String(s)) => s.trim().to_string(),
+            _ => return None,
+        },
+    };
+    (name != "none" && is_bare_ident(&name)).then_some(name)
 }
 
 /// Apply `node`'s plain properties (size, spacing, colors, font,
@@ -1217,9 +1230,9 @@ fn bind_change_action(
     sink: &Sender<UiEvent>,
     obj: &Obj<'_>,
 ) -> Option<Vec<InlineSetItem>> {
-    if let Some(action) = find_simple(node, handler).map(str::trim) {
-        if action != "none" && is_bare_ident(action) {
-            obj.on_change_action(widget, sink.clone(), action.to_string(), local_args(ctx));
+    if let Some((raw, span)) = find_raw(node, handler) {
+        if let Some(action) = action_name(raw, span, ctx) {
+            obj.on_change_action(widget, sink.clone(), action, local_args(ctx));
             return None;
         }
     }

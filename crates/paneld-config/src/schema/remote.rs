@@ -57,6 +57,7 @@ macro_rules! action_keys {
         &[
             k("pin", E::Bool, false, false),
             k("confirm", E::Str, false, true),
+            k("title", E::Str, false, true),
             k("timeout", E::Dur, false, false),
             k("goto", E::Ident, false, false),
             k("refresh", E::IdentOrList, false, false),

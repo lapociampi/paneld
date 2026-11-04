@@ -505,7 +505,8 @@ fn a_param_is_asked_for_and_checked() {
     let conf = d.join("p.conf");
     std::fs::write(
         &conf,
-        "var m: int = 0\n\
+        "theme t { dialog_backdrop = #ff00ff }\nscreen { theme = t }\n\
+         var m: int = 0\n\
          action pause {\n\
              param minutes: int { ask = select; options = [5, 30]; max = 10 }\n\
              set { m = {{ minutes }} }\n\
@@ -519,9 +520,11 @@ fn a_param_is_asked_for_and_checked() {
     .unwrap();
     let green = |p| close(p, [0, 0xff, 0], 16);
     let blue = |p| close(p, [0, 0, 0xff], 16);
-    // The dialog is up: nothing set yet.
+    // The dialog is up over the page (an opaque backdrop here): nothing
+    // set yet.
+    let magenta = |p| close(p, [0xff, 0, 0xff], 16);
     let asked = shot(&conf, &["--tap", "50,85", "--settle", "150"]);
-    assert!(!asked.any(green) && !asked.any(blue), "no dialog over the page");
+    assert!(asked.any(magenta) && !asked.any(green) && !asked.any(blue), "no dialog over the page");
     // OK takes the first option, 5.
     let ok = shot(&conf, &["--tap", "50,85", "--settle", "150", "--tap", "463,295", "--settle", "200"]);
     assert!(ok.any(green), "5 was not set");
@@ -544,7 +547,8 @@ fn an_empty_keypad_is_asked_again() {
     let conf = d.join("p.conf");
     std::fs::write(
         &conf,
-        "var m: int = 0\n\
+        "theme t { dialog_backdrop = #ff00ff }\nscreen { theme = t }\n\
+         var m: int = 0\n\
          action setn { param n: int { ask = keypad }; set { m = {{ n }} } }\n\
          page home {\n\
              button { label = Set; on_tap = setn }\n\
@@ -987,4 +991,67 @@ fn an_inline_set_can_read_the_page_it_was_tapped_on() {
     .unwrap();
     let img = shot(&conf, &["--tap", "100,120", "--settle", "100"]);
     assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "page.name was not in scope");
+}
+
+#[test]
+fn an_action_named_by_an_expression_runs() {
+    // Schema 7's pattern: a component takes `param tap: action` and
+    // does `on_tap = {{ tap }}`.
+    let d = tmp("action-param");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var n: int = 0\n\
+         action bump { set { n = {{ vars.n + 1 }} } }\n\
+         action jump { set { n = {{ vars.n + 10 }} } }\n\
+         component tile {\n\
+             param tap: action = none\n\
+             button { width = 200; height = 60; label = go; on_tap = {{ tap }} }\n\
+         }\n\
+         page home {\n\
+             tile { tap = bump }\n\
+             tile { }\n\
+             button { width = 200; height = 60; label = pick; on_tap = {{ vars.n >= 1 ? 'jump' : 'bump' }} }\n\
+             rect { width = 200; height = 40; background = {{ vars.n == 1 ? '#00ff00' : vars.n == 11 ? '#0000ff' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    // The param's action.
+    let img = shot(&conf, &["--tap", "100,90", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "on_tap = {{ tap }} did nothing");
+    // `none` (the default) binds nothing.
+    let img = shot(&conf, &["--tap", "100,158", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0xff, 0, 0], 16)), "the none tile ran something");
+    // An expression choosing between actions, re-evaluated per render.
+    let img = shot(&conf, &["--tap", "100,90", "--settle", "100", "--tap", "100,226", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 16)), "the chosen action did not run");
+}
+
+#[test]
+fn a_dialog_shows_over_the_page_as_the_theme_says() {
+    let d = tmp("backdrop");
+    let conf = |backdrop: &str| {
+        let c = d.join(format!("{}.conf", backdrop.len()));
+        std::fs::write(
+            &c,
+            format!(
+                "theme t {{ {backdrop} }}\nscreen {{ theme = t }}\n\
+                 action go {{ title = Go; confirm = Sure? }}\n\
+                 page home {{\n\
+                     button {{ width = 200; height = 60; label = go; on_tap = go }}\n\
+                     rect {{ x = 0; width = 780; height = 300; background = #00ff00 }}\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+        c
+    };
+    let green = |img: &Image| img.any(|p| close(p, [0, 0xff, 0], 8));
+    // Default: transparent, the page shows unchanged.
+    assert!(green(&shot(&conf(""), &["--tap", "100,90", "--settle", "100"])), "the page is gone");
+    // A color covers it.
+    let covered = shot(&conf("dialog_backdrop = #000000"), &["--tap", "100,90", "--settle", "100"]);
+    assert!(!green(&covered) && covered.any(|p| p == [0, 0, 0]), "the color backdrop did not cover the page");
+    // A blur keeps its colors but softens its edges: still green somewhere.
+    assert!(green(&shot(&conf("dialog_backdrop = blur 8"), &["--tap", "100,90", "--settle", "100"])));
 }

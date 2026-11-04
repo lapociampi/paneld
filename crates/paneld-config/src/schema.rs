@@ -326,6 +326,13 @@ const ACTION_SCHEMA: &BlockSchema = &BlockSchema {
             required: false,
             expr_ok: true,
         },
+        // How the action is named in its dialogs and messages.
+        KeyRule {
+            name: "title",
+            ty: ExpectedType::Str,
+            required: false,
+            expr_ok: true,
+        },
         KeyRule {
             name: "run",
             ty: ExpectedType::Command,
@@ -834,7 +841,7 @@ const EVENT_HANDLER_KINDS: &[&str] = &["on_tap", "on_hold", "on_change", "on_sub
 /// Inline-action keys accepted inside an action-call shortcut body
 /// (e.g. `on_tap { goto = home; refresh = foo }`).
 const INLINE_ACTION_KEYS: &[&str] =
-    &["goto", "refresh", "set", "then", "else", "run", "confirm", "pin"];
+    &["goto", "refresh", "set", "then", "else", "run", "confirm", "pin", "title"];
 
 /// A chart `series { }` sub-block.
 const CHART_SERIES_SCHEMA: &BlockSchema = &BlockSchema {
@@ -1943,6 +1950,12 @@ fn validate_param_in_body(p: &Param, parent_kind: &str, diags: &mut Vec<Diagnost
             diags.push(Diagnostic::new(d.1, format!("the default of `{}` is outside its `min` / `max`", p.name.text)));
         }
     }
+    if let (Some(d), Some(pat)) = (&p.default, option("pattern")) {
+        let pattern = crate::value::parse_string(&pat.value.text);
+        if !d.text.contains("{{") && crate::value::pattern_matches(&pattern, &crate::value::parse_string(&d.text)) == Ok(false) {
+            diags.push(Diagnostic::new(d.span, format!("the default of `{}` does not match its `pattern`", p.name.text)));
+        }
+    }
     if let Some(ask) = option("ask") {
         if parent_kind != "action" {
             diags.push(Diagnostic::new(ask.span, "`ask` is for action params only"));
@@ -1976,6 +1989,10 @@ fn validate_param_options(opts: &OptionsBlock, diags: &mut Vec<Diagnostic>) {
             }
             "pattern" => {
                 check_value_type(&a.value.text, a.value.span, ExpectedType::Str, false, diags);
+                let pattern = crate::value::parse_string(&a.value.text);
+                if let Err(e) = crate::value::pattern_matches(&pattern, "") {
+                    diags.push(Diagnostic::new(a.value.span, format!("`pattern` is not a valid regex: {e}")));
+                }
             }
             "options" => {
                 check_value_type(&a.value.text, a.value.span, ExpectedType::List, true, diags);
@@ -2392,6 +2409,20 @@ fn validate_theme_assign(a: &Assign, diags: &mut Vec<Diagnostic>) {
         ));
         return;
     };
+    // How a dialog's backdrop looks: `transparent`, a color, `blur <px>`.
+    if key.text == "dialog_backdrop" {
+        let v = a.value.text.trim();
+        let ok = v == "transparent"
+            || v.strip_prefix("blur").is_some_and(|px| px.trim().trim_end_matches("px").parse::<u32>().is_ok_and(|n| n <= 64))
+            || (v.starts_with('#') && matches!(v.len(), 7 | 9) && v[1..].bytes().all(|b| b.is_ascii_hexdigit()));
+        if !ok {
+            diags.push(Diagnostic::new(
+                a.value.span,
+                format!("`dialog_backdrop` is `transparent`, `#rrggbb[aa]` or `blur <px>` (0 to 64), not `{v}`"),
+            ));
+        }
+        return;
+    }
     // Known token: type-check against its declared shape, with
     // expression tolerance (a theme may interpolate another token).
     if let Some(ty) = theme_token_type(&key.text) {
@@ -3740,6 +3771,27 @@ mod tests {
         assert!(!flagged("ssh h uptime"));
         assert!(!flagged("echo ssh h {{ x }}"));
         assert!(!flagged("scp {{ x }} h:/tmp"));
+    }
+
+    #[test]
+    fn dialog_backdrop_takes_transparent_a_color_or_a_blur() {
+        for ok in ["transparent", "#102030", "#10203080", "blur 8", "blur 12px"] {
+            let d = check_text(&format!("theme t {{ dialog_backdrop = {ok} }}\n"));
+            assert!(d.is_empty(), "{ok}: {d:?}");
+        }
+        for bad in ["red", "#12", "blur", "blur 100", "fog"] {
+            let d = check_text(&format!("theme t {{ dialog_backdrop = {bad} }}\n"));
+            assert!(d.iter().any(|m| m.contains("`dialog_backdrop` is")), "{bad}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn a_param_pattern_must_compile_and_its_default_match() {
+        let d = check_text("action a { param p: string { pattern = \"[a-z\" }\n run = x }\n");
+        assert_msg(&d, "`pattern` is not a valid regex");
+        let d = check_text("action a { param p: string = Bad { pattern = \"[a-z]+\" }\n run = x }\n");
+        assert_msg(&d, "the default of `p` does not match its `pattern`");
+        assert!(check_text("action a { param p: string = ok { pattern = \"[a-z]+\" }\n run = x }\n").is_empty());
     }
 
     #[test]

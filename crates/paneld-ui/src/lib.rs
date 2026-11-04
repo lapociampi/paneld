@@ -23,7 +23,7 @@ pub mod ui;
 pub use expr::{eval, Context, EvalError, Value};
 pub use render::{interpolate, render_page, render_toast, resolve_value, set_styles};
 pub use ui::{
-    hide_sleep_cover, inactive_ms, reset_action_bindings, restore_inputs, set_ask_value, set_asset_dir, set_wake_sink, show_sleep_cover,
-    snapshot_inputs, trigger_activity, ActionArg, ActionTrigger, EventValue, InlineSetItem, MemDisplay, Ui, UiEvent,
+    hide_sleep_cover, inactive_ms, reset_action_bindings, restore_inputs, set_ask_value, set_asset_dir, set_dialog_backdrop, set_wake_sink, show_sleep_cover,
+    snapshot_inputs, trigger_activity, ActionArg, ActionTrigger, Backdrop, EventValue, InlineSetItem, MemDisplay, Ui, UiEvent,
     Window,
 };

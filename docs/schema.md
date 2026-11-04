@@ -124,6 +124,7 @@ action pause_adblock {
 | `param` | repeatable | Typed parameters (section 6); passed by the caller or asked for |
 | `pin` | bool | Ask the PIN first (section 14) |
 | `confirm` | string, expr | Ask for confirmation with this text |
+| `title` | string, expr | How the action is named in its dialogs and messages (`PIN for <title>`, `<title> failed`); without it they name no action |
 | `run` | command | Optional: an action may only change the UI |
 | `timeout` | duration | |
 | `env { }` | block | |
@@ -148,6 +149,7 @@ Wherever a type is `action` (`on_tap`, `then`, a component param):
 | Form | Example |
 | --- | --- |
 | By name | `on_tap = refresh_all` |
+| By an expression giving a name | `on_tap = {{ tap }}` (a component's `action` param), `on_tap = {{ vars.on ? 'stop' : 'start' }}`; `none` binds nothing |
 | By name with arguments | `on_tap vm_stop { vm = {{ item.id }} }` |
 | Inline | `on_tap { goto = settings }` |
 | Nothing | `on_tap = none` |
@@ -174,7 +176,7 @@ Options:
 | Key | Notes |
 | --- | --- |
 | `min`, `max` | numbers |
-| `pattern` | regex for strings (not enforced yet) |
+| `pattern` | regex the whole text must match ([ADR 0019](decisions/0019-param-patterns.md)); `paneld check` checks it compiles and that a default matches |
 | `options` | allowed values (list, expr) |
 | `ask` | `select`, `slider`, `keypad`, `toggle`: if the caller did not pass it, a dialog asks for it (actions only) |
 | `label` | dialog label |
@@ -368,7 +370,7 @@ See [Themes](themes.md) for the folder, styles, components and motion. Tokens ev
 | Colors | `background`, `surface`, `text`, `muted`, `accent`, `ok`, `info`, `warning`, `critical` |
 | Fonts | `font_small`, `font`, `font_big`, `font_huge`: font values with size, e.g. `roboto 16` |
 | Sizes | `gap`, `padding`, `radius`, `tap_min` (smallest touch target) |
-| Other | `shadow`, `background_image` (optional), `icons` (icon set folder), `motion` |
+| Other | `shadow`, `background_image` (optional), `icons` (icon set folder), `motion`, `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 64) |
 
 A theme may add any other token; they are read as `theme.<name>`.
 

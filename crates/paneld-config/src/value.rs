@@ -461,6 +461,19 @@ pub fn split_list(text: &str) -> Option<Vec<String>> {
     Some(items)
 }
 
+// --- pattern ---
+
+/// Whether `text` matches param `pattern` as a whole (schema 6): the
+/// regex is anchored at both ends. `Err` for a pattern that does not
+/// compile (or is too large), with the reason.
+pub fn pattern_matches(pattern: &str, text: &str) -> Result<bool, String> {
+    let re = regex_lite::RegexBuilder::new(&format!("^(?:{pattern})$"))
+        .size_limit(64 * 1024)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(re.is_match(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,5 +680,14 @@ mod tests {
         for bad in ["#", "#12", "#1234", "#12345", "#ggg", "123456", "#é12"] {
             assert_eq!(parse_color(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn patterns_match_the_whole_text() {
+        assert_eq!(pattern_matches("[a-z]+", "nginx"), Ok(true));
+        assert_eq!(pattern_matches("[a-z]+", "nginx; reboot"), Ok(false), "anchored");
+        assert_eq!(pattern_matches("a|b", "ab"), Ok(false), "the group is anchored, not the first branch");
+        assert_eq!(pattern_matches(r"\d{1,3}", "101"), Ok(true));
+        assert!(pattern_matches("(", "x").is_err());
     }
 }
