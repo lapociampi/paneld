@@ -2,7 +2,7 @@
 title: "Decisions"
 description: "The design decisions behind paneld, one record each."
 date: 2026-10-29
-updated: 2026-11-03
+updated: 2026-11-04
 tags: [paneld, adr]
 series: paneld
 order: 7
@@ -27,3 +27,4 @@ order: 7
 | [0015](0015-fonts.md) | Built-in fonts |
 | [0016](0016-builtin-alert-actions.md) | Built-in actions for acknowledge and snooze |
 | [0017](0017-vendored-libdrm.md) | libdrm built from a vendored copy |
+| [0018](0018-remotes.md) | Remotes |

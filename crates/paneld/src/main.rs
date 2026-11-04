@@ -15,6 +15,7 @@ mod history;
 mod pin;
 mod png;
 mod reminders;
+mod remotes;
 mod runner;
 mod screen;
 mod secrets;
@@ -541,8 +542,24 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // ctx including the current `alerts` map for symmetry with
     // the render-side ctx.
     while let Ok(update) = live.source_rx.try_recv() {
-        let event_value = update.value.clone();
         let mut value = update.value;
+        if update.status {
+            // Only `ok` / `error` change: the rest of the last result
+            // (`value`, `at`, `history`, `exit`, ...) stays, and no
+            // event goes out.
+            let mut values = live.source_values.lock().unwrap();
+            if let (Some(paneld_ui::Value::Map(prev)), paneld_ui::Value::Map(m)) = (values.get(&update.name), &value) {
+                let mut merged = prev.clone();
+                for k in ["ok", "error"] {
+                    merged.insert(k.to_string(), m.get(k).cloned().unwrap_or(paneld_ui::Value::Null));
+                }
+                value = paneld_ui::Value::Map(merged);
+            }
+            values.insert(update.name.clone(), value);
+            dirty = true;
+            continue;
+        }
+        let event_value = value.clone();
         live.histories.record(&update.name, &mut value, std::time::SystemTime::now());
         live.source_values
             .lock()
@@ -776,6 +793,14 @@ fn setup_live_state(
     // consumer below reads one form (and `action[x]:pin = true` is
     // honored).
     paneld_config::apply_overrides(&mut doc);
+    // Remote instances become sources and actions named
+    // `<instance>.<member>` (ADR 0018), after the overrides so
+    // `remote[x]:host` counts.
+    paneld_config::remote::lower(&mut doc);
+    remotes::install(remotes::Remotes::from_doc(
+        &doc,
+        &state_path.map(std::path::Path::to_path_buf).unwrap_or_else(|| state::config_path(&doc)),
+    ));
 
     // Pull the ADR 0013 defaults out once (10s timeout, 1 MiB
     // max_output unless `app:timeout` / `app:max_output` say
@@ -993,7 +1018,8 @@ fn route_call(
     // Schema 5 order: params (typed, checked, asked), then PIN, then
     // confirm. Built-in actions choose their own defaults.
     let builtin = paneld_config::library::BUILTIN_ACTIONS.contains(&call.name.as_str());
-    let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+    let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+    def.bind(&mut ctx);
     match actions::prepare_args(&def, std::mem::take(&mut call.args), &ctx, !builtin) {
         actions::Prepared::Ready(args) => call.args = args,
         actions::Prepared::Ask(param) => {
@@ -1042,18 +1068,20 @@ fn route_call(
         live.pending = Some(Pending { call, stage: Stage::Pin });
         return;
     }
-    if let Some(cp) = def.confirm {
+    if let Some(cp) = &def.confirm {
         let mut ctx = build_ctx(
             &live.source_values,
             &live.theme,
             &live.vars,
             Some(&live.alerts),
         );
-        // The message can name the call's args (`Stop VM {{ vm }}?`),
-        // bound the same way the worker binds them for `run`.
+        // The message can name the call's args (`Stop VM {{ vm }}?`)
+        // and a remote's params (`Reboot {{ host }}?`), bound the same
+        // way the worker binds them for `run`.
         for a in &call.args {
             ctx.insert(a.name.clone(), a.value.clone());
         }
+        def.bind(&mut ctx);
         let message = paneld_ui::interpolate(&cp.raw, cp.span.file, cp.span.start, &ctx);
         show_confirm_modal(screen, &call.name, &message, &live.event_tx);
         live.pending = Some(Pending { call, stage: Stage::Confirm });
@@ -1183,6 +1211,7 @@ fn run_screen_job(job: ScreenJob) {
                 name: "screen",
                 cwd: Some(&job.cwd),
                 env: &[],
+                stdin: None,
             },
         )
     });
@@ -1251,6 +1280,7 @@ fn action_done(
     let message = if ok {
         def.done.as_ref().map(|d| {
             let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+            def.bind(&mut ctx);
             ctx.insert("output".into(), paneld_ui::Value::String(field("stdout").trim().to_string()));
             ctx.insert("result".into(), result.clone());
             paneld_ui::interpolate(&d.raw, d.span.file, d.span.start, &ctx)
@@ -1259,6 +1289,7 @@ fn action_done(
         Some(match &def.failed {
             Some(f) => {
                 let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+                def.bind(&mut ctx);
                 ctx.insert("result".into(), result.clone());
                 paneld_ui::interpolate(&f.raw, f.span.file, f.span.start, &ctx)
             }
@@ -1837,7 +1868,7 @@ fn build_ctx(
     // them, see `with_secrets`.
     let mut ctx = paneld_ui::Context::new();
     let sources_snapshot = source_values.lock().unwrap().clone();
-    ctx.insert("sources".into(), paneld_ui::Value::Map(sources_snapshot));
+    remotes::expose(&mut ctx, sources_snapshot);
     ctx.insert("theme".into(), paneld_ui::Value::Map(theme.clone()));
     let snapshot = vars.lock().unwrap().clone();
     ctx.insert("vars".into(), paneld_ui::Value::Map(snapshot));

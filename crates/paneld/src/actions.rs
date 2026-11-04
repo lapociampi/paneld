@@ -62,6 +62,27 @@ pub struct ActionDef {
     pub failed: Option<ConfirmPrompt>,
     /// `param name: type [= default] [{ options }]` (schema 6).
     pub params: Vec<ParamDef>,
+    /// A remote member's block (schema 17): its command is built from
+    /// it and its kind, and the kind's params are bound for its
+    /// expressions.
+    pub remote: Option<Block>,
+}
+
+impl ActionDef {
+    /// It runs a command: a `run`, or a remote member's request.
+    pub fn runs(&self) -> bool {
+        self.run.is_some()
+            || self.remote.as_ref().is_some_and(|b| {
+                b.items.iter().any(|it| matches!(it, Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "send" || paneld_config::remote::METHODS.contains(&key.text.as_str()))))
+            })
+    }
+
+    /// Bind a remote member's params into `ctx`.
+    pub fn bind(&self, ctx: &mut Context) {
+        if let Some(b) = &self.remote {
+            crate::remotes::bind(b, ctx);
+        }
+    }
 }
 
 /// One declared action parameter (schema 6).
@@ -282,6 +303,7 @@ fn parse_def(b: &Block) -> ActionDef {
                     _ => None,
                 })
                 .collect(),
+            remote: paneld_config::remote::remote_of(b).is_some().then(|| b.clone()),
             ..ActionDef::default()
         };
         if let Some(run) = find_simple(b, "run") {
@@ -488,7 +510,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                 refused("refused, its PIN / confirm gate was not passed");
                 continue;
             }
-            if def.run.is_none() && def.refresh.is_empty() {
+            if !def.runs() && def.refresh.is_empty() {
                 run_call(&wctx, call, def, key);
                 continue;
             }
@@ -531,19 +553,31 @@ pub fn run_key(name: &str, args: &[ActionArg]) -> String {
 /// Run one call of `def` (gates already passed) and report it.
 fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
     let name = call.name;
-    let had_run = def.run.is_some();
+    let had_run = def.runs();
     let mut ok = true;
     // Schema 5: `result` = {ok, code, stdout, stderr}.
     let mut code: Option<i32> = None;
     let mut stdout = String::new();
     let mut stderr = String::new();
 
-    if let Some(raw) = def.run {
+    if had_run {
         let mut ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
         ctx.insert("secrets".into(), Value::Map(wctx.secrets.clone()));
+        // Bound last: a kind's params win over any arg of that name (a
+        // `repeat` item called `host`). The check refuses an action
+        // param that clashes with one.
+        def.bind(&mut ctx);
         let file = paneld_config::source::FileId::default();
-        // Split first, then interpolate each argv item.
-        let argv = runner::command_argv(&raw, |t| paneld_ui::interpolate(t, file, 0, &ctx));
+        let timeout = def.timeout.unwrap_or(wctx.app_defaults.timeout);
+        // Split first, then interpolate each argv item. A remote
+        // member's command is built around it (ADR 0018).
+        let request = match &def.remote {
+            Some(b) => crate::remotes::request(b, &ctx, timeout, false)
+                .and_then(|r| r.ok_or_else(|| "nothing to run".to_string()))
+                .map_err(|e| runner::RunError { message: e }),
+            None => runner::command_argv(def.run.as_deref().unwrap_or_default(), |t| paneld_ui::interpolate(t, file, 0, &ctx))
+                .map(|argv| crate::remotes::Request { argv, stdin: None }),
+        };
         // Interpolate each env value against the same ctx so
         // `env { TOKEN = {{ secrets.token }} }` reaches the
         // child.
@@ -558,7 +592,7 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
             })
             .collect();
         let cwd = resolve_action_cwd(&wctx.config_dir, def.cwd.as_deref());
-        let timeout = def.timeout.unwrap_or(wctx.app_defaults.timeout);
+        let stdin = request.as_ref().ok().and_then(|r| r.stdin.clone());
         let opts = runner::Opts {
             timeout,
             max_bytes: wctx.app_defaults.max_output,
@@ -566,11 +600,12 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
             name: &name,
             cwd: Some(&cwd),
             env: &env_pairs,
+            stdin: stdin.as_deref(),
         };
         // Nothing a command prints reaches the log, the screen
         // or `result` with a secret in it.
         let mask = crate::secrets::Mask::new(&wctx.secrets);
-        match argv.and_then(|argv| runner::exec(&argv, opts)) {
+        match request.and_then(|r| runner::exec(&r.argv, opts)) {
             Ok(mut r) => {
                 r.stdout = mask.apply(&r.stdout);
                 r.stderr = mask.apply(&r.stderr);
@@ -591,8 +626,12 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
                 stdout = r.stdout;
                 stderr = if r.too_large {
                     "output too large".to_string()
+                } else if r.timed_out && def.remote.is_some() {
+                    "timed out; it may still have run".to_string()
                 } else if r.timed_out {
                     "timed out".to_string()
+                } else if let Some(why) = def.remote.as_ref().filter(|_| !ok).and_then(|b| crate::remotes::explain(b, r.exit_code, &r.stderr)) {
+                    mask.apply(&why)
                 } else {
                     r.stderr
                 };
@@ -612,7 +651,8 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
     let should_set = (had_run && ok) || !had_run;
     if should_set && !def.set.is_empty() {
         let _set = set_lock();
-        let ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
+        let mut ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
+        def.bind(&mut ctx);
         apply_set(
             &name,
             &def.set,
@@ -650,12 +690,18 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
                     let _ = wctx.source_tx.send(crate::sources::SourceUpdate {
                         name: src_name.clone(),
                         value: v,
+                        status: false,
                     });
                 }
                 Err(e) => {
                     eprintln!(
                         "paneld: action `{name}`: refresh `{src_name}`: {e}"
                     );
+                    let _ = wctx.source_tx.send(crate::sources::SourceUpdate {
+                        name: src_name.clone(),
+                        value: crate::sources::not_ok(&e),
+                        status: true,
+                    });
                 }
             }
         }
@@ -718,7 +764,7 @@ fn ctx_with_vars_and_args(
 ) -> Context {
     let mut ctx = base.clone();
     let sources_snapshot = sources.lock().unwrap().clone();
-    ctx.insert("sources".into(), Value::Map(sources_snapshot));
+    crate::remotes::expose(&mut ctx, sources_snapshot);
     let snapshot = vars.lock().unwrap().clone();
     ctx.insert("vars".into(), Value::Map(snapshot));
     for a in args {

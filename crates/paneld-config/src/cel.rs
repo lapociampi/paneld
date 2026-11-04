@@ -1050,6 +1050,46 @@ pub fn find_ident(expr: &Expr, name: &str) -> Option<Span> {
     }
 }
 
+/// Every bare identifier in `expr` with its span: the roots an
+/// expression reads (`a` in `a.b[c]`, and `c`).
+pub fn idents(expr: &Expr) -> Vec<(String, Span)> {
+    let mut out = Vec::new();
+    fn walk(e: &Expr, out: &mut Vec<(String, Span)>) {
+        match &e.kind {
+            ExprKind::Ident(n) => out.push((n.clone(), e.span)),
+            ExprKind::IntLit(_) | ExprKind::DoubleLit(_) | ExprKind::StringLit(_) | ExprKind::BoolLit(_) | ExprKind::Null => {}
+            ExprKind::Field(inner, _) | ExprKind::Unary(_, inner) => walk(inner, out),
+            ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            ExprKind::Conditional(a, b, c) => {
+                walk(a, out);
+                walk(b, out);
+                walk(c, out);
+            }
+            ExprKind::Call(_, args) | ExprKind::List(args) => args.iter().for_each(|a| walk(a, out)),
+            ExprKind::Method(inner, name, args) => {
+                walk(inner, out);
+                // `l.exists(x, x > 1)`: `x` is the macro's own name.
+                let bound = match (name.as_str(), args.first().map(|a| &a.kind)) {
+                    ("all" | "exists" | "exists_one" | "map" | "filter", Some(ExprKind::Ident(v))) if args.len() >= 2 => Some(v.clone()),
+                    _ => None,
+                };
+                let mut inner_out = Vec::new();
+                args.iter().skip(usize::from(bound.is_some())).for_each(|a| walk(a, &mut inner_out));
+                out.extend(inner_out.into_iter().filter(|(n, _)| Some(n) != bound.as_ref()));
+            }
+            ExprKind::Map(pairs) => pairs.iter().for_each(|(k, v)| {
+                walk(k, out);
+                walk(v, out);
+            }),
+        }
+    }
+    walk(expr, &mut out);
+    out
+}
+
 /// Walk a parsed CEL expression and append diagnostics for any
 /// `sources.<name>` whose `<name>` is not in `known_sources`. Other
 /// identifier roots are left alone -- they may be component / action

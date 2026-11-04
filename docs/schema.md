@@ -26,6 +26,8 @@ Notation: `name: type = default`. A property marked `expr` can be a `{{ }}` expr
 | `page` | `page <name> { }` | [8](#8-pages-and-building-blocks) |
 | `alert` | `alert <name> { }` | [9](#9-alerts) |
 | `reminder` | `reminder <name> { }` | [10](#10-reminders) |
+| `remote_kind` | `remote_kind <name> { }` | [17](#17-remotes) |
+| `remote` | `remote <name>: <kind> { }` | [17](#17-remotes) |
 | `theme` | `theme <name> { }` | [11](#11-themes) |
 | `screen` | `screen { }` | [12](#12-screen) |
 | `display` | `display { }` | [13](#13-display) |
@@ -89,7 +91,7 @@ In expressions, `sources.<name>`:
 | Field | Type |
 | --- | --- |
 | `value` | the value's type |
-| `ok` | bool, last run succeeded; `false` (with `value` null) before the first result |
+| `ok` | bool, last run succeeded; `false` (with `value` null) before the first result. A run with no result (timeout, unparseable output, a stream that stopped or cannot start) changes only `ok` and `error`; the rest of the last result stays |
 | `error` | string, stderr or the reason |
 | `at` | timestamp of the last value |
 | `age` | duration since `at` |
@@ -434,6 +436,7 @@ screen {
 | Name | Where |
 | --- | --- |
 | `sources`, `vars`, `alerts`, `theme`, `now` | everywhere |
+| remote instances by name (section 17) | everywhere |
 | `secrets` | only in `run` and `env` |
 | params by name | in components and actions |
 | `<repeat name>` | inside `repeat` |
@@ -448,3 +451,90 @@ Secret values (4 characters or more) are replaced with `****` in everything comm
 `ago(t)` is worked out when the page is drawn; an idle screen is not redrawn, so the text can lag until something changes.
 
 Extra functions on top of CEL: `round(x, n)`, `format(x, unit)`, `duration(x)` and `ago(t)` for display, `clamp(x, a, b)`, `color(token or hex)`, `mix(color, color, t)`.
+
+## 17. Remotes
+
+A machine or service described once: how to reach it and what it exposes ([ADR 0018](decisions/0018-remotes.md), which has the exact commands).
+
+```
+# remotes/linux.conf
+remote_kind linux {
+    param host: string
+    param user: string = admin
+
+    via  = ssh
+    host = {{ host }}
+    user = {{ user }}
+    key  = /etc/paneld/id_ed25519
+
+    value temp {
+        run   = cat /sys/class/thermal/thermal_zone0/temp
+        parse = number
+        value = {{ out / 1000.0 }}
+        poll  = 30s
+    }
+    action reboot {
+        pin     = true
+        confirm = Reboot {{ host }}?
+        run     = sudo systemctl reboot
+    }
+    action restart {
+        param unit: string { ask = select; options = [nginx, ssh] }
+        run = sudo systemctl restart -- {{ unit }}
+    }
+}
+
+# paneld.conf
+include = remotes/*.conf
+remote device1: linux { host = 10.0.0.5 }
+remote device2: linux { host = 10.0.0.6; user = pi }
+
+page home {
+    text { value = {{ device1.status.temp.ok ? string(round(device1.temp, 1)) + ' C' : device1.status.temp.error }} }
+    button { label = Reboot; on_tap = device1.reboot }
+}
+```
+
+### 17.1 Kind
+
+| Key | Notes |
+| --- | --- |
+| `param` | repeatable; per-instance settings, not named like an expression root (section 17.3): `string`, `int`, `number`, `bool`, `duration`, `color`, `size`, or `secret` (the name of a `secret` item; usable only where `secrets` is). No `ask` |
+| `via` | `local`, `ssh`, `http`, `socket`; required |
+| connection keys | per `via`, below; may use `{{ }}` with the params only (and `secrets` where noted) |
+| `timeout` | duration; default for its members |
+| `value <name> { }` | a source (section 4) |
+| `action <name> { }` | an action (section 5) |
+
+| `via` | Keys |
+| --- | --- |
+| `local` | none |
+| `ssh` | `host` (required), `key` (private key file, required), `user`, `port` (22), `known_hosts` (default `known_hosts` in the folder of `app:state`), `host_key` (`check` default, or `accept_new`) |
+| `http` | `url` (base URL, required; `secrets` allowed), `headers { Name = value }` (`secrets` allowed; `_` in a name is sent as `-`: `X_Api_Key`), `ca` (CA file), `insecure` (bool, skip TLS checks) |
+| `socket` | `path` (Unix socket), or `host` and `port` (TCP) |
+
+### 17.2 Members
+
+A `value` takes the source keys and an `action` the action keys, with the request in place of `run` where the `via` needs it:
+
+| `via` | Request |
+| --- | --- |
+| `local` | `run`, as anywhere |
+| `ssh` | `run`: argv, each item quoted for the remote (POSIX) shell. No `env { }`, no `cwd`, no `secrets` |
+| `http` | `get`, `post`, `put`, `patch` or `delete` = path after `url` (each `{{ }}` in it percent-encoded; no `secrets`), `body` (string, expr; `secrets` allowed), `headers { }` (added to the kind's) |
+| `socket` | `send` (string, expr): written to the socket; the reply is the output |
+
+A `value` needs its request (`run`, a method, or `send`). Member names `ok`, `error` and `status` are reserved. Kind params and an action's own params may not share a name. Inside a kind, `refresh`, `then` and `else` can name a sibling member (`refresh = temp`).
+
+### 17.3 Instance
+
+`remote <name>: <kind> { <param> = <value> }`, a literal or `$variable` per param. `remote[device1]:host = ...` overrides one param. Names are `[a-z][a-z0-9_]*`; an instance name may not be an expression root (section 16), a CEL keyword, a `repeat` binding or a param name.
+
+| Expression | Value |
+| --- | --- |
+| `device1.temp` | the value of member `temp` (null before its first result) |
+| `device1.ok` | bool: at least one member value has a result and none has failed since |
+| `device1.error` | the first failing member's `error` in declaration order, or `""` |
+| `device1.status.temp` | the source map of `temp` (section 4: `ok`, `error`, `at`, `history`, ...) |
+
+Members are named `device1.temp`, `device1.reboot` wherever a source or action name fits: `on_tap = device1.reboot`, `on_tap device1.restart { unit = nginx }`, `refresh = device1.temp`, `alert ... { from = device1.log }`, `ctl` commands. They are not in `sources`.

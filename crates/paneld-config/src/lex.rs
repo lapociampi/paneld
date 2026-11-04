@@ -353,12 +353,23 @@ impl<'src> Lexer<'src> {
                 })
             }
             c if is_ident_start(c) => {
-                while let Some(c) = self.peek() {
-                    if is_ident_cont(c) {
-                        self.pos += 1;
-                    } else {
+                // `a.b` is one identifier: a remote member
+                // (`on_tap device1.restart { }`, schema 17). The schema
+                // check decides where a dotted name is allowed.
+                loop {
+                    while let Some(c) = self.peek() {
+                        if is_ident_cont(c) {
+                            self.pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let dotted = self.peek() == Some(b'.')
+                        && self.src.get(self.pos + 1).copied().is_some_and(is_ident_start);
+                    if !dotted {
                         break;
                     }
+                    self.pos += 1;
                 }
                 let span = self.make_span(start, self.pos);
                 if &self.src[start..self.pos] == b"param" {

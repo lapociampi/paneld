@@ -48,6 +48,8 @@ use crate::value::{
 };
 use crate::{SourceMap, Span};
 
+pub(crate) mod remote;
+
 // ---------------------------------------------------------------------------
 // Structural tables
 // ---------------------------------------------------------------------------
@@ -60,7 +62,8 @@ enum KindKind {
 
 fn classify_kind(kind: &str) -> Option<KindKind> {
     match kind {
-        "secret" | "source" | "action" | "component" | "page" | "alert" | "reminder" | "theme" => {
+        "secret" | "source" | "action" | "component" | "page" | "alert" | "reminder" | "theme"
+        | "remote_kind" | "remote" => {
             Some(KindKind::Named)
         }
         "screen" | "display" | "security" | "app" | "alerts" => Some(KindKind::Category),
@@ -1223,6 +1226,19 @@ pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     for item in &doc.items {
         check_top_item(item, source, &ctx, &mut seen, &mut diags);
     }
+    // Remotes as they will run: `remote[x]:host` and
+    // `remote_kind[k]:url` overrides applied, so an override gets the
+    // same checks as the key written in the block.
+    let mut applied = doc.clone();
+    crate::apply_overrides(&mut applied);
+    for item in &applied.items {
+        let Item::Block(b) = item else { continue };
+        match b.kind.text.as_str() {
+            "remote_kind" => remote::check_kind(b, source, &mut diags),
+            "remote" if b.name.is_some() => remote::check_instance(b, &applied, source, &mut diags),
+            _ => {}
+        }
+    }
 
     resolve_refs(doc, &names, &mut diags);
     check_override_targets(doc, &mut diags);
@@ -1489,10 +1505,14 @@ fn check_top_item(
     match item {
         Item::Block(b) => check_top_block(b, source, ctx, seen, diags),
         Item::Assign(a) => check_top_assign(a, diags),
-        Item::Var(_) => {
+        Item::Var(v) => {
             // Top-level `var name: type = default`: name/type/default
             // all live inside the AST node. Default-type agreement is
-            // Phase 5+ work (needs the type-dispatch table).
+            // Phase 5+ work (needs the type-dispatch table). A dotted
+            // name could not be read as `vars.<name>`.
+            if v.name.text.contains('.') {
+                diags.push(Diagnostic::new(v.name.span, "a `var` name cannot contain `.`"));
+            }
         }
         Item::Param(p) => diags.push(Diagnostic::new(
             p.span,
@@ -1521,6 +1541,13 @@ fn check_top_block(
                 ));
                 return;
             };
+            // Dotted names are remote members (`device1.temp`).
+            if name.text.contains('.') {
+                diags.push(Diagnostic::new(
+                    name.span,
+                    format!("a `{}` name cannot contain `.`", b.kind.text),
+                ));
+            }
             let key = (b.kind.text.clone(), name.text.clone());
             if let Some(prev_span) = seen.get(&key) {
                 diags.push(Diagnostic::new(
@@ -1556,8 +1583,19 @@ fn check_top_block(
         }
     }
 
+    if let Some(of) = &b.of {
+        if b.kind.text != "remote" {
+            diags.push(Diagnostic::new(
+                of.span,
+                format!("`{}: <kind>` is for `remote` only", b.name.as_ref().map_or("", |n| n.text.as_str())),
+            ));
+        }
+    }
+
     // Per-key validation of the body, if we have a schema for this kind.
-    if let Some(schema) = top_schema_for(&b.kind.text) {
+    if matches!(b.kind.text.as_str(), "remote_kind" | "remote") {
+        // Checked with their overrides applied: see `check`.
+    } else if let Some(schema) = top_schema_for(&b.kind.text) {
         validate_block_body(b, schema, source, diags);
     } else if b.kind.text == "page" {
         validate_page_body(b, ctx, diags);
@@ -2061,7 +2099,11 @@ fn is_bare_ident(s: &str) -> bool {
     if !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
         return false;
     }
-    b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    // `a.b`: a remote member.
+    s.split('.').all(|seg| {
+        let b = seg.as_bytes();
+        !b.is_empty() && (b[0].is_ascii_alphabetic() || b[0] == b'_') && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    })
 }
 
 fn type_name(ty: ExpectedType) -> &'static str {
@@ -2860,7 +2902,7 @@ fn format_param_list(specs: &[ParamSpec]) -> String {
 // `back` short-circuits page refs. If a name is written literally and
 // isn't in the collected table, we emit a diagnostic.
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Names {
     sources: std::collections::HashSet<String>,
     actions: std::collections::HashSet<String>,
@@ -2893,6 +2935,7 @@ fn collect_names(doc: &Document) -> Names {
             _ => {}
         }
     }
+    remote::add_names(doc, &mut n);
     n
 }
 
@@ -2961,6 +3004,8 @@ fn param_type_from_ident(s: &str) -> Option<ParamType> {
         "any" => ParamType::Expected(E::Any),
         "action" => ParamType::ActionRef,
         "source" => ParamType::SourceRef,
+        // A remote kind's param: the name of a `secret` item (schema 17).
+        "secret" => ParamType::Expected(E::Ident),
         _ => return None,
     })
 }
@@ -2994,6 +3039,7 @@ fn collect_params(doc: &Document, source: &SourceMap, diags: &mut Vec<Diagnostic
         let specs = collect_params_in_body(b, parent, source, diags);
         bucket.insert(name.text.clone(), specs);
     }
+    remote::add_params(doc, source, &mut params);
     params
 }
 
@@ -3046,6 +3092,9 @@ fn collect_params_in_body(
                 ));
                 continue;
             }
+        }
+        if p.ty.text == "secret" && parent != "remote_kind" {
+            diags.push(Diagnostic::new(p.ty.span, "`secret` params are for remote kinds only"));
         }
         let ty = match param_type_from_ident(&p.ty.text) {
             Some(t) => t,
@@ -3164,6 +3213,7 @@ fn check_param_arg(
 fn resolve_refs(doc: &Document, names: &Names, diags: &mut Vec<Diagnostic>) {
     for item in &doc.items {
         match item {
+            Item::Block(b) if b.kind.text == "remote_kind" => remote::resolve_kind_refs(b, names, diags),
             Item::Block(b) => resolve_refs_in_block(b, &b.kind.text, names, diags),
             // Top-level qualified / indexed shorthand carries the same
             // ref-containing keys as the opened form, so route them
@@ -3413,8 +3463,10 @@ fn check_cel_in_item(item: &Item, names: &Names, in_env: bool, diags: &mut Vec<D
             // `run = ...`, or overridden as `action[x]:run` /
             // `source[x]:run`: the one key besides `env` that may
             // use secrets.
+            // In a remote kind, the request keys go to the command's
+            // stdin, not on screen (schema 17).
             let is_run = match &a.target {
-                AssignTarget::Simple { key } => key.text == "run",
+                AssignTarget::Simple { key } => matches!(key.text.as_str(), "run" | "body" | "send" | "url"),
                 AssignTarget::Indexed { kind, key, .. } => {
                     key.text == "run" && matches!(kind.text.as_str(), "action" | "source")
                 }
@@ -3423,7 +3475,7 @@ fn check_cel_in_item(item: &Item, names: &Names, in_env: bool, diags: &mut Vec<D
             check_cel_in_raw_value(&a.value, names, in_env || is_run, diags)
         }
         Item::Block(b) => {
-            let in_env = in_env || b.kind.text == "env";
+            let in_env = in_env || b.kind.text == "env" || b.kind.text == "headers";
             for child in &b.items {
                 check_cel_in_item(child, names, in_env, diags);
             }

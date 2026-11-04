@@ -116,6 +116,35 @@ security {
 
 Without a usable `security.pin` a guarded action refuses to run. A config reload keeps any active lockout, and the unlock window unless the PIN itself changed.
 
+## Remotes over ssh
+
+A `remote_kind` with `via = ssh` ([Schema](schema.md), section 17) runs `ssh` as the service user, which has no home folder. It needs its own key and a `known_hosts` it can write:
+
+```
+# On the panel: a key only paneld can read.
+sudo -u paneld ssh-keygen -t ed25519 -N '' -C paneld -f /var/lib/paneld/id_ed25519
+
+# Trust each host once (or set `host_key = accept_new` in the kind).
+ssh-keyscan -t ed25519 10.0.0.5 | sudo -u paneld tee -a /var/lib/paneld/known_hosts >/dev/null
+
+# On each remote: allow the key, ideally for a user that can only do
+# what the panel needs (sudo rules for `systemctl reboot`, ...).
+cat /var/lib/paneld/id_ed25519.pub   # append to ~/.ssh/authorized_keys there
+```
+
+```
+remote_kind linux {
+    param host: string
+    via  = ssh
+    host = {{ host }}
+    user = panel
+    key  = /var/lib/paneld/id_ed25519
+    ...
+}
+```
+
+`known_hosts` defaults to the folder of `app:state` (`/var/lib/paneld`). `via = http` needs `curl` (installed on Raspberry Pi OS); `via = socket` needs `sudo apt install socat`.
+
 ## Diagnostics
 
 - `journalctl -u paneld -f` -- daemon logs.

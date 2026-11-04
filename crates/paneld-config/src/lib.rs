@@ -10,6 +10,7 @@ pub mod library;
 pub mod load;
 pub mod overrides;
 pub mod parse;
+pub mod remote;
 pub mod schema;
 pub mod source;
 pub mod value;

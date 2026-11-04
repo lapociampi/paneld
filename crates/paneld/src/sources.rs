@@ -36,6 +36,10 @@ use crate::runner;
 pub struct SourceUpdate {
     pub name: String,
     pub value: Value,
+    /// Only `ok` / `error` changed (a run with no result, a stream that
+    /// stopped or came back): the main loop keeps the rest of the last
+    /// value, records no history and sends no alert event.
+    pub status: bool,
 }
 
 /// Resolve every top-level `source` block in `doc`, producing the
@@ -100,6 +104,13 @@ pub fn not_ok(error: &str) -> Value {
     ]))
 }
 
+/// A [`not_ok`] value: the run produced no result (it failed to
+/// start, timed out, or its output did not parse), as opposed to a
+/// command that ran and exited non-zero.
+pub fn is_failure(v: &Value) -> bool {
+    matches!(v, Value::Map(m) if m.get("ok") == Some(&Value::Bool(false)) && !m.contains_key("exit"))
+}
+
 /// Give every source of `doc` missing from `values` a [`not_ok`]
 /// value: stream sources before their first line, and sources added
 /// by a reload before their first run.
@@ -121,7 +132,7 @@ pub fn resolve_all_in_background(
 ) {
     thread::spawn(move || {
         for (name, value) in resolve_all(&doc, &ctx, &base_cwd, app_defaults) {
-            if tx.send(SourceUpdate { name, value }).is_err() {
+            if tx.send(SourceUpdate { status: is_failure(&value), name, value }).is_err() {
                 return;
             }
         }
@@ -283,7 +294,7 @@ fn poll_loop(
         match resolve_one(&block, &ctx, &cwd, app_defaults) {
             Ok(v) => {
                 delay = interval;
-                if tx.send(SourceUpdate { name: name.clone(), value: v }).is_err() {
+                if tx.send(SourceUpdate { name: name.clone(), value: v, status: false }).is_err() {
                     // Receiver dropped; the daemon is shutting down.
                     return;
                 }
@@ -291,6 +302,10 @@ fn poll_loop(
             Err(e) => {
                 eprintln!("paneld: source `{name}`: {e}");
                 delay = next_backoff(delay, max_delay);
+                // `ok` turns false; the main loop keeps the last value.
+                if tx.send(SourceUpdate { name: name.clone(), value: not_ok(&e), status: true }).is_err() {
+                    return;
+                }
             }
         }
     }
@@ -318,21 +333,22 @@ fn stream_loop(
     let mut delay = RESTART_FLOOR;
     let mask = crate::secrets::Mask::from_ctx(&ctx);
 
+    let mut ctx = ctx;
+    crate::remotes::bind(&block, &mut ctx);
     while !shutdown.load(Ordering::SeqCst) {
-        let (run_raw, run_span) = match find_raw(&block, "run") {
-            Some(r) => r,
-            None => {
+        let request = match crate::remotes::request(&block, &ctx, Duration::from_secs(10), true) {
+            Ok(Some(r)) => Ok(r),
+            Ok(None) => {
                 eprintln!("paneld: source `{name}`: missing `run`; stream disabled");
                 return;
             }
+            Err(e) => Err(runner::RunError { message: e }),
         };
-        let run = runner::command_argv(run_raw, |t| {
-            paneld_ui::interpolate(t, run_span.file, run_span.start, &ctx)
-        });
         let env_pairs: Vec<(String, String)> = collect_env(&block)
             .into_iter()
             .map(|(k, raw, span)| (k, paneld_ui::interpolate(&raw, span.file, span.start, &ctx)))
             .collect();
+        let stdin_bytes = request.as_ref().ok().and_then(|r| r.stdin.clone());
         let opts = runner::Opts {
             timeout: Duration::MAX,
             max_bytes: usize::MAX,
@@ -340,10 +356,12 @@ fn stream_loop(
             name: &name,
             cwd: Some(&cwd),
             env: &env_pairs,
+            stdin: stdin_bytes.as_deref(),
         };
-        let mut command = match run.and_then(|argv| runner::prepared_command(&argv, &opts)) {
+        let mut command = match request.and_then(|r| runner::prepared_command(&r.argv, &opts)) {
             Ok(c) => c,
             Err(e) => {
+                let _ = tx.send(SourceUpdate { name: name.clone(), value: not_ok(&mask.apply(&e.to_string())), status: true });
                 eprintln!("paneld: source `{name}`: {}; retrying in {:?}", mask.apply(&e.to_string()), delay);
                 sleep_or_shutdown(delay, &shutdown);
                 delay = next_backoff(delay, RESTART_CEILING);
@@ -353,12 +371,30 @@ fn stream_loop(
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
+                let _ = tx.send(SourceUpdate {
+                    name: name.clone(),
+                    value: not_ok(&format!("spawn: {}", mask.apply(&e.to_string()))),
+                    status: true,
+                });
                 eprintln!("paneld: source `{name}`: spawn: {}; retrying in {:?}", mask.apply(&e.to_string()), delay);
                 sleep_or_shutdown(delay, &shutdown);
                 delay = next_backoff(delay, RESTART_CEILING);
                 continue;
             }
         };
+        // Running again: healthy until it says otherwise.
+        let up = Value::Map(BTreeMap::from([("ok".to_string(), Value::Bool(true)), ("error".to_string(), Value::String(String::new()))]));
+        if tx.send(SourceUpdate { name: name.clone(), value: up, status: true }).is_err() {
+            runner::kill_group(runner::Pid::from_raw(child.id() as i32), runner::Signal::SIGTERM);
+            let _ = child.wait();
+            return;
+        }
+        if let (Some(data), Some(mut pipe)) = (stdin_bytes, child.stdin.take()) {
+            thread::spawn(move || {
+                use std::io::Write;
+                let _ = pipe.write_all(&data);
+            });
+        }
         let pid = runner::Pid::from_raw(child.id() as i32);
         // Register this child's pgid so ShutdownHandle::stop can
         // deliver SIGTERM even while we're blocked in read_line.
@@ -426,7 +462,7 @@ fn stream_loop(
             let parsed = mask.apply_value(parsed);
             // `value` can put masked pieces back together: mask it too.
             let value = mask.apply_value(finish_stream_value(&block, &ctx, parsed));
-            if tx.send(SourceUpdate { name: name.clone(), value }).is_err() {
+            if tx.send(SourceUpdate { name: name.clone(), value, status: false }).is_err() {
                 // Receiver dropped: daemon is going down.
                 runner::kill_group(pid, runner::Signal::SIGTERM);
                 let _ = child.wait();
@@ -450,6 +486,9 @@ fn stream_loop(
 
         if sent_any && started.elapsed() >= RESET_AFTER {
             delay = RESTART_FLOOR;
+        }
+        if tx.send(SourceUpdate { name: name.clone(), value: not_ok("the stream stopped; restarting"), status: true }).is_err() {
+            return;
         }
         eprintln!(
             "paneld: source `{name}`: stream exited after {:?}; restarting in {:?}",
@@ -545,7 +584,7 @@ fn sleep_or_shutdown(d: Duration, shutdown: &Arc<AtomicBool>) {
 /// evaluates against `out` only (same as `resolve_one`).
 fn finish_stream_value(b: &Block, _ctx: &Context, out: Value) -> Value {
     let value = if let Some((raw, span)) = find_raw(b, "value") {
-        eval_value_transform(raw, span, &out).unwrap_or(out)
+        eval_value_transform(b, raw, span, &out).unwrap_or(out)
     } else {
         out
     };
@@ -592,18 +631,26 @@ pub fn resolve_one(
     base_cwd: &std::path::Path,
     app_defaults: runner::AppDefaults,
 ) -> Result<Value, String> {
-    let (run_raw, run_span) =
-        find_raw(b, "run").ok_or_else(|| "missing `run`".to_string())?;
     let parse_mode = find_simple(b, "parse").unwrap_or("text").trim().to_string();
+    // Built before the params are bound, so no param can hide the
+    // secrets from it.
+    let mask = crate::secrets::Mask::from_ctx(ctx);
+    // A remote member's params (schema 17) are plain names here.
+    let mut bound = ctx.clone();
+    crate::remotes::bind(b, &mut bound);
+    let ctx = &bound;
+    let timeout = find_simple(b, "timeout")
+        .and_then(paneld_config::value::parse_duration)
+        .unwrap_or(app_defaults.timeout);
 
     // Interpolate secrets, theme tokens and other context values into
-    // the shell command before executing.
-    // Split first, then interpolate each argv item, so a value with
-    // spaces stays one argument.
-    let argv = runner::command_argv(run_raw, |t| {
-        paneld_ui::interpolate(t, run_span.file, run_span.start, ctx)
-    })
-    .map_err(|e| format!("run: {e}"))?;
+    // the command before executing: split first, then interpolate each
+    // argv item, so a value with spaces stays one argument. A remote
+    // member's command is built around it (ADR 0018).
+    // A filled-in URL can hold a secret: mask what the error says.
+    let request = crate::remotes::request(b, ctx, timeout, false)
+        .map_err(|e| mask.apply(&e))?
+        .ok_or_else(|| "missing `run`".to_string())?;
     let name = b.name.as_ref().map(|n| n.text.as_str()).unwrap_or("");
     // `env { KEY = value }` on the source becomes extra env pairs on
     // top of the clean base env (ADR 0013). Each value is
@@ -613,9 +660,6 @@ pub fn resolve_one(
         .map(|(k, raw, span)| (k, paneld_ui::interpolate(&raw, span.file, span.start, ctx)))
         .collect();
     let cwd = resolve_cwd(b, base_cwd);
-    let timeout = find_simple(b, "timeout")
-        .and_then(paneld_config::value::parse_duration)
-        .unwrap_or(app_defaults.timeout);
     let opts = runner::Opts {
         timeout,
         max_bytes: app_defaults.max_output,
@@ -623,15 +667,15 @@ pub fn resolve_one(
         name,
         cwd: Some(&cwd),
         env: &env_pairs,
+        stdin: request.stdin.as_deref(),
     };
     // What the command prints becomes a value the screen shows: mask
     // secrets (see `secrets::Mask`). Parsed output is masked after
     // parsing, where JSON escapes are undone and numbers are left
     // alone; the raw `stdout` / `stderr` as text.
-    let mask = crate::secrets::Mask::from_ctx(ctx);
-    let r = runner::exec(&argv, opts).map_err(|e| mask.apply(&format!("run: {e}")))?;
+    let r = runner::exec(&request.argv, opts).map_err(|e| mask.apply(&format!("run: {e}")))?;
     if r.timed_out {
-        return Err("timed out".into());
+        return Err(if crate::remotes::is_remote(b) { "timed out; it may still have run".into() } else { "timed out".into() });
     }
     if r.too_large {
         return Err("output too large".into());
@@ -648,7 +692,7 @@ pub fn resolve_one(
     // `value` can put masked pieces back together: mask it too.
     let value = if let Some((raw, span)) = find_raw(b, "value") {
         mask.apply_value(
-            eval_value_transform(raw, span, &out).unwrap_or_else(|e| Value::String(format!("[eval error: {e}]"))),
+            eval_value_transform(b, raw, span, &out).unwrap_or_else(|e| Value::String(format!("[eval error: {e}]"))),
         )
     } else {
         out.clone()
@@ -660,6 +704,13 @@ pub fn resolve_one(
     m.insert("exit".into(), r.exit_code.map(|n| Value::Int(n as i64)).unwrap_or(Value::Null));
     m.insert("stdout".into(), Value::String(mask.apply(&r.stdout)));
     m.insert("stderr".into(), Value::String(mask.apply(&r.stderr)));
+    if !ok {
+        let error = crate::remotes::explain(b, r.exit_code, &r.stderr).unwrap_or_else(|| match r.stderr.trim() {
+            "" => format!("exit {}", r.exit_code.map_or("?".to_string(), |c| c.to_string())),
+            e => e.to_string(),
+        });
+        m.insert("error".into(), Value::String(mask.apply(&error)));
+    }
     Ok(Value::Map(m))
 }
 
@@ -678,6 +729,7 @@ fn parse_output(text: &str, mode: &str) -> Option<Value> {
 
 /// Evaluate the `value = {{ ... }}` transform with `out` bound.
 fn eval_value_transform(
+    b: &Block,
     raw: &str,
     span: paneld_config::source::Span,
     out: &Value,
@@ -685,7 +737,9 @@ fn eval_value_transform(
     use paneld_config::cel;
     use paneld_config::value::{classify, ValueShape};
 
+    // `out`, and a remote member's params (schema 17).
     let mut ctx: Context = Context::new();
+    crate::remotes::bind(b, &mut ctx);
     ctx.insert("out".into(), out.clone());
 
     match classify(raw) {
@@ -982,6 +1036,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_that_cannot_start_says_so() {
+        let doc = parse_doc("source s { run = /nonexistent/bin\n stream = true }\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = spawn_pollers(&doc, &Context::new(), tx, std::path::Path::new("."), runner::AppDefaults::default());
+        let u = rx.recv_timeout(Duration::from_secs(5)).expect("a status");
+        handle.stop();
+        assert!(u.status);
+        let Value::Map(m) = &u.value else { panic!() };
+        assert_eq!(m["ok"], Value::Bool(false));
+        assert!(matches!(&m["error"], Value::String(e) if e.starts_with("spawn:")), "{m:?}");
+    }
+
+    #[test]
     fn sources_without_a_result_are_not_ok() {
         let doc = parse_doc(
             "source good { run = /bin/echo 1 }\nsource gone { run = /nonexistent/x }\nsource s { run = /bin/cat\n stream = true }\n",
@@ -1058,9 +1125,13 @@ mod tests {
         let (tx, rx) = channel();
         let handle = spawn_pollers(&doc, &Context::new(), tx, std::path::Path::new("."), runner::AppDefaults::default());
 
+        // The first update says the stream is up (status only).
+        let up = rx.recv_timeout(Duration::from_secs(5)).expect("up");
+        assert!(up.status && matches!(&up.value, Value::Map(m) if m["ok"] == Value::Bool(true)));
         let mut got = Vec::new();
-        for _ in 0..2 {
+        while got.len() < 2 {
             match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(u) if u.status => {}
                 Ok(u) => got.push(u),
                 Err(e) => panic!("stream update timed out: {e}"),
             }
@@ -1092,8 +1163,14 @@ mod tests {
         let (tx, rx) = channel();
         let handle = spawn_pollers(&doc, &Context::new(), tx, std::path::Path::new("."), runner::AppDefaults::default());
 
-        let u1 = rx.recv_timeout(Duration::from_secs(5)).expect("one");
-        let u2 = rx.recv_timeout(Duration::from_secs(5)).expect("two");
+        let next = || loop {
+            let u = rx.recv_timeout(Duration::from_secs(5)).expect("a line");
+            if !u.status {
+                return u;
+            }
+        };
+        let u1 = next();
+        let u2 = next();
         handle.stop();
 
         let title = |u: &SourceUpdate| -> String {
@@ -1155,7 +1232,12 @@ mod tests {
         let handle = spawn_pollers(&doc, &Context::new(), tx, std::path::Path::new("."), runner::AppDefaults::default());
 
         // First line arrives, confirming the child is up.
-        let first = rx.recv_timeout(Duration::from_secs(5)).expect("first line");
+        let first = loop {
+            let u = rx.recv_timeout(Duration::from_secs(5)).expect("first line");
+            if !u.status {
+                break u;
+            }
+        };
         assert_eq!(first.name, "quiet");
 
         // Capture the live pgid for a liveness check post-stop.

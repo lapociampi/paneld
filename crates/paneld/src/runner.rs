@@ -182,6 +182,9 @@ pub struct Opts<'a> {
     /// block. The clean base env (PATH, HOME, LANG, PANELD) is still
     /// applied first and these can override it.
     pub env: &'a [(String, String)],
+    /// Written to the child's stdin, then closed: a remote `http` or
+    /// `socket` request (ADR 0018). `None` is `/dev/null`.
+    pub stdin: Option<&'a [u8]>,
 }
 
 
@@ -299,7 +302,7 @@ pub fn command_argv(
 }
 
 /// Run `argv`. The child gets a clean environment, its own process
-/// group, stdin from `/dev/null`, stdout and stderr captured up to
+/// group, stdin from `/dev/null` (or `opts.stdin`), stdout and stderr captured up to
 /// their caps, and is killed as a group once `opts.timeout` elapses.
 /// Commands running now, the cap, and the waiting line. Waiters get
 /// a ticket and are served in ticket order, actions before sources
@@ -379,7 +382,7 @@ pub fn exec(argv: &[String], opts: Opts<'_>) -> Result<RunResult, RunError> {
         .args(args)
         .env_clear()
         .envs(clean_env(&opts))
-        .stdin(Stdio::null())
+        .stdin(if opts.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Put the child in its own process group so a timeout can
@@ -400,6 +403,15 @@ pub fn exec(argv: &[String], opts: Opts<'_>) -> Result<RunResult, RunError> {
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
+    // On a thread of its own: a child that answers before it has read
+    // everything must not block us on a full pipe.
+    if let (Some(data), Some(mut pipe)) = (opts.stdin, child.stdin.take()) {
+        let data = data.to_vec();
+        thread::spawn(move || {
+            use std::io::Write;
+            let _ = pipe.write_all(&data);
+        });
+    }
 
     // ADR 0013: stdout up to `max_output`, stderr up to 64 KiB; more
     // fails the run. The readers only raise the flag; the wait loop
@@ -473,7 +485,8 @@ pub fn kill_group(pid: Pid, sig: Signal) {
 
 /// Build a [`Command`] primed with the ADR 0013 base environment
 /// (clean env, PATH, HOME, LANG, PANELD, PANELD_SOURCE / _ACTION),
-/// stdin from /dev/null, stdout and stderr piped, and the child in
+/// stdin from /dev/null (piped when `opts.stdin` is set; the caller
+/// writes it), stdout and stderr piped, and the child in
 /// its own process group. The caller spawns, drains output, and
 /// kills on their own terms -- used by [`exec`] for one-shots and by
 /// `sources.rs` for long-lived stream children.
@@ -483,7 +496,7 @@ pub fn prepared_command(argv: &[String], opts: &Opts<'_>) -> Result<Command, Run
         .args(&argv[1..])
         .env_clear()
         .envs(clean_env(opts))
-        .stdin(Stdio::null())
+        .stdin(if opts.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -548,6 +561,7 @@ mod tests {
             name: "",
             cwd: None,
             env: &[],
+            stdin: None,
         }
     }
 
@@ -734,6 +748,7 @@ mod tests {
             name: "cpu",
             cwd: None,
             env: &[],
+            stdin: None,
         };
         let r = exec(
             "/bin/sh -c 'echo $PANELD:$PANELD_SOURCE:$PANELD_RUNNER_LEAK_TEST'",
@@ -754,9 +769,21 @@ mod tests {
             name: "noop",
             cwd: None,
             env: &env,
+            stdin: None,
         };
         let r = exec("/bin/sh -c 'echo $GREETING $PANELD_ACTION'", o).unwrap();
         assert_eq!(r.stdout.trim(), "hi noop");
+    }
+
+    #[test]
+    fn stdin_reaches_the_child() {
+        let mut o = opts(2000, 4096);
+        o.stdin = Some(b"line one\nline two\n");
+        let r = exec("/bin/cat", o).unwrap();
+        assert_eq!(r.stdout, "line one\nline two\n");
+        // Without it, stdin is empty.
+        let r = exec("/bin/cat", opts(2000, 4096)).unwrap();
+        assert_eq!(r.stdout, "");
     }
 
     #[test]

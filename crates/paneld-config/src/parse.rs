@@ -120,6 +120,8 @@ pub struct Block {
     /// it is `None`. Also used for `on_tap action { arg = ... }` style
     /// calls inside UI nodes.
     pub name: Option<Ident>,
+    /// `remote device1: linux { }`: the kind after the `:` (schema 17).
+    pub of: Option<Ident>,
     pub items: Vec<Item>,
     pub span: Span,
 }
@@ -414,7 +416,15 @@ impl<'t> Parser<'t> {
                     text: self.slice(name_tok.span).to_string(),
                     span: name_tok.span,
                 };
-                let block = self.parse_block(first_ident, Some(name))?;
+                // `kind name: of { ... }` (a remote instance).
+                let of = if self.peek().kind == TokenKind::Colon {
+                    self.bump();
+                    Some(self.expect_ident("expected a kind name after `:`")?)
+                } else {
+                    None
+                };
+                let mut block = self.parse_block(first_ident, Some(name))?;
+                block.of = of;
                 Some(Item::Block(block))
             }
             TokenKind::Selector => {
@@ -462,6 +472,7 @@ impl<'t> Parser<'t> {
         Some(Block {
             kind,
             name,
+            of: None,
             items,
             span,
         })

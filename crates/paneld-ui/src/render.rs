@@ -688,7 +688,9 @@ fn resolve_expr_value(
     ctx: &Context,
 ) -> Option<Value> {
     match classify(raw) {
-        ValueShape::Literal(text) => Some(Value::String(text.to_string())),
+        // `"..."` keeps spaces and `;` (config-format, "Lines"); the
+        // quotes themselves are not part of the value.
+        ValueShape::Literal(text) => Some(Value::String(paneld_config::value::parse_string(text))),
         ValueShape::Expression(body) => {
             let (expr, diags) = cel::parse_fragment(body, span.file, span.start + 2);
             if !diags.is_empty() {
@@ -720,7 +722,7 @@ fn resolve_expr_value(
 fn resolve_text(node: &Block, key: &str, ctx: &Context) -> Option<String> {
     let (raw, span) = find_raw(node, key)?;
     Some(match classify(raw) {
-        ValueShape::Literal(text) => text.to_string(),
+        ValueShape::Literal(text) => paneld_config::value::parse_string(text),
         ValueShape::Expression(body) => {
             let (expr, diags) = cel::parse_fragment(body, span.file, span.start + 2);
             if !diags.is_empty() {
@@ -1311,11 +1313,14 @@ fn value_truthy(v: &Value) -> bool {
     }
 }
 
+/// A name, or a remote member's `device1.reboot` (schema 17).
 fn is_bare_ident(s: &str) -> bool {
-    let b = s.as_bytes();
-    !b.is_empty()
-        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
-        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    s.split('.').all(|seg| {
+        let b = seg.as_bytes();
+        !b.is_empty()
+            && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+            && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    })
 }
 
 /// Find a simple `key = value` on `node`, returning the raw text and
@@ -1424,6 +1429,14 @@ mod tests {
         // Not convertible: passed through unchanged.
         assert_eq!(typed_param("number", s("abc")), s("abc"));
         assert_eq!(typed_param("number", Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn a_quoted_literal_loses_its_quotes() {
+        let span = paneld_config::source::Span::new(paneld_config::source::FileId::default(), 0, 0);
+        let v = resolve_value("\" a; b \"", span, &Context::new());
+        assert_eq!(v, Some(Value::String(" a; b ".into())));
+        assert!(is_bare_ident("device1.reboot") && !is_bare_ident("a..b") && !is_bare_ident("a."));
     }
 
     #[test]

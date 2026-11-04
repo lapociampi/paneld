@@ -632,3 +632,128 @@ fn theme_classes_call_props_min_height_and_scroll() {
     assert!(img.any(|p| close(p, [0x44, 0xaa, 0x44], 8)));
     assert!(!(0..800).any(|x| close(img.px(x, 440), [0x44, 0xaa, 0x44], 8)), "scroll overflowed");
 }
+
+#[test]
+fn a_remote_value_reads_kind_params_and_the_kind_timeout_applies() {
+    let d = tmp("remote-params");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "remote_kind box {\n\
+             param scale: int = 2\n\
+             via = local\n\
+             timeout = 1s\n\
+             value a { run = echo 21; parse = number; value = {{ out * scale }} }\n\
+             value slow { run = sleep 3 }\n\
+         }\n\
+         remote b1: box { }\n\
+         page home {\n\
+             rect { width = 200; height = 100\n\
+                    background = {{ b1.a == 42.0 && !b1.ok && b1.error == 'slow: timed out; it may still have run' ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "params or timeout not applied");
+}
+
+#[test]
+fn a_local_remote_shows_its_values_under_its_name() {
+    let d = tmp("remote-local");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "remote_kind box {\n\
+             param factor: int = 1\n\
+             via = local\n\
+             value temp { run = echo {{ factor * 21 }}; parse = number }\n\
+         }\n\
+         remote b1: box { factor = 2 }\n\
+         page home {\n\
+             rect { width = 200; height = 100\n\
+                    background = {{ b1.ok && b1.temp == 42.0 && b1.status.temp.ok ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "b1.temp is not 42");
+}
+
+/// A one-request-per-connection HTTP server on 127.0.0.1 that answers
+/// `body` and hands back each request it read.
+fn http_server(body: &'static str) -> (u16, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            conn.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Headers, then a body of Content-Length bytes.
+            loop {
+                let n = conn.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if req.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = tx.send(String::from_utf8_lossy(&req).to_string());
+        }
+    });
+    (port, rx)
+}
+
+#[test]
+fn an_http_remote_polls_and_its_action_posts_through_curl() {
+    let (port, requests) = http_server("{\"v\": 7}");
+    let d = tmp("remote-http");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "secret tok {{ file = {tok} }}\n\
+             remote_kind api {{\n\
+                 param port: int\n\
+                 param token: secret\n\
+                 via = http\n\
+                 url = http://127.0.0.1:{{{{ port }}}}/api\n\
+                 headers {{ Authorization = Bearer {{{{ token }}}} }}\n\
+                 value info {{ get = /status; parse = json; value = {{{{ out.v }}}} }}\n\
+                 action stop {{ param vm: string = \"../a b\"\n post = /vms/{{{{ vm }}}}/stop\n body = {{\"why\": \"tap\"}} }}\n\
+             }}\n\
+             remote h1: api {{ port = {port}; token = tok }}\n\
+             page home {{\n\
+                 button {{ width = 200; height = 100; label = Stop; on_tap = h1.stop }}\n\
+                 rect {{ width = 200; height = 100\n\
+                        background = {{{{ h1.info == 7 ? '#00ff00' : '#ff0000' }}}} }}\n\
+             }}\n",
+            tok = d.join("tok").display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(d.join("tok"), "s3cret-token\n").unwrap();
+    let img = shot(&conf, &["--tap", "100,120", "--wait", "1500", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "h1.info is not 7");
+    let reqs: Vec<String> = requests.try_iter().collect();
+    let get = reqs.iter().find(|r| r.starts_with("GET ")).expect("no GET");
+    assert!(get.starts_with("GET /api/status HTTP/1.1\r\n"), "{get}");
+    assert!(get.contains("Authorization: Bearer s3cret-token\r\n"), "{get}");
+    let post = reqs.iter().find(|r| r.starts_with("POST ")).unwrap_or_else(|| panic!("no POST in {reqs:?}"));
+    // The arg is one encoded segment: no `..` folding, no space.
+    assert!(post.starts_with("POST /api/vms/..%2Fa%20b/stop HTTP/1.1\r\n"), "{post}");
+    assert!(post.ends_with("\r\n\r\n{\"why\": \"tap\"}"), "{post}");
+}

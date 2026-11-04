@@ -2,6 +2,7 @@
 title: "ADR 0013: Command runner limits, environment and retries"
 description: "How paneld runs commands: working directory, environment, output limits, concurrency, timeouts and retries."
 date: 2026-10-29
+updated: 2026-11-04
 tags: [paneld, adr, commands]
 series: paneld
 order: 20
@@ -21,7 +22,7 @@ Every integration is a command ([ADR 0005](0005-commands-only.md)). The requirem
 | Topic | Rule |
 | --- | --- |
 | Working directory | The directory of the main config file, so `./scripts/x.sh` works; `cwd` on a source or action overrides it |
-| stdin | `/dev/null` |
+| stdin | `/dev/null`; a remote `http` or `socket` run gets its request ([ADR 0018](0018-remotes.md)) |
 | Environment | A clean one: `PATH=/usr/local/bin:/usr/bin:/bin`, `HOME`, `LANG=C.UTF-8`, `PANELD=1`, plus `PANELD_SOURCE` or `PANELD_ACTION` with the item's name, plus the item's `env { }`. Nothing else is inherited from the service, so secrets in its environment reach a command only through `secret` items |
 | Process | Its own process group (`setsid`), so a timeout kills the command and everything it started |
 | Timeout | `timeout`, default `app:timeout` (10s): SIGTERM to the group, SIGKILL 2s later; counts as a failure (`error` = `timeout`) |

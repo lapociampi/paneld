@@ -116,7 +116,7 @@ fn fold_categories(doc: &mut Document) {
         items.extend(others);
         doc.items.insert(
             pos,
-            Item::Block(Block { kind: ident, name: None, items, span }),
+            Item::Block(Block { kind: ident, name: None, of: None, items, span }),
         );
     }
 }
