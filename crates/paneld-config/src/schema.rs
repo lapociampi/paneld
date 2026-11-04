@@ -2601,8 +2601,17 @@ fn validate_style_selector(sel: &str) -> Result<(), String> {
             "selector lists are not supported yet; split `{s}` into separate `style` blocks"
         ));
     }
-    // `.class` form.
+    // `.class[:state]` form.
     if let Some(rest) = s.strip_prefix('.') {
+        let (class, state) = rest.split_once(':').map_or((rest, None), |(c, st)| (c, Some(st)));
+        if let Some(state) = state {
+            if !matches!(state, "pressed" | "checked" | "disabled" | "focused" | "hover") {
+                return Err(format!(
+                    "unknown pseudo-state `:{state}`; valid: `:pressed`, `:checked`, `:disabled`, `:focused`, `:hover`"
+                ));
+            }
+        }
+        let rest = class;
         if !is_bare_ident(rest) {
             return Err(format!(
                 "expected a class name after `.` (identifier), got `{s}`"

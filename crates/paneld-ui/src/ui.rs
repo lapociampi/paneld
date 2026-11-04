@@ -149,6 +149,10 @@ pub enum ValueWidget {
     Toggle,
     Slider,
     Dropdown,
+    /// `select { style = roller }`.
+    Roller,
+    /// `select { style = buttons }`: a row of buttons, one checked.
+    Buttons,
     /// A keypad's keyboard (`on_submit`).
     Keypad,
 }
@@ -163,6 +167,10 @@ enum ChangeKind {
     /// A `select` on a page: the selected option's text (schema 8.4,
     /// `value` is the new value, not its position).
     Select,
+    /// The same for `style = roller`.
+    Roller,
+    /// The same for `style = buttons`.
+    Buttons,
     /// Keypad: READY on the keyboard. The trampoline reads the
     /// attached textarea's typed content and emits it as a
     /// [`EventValue::String`].
@@ -417,6 +425,20 @@ fn widget_value(kind: ChangeKind, target: *mut sys::lv_obj_t) -> Option<EventVal
             let text = if all.is_null() { Default::default() } else { unsafe { std::ffi::CStr::from_ptr(all) }.to_string_lossy() };
             EventValue::String(text.split('\n').nth(idx).unwrap_or_default().to_string())
         }
+        ChangeKind::Roller => {
+            let idx = unsafe { sys::lv_roller_get_selected(target) } as usize;
+            let all = unsafe { sys::lv_roller_get_options(target) };
+            let text = if all.is_null() { Default::default() } else { unsafe { std::ffi::CStr::from_ptr(all) }.to_string_lossy() };
+            EventValue::String(text.split('\n').nth(idx).unwrap_or_default().to_string())
+        }
+        ChangeKind::Buttons => {
+            let idx = unsafe { sys::lv_buttonmatrix_get_selected_button(target) };
+            let text = unsafe { sys::lv_buttonmatrix_get_button_text(target, idx) };
+            if text.is_null() {
+                return None;
+            }
+            EventValue::String(unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned())
+        }
         ChangeKind::Keypad => EventValue::String(keyboard_text(target)),
         ChangeKind::PinEntry => return None,
     })
@@ -632,6 +654,7 @@ impl Ui {
     /// Advance LVGL's clock by `ms` and run its timers, without
     /// sleeping. Drives a [`MemDisplay`].
     pub fn advance(&self, ms: u32) {
+        RETIRED_LABELS.with(|r| r.borrow_mut().clear());
         unsafe {
             sys::lv_tick_inc(ms);
             sys::lv_timer_handler();
@@ -783,6 +806,7 @@ impl<'ui> Pump<'ui> {
     /// the hint it returned (capped at 100ms). Returns the hint so
     /// the caller can use it as its own idle timeout.
     pub fn step(&mut self) -> Duration {
+        RETIRED_LABELS.with(|r| r.borrow_mut().clear());
         self.tick();
         let sleep_ms = unsafe { sys::lv_timer_handler() }.min(IDLE_STEP_MS);
         let sleep = Duration::from_millis(sleep_ms as u64);
@@ -1049,6 +1073,55 @@ impl<'ui> Obj<'ui> {
         }
     }
 
+    /// Fill under each line series (`chart { type = area }`): LVGL draws
+    /// lines only, so the strip from each segment down to the chart's
+    /// bottom is drawn after it, in the series color, translucent.
+    pub fn chart_fill_area(&self) {
+        unsafe extern "C" fn fill(e: *mut sys::lv_event_t) {
+            // SAFETY: registered on a chart below; LVGL hands the layer it
+            // is drawing into for DRAW_MAIN_END.
+            unsafe {
+                let chart = sys::lv_event_get_target(e) as *mut sys::lv_obj_t;
+                let layer = sys::lv_event_get_layer(e);
+                let mut coords: sys::lv_area_t = std::mem::zeroed();
+                sys::lv_obj_get_coords(chart, &mut coords);
+                let mut content: sys::lv_area_t = std::mem::zeroed();
+                sys::lv_obj_get_content_coords(chart, &mut content);
+                let bottom = content.y2;
+                let count = sys::lv_chart_get_point_count(chart);
+                let mut ser = sys::lv_chart_get_series_next(chart, std::ptr::null_mut());
+                while !ser.is_null() {
+                    let ys = sys::lv_chart_get_series_y_array(chart, ser);
+                    let color = sys::lv_chart_get_series_color(chart, ser);
+                    let at = |i: u32| {
+                        let mut p: sys::lv_point_t = std::mem::zeroed();
+                        sys::lv_chart_get_point_pos_by_id(chart, ser, i, &mut p);
+                        (coords.x1 + p.x, coords.y1 + p.y)
+                    };
+                    for i in 0..count.saturating_sub(1) {
+                        let none = |k: u32| *ys.add(k as usize) == sys::LV_CHART_POINT_NONE as i32;
+                        if none(i) || none(i + 1) {
+                            continue;
+                        }
+                        let ((x0, y0), (x1, y1)) = (at(i), at(i + 1));
+                        for tri in [[(x0, y0), (x1, y1), (x1, bottom)], [(x0, y0), (x1, bottom), (x0, bottom)]] {
+                            let mut dsc: sys::lv_draw_triangle_dsc_t = std::mem::zeroed();
+                            sys::lv_draw_triangle_dsc_init(&mut dsc);
+                            dsc.color = color;
+                            dsc.opa = 80;
+                            for (k, (x, y)) in tri.into_iter().enumerate() {
+                                dsc.p[k] = sys::lv_point_precise_t { x, y };
+                            }
+                            sys::lv_draw_triangle(layer, &dsc);
+                        }
+                    }
+                    ser = sys::lv_chart_get_series_next(chart, ser);
+                }
+            }
+        }
+        unsafe { sys::lv_obj_add_event_cb(self.raw, Some(fill), sys::lv_event_code_t_LV_EVENT_DRAW_MAIN_END, std::ptr::null_mut()) };
+    }
+
     /// Add a series in `rgb`. `None` values are gaps. The chart owns
     /// the series and copies the values.
     pub fn chart_add_series(&self, rgb: u32, values: &[Option<i32>]) {
@@ -1214,6 +1287,54 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_dropdown_set_options(self.raw, c.as_ptr()) };
     }
 
+    /// A roller (`select { style = roller }`) showing `options`, one per
+    /// line, with `rows` visible.
+    pub fn new_roller(&self, options: &str, rows: u32) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_roller_create(self.raw) };
+        assert!(!raw.is_null());
+        let c = CString::new(options).unwrap_or_default();
+        unsafe {
+            sys::lv_roller_set_options(raw, c.as_ptr(), sys::lv_roller_mode_t_LV_ROLLER_MODE_NORMAL);
+            sys::lv_roller_set_visible_row_count(raw, rows);
+        }
+        Obj { raw, _ui: PhantomData }
+    }
+
+    pub fn set_roller_selected(&self, idx: u32) {
+        unsafe { sys::lv_roller_set_selected(self.raw, idx, false) };
+    }
+
+    /// One row of buttons (`select { style = buttons }`), exactly one
+    /// checked: the selected option.
+    pub fn new_button_row(&self, options: &[String], selected: Option<usize>) -> Obj<'ui> {
+        let raw = unsafe { sys::lv_buttonmatrix_create(self.raw) };
+        assert!(!raw.is_null());
+        // LVGL keeps pointers to the labels: they live with the widget
+        // and are freed when LVGL deletes it.
+        let labels: Vec<CString> = options.iter().map(|o| CString::new(o.as_str()).unwrap_or_default()).collect();
+        let mut map: Vec<*const std::os::raw::c_char> = labels.iter().map(|c| c.as_ptr()).collect();
+        map.push(c"".as_ptr());
+        let owned: Box<ButtonLabels> = Box::new((labels, map));
+        unsafe extern "C" fn free_map(e: *mut sys::lv_event_t) {
+            // SAFETY: the user data is the Box leaked below, taken once.
+            // LVGL still reads the map while it finishes deleting the
+            // widget, so it is freed at the next pump step, not here.
+            let p = unsafe { sys::lv_event_get_user_data(e) } as *mut ButtonLabels;
+            let labels = unsafe { Box::from_raw(p) };
+            RETIRED_LABELS.with(|r| r.borrow_mut().push(*labels));
+        }
+        unsafe {
+            sys::lv_buttonmatrix_set_map(raw, owned.1.as_ptr());
+            sys::lv_buttonmatrix_set_button_ctrl_all(raw, sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_CHECKABLE);
+            sys::lv_buttonmatrix_set_one_checked(raw, true);
+            if let Some(i) = selected {
+                sys::lv_buttonmatrix_set_button_ctrl(raw, i as u32, sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_CHECKED);
+            }
+            sys::lv_obj_add_event_cb(raw, Some(free_map), sys::lv_event_code_t_LV_EVENT_DELETE, Box::into_raw(owned).cast());
+        }
+        Obj { raw, _ui: PhantomData }
+    }
+
     pub fn set_dropdown_selected(&self, idx: u16) {
         unsafe { sys::lv_dropdown_set_selected(self.raw, idx.into()) };
     }
@@ -1269,6 +1390,8 @@ impl<'ui> Obj<'ui> {
             ValueWidget::Toggle => (Binding::AskValue { kind: ChangeKind::Toggle }, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Slider => (Binding::AskValue { kind: ChangeKind::Slider }, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Dropdown => (Binding::AskValue { kind: ChangeKind::Dropdown }, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Roller => (Binding::AskValue { kind: ChangeKind::Roller }, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Buttons => (Binding::AskValue { kind: ChangeKind::Buttons }, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Keypad => (Binding::AskButton { accept: true, sink }, sys::lv_event_code_t_LV_EVENT_READY),
         };
         let idx = {
@@ -1306,6 +1429,8 @@ impl<'ui> Obj<'ui> {
             ValueWidget::Toggle => (ChangeKind::Toggle, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Slider => (ChangeKind::Slider, sys::lv_event_code_t_LV_EVENT_RELEASED),
             ValueWidget::Dropdown => (ChangeKind::Select, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Roller => (ChangeKind::Roller, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Buttons => (ChangeKind::Buttons, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Keypad => (ChangeKind::Keypad, sys::lv_event_code_t_LV_EVENT_READY),
         };
         let idx = {
@@ -1517,19 +1642,19 @@ impl<'ui> Obj<'ui> {
     }
 
     pub fn set_min_width(&self, w: Size) {
-        unsafe { sys::lv_obj_set_style_min_width(self.raw, w.to_lvgl(), 0) };
+        unsafe { sys::lv_obj_set_style_min_width(self.raw, w.to_lvgl(), sel()) };
     }
 
     pub fn set_max_width(&self, w: Size) {
-        unsafe { sys::lv_obj_set_style_max_width(self.raw, w.to_lvgl(), 0) };
+        unsafe { sys::lv_obj_set_style_max_width(self.raw, w.to_lvgl(), sel()) };
     }
 
     pub fn set_min_height(&self, h: Size) {
-        unsafe { sys::lv_obj_set_style_min_height(self.raw, h.to_lvgl(), 0) };
+        unsafe { sys::lv_obj_set_style_min_height(self.raw, h.to_lvgl(), sel()) };
     }
 
     pub fn set_max_height(&self, h: Size) {
-        unsafe { sys::lv_obj_set_style_max_height(self.raw, h.to_lvgl(), 0) };
+        unsafe { sys::lv_obj_set_style_max_height(self.raw, h.to_lvgl(), sel()) };
     }
 
     /// Scroll only along one axis (`scroll`), snapping children to
@@ -1579,45 +1704,51 @@ impl<'ui> Obj<'ui> {
     }
 
     pub fn set_padding(&self, px: i32) {
-        unsafe { sys::lv_obj_set_style_pad_all(self.raw, px, 0) };
+        unsafe { sys::lv_obj_set_style_pad_all(self.raw, px, sel()) };
     }
 
     pub fn set_gap(&self, px: i32) {
-        unsafe { sys::lv_obj_set_style_pad_gap(self.raw, px, 0) };
+        unsafe { sys::lv_obj_set_style_pad_gap(self.raw, px, sel()) };
     }
 
     pub fn set_background_hex(&self, rgb: u32) {
         let color = unsafe { sys::lv_color_hex(rgb) };
         unsafe {
-            sys::lv_obj_set_style_bg_color(self.raw, color, 0);
+            sys::lv_obj_set_style_bg_color(self.raw, color, sel());
             // Layout containers start transparent.
-            sys::lv_obj_set_style_bg_opa(self.raw, sys::_lv_opacity_level_t_LV_OPA_COVER as sys::lv_opa_t, 0);
+            sys::lv_obj_set_style_bg_opa(self.raw, sys::_lv_opacity_level_t_LV_OPA_COVER as sys::lv_opa_t, sel());
         }
     }
 
     pub fn set_radius(&self, px: i32) {
-        unsafe { sys::lv_obj_set_style_radius(self.raw, px, 0) };
+        unsafe { sys::lv_obj_set_style_radius(self.raw, px, sel()) };
     }
 
     /// `border = <width> [<color>]`; width 0 removes the border.
     pub fn set_border(&self, width: i32, rgb: Option<u32>) {
         unsafe {
-            sys::lv_obj_set_style_border_width(self.raw, width, 0);
+            sys::lv_obj_set_style_border_width(self.raw, width, sel());
             if let Some(rgb) = rgb {
-                sys::lv_obj_set_style_border_color(self.raw, sys::lv_color_hex(rgb), 0);
+                sys::lv_obj_set_style_border_color(self.raw, sys::lv_color_hex(rgb), sel());
             }
         }
+    }
+
+    /// `scale`: 1.0 is the node's own size (a pressed button at 0.96).
+    pub fn set_scale(&self, scale: f64) {
+        let v = (scale.clamp(0.1, 10.0) * 256.0).round() as i32;
+        unsafe { sys::lv_obj_set_style_transform_scale(self.raw, v, sel()) };
     }
 
     /// 0.0 transparent .. 1.0 opaque.
     pub fn set_opacity(&self, opacity: f64) {
         let opa = (opacity.clamp(0.0, 1.0) * 255.0).round() as sys::lv_opa_t;
-        unsafe { sys::lv_obj_set_style_opa(self.raw, opa, 0) };
+        unsafe { sys::lv_obj_set_style_opa(self.raw, opa, sel()) };
     }
 
     pub fn set_text_color_hex(&self, rgb: u32) {
         let color = unsafe { sys::lv_color_hex(rgb) };
-        unsafe { sys::lv_obj_set_style_text_color(self.raw, color, 0) };
+        unsafe { sys::lv_obj_set_style_text_color(self.raw, color, sel()) };
     }
 
     /// Pick one of the compiled Montserrat font sizes for this
@@ -1635,13 +1766,13 @@ impl<'ui> Obj<'ui> {
                 _ => return false,
             }
         };
-        unsafe { sys::lv_obj_set_style_text_font(self.raw, font, 0) };
+        unsafe { sys::lv_obj_set_style_text_font(self.raw, font, sel()) };
         true
     }
 
     pub fn set_text_align_left(&self) {
         unsafe {
-            sys::lv_obj_set_style_text_align(self.raw, sys::lv_text_align_t_LV_TEXT_ALIGN_LEFT, 0)
+            sys::lv_obj_set_style_text_align(self.raw, sys::lv_text_align_t_LV_TEXT_ALIGN_LEFT, sel())
         };
     }
     pub fn set_text_align_center(&self) {
@@ -1754,6 +1885,13 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_clickable(self.raw, enabled) };
     }
 
+    /// The `enabled` property (schema 8.1): disabled takes no input and
+    /// is in LVGL's disabled state, so a theme's `:disabled` style shows.
+    pub fn set_disabled(&self, disabled: bool) {
+        self.set_enabled(!disabled);
+        unsafe { sys::lv_obj_set_state(self.raw, sys::lv_state_t_LV_STATE_DISABLED as _, disabled) };
+    }
+
     /// On `trigger`, push a [`UiEvent::Action`] carrying `args`
     /// (already evaluated at render time; empty for `on_tap = name`).
     pub fn bind_action(
@@ -1828,8 +1966,18 @@ impl<'ui> Obj<'ui> {
         sink: Sender<UiEvent>,
         assigns: Vec<InlineSetItem>,
     ) {
+        self.on_change_select_inline_set(ValueWidget::Dropdown, sink, assigns);
+    }
+
+    /// The same for any `select` style.
+    pub fn on_change_select_inline_set(&self, widget: ValueWidget, sink: Sender<UiEvent>, assigns: Vec<InlineSetItem>) {
+        let kind = match widget {
+            ValueWidget::Roller => ChangeKind::Roller,
+            ValueWidget::Buttons => ChangeKind::Buttons,
+            _ => ChangeKind::Select,
+        };
         self.register_change_binding(
-            ChangeKind::Select,
+            kind,
             assigns,
             sink,
             sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED,
@@ -1969,6 +2117,47 @@ pub enum Size {
     Px(i32),
     Percent(u16),
     Content,
+}
+
+/// A button row's labels and the pointer map LVGL reads.
+type ButtonLabels = (Vec<CString>, Vec<*const std::os::raw::c_char>);
+
+thread_local! {
+    /// Labels of deleted button rows, freed at the next pump step.
+    static RETIRED_LABELS: std::cell::RefCell<Vec<ButtonLabels>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// The style selector the property setters write to: the default
+    /// state, or a state (`pressed`, ...) while a theme's `style
+    /// button:pressed { }` is applied ([`with_state`]).
+    static SELECTOR: std::cell::Cell<sys::lv_style_selector_t> = const { std::cell::Cell::new(0) };
+}
+
+fn sel() -> sys::lv_style_selector_t {
+    SELECTOR.with(|s| s.get())
+}
+
+/// The LVGL state for a style selector's `:state`.
+fn state_of(name: &str) -> Option<sys::lv_style_selector_t> {
+    Some(match name {
+        "pressed" => sys::lv_state_t_LV_STATE_PRESSED,
+        "checked" => sys::lv_state_t_LV_STATE_CHECKED,
+        "disabled" => sys::lv_state_t_LV_STATE_DISABLED,
+        "focused" => sys::lv_state_t_LV_STATE_FOCUSED,
+        "hover" => sys::lv_state_t_LV_STATE_HOVERED,
+        _ => return None,
+    } as sys::lv_style_selector_t)
+}
+
+/// Run `f` with the property setters writing to state `state`
+/// (`pressed`, `checked`, `disabled`, `focused`, `hover`); does nothing
+/// for an unknown state.
+pub fn with_state(state: &str, f: impl FnOnce()) {
+    let Some(s) = state_of(state) else { return };
+    let before = SELECTOR.with(|c| c.replace(s));
+    f();
+    SELECTOR.with(|c| c.set(before));
 }
 
 /// The largest backdrop blur: the Pi draws it in software, over the

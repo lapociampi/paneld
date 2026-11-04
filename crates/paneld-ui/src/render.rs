@@ -474,36 +474,43 @@ fn render_node(
             }
         }
         "select" => {
-            // Schema v1: `options` is a list expression, `value`
-            // picks the initial index (or the matching option when
-            // it's a value from the same list). Only the default
-            // `style = dropdown` ships today; `roller` and `buttons`
-            // are deferred.
-            let obj = parent.new_dropdown();
+            // Schema 8.4: `options` (a list), `value` (the selected
+            // option, or its position), `style` = `dropdown` (default),
+            // `roller` or `buttons`; `on_change` gets the option.
             let options = resolve_assign_value(node, "options", ctx)
                 .map(dropdown_options)
                 .unwrap_or_default();
-            if !options.is_empty() {
-                obj.set_dropdown_options(&options.join("\n"));
-            }
-            if let Some(v) = resolve_assign_value(node, "value", ctx) {
-                let idx = match v {
-                    Value::Int(n) if n >= 0 => n as u16,
-                    Value::Double(d) if d >= 0.0 => d as u16,
-                    other => {
-                        let s = other.to_display_string();
-                        options
-                            .iter()
-                            .position(|o| o == &s)
-                            .map(|p| p as u16)
-                            .unwrap_or(0)
+            let selected = resolve_assign_value(node, "value", ctx).map(|v| match v {
+                Value::Int(n) if n >= 0 => n as usize,
+                Value::Double(d) if d >= 0.0 => d as usize,
+                other => {
+                    let s = other.to_display_string();
+                    options.iter().position(|o| o == &s).unwrap_or(0)
+                }
+            });
+            let (obj, widget) = match find_simple(node, "style").map(str::trim) {
+                Some("roller") => {
+                    let obj = parent.new_roller(&options.join("\n"), 3);
+                    if let Some(i) = selected {
+                        obj.set_roller_selected(i as u32);
                     }
-                };
-                obj.set_dropdown_selected(idx);
-            }
+                    (obj, ValueWidget::Roller)
+                }
+                Some("buttons") => (parent.new_button_row(&options, selected), ValueWidget::Buttons),
+                _ => {
+                    let obj = parent.new_dropdown();
+                    if !options.is_empty() {
+                        obj.set_dropdown_options(&options.join("\n"));
+                    }
+                    if let Some(i) = selected {
+                        obj.set_dropdown_selected(i as u16);
+                    }
+                    (obj, ValueWidget::Dropdown)
+                }
+            };
             apply_props(node, ctx, sink, &obj);
-            if let Some(assigns) = bind_change_action(node, "on_change", ValueWidget::Dropdown, ctx, sink, &obj) {
-                obj.on_change_dropdown_inline_set(sink.clone(), assigns);
+            if let Some(assigns) = bind_change_action(node, "on_change", widget, ctx, sink, &obj) {
+                obj.on_change_select_inline_set(widget, sink.clone(), assigns);
             }
         }
         "slot" => {
@@ -851,8 +858,8 @@ fn class_names(items: &[Item]) -> Vec<String> {
 /// Theme styles for a node of `kind` with `items` (themes.md,
 /// "Precedence": under what the node itself sets): `*`, then the
 /// kind, then each `class` in order, later winning. State selectors
-/// (`button:pressed`) are not applied yet. Without `by_kind`, only
-/// the classes.
+/// (`button:pressed`, `.card:checked`) follow, for that state.
+/// Without `by_kind`, only the classes.
 fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Context, obj: &Obj<'_>) {
     let classes = class_names(items);
     STYLES.with(|styles| {
@@ -864,9 +871,19 @@ fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Context, obj: &
             .into_iter()
             .filter(|_| by_kind)
             .chain(classes.iter().map(|c| format!(".{c}")));
-        for sel in selectors {
-            if let Some(body) = styles.get(&sel) {
+        let selectors: Vec<String> = selectors.collect();
+        for sel in &selectors {
+            if let Some(body) = styles.get(sel) {
                 apply_plain_props(kind, body, ctx, obj);
+            }
+        }
+        // Then the states (`button:pressed`, `.card:checked`): the
+        // same properties, for when the node is in that state.
+        for sel in &selectors {
+            for state in ["pressed", "checked", "disabled", "focused", "hover"] {
+                if let Some(body) = styles.get(&format!("{sel}:{state}")) {
+                    crate::ui::with_state(state, || apply_plain_props(kind, body, ctx, obj));
+                }
             }
         }
     });
@@ -1048,6 +1065,11 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
                     obj.set_border(w, parts.next().and_then(parse_hex_color));
                 }
             }
+            "scale" => {
+                if let Ok(x) = resolve_scalar(value, a.value.span, ctx).trim().parse::<f64>() {
+                    obj.set_scale(x);
+                }
+            }
             "opacity" => {
                 if let Ok(o) = resolve_scalar(value, a.value.span, ctx).trim().parse::<f64>() {
                     obj.set_opacity(o);
@@ -1068,7 +1090,7 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
                 let flag = resolve_expr_value(value, a.value.span, ctx)
                     .map(|v| value_truthy(&v))
                     .unwrap_or(true);
-                obj.set_enabled(flag);
+                obj.set_disabled(!flag);
             }
             _ => {
                 // Handlers are bound by `bind_handlers`; other keys
@@ -1183,8 +1205,12 @@ fn render_chart(node: &Block, ctx: &Context, obj: &Obj<'_>) {
         })
         .unwrap_or((3, 0));
     let scaled = |x: f64| (x * CHART_SCALE).round().clamp(i32::MIN as f64 + 1.0, i32::MAX as f64 - 1.0) as i32;
-    let bars = find_simple(node, "type").map(str::trim) == Some("bar");
+    let ty = find_simple(node, "type").map(str::trim);
+    let bars = ty == Some("bar");
     obj.chart_setup(bars, points as u32, scaled(min), scaled(max), hdiv.min(20), vdiv.min(20));
+    if ty == Some("area") {
+        obj.chart_fill_area();
+    }
     for (values, color) in &series {
         let tail = shown(values);
         let mut padded: Vec<Option<i32>> = vec![None; points - tail.len()];
@@ -1334,7 +1360,8 @@ fn value_truthy(v: &Value) -> bool {
         Value::Null => false,
         Value::Int(n) => *n != 0,
         Value::Double(d) => *d != 0.0,
-        Value::String(s) => !s.is_empty(),
+        // A literal `visible = false` arrives as text.
+        Value::String(s) => paneld_config::value::parse_bool(s.trim()).unwrap_or(!s.is_empty()),
         Value::List(items) => !items.is_empty(),
         Value::Map(m) => !m.is_empty(),
     }

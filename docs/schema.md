@@ -278,7 +278,7 @@ Layout blocks are transparent and borderless: only a `background`, `border` or t
 | `arc` | `value`, `min` = 0, `max` = 100 (expr), `start` = 135, `end` = 45 (degrees), `thickness`, `track` (color), `rounded` (bool) |
 | `bar` | `value`, `min`, `max` (expr), `direction` (`horizontal`, `vertical`), `track` (color) |
 | `line` | `points` (list of `[x, y]` in px, expr), `thickness` (default 2), `rounded`, `color` (default the theme's `text`) |
-| `chart` | `type` (`line`, `bar`; `area` draws as `line` for now), `min`, `max` (default: the data's range), `points` (count, default: the longest series), `divisions` (`<h> <v>`, default `3 0`), `series { values = {{ }}; color = ... }` repeatable. `values` is a list of numbers or of `{value}` maps, such as a source's `history`; the newest `points` are shown, against the right edge |
+| `chart` | `type` (`line`, `bar`, `area`: a line with the space under it filled, translucent), `min`, `max` (default: the data's range), `points` (count, default: the longest series), `divisions` (`<h> <v>`, default `3 0`), `series { values = {{ }}; color = ... }` repeatable. `values` is a list of numbers or of `{value}` maps, such as a source's `history`; the newest `points` are shown, against the right edge |
 | `qr` | `data` (string, expr), `size` |
 | `spinner` | `size` |
 
@@ -291,7 +291,7 @@ Value changes of `arc`, `bar` and `chart` animate when the theme's motion allows
 | `button` | `action` (action), plus children or `label` / `icon` shortcuts. Shows the action's state: `:running`, `:failed` styles, `busy` and `done` texts |
 | `toggle` | `value` (bool, expr), `on_change` (action; `value` = the new state) |
 | `slider` | `value`, `min`, `max`, `step` (expr), `direction`, `on_change` (on release) |
-| `select` | `options` (list, expr), `value` (expr), `style` (`dropdown`, `roller`, `buttons`), `on_change` |
+| `select` | `options` (list, expr), `value` (expr; the option, or its position), `style` (`dropdown` default, `roller`, `buttons`: a row with one checked), `on_change` (`value` = the option) |
 | `keypad` | `length` (max digits), `masked` (bool), `on_submit` (action; `value` = the digits) |
 
 Inputs show the value from their `value` expression; a change runs `on_change` and the display follows the source of `value` (for example a `var` set by the action, or a refreshed source).

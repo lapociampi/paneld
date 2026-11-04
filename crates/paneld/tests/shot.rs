@@ -1076,3 +1076,81 @@ fn one_dialog_replaces_the_one_before() {
     // The page background is about 0xf4; under one backdrop about 0x7a.
     assert!((0x6a..=0x8a).contains(&r), "background at {r:#x}: dialogs stacked, or none");
 }
+
+#[test]
+fn state_styles_apply_and_literal_false_means_false() {
+    let d = tmp("states");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t {\n\
+             style button:disabled { background = #00ff00 }\n\
+             style .card:disabled { background = #0000ff }\n\
+         }\n\
+         screen { theme = t }\n\
+         var n: int = 0\n\
+         page home {\n\
+             button { width = 200; height = 60; label = off; enabled = false; on_tap { set { n = 1 } } }\n\
+             rect { class = card; width = 100; height = 40; enabled = false }\n\
+             rect { width = 100; height = 40; background = #ff0000; visible = false }\n\
+             rect { width = 100; height = 40; background = {{ vars.n == 1 ? '#ff00ff' : '#000000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--tap", "100,90", "--settle", "300"]);
+    // `:disabled` styles (LVGL lightens a disabled button a little).
+    assert!(img.any(|[r, g, b]| g > 0xd0 && r < 0x90 && b < 0x90), "button:disabled not applied");
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 8)), ".card:disabled not applied");
+    // `visible = false` written plainly hides; `enabled = false` takes no tap.
+    assert!(!img.any(|p| close(p, [0xff, 0, 0], 8)), "visible = false still drawn");
+    assert!(!img.any(|p| close(p, [0xff, 0, 0xff], 8)), "a disabled button took a tap");
+}
+
+#[test]
+fn roller_and_button_row_selects_send_their_option() {
+    let d = tmp("select-styles");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var a: string = \"\"\n\
+         var b: string = \"y\"\n\
+         page home {\n\
+             title = Selects\n\
+             row {\n\
+                 gap = 16\n\
+                 select { style = roller; width = 120; options = {{ ['x', 'y', 'z'] }}; value = {{ vars.a }}; on_change { set { a = {{ value }} } } }\n\
+                 rect { width = 40; height = 40; background = {{ vars.a == 'y' ? '#00ff00' : '#ff0000' }} }\n\
+                 select { style = buttons; width = 300; height = 60; options = {{ ['x', 'y', 'z'] }}; value = {{ vars.b }}; on_change { set { b = {{ value }} } } }\n\
+                 rect { width = 40; height = 40; background = {{ vars.b == 'x' ? '#0000ff' : '#ff00ff' }} }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--tap", "91,170", "--settle", "400", "--tap", "284,113", "--settle", "300"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the roller did not send `y`");
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 16)), "the button row did not send `x`");
+}
+
+#[test]
+fn an_area_chart_fills_under_its_line() {
+    let d = tmp("area");
+    let conf = |ty: &str| {
+        let c = d.join(format!("{ty}.conf"));
+        std::fs::write(
+            &c,
+            format!(
+                "page home {{ chart {{ type = {ty}; width = 600; height = 300; min = 0; max = 10\n\
+                     series {{ values = {{{{ [8, 8, 8] }}}}; color = #ff0000 }} }} }}\n"
+            ),
+        )
+        .unwrap();
+        c
+    };
+    // Below the line, in the middle of the chart.
+    let tinted = |img: &Image| {
+        let [r, g, b] = img.px(300, 300);
+        r > 0xe0 && (0x80..0xe0).contains(&g) && (0x80..0xe0).contains(&b)
+    };
+    assert!(tinted(&shot(&conf("area"), &["--settle", "50"])), "no fill under an area chart");
+    assert!(!tinted(&shot(&conf("line"), &["--settle", "50"])), "a line chart got a fill");
+}
