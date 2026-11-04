@@ -143,7 +143,7 @@ remote_kind linux {
 }
 ```
 
-`known_hosts` defaults to the folder of `app:state` (`/var/lib/paneld`). `via = http` needs `curl` (installed on Raspberry Pi OS); `via = socket` needs `sudo apt install socat`.
+`known_hosts` defaults to the folder of `app:state` (`/var/lib/paneld`). Runs to the same host share one connection, kept open for a minute after the last one (`reuse`); its socket lives in `/run/paneld`. `via = http` needs `curl` (installed on Raspberry Pi OS); `via = socket` needs `sudo apt install socat`.
 
 ## Diagnostics
 

@@ -114,7 +114,7 @@ fn fallback_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/paneld-{}", current_uid()))
 }
 
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0)
 }

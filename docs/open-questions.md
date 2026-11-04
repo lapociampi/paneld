@@ -20,7 +20,8 @@ order: 6
 - [ ] Docker image: deferred. Commands run inside the container, so host actions would need ssh to the host or a privileged container.
 - [x] Name of the program: paneld.
 - [x] `ssh host cmd {{ x }}` written by hand: `paneld check` rejects a value in the remote command or before the host unless it is typed or held to `options` / `pattern` ([Config format](config-format.md)).
-- [ ] Remotes, later: a `via` override per instance, ssh connection reuse (ControlMaster) ([ADR 0018](decisions/0018-remotes.md)).
+- [x] A `via` override per instance: only `via = local` on an instance of an ssh kind, for the panel itself ([ADR 0018](decisions/0018-remotes.md)).
+- [x] ssh connection reuse: one shared connection per target, kept open `reuse` (1m) after its last run ([ADR 0018](decisions/0018-remotes.md)).
 - [x] A running action on its caller: the button's `:running` / `:failed` states and the action's `busy` text or a spinner ([Schema](schema.md), section 8).
 - [x] `active = visible` on a source: applied ([Schema](schema.md), section 4).
 - [x] A `secret` with a relative `file` is read from the main config file's folder.

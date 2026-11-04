@@ -5,6 +5,7 @@ date: 2026-11-04
 tags: [paneld, adr, config]
 series: paneld
 order: 25
+updated: 2026-11-04
 ---
 
 - Status: Accepted. Builds on [ADR 0005](0005-commands-only.md) and amends [ADR 0013](0013-command-runner.md) (stdin).
@@ -27,6 +28,7 @@ A panel mostly watches and drives other machines and services. With only `source
 - Kind params are literals (or `$vars`), read at load; inside the kind they are plain names (`{{ host }}`), and they win over any page name (a `repeat` binding called `host`). Connection keys (`host`, `url`, the kind's `headers`, ...) read the params and `secrets` only, so nothing on screen can change where a request goes. The kind's `timeout` is its members' default. A `secret` param names a `secret` item, so two boxes of one kind can have their own tokens; it is usable only where `secrets` is.
 - In expressions, `device1.temp` is the value; `device1.ok` / `device1.error` the remote as a whole; `device1.status.temp` the full source map (`ok`, `error`, `at`, `history`, ...). `device1.reboot` is an action anywhere an action fits (`on_tap = device1.reboot`, `refresh = device1.temp`, `alert ... from = device1.log`). Dotted members are not in `sources`.
 - `remote[device1]:host = 10.0.0.9` overrides one param, like any named item.
+- An instance of a `via = ssh` kind can set `via = local`: the kind that describes a Linux box then also describes the panel itself, its `run`s used as they are. Only this switch is allowed: other `via`s take other member keys (`get`, `send`), and `local` to `ssh` would need connection keys the kind does not have. A kind param may not be named `via`.
 - A kind can declare `alert <name> { }`: each instance gets its own, `<instance>.<name>`, whose expressions read the kind's params and `self` (the instance's root, `self.temp`). Five boxes of one kind need no five hand-written alerts.
 - Names are `[a-z][a-z0-9_]*`, not a CEL keyword. A kind param may not be named like an expression root (`secrets`, `vars`, ...), which it would hide in its members. An instance name may not be an expression root, nor a `repeat` binding or a param name anywhere (it would shadow the instance).
 
@@ -52,7 +54,7 @@ Every run keeps the ADR 0013 rules: clean environment, timeout, output limits, `
 - `secrets` are refused in an ssh `run` (they would be on ssh's argv and in the remote process list) and `env { }` is refused (OpenSSH passes it only where the server allows it).
 - Exit code 255 is ssh's own failure (cannot connect, host key mismatch): `error` says so. A remote command that exits 255 looks the same.
 - Killing ssh (timeout, reload, a stream restart) does not always stop the remote command; `ServerAlive` ends a stream's remote side once the link is gone. A timed-out remote action is reported as "timed out; it may still have run".
-- No ControlMaster: each run is a full connection. Poll intervals should allow for that on a Pi.
+- Connection reuse: runs to the same target and identity (host, user, port, key, `known_hosts`, `host_key`) share one connection (`ControlMaster=auto`, `ControlPersist`), kept open `reuse` (default 1m) after its last run, so a poll is a new session, not a new key exchange. The socket is `ssh-<hash>` in the ctl socket's folder (`/run/paneld`), used only while that folder belongs to the service user, no one else can write to it, and the socket path fits (no spaces, short enough for a socket address); otherwise, or with `reuse = 0s`, each run is a full connection. `reuse` counts whole seconds (at least 1s). A key file replaced at the same path, or an edited `known_hosts`, takes effect once the open connection has closed. The shared connection runs detached, so a run's timeout kills only its own session; `ServerAlive` closes a connection to a host that has gone away.
 
 #### http
 
@@ -84,4 +86,3 @@ After the check, each instance becomes ordinary sources and actions named `<inst
 - A remote member's `run` is argv, not shell text, exactly as a local one: pipes need `sh -c '...'` (run on the remote), and the inline-script lint applies. Free-text params can still start with `-`; write `--` before them (`systemctl restart -- {{ unit }}`) or give them `options`.
 - No native protocol code: no TLS or ssh library in the binary. A future `via` is a new command builder, not a client.
 - Member names `ok`, `error` and `status` are reserved.
-- Open: a `via` override per instance, ssh connection reuse.

@@ -158,6 +158,7 @@ const KIND_SSH: &BlockSchema = kind_schema!(
         k("key", E::Path, true, true),
         k("known_hosts", E::Path, false, true),
         k("host_key", E::OneOf(&["check", "accept_new"]), false, false),
+        k("reuse", E::Dur, false, false),
     ],
     []
 );
@@ -285,6 +286,9 @@ pub(super) fn check_kind(b: &Block, source: &SourceMap, diags: &mut Vec<Diagnost
                 p.name.span,
                 format!("`{}` is a name expressions already use; pick another param name", p.name.text),
             ));
+        }
+        if p.name.text == "via" {
+            diags.push(Diagnostic::new(p.name.span, "`via` is an instance's own key (`via = local`); pick another param name"));
         }
         if let Some(opts) = &p.options {
             validate_param_options(opts, diags);
@@ -578,6 +582,22 @@ pub(super) fn check_instance(b: &Block, doc: &Document, source: &SourceMap, diag
             diags.push(Diagnostic::new(a.span, "a remote only sets its kind's params: `<param> = <value>`"));
             continue;
         };
+        if key.text == "via" {
+            if let Some(prev) = seen.insert("via", key.span) {
+                diags.push(Diagnostic::new(key.span, format!("`via` is already set (first at {})", source.location(prev))));
+            }
+            // Only `run` members carry over: an ssh kind can describe
+            // the panel itself, where its commands run as they are.
+            if a.value.text.trim() != "local" {
+                diags.push(Diagnostic::new(a.value.span, "a remote can only set `via = local` (to run an ssh kind on the panel itself)"));
+            } else if !matches!(via_of(kind), Some("ssh" | "local")) {
+                diags.push(Diagnostic::new(
+                    a.value.span,
+                    format!("a remote can only set `via = local` on a kind with `via = ssh`; `{}` has `via = {}`", of.text, via_of(kind).unwrap_or("?")),
+                ));
+            }
+            continue;
+        }
         let Some(spec) = specs.iter().find(|s| s.name == key.text) else {
             diags.push(Diagnostic::new(
                 key.span,
@@ -736,7 +756,8 @@ mod tests {
                  button {{ label = Reboot; on_tap = device1.reboot }}\n\
                  button {{ label = Restart; on_tap device2.restart {{ unit = nginx }} }}\n\
              }}\n\
-             action both {{ refresh = [device1.temp, device2.temp] }}\n"
+             remote panel: linux {{ host = localhost; via = local }}\n\
+             action both {{ refresh = [device1.temp, device2.temp, panel.temp] }}\n"
         ));
         assert!(d.is_empty(), "{d:?}");
     }
@@ -749,6 +770,8 @@ mod tests {
              remote device3: linux {{ host = {{{{ vars.h }}}}; port = 2 }}\n\
              remote vars: linux {{ host = x }}\n\
              remote device4 {{ host = x }}\n\
+             remote device5: linux {{ host = x; via = http }}\n\
+             remote_kind web {{ via = http; url = http://x }}\nremote device6: web {{ via = local }}\n\
              source s: linux {{ run = x }}\n\
              page p {{ button {{ on_tap = device1.nope }} }}\n\
              page q {{ repeat device1 in {{{{ [1] }}}} {{ text {{ value = x }} }} }}\n"
@@ -763,6 +786,8 @@ mod tests {
             "is for `remote` only",
             "unknown action `device1.nope`",
             "would hide it in expressions",
+            "can only set `via = local` (to run",
+            "on a kind with `via = ssh`; `web` has `via = http`",
         ] {
             assert!(has(&d, needle), "missing `{needle}` in {d:?}");
         }

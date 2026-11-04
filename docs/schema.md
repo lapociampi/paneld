@@ -468,7 +468,7 @@ Functions (`paneld check` refuses any other name, or a wrong number of arguments
 | `color(c)` | a theme color token or `#rgb` / `#rrggbb` / `#rrggbbaa`, as `#rrggbb[aa]` |
 | `mix(a, b, t)` | colors `a` and `b` blended, `t` from 0 to 1 |
 
-Methods: `l.all(x, p)`, `l.exists(x, p)`, `l.exists_one(x, p)`, `l.filter(x, p)`, `l.map(x, e)` and `l.map(x, p, e)` over a list (or a map's keys); `size()`, `contains(s)`, `startsWith(s)`, `endsWith(s)`, `lowerAscii()`, `upperAscii()`, `trim()`, `split(sep)` on text; `join()` / `join(sep)` on a list of text.
+Methods: `l.all(x, p)`, `l.exists(x, p)`, `l.exists_one(x, p)`, `l.filter(x, p)`, `l.map(x, e)` and `l.map(x, p, e)` over a list (or a map's keys); `size()`, `contains(s)`, `startsWith(s)`, `endsWith(s)`, `lowerAscii()`, `upperAscii()`, `trim()`, `split(sep)` on text; `join()` / `join(sep)` on a list of text. As in CEL, a part that decides the result wins over an error elsewhere: `a || b` is true when either side is, `a && b` false when either is, `exists` true when any item matches and `all` false when any does not, whatever the other sides or items give.
 
 ## 17. Remotes
 
@@ -528,7 +528,7 @@ page home {
 | `via` | Keys |
 | --- | --- |
 | `local` | none |
-| `ssh` | `host` (required), `key` (private key file, required), `user`, `port` (22), `known_hosts` (default `known_hosts` in the folder of `app:state`), `host_key` (`check` default, or `accept_new`) |
+| `ssh` | `host` (required), `key` (private key file, required), `user`, `port` (22), `known_hosts` (default `known_hosts` in the folder of `app:state`), `host_key` (`check` default, or `accept_new`), `reuse` (duration, 1m, whole seconds: how long a connection stays open for the next run to the same target; `0s` = a new connection each run) |
 | `http` | `url` (base URL, required; `secrets` allowed), `user` (`user:password` for HTTP basic auth; `secrets` allowed), `headers { Name = value }` (`secrets` allowed; `_` in a name is sent as `-`: `X_Api_Key`), `ca` (CA file), `insecure` (bool, skip TLS checks) |
 | `socket` | `path` (Unix socket), or `host` and `port` (TCP) |
 
@@ -547,7 +547,7 @@ A `value` needs its request (`run`, a method, or `send`). Member names `ok`, `er
 
 ### 17.3 Instance
 
-`remote <name>: <kind> { <param> = <value> }`, a literal or `$variable` per param. `self` is reserved. `remote[device1]:host = ...` overrides one param. Names are `[a-z][a-z0-9_]*`; an instance name may not be an expression root (section 16), a CEL keyword, a `repeat` binding or a param name.
+`remote <name>: <kind> { <param> = <value> }`, a literal or `$variable` per param. `self` is reserved. `remote[device1]:host = ...` overrides one param. `via = local` on an instance of a `via = ssh` kind runs its members' `run` on the panel itself, as they are (the kind's connection keys are unused; its params are still set); no other `via` can be set per instance, and a kind param may not be named `via`. Names are `[a-z][a-z0-9_]*`; an instance name may not be an expression root (section 16), a CEL keyword, a `repeat` binding or a param name.
 
 | Expression | Value |
 | --- | --- |

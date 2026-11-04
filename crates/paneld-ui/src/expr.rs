@@ -171,27 +171,21 @@ pub fn eval(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
             }
         }
         ExprKind::Binary(op, l, r) => {
-            // Short-circuit `&&` / `||` so a bad right-hand side
-            // doesn't error when the left already decides the result.
+            // `&&` / `||` as in CEL: a side that decides the result
+            // (`false` for `&&`, `true` for `||`) wins over an error on
+            // the other side, in either order.
             if matches!(op, BinaryOp::And | BinaryOp::Or) {
-                let lv = eval(l, ctx)?;
-                let lb = to_bool(&lv)?;
-                match op {
-                    BinaryOp::And => {
-                        if !lb {
-                            return Ok(Value::Bool(false));
-                        }
-                    }
-                    BinaryOp::Or => {
-                        if lb {
-                            return Ok(Value::Bool(true));
-                        }
-                    }
-                    _ => unreachable!(),
+                let decides = matches!(op, BinaryOp::Or);
+                let lb = eval(l, ctx).and_then(|v| to_bool(&v));
+                if lb.as_ref().is_ok_and(|b| *b == decides) {
+                    return Ok(Value::Bool(decides));
                 }
-                let rv = eval(r, ctx)?;
-                let rb = to_bool(&rv)?;
-                return Ok(Value::Bool(rb));
+                let rb = eval(r, ctx).and_then(|v| to_bool(&v));
+                return match (lb, rb) {
+                    (_, Ok(b)) if b == decides => Ok(Value::Bool(decides)),
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                    (Ok(_), Ok(b)) => Ok(Value::Bool(b)),
+                };
             }
             let lv = eval(l, ctx)?;
             let rv = eval(r, ctx)?;
@@ -485,21 +479,21 @@ fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Res
         };
         let pred = |v: Value| to_bool(&v);
         return match (name, rest) {
-            ("all", [p]) => {
+            // As in CEL: an item that decides the result (`false` for
+            // `all`, `true` for `exists`) wins over an error on another.
+            ("all" | "exists", [p]) => {
+                let decides = name == "exists";
+                let mut error = None;
                 for i in &items {
-                    if !pred(with(i, p)?)? {
-                        return Ok(Value::Bool(false));
+                    match with(i, p).and_then(pred) {
+                        Ok(b) if b == decides => return Ok(Value::Bool(decides)),
+                        Ok(_) => {}
+                        Err(e) => {
+                            error.get_or_insert(e);
+                        }
                     }
                 }
-                Ok(Value::Bool(true))
-            }
-            ("exists", [p]) => {
-                for i in &items {
-                    if pred(with(i, p)?)? {
-                        return Ok(Value::Bool(true));
-                    }
-                }
-                Ok(Value::Bool(false))
+                error.map_or(Ok(Value::Bool(!decides)), Err)
             }
             ("exists_one", [p]) => {
                 let mut n = 0;
@@ -1011,6 +1005,27 @@ mod more_tests {
         assert_eq!(ev("true || nope.x"), B(true));
         assert_eq!(ev("true && false"), B(false));
         assert_eq!(ev("false || true"), B(true));
+    }
+
+    #[test]
+    fn a_deciding_side_or_item_wins_over_an_error_as_in_cel() {
+        // Either side decides `&&` / `||`, whatever the other's error.
+        assert_eq!(ev("nope.x || true"), B(true));
+        assert_eq!(ev("nope.x && false"), B(false));
+        assert_eq!(ev("1 || true"), B(true));
+        // Undecided: the error stays.
+        assert!(err("nope.x || false").contains("nope"));
+        assert!(err("nope.x && true").contains("nope"));
+        assert_eq!(err("true && 1"), "expected a bool, got int");
+        // One item decides `exists` / `all` even when another errors
+        // (a pool with size 0: its percentage is NaN).
+        assert_eq!(ev("[1, {'a': 1}].exists(x, x.a == 1)"), B(true));
+        assert_eq!(ev("[1, {'a': 1}].all(x, x.a == 2)"), B(false));
+        assert_eq!(ev("[0.0 / 0.0, 90.0].exists(p, p > 80.0)"), B(true));
+        assert!(!err("[1, {'a': 1}].exists(x, x.a == 2)").is_empty());
+        assert!(!err("[1, {'a': 1}].all(x, x.a == 1)").is_empty());
+        assert_eq!(ev("[].exists(x, x.a == 1)"), B(false));
+        assert_eq!(ev("[].all(x, x.a == 1)"), B(true));
     }
 
     #[test]

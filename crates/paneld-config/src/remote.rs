@@ -36,7 +36,16 @@ pub fn remotes(doc: &Document) -> std::collections::BTreeMap<String, Remote> {
         }
         let (Some(name), Some(of)) = (&b.name, &b.of) else { continue };
         let Some(kind) = find_kind(doc, &of.text) else { continue };
-        let Some(via) = via_of(kind) else { continue };
+        let Some(mut via) = via_of(kind) else { continue };
+        // `via = local` on the instance (last one wins): an ssh kind
+        // run on the panel itself.
+        let local = b.items.iter().rev().find_map(|it| match it {
+            Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "via") => Some(a.value.text.trim() == "local"),
+            _ => None,
+        });
+        if local == Some(true) && via == "ssh" {
+            via = "local";
+        }
         let params = kind
             .items
             .iter()

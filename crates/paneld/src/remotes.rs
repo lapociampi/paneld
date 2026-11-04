@@ -24,6 +24,9 @@ pub struct Remotes {
     /// Where `known_hosts` lives unless a kind says: the folder of
     /// `app:state`, which the service can write.
     state_dir: PathBuf,
+    /// Where ssh keeps its shared connections: the ctl socket's folder,
+    /// used only while it is ours and closed to others.
+    mux_dir: Option<PathBuf>,
 }
 
 static CURRENT: RwLock<Option<Arc<Remotes>>> = RwLock::new(None);
@@ -137,6 +140,7 @@ impl Remotes {
         Remotes {
             by_name: cr::remotes(doc),
             state_dir: state_file.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")),
+            mux_dir: crate::ctl::default_socket_path().parent().map(Path::to_path_buf),
         }
     }
 
@@ -218,6 +222,31 @@ impl Remotes {
                     _ => "yes",
                 };
                 let connect = timeout.min(Duration::from_secs(10)).as_secs().max(1);
+                // One connection per target and identity, kept open
+                // `reuse` (1m) after its last run: a poll then costs a
+                // session, not a key exchange.
+                let reuse = match find(kind, "reuse") {
+                    Some((v, _)) => paneld_config::value::parse_duration(v).unwrap_or_default(),
+                    None => Duration::from_secs(60),
+                };
+                // ssh counts whole seconds: anything shorter than 1s
+                // but not 0 is 1s.
+                let secs = reuse.as_secs() + u64::from(reuse.subsec_nanos() > 0 && reuse.as_secs() == 0);
+                let mux = match &self.mux_dir {
+                    Some(dir) if secs > 0 && private_dir(dir) => {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::hash::DefaultHasher::new();
+                        (&host, &user, port, &key_file, &known_hosts, checking, secs).hash(&mut h);
+                        let path = dir.join(format!("ssh-{:016x}", h.finish())).to_string_lossy().into_owned();
+                        // ssh reads a space as the end of the option, and
+                        // the master binds `<path>.<16 random chars>`,
+                        // which must fit a socket address (104 bytes on
+                        // some systems): else each run would fail.
+                        (!path.chars().any(|c| c.is_whitespace() || c.is_control()) && path.len() + 17 < 104)
+                            .then(|| (path.replace('%', "%%"), secs))
+                    }
+                    _ => None,
+                };
                 let mut argv: Vec<String> = [
                     "ssh", "-T", "-F", "none", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i",
                 ]
@@ -237,6 +266,12 @@ impl Remotes {
                 ] {
                     argv.push("-o".into());
                     argv.push(opt);
+                }
+                if let Some((path, secs)) = mux {
+                    for opt in ["ControlMaster=auto".into(), format!("ControlPath={path}"), format!("ControlPersist={secs}")] {
+                        argv.push("-o".into());
+                        argv.push(opt);
+                    }
                 }
                 argv.push("-p".into());
                 argv.push(port.to_string());
@@ -478,6 +513,14 @@ fn fill_with(raw: &str, span: Span, ctx: &Context, map: impl Fn(String) -> Strin
     Ok(out)
 }
 
+/// `dir` is a folder of this user that no one else can write to, so
+/// no one can plant a socket ssh would take for its shared connection.
+fn private_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|m| m.is_dir() && m.uid() == crate::ctl::current_uid() && m.mode() & 0o022 == 0)
+}
+
 /// A host or user name: no leading `-` (ssh would read an option), no
 /// spaces or control characters.
 fn plain_word(s: &str) -> bool {
@@ -540,6 +583,63 @@ mod tests {
         let r2 = Remotes::from_doc(&d2, Path::new("/s/state"));
         let b2 = block(&d2, "source", "d.v");
         assert!(r2.build(&r2.by_name["d"], b2, &ctx_for(&r2, b2, &[]), Duration::from_secs(5), false).is_err());
+    }
+
+    #[test]
+    fn an_instance_of_an_ssh_kind_can_run_on_the_panel() {
+        let d = doc("remote_kind k {\n param host: string\n via = ssh\n host = {{ host }}\n key = /k\n value v { run = cat /proc/uptime }\n}\n\
+                     remote far: k { host = h }\nremote here: k { host = h }\nremote[here]:via = local\n");
+        let r = Remotes::from_doc(&d, Path::new("/s/state"));
+        let argv = |name: &str| {
+            let b = block(&d, "source", &format!("{name}.v"));
+            r.build(&r.by_name[name], b, &ctx_for(&r, b, &[]), Duration::from_secs(5), false).unwrap().unwrap().argv
+        };
+        assert_eq!(argv("here"), ["cat", "/proc/uptime"]);
+        assert_eq!(argv("far")[0], "ssh");
+    }
+
+    #[test]
+    fn ssh_shares_a_connection_per_target_in_a_private_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("paneld-mux-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let conf = |extra: &str| {
+            doc(&format!(
+                "remote_kind k {{\n param host: string\n via = ssh\n host = {{{{ host }}}}\n key = /k\n {extra}\n value v {{ run = true }}\n}}\n\
+                 remote a: k {{ host = h1 }}\nremote b: k {{ host = h2 }}\nremote c: k {{ host = h1 }}\n"
+            ))
+        };
+        let opts = |d: &paneld_config::Document, mux: Option<&Path>, name: &str| -> Vec<String> {
+            let mut r = Remotes::from_doc(d, Path::new("/s/state"));
+            r.mux_dir = mux.map(Path::to_path_buf);
+            let b = block(d, "source", &format!("{name}.v"));
+            let argv = r.build(&r.by_name[name], b, &ctx_for(&r, b, &[]), Duration::from_secs(5), false).unwrap().unwrap().argv;
+            argv.into_iter().filter(|a| a.starts_with("Control")).collect()
+        };
+        let d = conf("");
+        let a = opts(&d, Some(&dir), "a");
+        assert_eq!(a[0], "ControlMaster=auto");
+        assert!(a[1].starts_with(&format!("ControlPath={}/ssh-", dir.display())), "{a:?}");
+        assert_eq!(a[2], "ControlPersist=60");
+        // Same target, same connection; another host, another one.
+        assert_eq!(opts(&d, Some(&dir), "c"), a);
+        assert_ne!(opts(&d, Some(&dir), "b")[1], a[1]);
+        assert_eq!(opts(&conf("reuse = 5m"), Some(&dir), "a")[2], "ControlPersist=300");
+        assert_eq!(opts(&conf("reuse = 500ms"), Some(&dir), "a")[2], "ControlPersist=1");
+        // A folder ssh cannot use: a space in it, or too long a path.
+        for bad in [dir.join("a b"), dir.join("x".repeat(80))] {
+            std::fs::create_dir(&bad).unwrap();
+            std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(opts(&d, Some(&bad), "a").is_empty(), "{}", bad.display());
+            std::fs::remove_dir(&bad).unwrap();
+        }
+        // Off by `reuse = 0s`, without a folder, or in one others can write to.
+        assert!(opts(&conf("reuse = 0s"), Some(&dir), "a").is_empty());
+        assert!(opts(&d, None, "a").is_empty());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(opts(&d, Some(&dir), "a").is_empty());
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
