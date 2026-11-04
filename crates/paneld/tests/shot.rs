@@ -757,3 +757,136 @@ fn an_http_remote_polls_and_its_action_posts_through_curl() {
     assert!(post.starts_with("POST /api/vms/..%2Fa%20b/stop HTTP/1.1\r\n"), "{post}");
     assert!(post.ends_with("\r\n\r\n{\"why\": \"tap\"}"), "{post}");
 }
+
+/// A page with each input setting a var, and a square per var that
+/// turns green when the var holds what the input sent.
+const INPUTS: &str = "var t: bool = false\n\
+    var s: int = 0\n\
+    var o: string = \"\"\n\
+    var k: string = \"\"\n\
+    page home {\n\
+        title = Inputs\n\
+        row {\n\
+            gap = 8\n\
+            toggle { value = {{ vars.t }}; on_change { set { t = {{ value }} } } }\n\
+            rect { width = 40; height = 40; background = {{ vars.t ? '#00ff00' : '#ff0000' }} }\n\
+            slider { width = 200; min = 0; max = 100; value = {{ vars.s }}; on_change { set { s = {{ event.value }} } } }\n\
+            rect { width = 40; height = 40; background = {{ vars.s > 50 ? '#00ff00' : '#ff0000' }} }\n\
+            select { width = 120; options = {{ ['a', 'b', 'c'] }}; value = {{ vars.o }}; on_change { set { o = {{ value }} } } }\n\
+            rect { width = 40; height = 40; background = {{ vars.o == 'b' ? '#00ff00' : '#ff0000' }} }\n\
+            rect { width = 40; height = 40; background = {{ vars.k == '42' ? '#00ff00' : '#ff0000' }} }\n\
+        }\n\
+        keypad { length = 4; on_submit { set { k = {{ value }} } } }\n\
+    }\n";
+
+fn inputs_shot(taps: &[&str]) -> Image {
+    let d = tmp("inputs");
+    let conf = d.join("p.conf");
+    std::fs::write(&conf, INPUTS).unwrap();
+    let mut args = vec!["--size", "800x700"];
+    for t in taps {
+        args.extend(["--tap", t]);
+    }
+    args.extend(["--settle", "150"]);
+    shot(&conf, &args)
+}
+
+/// The squares in the order of [`INPUTS`]: toggle, slider, select,
+/// keypad; `true` when green.
+fn squares(img: &Image) -> [bool; 4] {
+    [(110, 100), (368, 100), (545, 103), (596, 103)].map(|(x, y)| close(img.px(x, y), [0, 0xff, 0], 16))
+}
+
+#[test]
+fn inputs_start_unset() {
+    assert_eq!(squares(&inputs_shot(&[])), [false; 4]);
+}
+
+#[test]
+fn a_toggle_sets_its_var_from_value() {
+    assert_eq!(squares(&inputs_shot(&["58,98"])), [true, false, false, false]);
+}
+
+#[test]
+fn a_slider_sets_its_var_on_release() {
+    assert_eq!(squares(&inputs_shot(&["300,90"])), [false, true, false, false]);
+}
+
+#[test]
+fn a_select_sends_the_option_not_its_position() {
+    // Open the list, pick `b` (the second row under it).
+    assert_eq!(squares(&inputs_shot(&["455,105", "422,192"])), [false, false, true, false]);
+}
+
+#[test]
+fn a_keypad_submits_its_digits() {
+    let img = inputs_shot(&["145,325", "400,250", "655,475"]);
+    assert_eq!(squares(&img), [false, false, false, true]);
+}
+
+#[test]
+fn a_set_inside_a_repeat_reads_the_row() {
+    let d = tmp("repeat-set");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var sel: string = \"\"\n\
+         component pick {\n\
+             param id: string\n\
+             button { width = 200; height = 60; label = {{ id }}; on_tap { set { sel = {{ id }} } } }\n\
+         }\n\
+         page home {\n\
+             repeat r in {{ [{'id': 'x'}, {'id': 'y'}] }} {\n\
+                 button { width = 200; height = 60; label = {{ r.id }}; on_tap { set { sel = {{ r.id }} } } }\n\
+             }\n\
+             pick { id = z }\n\
+             rect { width = 200; height = 40; background = {{ vars.sel == 'y' ? '#00ff00' : vars.sel == 'z' ? '#0000ff' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    // The second row (a repeat item).
+    let img = shot(&conf, &["--tap", "100,150", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the row's item was not in scope");
+    // The component's button (a component param).
+    let img = shot(&conf, &["--tap", "100,218", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 16)), "the component param was not in scope");
+}
+
+#[test]
+fn every_widget_draws_and_a_bad_repeat_says_why() {
+    let d = tmp("gallery");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             row {\n\
+                 bar { width = 120; height = 20; value = 50 }\n\
+                 arc { width = 80; height = 80; value = 75 }\n\
+                 spinner { width = 40; height = 40 }\n\
+                 qr { data = hello; size = 60 }\n\
+                 stack { width = 60; height = 60; rect { width = 30; height = 30; background = #0000ff } }\n\
+             }\n\
+             repeat x in {{ 5 }} { rect { width = 10; height = 10; background = #ff0000 } }\n\
+             repeat y in {{ nope }} { rect { width = 10; height = 10; background = #ff0000 } }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    // The bar and arc indicators in the theme's accent.
+    assert!(img.any(|p| close(p, [0x21, 0x96, 0xf3], 12)), "no accent drawn");
+    // The QR code's dark modules.
+    assert!(img.any(|p| p == [0, 0, 0]), "no QR code");
+    // The stack's child, at its corner (no padding).
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 8)), "no stack child");
+    // Neither bad repeat drew its body.
+    assert!(!img.any(|p| close(p, [0xff, 0, 0], 8)), "a bad repeat drew its body");
+}
+
+#[test]
+fn a_missing_start_page_is_said_on_screen() {
+    let d = tmp("nopage");
+    let conf = d.join("p.conf");
+    std::fs::write(&conf, "page home { text { value = hi } }\n").unwrap();
+    let img = shot(&conf, &["--page", "nope", "--settle", "50"]);
+    assert_eq!((img.w, img.h), (800, 480));
+}

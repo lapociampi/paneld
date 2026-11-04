@@ -509,9 +509,11 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                     paneld_ui::EventValue::Double(d) => paneld_ui::Value::Double(d),
                     paneld_ui::EventValue::String(s) => paneld_ui::Value::String(s),
                 };
+                // Schema 8.4: the new value is `value` and `event.value`.
                 let mut event = std::collections::BTreeMap::new();
-                event.insert("value".to_string(), v);
+                event.insert("value".to_string(), v.clone());
                 ctx.insert("event".into(), paneld_ui::Value::Map(event));
+                ctx.insert("value".into(), v);
                 if actions::apply_inline_set(
                     &assigns,
                     &ctx,

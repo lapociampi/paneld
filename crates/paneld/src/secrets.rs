@@ -31,10 +31,11 @@ pub fn resolve(doc: &Document) -> BTreeMap<String, Value> {
 
 fn resolve_one(b: &Block) -> Option<String> {
     if let Some(env_name) = find_simple(b, "env") {
-        return std::env::var(env_name.trim()).ok();
+        return std::env::var(paneld_config::value::parse_string(env_name)).ok();
     }
     if let Some(path) = find_simple(b, "file") {
-        return std::fs::read_to_string(path.trim())
+        // A quoted path keeps its spaces, not its quotes.
+        return std::fs::read_to_string(paneld_config::value::parse_string(path))
             .ok()
             .map(|s| s.trim().to_string());
     }
@@ -144,5 +145,28 @@ mod tests {
         assert_eq!(n["n"], Value::Int(17623));
         assert_eq!(out["user"], Value::String("a **** b".into()));
         assert!(out.contains_key("****"));
+    }
+
+    #[test]
+    fn secrets_come_from_env_or_a_file_and_missing_ones_are_left_out() {
+        let dir = std::env::temp_dir().join(format!("paneld-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a b")).unwrap();
+        let file = dir.join("a b").join("tok");
+        std::fs::write(&file, "from-file\n").unwrap();
+        // The test binary's own environment always has PATH.
+        let src = format!(
+            "secret p {{ env = PATH }}\nsecret f {{ file = \"{}\" }}\nsecret gone {{ file = /nonexistent/x }}\nsecret unset {{ env = PANELD_TEST_UNSET_VAR }}\n",
+            file.display()
+        );
+        let mut map = paneld_config::SourceMap::new();
+        let id = map.add(std::path::PathBuf::from("t.conf"), src.clone());
+        let (toks, _) = paneld_config::lex::tokenize(id, &src);
+        let (doc, d) = paneld_config::parse(&toks, &map);
+        assert!(d.is_empty(), "{d:?}");
+        let s = resolve(&doc);
+        assert_eq!(s["f"], Value::String("from-file".into()), "trailing newline stripped");
+        assert_eq!(s["p"], Value::String(std::env::var("PATH").unwrap()));
+        assert!(!s.contains_key("gone") && !s.contains_key("unset"), "{:?}", s.keys());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

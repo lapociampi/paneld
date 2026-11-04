@@ -574,8 +574,12 @@ mod tests {
         assert!(cfg.contains("header = \"X-A: 1\""), "{cfg}");
     }
 
+    /// Tests that install a remote set hold this: the set is global.
+    static INSTALLED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_member_of_a_removed_remote_does_not_run_locally() {
+        let _g = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
         let d = doc("remote_kind k { via = ssh\n host = h\n key = /k\n action reboot { run = reboot } }\nremote gone: k { }\n");
         let b = block(&d, "action", "gone.reboot").clone();
         install(Remotes::default());
@@ -624,5 +628,105 @@ mod tests {
             Value::Map(BTreeMap::from([("ok".into(), Value::Bool(false)), ("error".into(), Value::String("timed out".into()))])),
         )]);
         assert_eq!(root(&failed)["error"], Value::String("a: timed out".into()));
+    }
+
+    fn built(src: &str, kind: &str, name: &str, ctx_extra: &[(&str, Value)]) -> Result<Option<Request>, String> {
+        let d = doc(src);
+        let r = Remotes::from_doc(&d, Path::new("/s/state"));
+        let b = block(&d, kind, name);
+        let mut ctx = ctx_for(&r, b, &[]);
+        for (k, v) in ctx_extra {
+            ctx.insert(k.to_string(), v.clone());
+        }
+        let inst = cr::remote_of(b).unwrap();
+        r.build(&r.by_name[inst], b, &ctx, Duration::from_secs(5), false)
+    }
+
+    #[test]
+    fn ssh_refuses_bad_users_ports_and_paths() {
+        let kind = |extra: &str| {
+            format!("remote_kind k {{\n param v: string\n via = ssh\n host = h\n key = /k\n {extra}\n value x {{ run = true }}\n}}\nremote r: k {{ v = a }}\n")
+        };
+        let err = |extra: &str| built(&kind(extra), "source", "r.x", &[]).unwrap_err();
+        assert!(err("user = -oX").contains("not a user name"));
+        assert!(err("user = a@b").contains("not a user name"));
+        assert!(err("port = 99999").contains("not a port"));
+        assert!(err("known_hosts = \"/a b\"").contains("no spaces"));
+        assert!(err("key = \"\"").contains("no spaces"));
+        // `%` in a path is escaped for ssh, and accept_new maps.
+        let req = built(&kind("key = /k%h\n host_key = accept_new\n port = 2222"), "source", "r.x", &[]).unwrap().unwrap();
+        assert!(req.argv.contains(&"/k%%h".to_string()), "{:?}", req.argv);
+        assert!(req.argv.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(req.argv.windows(2).any(|w| w == ["-p", "2222"]));
+        // No `-l` without a user.
+        assert!(!req.argv.contains(&"-l".to_string()));
+    }
+
+    #[test]
+    fn http_options_and_refusals() {
+        let kind = |url: &str, extra: &str| {
+            format!("remote_kind k {{\n via = http\n url = {url}\n {extra}\n value v {{ get = /s }}\n action a {{ }}\n}}\nremote r: k {{ }}\n")
+        };
+        let cfg = |r: Request| String::from_utf8(r.stdin.unwrap()).unwrap();
+        let c = cfg(built(&kind("https://x/api/", "ca = /etc/ca.pem\n insecure = true"), "source", "r.v", &[]).unwrap().unwrap());
+        assert!(c.contains("url = \"https://x/api/s\"\n"), "one slash between: {c}");
+        assert!(c.contains("cacert = \"/etc/ca.pem\"\n") && c.contains("insecure\n"), "{c}");
+        assert!(built(&kind("ftp://x", ""), "source", "r.v", &[]).unwrap_err().contains("not an http(s) URL"));
+        assert!(built(&kind("\"http://a b\"", ""), "source", "r.v", &[]).unwrap_err().contains("not an http(s) URL"));
+        // An action with no request has nothing to run.
+        assert_eq!(built(&kind("http://x", ""), "action", "r.a", &[]).unwrap(), None);
+        // A stream has no overall time limit.
+        let d = doc(&kind("http://x", ""));
+        let r = Remotes::from_doc(&d, Path::new("/s/state"));
+        let b = block(&d, "source", "r.v");
+        let req = r.build(&r.by_name["r"], b, &ctx_for(&r, b, &[]), Duration::from_secs(5), true).unwrap().unwrap();
+        assert!(!cfg(req).contains("max-time"));
+    }
+
+    #[test]
+    fn socket_over_tcp_and_its_refusals() {
+        let kind = |addr: &str| format!("remote_kind k {{\n via = socket\n {addr}\n value v {{ send = ping }}\n}}\nremote r: k {{ }}\n");
+        let req = built(&kind("host = [::1]\n port = 7000"), "source", "r.v", &[]).unwrap().unwrap();
+        assert_eq!(req.argv.last().unwrap(), "TCP:[::1]:7000");
+        assert!(built(&kind("host = h\n port = x"), "source", "r.v", &[]).unwrap_err().contains("not a port"));
+        // A stream keeps reading after its request.
+        let d = doc(&kind("path = /run/s"));
+        let r = Remotes::from_doc(&d, Path::new("/s/state"));
+        let b = block(&d, "source", "r.v");
+        let req = r.build(&r.by_name["r"], b, &ctx_for(&r, b, &[]), Duration::from_secs(5), true).unwrap().unwrap();
+        assert_eq!(&req.argv[1..3], ["-t", "2147483647"]);
+        // Short timeouts: socat gives up first, in fractions of a second.
+        let req = r.build(&r.by_name["r"], b, &ctx_for(&r, b, &[]), Duration::from_millis(500), false).unwrap().unwrap();
+        assert_eq!(&req.argv[1..5], ["-T", "0.25", "-t", "0.25"]);
+    }
+
+    #[test]
+    fn expressions_that_do_not_evaluate_are_errors_not_text() {
+        let src = "remote_kind k {\n via = http\n url = http://x\n action a { param p: string\n post = /{{ p }}\n } }\nremote r: k { }\n";
+        let e = built(src, "action", "r.a", &[]).unwrap_err();
+        assert!(e.contains("did not evaluate"), "{e}");
+        let ok = built(src, "action", "r.a", &[("p", Value::String("x".into()))]).unwrap().unwrap();
+        assert!(String::from_utf8(ok.stdin.unwrap()).unwrap().contains("http://x/x"));
+    }
+
+    #[test]
+    fn transport_failures_are_explained() {
+        let _g = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+        let d = doc("remote_kind s { via = ssh\n host = h\n key = /k\n value v { run = x } }\nremote a: s { }\n\
+                     remote_kind h { via = http\n url = http://x\n value v { get = / } }\nremote b: h { }\n\
+                     remote_kind o { via = socket\n path = /p\n value v { send = x } }\nremote c: o { }\n\
+                     remote_kind l { via = local\n value v { run = x } }\nremote e: l { }\n");
+        install(Remotes::from_doc(&d, Path::new("/s/state")));
+        let ex = |name: &str, code: i32, err: &str| explain(block(&d, "source", name), Some(code), err);
+        assert_eq!(ex("a.v", 255, "Connection refused").as_deref(), Some("ssh could not run it on the remote: Connection refused"));
+        assert_eq!(ex("a.v", 1, ""), None, "a command's own failure is its own");
+        assert_eq!(ex("b.v", 22, "").as_deref(), Some("the server answered with an error status"));
+        assert_eq!(ex("b.v", 6, "").as_deref(), Some("the host name did not resolve"));
+        assert_eq!(ex("b.v", 7, "").as_deref(), Some("could not connect"));
+        assert_eq!(ex("b.v", 28, "").as_deref(), Some("the request timed out"));
+        assert_eq!(ex("b.v", 60, "cert").as_deref(), Some("TLS failed: cert"));
+        assert_eq!(ex("c.v", 1, "").as_deref(), Some("socat failed"));
+        assert_eq!(ex("e.v", 1, ""), None);
+        install(Remotes::default());
     }
 }

@@ -1430,3 +1430,105 @@ mod tests {
         assert_eq!(exprs.len(), 1);
     }
 }
+
+/// The parser on every literal form, every syntax error it reports,
+/// and its size limits.
+#[cfg(test)]
+mod parse_table {
+    use super::*;
+
+    fn ok(s: &str) -> Expr {
+        let (e, d) = parse_fragment(s, FileId::default(), 0);
+        assert!(d.is_empty(), "`{s}`: {d:?}");
+        e.unwrap_or_else(|| panic!("`{s}` parsed to nothing"))
+    }
+
+    fn errs(s: &str) -> Vec<String> {
+        parse_fragment(s, FileId::default(), 0).1.into_iter().map(|d| d.message).collect()
+    }
+
+    fn has(s: &str, needle: &str) {
+        let e = errs(s);
+        assert!(e.iter().any(|m| m.contains(needle)), "`{s}`: no `{needle}` in {e:?}");
+    }
+
+    #[test]
+    fn number_literals() {
+        assert!(matches!(ok("0x1F").kind, ExprKind::IntLit(31)));
+        assert!(matches!(ok("0XffU").kind, ExprKind::IntLit(255)));
+        assert!(matches!(ok("42u").kind, ExprKind::IntLit(42)));
+        assert!(matches!(ok("1e3").kind, ExprKind::DoubleLit(d) if d == 1000.0));
+        assert!(matches!(ok("2.5E-1").kind, ExprKind::DoubleLit(d) if d == 0.25));
+        assert!(matches!(ok("1e+2").kind, ExprKind::DoubleLit(d) if d == 100.0));
+        has("99999999999999999999", "invalid integer literal");
+        has("0x", "invalid integer literal");
+    }
+
+    #[test]
+    fn string_literals_and_escapes() {
+        assert!(matches!(ok(r#""a\nb\tc\r\\\"\'\0""#).kind, ExprKind::StringLit(ref t) if t == "a\nb\tc\r\\\"'\0"));
+        assert!(matches!(ok(r"'\q'").kind, ExprKind::StringLit(ref t) if t == r"\q"), "unknown escapes stay");
+        has("'open", "unterminated string");
+        has("\"open\\", "unterminated string");
+    }
+
+    #[test]
+    fn syntax_errors_say_where_and_what() {
+        has("a.", "expected a field name after `.`");
+        has("a.1", "expected a field name after `.`");
+        has("a[1", "expected `]`");
+        has("f(1, 2", "expected `)`");
+        has("a ? b", "expected `:`");
+        has("1 $ 2", "unexpected character `$`");
+        has("1 é 2", "unexpected character `é`");
+        has("(1", "expected `)`");
+        has("[1, 2", "expected `]`");
+        has("{'a' 1}", "expected `:`");
+    }
+
+    #[test]
+    fn methods_fields_and_indexes_chain() {
+        let e = ok("a.b(1, 'x')[0].c");
+        let ExprKind::Field(inner, c) = e.kind else { panic!() };
+        assert_eq!(c, "c");
+        let ExprKind::Index(inner, _) = inner.kind else { panic!() };
+        assert!(matches!(inner.kind, ExprKind::Method(_, ref m, ref args) if m == "b" && args.len() == 2));
+    }
+
+    #[test]
+    fn size_limits() {
+        // Too many tokens.
+        let long = vec!["1"; MAX_TOKENS as usize].join(" + ");
+        has(&long, "too long");
+        // Too deep.
+        let deep = "(".repeat(MAX_NESTING as usize + 1) + "1" + &")".repeat(MAX_NESTING as usize + 1);
+        assert!(!errs(&deep).is_empty(), "nesting past the limit accepted");
+        let fine = "(".repeat(10) + "1" + &")".repeat(10);
+        ok(&fine);
+        let unary = "!".repeat(MAX_NESTING as usize + 1) + "true";
+        assert!(!errs(&unary).is_empty(), "deep unary accepted");
+    }
+
+    #[test]
+    fn interpolation_errors() {
+        let (_, d) = parse_interp("a {{ 1 + }} b", FileId::default(), 0);
+        assert!(!d.is_empty());
+        let (_, d) = parse_interp("a {{ 1", FileId::default(), 0);
+        assert!(d.iter().any(|x| x.message.contains("unterminated `{{`")), "{d:?}");
+        let (e, d) = parse_interp(r"\{{ x }} {{ 'a}}b' }}", FileId::default(), 0);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(e.len(), 1, "the escaped opener is text");
+        assert_eq!(expr_end("{{ \"}}\" }}", 0), Some(10));
+        assert_eq!(expr_end("{{ 'a\\'b' }}", 0), Some(12));
+        assert_eq!(expr_end("{{ x", 0), None);
+    }
+
+    #[test]
+    fn idents_skip_macro_variables_but_not_the_rest() {
+        let names: Vec<String> = idents(&ok("l.exists(x, x > y) && m.map(k, k) == z[w]")).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["l", "y", "m", "z", "w"]);
+        // A method with one argument binds nothing.
+        let names: Vec<String> = idents(&ok("l.contains(x)")).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["l", "x"]);
+    }
+}

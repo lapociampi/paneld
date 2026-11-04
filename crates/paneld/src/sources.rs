@@ -228,7 +228,8 @@ pub fn spawn_pollers(
 /// overrides: an absolute path is used as-is, a relative one joins
 /// onto `base_cwd`.
 fn resolve_cwd(b: &Block, base_cwd: &std::path::Path) -> std::path::PathBuf {
-    match find_simple(b, "cwd").map(str::trim).filter(|s| !s.is_empty()) {
+    let cwd = find_simple(b, "cwd").map(paneld_config::value::parse_string);
+    match cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => {
             let p = std::path::Path::new(raw);
             if p.is_absolute() {
@@ -591,6 +592,7 @@ fn finish_stream_value(b: &Block, _ctx: &Context, out: Value) -> Value {
     let mut m = BTreeMap::new();
     m.insert("value".to_string(), value);
     m.insert("ok".to_string(), Value::Bool(true));
+    m.insert("error".to_string(), Value::String(String::new()));
     Value::Map(m)
 }
 
@@ -704,13 +706,16 @@ pub fn resolve_one(
     m.insert("exit".into(), r.exit_code.map(|n| Value::Int(n as i64)).unwrap_or(Value::Null));
     m.insert("stdout".into(), Value::String(mask.apply(&r.stdout)));
     m.insert("stderr".into(), Value::String(mask.apply(&r.stderr)));
-    if !ok {
-        let error = crate::remotes::explain(b, r.exit_code, &r.stderr).unwrap_or_else(|| match r.stderr.trim() {
+    // Schema 4: `error` is always there, empty after a success.
+    let error = if ok {
+        String::new()
+    } else {
+        crate::remotes::explain(b, r.exit_code, &r.stderr).unwrap_or_else(|| match r.stderr.trim() {
             "" => format!("exit {}", r.exit_code.map_or("?".to_string(), |c| c.to_string())),
             e => e.to_string(),
-        });
-        m.insert("error".into(), Value::String(mask.apply(&error)));
-    }
+        })
+    };
+    m.insert("error".into(), Value::String(mask.apply(&error)));
     Ok(Value::Map(m))
 }
 
@@ -944,22 +949,64 @@ impl<'a> JsonParser<'a> {
         if self.bump()? != b'"' {
             return None;
         }
-        let mut out = String::new();
+        // Bytes, decoded as UTF-8 at the end: text is not one char per
+        // byte.
+        let mut out: Vec<u8> = Vec::new();
+        let push = |out: &mut Vec<u8>, c: char| out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
         loop {
             match self.bump()? {
-                b'"' => return Some(out),
+                b'"' => return Some(String::from_utf8_lossy(&out).into_owned()),
                 b'\\' => match self.bump()? {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'n' => out.push('\n'),
-                    b't' => out.push('\t'),
-                    b'r' => out.push('\r'),
+                    b'"' => out.push(b'"'),
+                    b'\\' => out.push(b'\\'),
+                    b'/' => out.push(b'/'),
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'u' => {
+                        let hi = self.hex4()?;
+                        if (0xd800..0xdc00).contains(&hi) {
+                            // A surrogate pair: `😀`.
+                            let lo = if self.bytes.get(self.pos..self.pos + 2) == Some(b"\\u") {
+                                self.pos += 2;
+                                Some(self.hex4()?)
+                            } else {
+                                None
+                            };
+                            match lo {
+                                Some(lo) if (0xdc00..0xe000).contains(&lo) => {
+                                    let c = char::from_u32(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00));
+                                    push(&mut out, c.unwrap_or('\u{fffd}'));
+                                }
+                                // A lone half, then whatever followed.
+                                Some(other) => {
+                                    push(&mut out, '\u{fffd}');
+                                    push(&mut out, char::from_u32(other).unwrap_or('\u{fffd}'));
+                                }
+                                None => push(&mut out, '\u{fffd}'),
+                            }
+                        } else {
+                            push(&mut out, char::from_u32(hi).unwrap_or('\u{fffd}'));
+                        }
+                    }
                     _ => return None,
                 },
-                b => out.push(b as char),
+                b => out.push(b),
             }
         }
+    }
+
+    /// Four hex digits after `\u`.
+    fn hex4(&mut self) -> Option<u32> {
+        let digits = self.bytes.get(self.pos..self.pos + 4)?;
+        if !digits.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let n = u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?;
+        self.pos += 4;
+        Some(n)
     }
 
     fn parse_bool(&mut self) -> Option<Value> {
@@ -1013,7 +1060,8 @@ impl<'a> JsonParser<'a> {
         if is_double {
             text.parse::<f64>().ok().map(Value::Double)
         } else {
-            text.parse::<i64>().ok().map(Value::Int)
+            // Past i64 (a long id): a number, not a failed document.
+            text.parse::<i64>().ok().map(Value::Int).or_else(|| text.parse::<f64>().ok().map(Value::Double))
         }
     }
 }
@@ -1319,5 +1367,58 @@ mod tests {
         } else {
             panic!("expected list");
         }
+    }
+}
+
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+
+    #[test]
+    fn text_survives_whole() {
+        let v = parse_json(r#"{"a": "été é日 😀 \b\f"}"#);
+        let Some(Value::Map(m)) = v else { panic!("{v:?}") };
+        assert_eq!(m["a"], Value::String("été é日 😀 \u{8}\u{c}".into()));
+        // A lone surrogate becomes the replacement character.
+        assert_eq!(parse_json(r#""\ud800x""#), Some(Value::String("\u{fffd}x".into())));
+        assert_eq!(parse_json(r#""\ud800A""#), Some(Value::String("\u{fffd}A".into())));
+    }
+
+    #[test]
+    fn numbers() {
+        assert_eq!(parse_json("-12"), Some(Value::Int(-12)));
+        assert_eq!(parse_json("1.5e3"), Some(Value::Double(1500.0)));
+        assert_eq!(parse_json("2E-2"), Some(Value::Double(0.02)));
+        assert_eq!(parse_json("1e+2"), Some(Value::Double(100.0)));
+        assert_eq!(parse_json("12345678901234567890123"), Some(Value::Double(1.2345678901234568e22)));
+        assert_eq!(parse_json("-"), None);
+    }
+
+    #[test]
+    fn structure() {
+        assert_eq!(parse_json(" [ ] "), Some(Value::List(vec![])));
+        assert_eq!(parse_json("{ }"), Some(Value::Map(BTreeMap::new())));
+        assert_eq!(
+            parse_json(r#"{"a": [1, {"b": null}], "c": true, "d": false}"#),
+            Some(Value::Map(BTreeMap::from([
+                ("a".into(), Value::List(vec![Value::Int(1), Value::Map(BTreeMap::from([("b".into(), Value::Null)]))])),
+                ("c".into(), Value::Bool(true)),
+                ("d".into(), Value::Bool(false)),
+            ])))
+        );
+        for bad in [
+            "", "{", "[1,", "[1 2]", r#"{"a" 1}"#, r#"{"a": 1,}"#, "{a: 1}", "[1] x", "tru", "nul",
+            r#""\x""#, r#""\u12""#, r#""\u+041""#, r#""open"#, "@",
+        ] {
+            assert_eq!(parse_json(bad), None, "accepted `{bad}`");
+        }
+    }
+
+    #[test]
+    fn nesting_is_bounded() {
+        let deep = |n: usize| "[".repeat(n) + &"]".repeat(n);
+        assert!(parse_json(&deep(JSON_MAX_DEPTH)).is_some());
+        assert_eq!(parse_json(&deep(JSON_MAX_DEPTH + 1)), None);
+        assert_eq!(parse_json(&deep(100_000)), None, "no stack overflow");
     }
 }

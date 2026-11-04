@@ -331,7 +331,8 @@ fn parse_def(b: &Block) -> ActionDef {
             def.env = collect_env(env_block);
         }
         if let Some(raw) = find_simple(b, "cwd") {
-            let t = raw.trim();
+            let unquoted = paneld_config::value::parse_string(raw);
+            let t = unquoted.trim();
             if !t.is_empty() {
                 def.cwd = Some(t.to_string());
             }
@@ -833,6 +834,17 @@ pub fn apply_inline_set(
         };
         let file = paneld_config::source::FileId::default();
         let span = paneld_config::source::Span { file, start: 0, end: 0 };
+        // Where it was drawn: a `repeat` item, a component's params.
+        let mut local;
+        let ctx = if a.locals.is_empty() {
+            ctx
+        } else {
+            local = ctx.clone();
+            for l in &a.locals {
+                local.entry(l.name.clone()).or_insert_with(|| l.value.clone());
+            }
+            &local
+        };
         let Some(v) = paneld_ui::resolve_value(&a.value_raw, span, ctx) else {
             eprintln!("paneld: inline on_tap set `{}`: expression did not evaluate", a.key);
             continue;
@@ -1302,5 +1314,28 @@ mod tests {
             panic!("cpu missing");
         };
         assert_eq!(cpu.get("value"), Some(&Value::Int(42)));
+    }
+
+    #[test]
+    fn an_inline_set_skips_what_it_cannot_set_and_reads_its_locals() {
+        let types = BTreeMap::from([("n".to_string(), "int".to_string()), ("s".to_string(), "string".to_string())]);
+        let vars = Arc::new(Mutex::new(BTreeMap::new()));
+        let item = |key: &str, raw: &str, locals: Vec<ActionArg>| InlineSetItem { key: key.into(), value_raw: raw.into(), locals };
+        let ctx = Context::new();
+        // Undeclared, not evaluating, the wrong type: nothing changes.
+        assert!(!apply_inline_set(&[item("x", "1", vec![])], &ctx, &types, &vars));
+        assert!(!apply_inline_set(&[item("n", "{{ nope }}", vec![])], &ctx, &types, &vars));
+        assert!(!apply_inline_set(&[item("n", "{{ [1] }}", vec![])], &ctx, &types, &vars));
+        assert!(vars.lock().unwrap().is_empty());
+        // A local binding (a repeat item) is in scope; a global of the
+        // same name wins.
+        let row = ActionArg { name: "row".into(), value: Value::Map(BTreeMap::from([("id".to_string(), Value::Int(7))])) };
+        assert!(apply_inline_set(&[item("n", "{{ row.id * 2 }}", vec![row])], &ctx, &types, &vars));
+        assert_eq!(vars.lock().unwrap()["n"], Value::Int(14));
+        let mut g = Context::new();
+        g.insert("who".into(), Value::String("global".into()));
+        let local = ActionArg { name: "who".into(), value: Value::String("local".into()) };
+        assert!(apply_inline_set(&[item("s", "{{ who }}", vec![local])], &g, &types, &vars));
+        assert_eq!(vars.lock().unwrap()["s"], Value::String("global".into()));
     }
 }

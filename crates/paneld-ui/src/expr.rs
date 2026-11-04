@@ -557,3 +557,229 @@ mod tests {
         assert_eq!(ev_ctx(r#"m["a"]"#, &ctx), Value::Int(1));
     }
 }
+
+/// Wider coverage of the evaluator: every operator pairing, every
+/// built-in, and the error each misuse gives (a page shows that text).
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+    use paneld_config::cel;
+    use paneld_config::source::FileId;
+
+    fn try_ev(s: &str, ctx: &Context) -> Result<Value, EvalError> {
+        let (e, d) = cel::parse_fragment(s, FileId::default(), 0);
+        assert!(d.is_empty(), "parse errors in `{s}`: {d:?}");
+        eval(&e.expect("parsed"), ctx)
+    }
+
+    fn ev(s: &str) -> Value {
+        try_ev(s, &Context::new()).unwrap_or_else(|e| panic!("`{s}`: {e}"))
+    }
+
+    fn err(s: &str) -> String {
+        match try_ev(s, &sample_ctx()) {
+            Ok(v) => panic!("`{s}` gave {v:?}, expected an error"),
+            Err(e) => e.message,
+        }
+    }
+
+    fn sample_ctx() -> Context {
+        let mut ctx = Context::new();
+        ctx.insert("m".into(), Value::Map(BTreeMap::from([("a".to_string(), Value::Int(1))])));
+        ctx.insert("l".into(), Value::List(vec![Value::Int(10), Value::Int(20)]));
+        ctx.insert("s".into(), Value::String("text".into()));
+        ctx
+    }
+
+    use Value::{Bool as B, Double as D, Int as I, String as S};
+
+    #[test]
+    fn integer_arithmetic_wraps_and_refuses_zero_divisors() {
+        assert_eq!(ev("7 - 10"), I(-3));
+        assert_eq!(ev("6 * 7"), I(42));
+        assert_eq!(ev("7 % 3"), I(1));
+        assert_eq!(ev("-7 / 2"), I(-3));
+        assert_eq!(ev("9223372036854775807 + 1"), I(i64::MIN));
+        assert_eq!(err("1 / 0"), "integer division by zero");
+        assert_eq!(err("1 % 0"), "integer modulo by zero");
+    }
+
+    #[test]
+    fn double_and_mixed_arithmetic_promote_to_double() {
+        assert_eq!(ev("1.5 + 1.5"), D(3.0));
+        assert_eq!(ev("5.0 - 1.5"), D(3.5));
+        assert_eq!(ev("2.0 * 1.5"), D(3.0));
+        assert_eq!(ev("7.5 % 2.0"), D(1.5));
+        assert_eq!(ev("2 - 0.5"), D(1.5));
+        assert_eq!(ev("2.5 - 1"), D(1.5));
+        assert_eq!(ev("2 * 0.5"), D(1.0));
+        assert_eq!(ev("0.5 * 4"), D(2.0));
+        assert_eq!(ev("1 / 4.0"), D(0.25));
+        assert_eq!(ev("1.0 / 4"), D(0.25));
+        assert_eq!(ev("2.5 + 1"), D(3.5));
+        // Division by zero in doubles is IEEE, not an error.
+        assert_eq!(ev("1.0 / 0.0"), D(f64::INFINITY));
+    }
+
+    #[test]
+    fn mismatched_operands_say_which_types() {
+        assert_eq!(err("'a' - 1"), "operator Sub does not accept string and int");
+        assert_eq!(err("true + 1"), "operator Add does not accept bool and int");
+        assert_eq!(err("'a' + 1"), "operator Add does not accept string and int");
+        assert_eq!(err("1 in 2"), "operator In does not accept int and int");
+    }
+
+    #[test]
+    fn comparisons_across_types() {
+        assert_eq!(ev("1 < 2.5"), B(true));
+        assert_eq!(ev("2.5 <= 2"), B(false));
+        assert_eq!(ev("3 >= 3.0"), B(true));
+        assert_eq!(ev("2.0 > 1"), B(true));
+        assert_eq!(ev("'a' < 'b'"), B(true));
+        assert_eq!(ev("false < true"), B(true));
+        assert_eq!(ev("1 == 1.0"), B(true));
+        assert_eq!(ev("1.0 == 1"), B(true));
+        assert_eq!(ev("1 != 2"), B(true));
+        assert_eq!(ev("null == null"), B(true));
+        assert_eq!(ev("[1, 2] == [1, 2.0]"), B(true));
+        assert_eq!(ev("[1, 2] == [1]"), B(false));
+        assert_eq!(ev("'1' == 1"), B(false));
+        assert_eq!(ev("{'a': 1} == {'a': 1}"), B(false), "maps never compare equal");
+        assert_eq!(err("'a' < 1"), "cannot compare string with int");
+        assert_eq!(err("[1] < [2]"), "cannot compare list with list");
+    }
+
+    #[test]
+    fn nan_comparisons_are_errors() {
+        let mut ctx = Context::new();
+        ctx.insert("nan".into(), D(f64::NAN));
+        for e in ["nan < 1.0", "nan < 1", "1 < nan"] {
+            assert_eq!(try_ev(e, &ctx).unwrap_err().message, "NaN in comparison", "{e}");
+        }
+    }
+
+    #[test]
+    fn in_on_strings_and_lists() {
+        assert_eq!(ev("'ex' in 'text'"), B(true));
+        assert_eq!(ev("'z' in 'text'"), B(false));
+        assert_eq!(ev("3 in [1, 2]"), B(false));
+        assert_eq!(ev("'a' in ['a']"), B(true));
+    }
+
+    #[test]
+    fn unary_operators() {
+        assert_eq!(ev("-(2)"), I(-2));
+        assert_eq!(ev("-(2.5)"), D(-2.5));
+        assert_eq!(ev("!false"), B(true));
+        assert!(err("!1").starts_with("cannot apply Not to int"));
+        assert!(err("-'a'").starts_with("cannot apply Neg to string"));
+    }
+
+    #[test]
+    fn logic_needs_bools_unless_short_circuited() {
+        assert_eq!(err("1 && true"), "expected a bool, got int");
+        assert_eq!(err("true && 1"), "expected a bool, got int");
+        assert_eq!(err("false || 'x'"), "expected a bool, got string");
+        assert_eq!(err("'x' ? 1 : 2"), "expected a bool, got string");
+        // The right side is not evaluated when the left decides.
+        assert_eq!(ev("false && nope.x"), B(false));
+        assert_eq!(ev("true || nope.x"), B(true));
+        assert_eq!(ev("true && false"), B(false));
+        assert_eq!(ev("false || true"), B(true));
+    }
+
+    #[test]
+    fn names_fields_and_indexes() {
+        let ctx = sample_ctx();
+        assert_eq!(try_ev("m.a", &ctx).unwrap(), I(1));
+        assert_eq!(try_ev("m['a']", &ctx).unwrap(), I(1));
+        assert_eq!(try_ev("l[1]", &ctx).unwrap(), I(20));
+        assert_eq!(err("nope"), "unknown identifier `nope`");
+        assert_eq!(err("m.b"), "field `b` not set on map");
+        assert_eq!(err("s.x"), "`.x` on a string is not supported");
+        assert_eq!(err("l[2]"), "list index 2 out of range (len 2)");
+        assert_eq!(err("l[-1]"), "list index -1 out of range (len 2)");
+        assert_eq!(err("m['z']"), "map has no key `z`");
+        assert_eq!(err("l['a']"), "cannot index list with string");
+        assert_eq!(err("s[0]"), "cannot index string with int");
+        // An error inside an index or a list item comes through.
+        assert_eq!(err("l[nope]"), "unknown identifier `nope`");
+        assert_eq!(err("[1, nope]"), "unknown identifier `nope`");
+    }
+
+    #[test]
+    fn map_literals_need_string_keys() {
+        assert_eq!(ev("{'a': 1 + 1}"), Value::Map(BTreeMap::from([("a".into(), I(2))])));
+        assert_eq!(err("{1: 2}"), "map keys must be strings");
+        assert_eq!(err("{'a': nope}"), "unknown identifier `nope`");
+    }
+
+    #[test]
+    fn methods_are_refused_after_their_parts_evaluate() {
+        assert_eq!(err("l.size()"), "method `.size(...)` is not supported yet");
+        assert_eq!(err("nope.size()"), "unknown identifier `nope`");
+        assert_eq!(err("l.exists(nope)"), "unknown identifier `nope`");
+    }
+
+    #[test]
+    fn conversions() {
+        assert_eq!(ev("int(2.9)"), I(2));
+        assert_eq!(ev("int(5)"), I(5));
+        assert_eq!(ev("int(' 12 ')"), I(12));
+        assert_eq!(ev("int(true)"), I(1));
+        assert_eq!(ev("int(false)"), I(0));
+        assert_eq!(err("int('x')"), "cannot parse `x` as int");
+        assert_eq!(err("int([1])"), "int(list) is not supported");
+        assert_eq!(ev("number(3)"), D(3.0));
+        assert_eq!(ev("number(1.5)"), D(1.5));
+        assert_eq!(ev("number(' 2.5 ')"), D(2.5));
+        assert_eq!(err("number('x')"), "cannot parse `x` as number");
+        assert_eq!(err("number(true)"), "number(bool) is not supported");
+        assert_eq!(ev("string(1.5)"), S("1.5".into()));
+        assert_eq!(ev("string(2.0)"), S("2".into()));
+        assert_eq!(ev("string(null)"), S("null".into()));
+        assert_eq!(ev("string([1, 'a', [true]])"), S("[1, a, [true]]".into()));
+        assert_eq!(ev("string({'a': 1})"), S("<map>".into()));
+    }
+
+    #[test]
+    fn rounding_and_length() {
+        assert_eq!(ev("round(2)"), I(2));
+        assert_eq!(ev("round(2.5)"), D(3.0));
+        assert_eq!(ev("round(7, 2)"), I(7));
+        assert_eq!(ev("round(1.005, 1)"), D(1.0));
+        assert_eq!(err("round('a')"), "round(string) is not supported");
+        assert_eq!(err("round(1.5, 'a')"), "round(number, string) is not supported");
+        assert_eq!(ev("len({'a': 1, 'b': 2})"), I(2));
+        assert_eq!(ev("len('héllo')"), I(5), "characters, not bytes");
+        assert_eq!(err("len(3)"), "len(int) is not supported");
+    }
+
+    #[test]
+    fn ago_takes_seconds_and_refuses_the_rest() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let mut ctx = Context::new();
+        ctx.insert("t".into(), I(now - 7_200));
+        ctx.insert("d".into(), D((now - 120) as f64));
+        assert_eq!(try_ev("ago(t)", &ctx).unwrap(), S("2h ago".into()));
+        assert_eq!(try_ev("ago(d)", &ctx).unwrap(), S("2m ago".into()));
+        assert_eq!(err("ago('x')"), "ago(string) is not supported");
+    }
+
+    #[test]
+    fn unknown_functions_and_wrong_argument_counts() {
+        assert_eq!(err("nope(1)"), "unknown function `nope` with 1 args");
+        assert_eq!(err("len(1, 2)"), "unknown function `len` with 2 args");
+        assert_eq!(err("has()"), "unknown function `has` with 0 args");
+    }
+
+    #[test]
+    fn display_strings() {
+        assert_eq!(D(1e16).to_display_string(), "10000000000000000");
+        assert_eq!(D(f64::INFINITY).to_display_string(), "inf");
+        assert_eq!(D(-0.5).to_display_string(), "-0.5");
+        assert_eq!(Value::Null.to_display_string(), "null");
+        assert_eq!(B(false).to_display_string(), "false");
+        assert_eq!(EvalError::new("boom").to_string(), "boom");
+    }
+}

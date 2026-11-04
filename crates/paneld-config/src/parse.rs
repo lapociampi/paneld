@@ -972,4 +972,86 @@ mod tests {
         };
         assert_eq!(map.slice(b.span), "page home {\n}");
     }
+
+    fn messages(src: &str) -> Vec<String> {
+        let (_, diags, _) = parse_str(src);
+        diags.into_iter().map(|d| d.message).collect()
+    }
+
+    fn has(src: &str, needle: &str) {
+        let m = messages(src);
+        assert!(m.iter().any(|x| x.contains(needle)), "`{src}`: no `{needle}` in {m:?}");
+    }
+
+    #[test]
+    fn every_parse_error_names_what_it_expected() {
+        has("source $x { }\n", "cannot be a `$variable`");
+        has("page ]\n", "expected `=`, `:`, `[`, `{` or a name after `page`");
+        has("page home ]\n", "expected `{`; got `]`");
+        has("app:\n", "expected a key name after `:`");
+        has("app:x {\n", "expected `=` after `category:key`");
+        has("theme[x\n", "expected `]`");
+        has("theme[x]k = 1\n", "expected `:` after `[name]`");
+        has("theme[x]:k {\n", "expected `=` after `kind[name]:key`");
+        has("theme[]:k = 1\n", "expected a name inside `[ ]`");
+        has("$v {\n", "expected `=` after `$name`");
+        has("repeat x of {{ [1] }} { }\n", "expected `in`");
+        has("repeat x in {{ [1] }}\n", "expected `{` after the repeat expression");
+        has("repeat in\n", "expected `in` after the repeat binding");
+        has("param p { }\n", "expected `:` after the parameter name");
+        has("param p: { }\n", "expected a type name after `:`");
+        has("var v: int\n", "expected `=` and a default value");
+        has("remote r: { }\n", "expected a kind name after `:`");
+        has("= 1\n", "expected an identifier at the start of an item");
+        has("}\n", "expected an identifier at the start of an item");
+    }
+
+    #[test]
+    fn recovery_reports_each_bad_line_and_keeps_the_good_ones() {
+        let (doc, diags, _) = parse_str("a ]\nb = 1\nc ]\nd { e ] ; f = 2 }\n} g = 3\n");
+        assert_eq!(diags.len(), 4, "{diags:?}");
+        let names: Vec<String> = doc
+            .items
+            .iter()
+            .map(|it| match it {
+                Item::Assign(a) => match &a.target {
+                    AssignTarget::Simple { key } => key.text.clone(),
+                    _ => "?".into(),
+                },
+                Item::Block(b) => b.kind.text.clone(),
+                _ => "?".into(),
+            })
+            .collect();
+        // A stray `}` at the top is skipped, and `g = 3` after it kept.
+        assert_eq!(names, ["b", "d", "g"], "{doc:?}");
+        let Item::Block(d) = &doc.items[1] else { panic!() };
+        assert_eq!(d.items.len(), 1, "`f = 2` survives inside the block");
+    }
+
+    #[test]
+    fn a_remote_header_carries_its_kind() {
+        let doc = parse_ok("remote device1: linux { host = a }\nsource s { run = x }\n");
+        let Item::Block(r) = &doc.items[0] else { panic!() };
+        assert_eq!(r.name.as_ref().unwrap().text, "device1");
+        assert_eq!(r.of.as_ref().unwrap().text, "linux");
+        let Item::Block(s) = &doc.items[1] else { panic!() };
+        assert!(s.of.is_none());
+        // A dotted name is one identifier.
+        let doc = parse_ok("page p { button { on_tap device1.restart { unit = x } } }\n");
+        let Item::Block(p) = &doc.items[0] else { panic!() };
+        let Item::Block(b) = &p.items[0] else { panic!() };
+        let Item::Block(h) = &b.items[0] else { panic!() };
+        assert_eq!(h.name.as_ref().unwrap().text, "device1.restart");
+    }
+
+    #[test]
+    fn item_spans_and_lex_errors_convert() {
+        let doc = parse_ok("var v: int = 1\nparam p: int\nrepeat x in {{ [1] }} { }\n");
+        for it in &doc.items {
+            assert!(it.span().end > it.span().start);
+        }
+        let e = crate::lex::LexError { span: Span::new(crate::FileId::default(), 1, 2), message: "boom".into() };
+        let d: Diagnostic = e.into();
+        assert_eq!((d.message.as_str(), d.span.start), ("boom", 1));
+    }
 }

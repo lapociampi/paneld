@@ -272,6 +272,8 @@ fn render_node(
         "stack" => {
             let obj = parent.new_layout();
             obj.set_size(Size::Content, Size::Content);
+            // Children are placed by `x` / `y` from its corner.
+            obj.set_padding(0);
             apply_props(node, ctx, sink, &obj);
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
@@ -337,6 +339,9 @@ fn render_node(
         "rect" => {
             let obj = parent.new_container();
             obj.set_size(Size::Content, Size::Content);
+            // A shape: no inner padding, which on a small one would
+            // leave no room and show scrollbars.
+            obj.set_padding(0);
             apply_props(node, ctx, sink, &obj);
         }
         "bar" => {
@@ -916,7 +921,7 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
                 }
             }
             if let Some(set_block) = find_block(child, "set") {
-                let assigns = collect_inline_set(set_block);
+                let assigns = collect_inline_set(set_block, ctx);
                 if !assigns.is_empty() {
                     obj.set_clickable();
                     obj.bind_inline_set(trigger, sink.clone(), assigns);
@@ -1232,7 +1237,7 @@ fn bind_change_action(
             return None;
         }
         if let Some(set_block) = find_block(child, "set") {
-            let assigns = collect_inline_set(set_block);
+            let assigns = collect_inline_set(set_block, ctx);
             if !assigns.is_empty() {
                 return Some(assigns);
             }
@@ -1269,7 +1274,8 @@ fn collect_action_args(call: &Block, ctx: &Context) -> Vec<ActionArg> {
     out
 }
 
-fn collect_inline_set(set_block: &Block) -> Vec<InlineSetItem> {
+fn collect_inline_set(set_block: &Block, ctx: &Context) -> Vec<InlineSetItem> {
+    let locals = local_args(ctx);
     let mut out = Vec::new();
     for item in &set_block.items {
         let Item::Assign(a) = item else { continue };
@@ -1279,6 +1285,7 @@ fn collect_inline_set(set_block: &Block) -> Vec<InlineSetItem> {
         out.push(InlineSetItem {
             key: key.text.clone(),
             value_raw: a.value.text.clone(),
+            locals: locals.clone(),
         });
     }
     out

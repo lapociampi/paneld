@@ -36,8 +36,8 @@ impl DisplayConfig {
             if let Some(v) = find_simple(b, "backend") {
                 cfg.backend = parse_backend(v.trim()).unwrap_or(cfg.backend);
             }
-            cfg.device = find_simple(b, "device").map(|s| s.trim().to_string());
-            cfg.touch = find_simple(b, "touch").map(|s| s.trim().to_string());
+            cfg.device = find_simple(b, "device").map(paneld_config::value::parse_string);
+            cfg.touch = find_simple(b, "touch").map(paneld_config::value::parse_string);
             if let Some(w) = find_simple(b, "width").and_then(|v| v.trim().parse().ok()) {
                 cfg.width = w;
             }
@@ -137,4 +137,56 @@ fn find_simple<'a>(node: &'a Block, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(src: &str) -> DisplayConfig {
+        let mut map = paneld_config::SourceMap::new();
+        let id = map.add(std::path::PathBuf::from("t.conf"), src.to_string());
+        let (toks, _) = paneld_config::lex::tokenize(id, src);
+        let (mut doc, diags) = paneld_config::parse(&toks, &map);
+        assert!(diags.is_empty(), "{diags:?}");
+        // As the daemon reads it: options merged, last one wins.
+        paneld_config::apply_overrides(&mut doc);
+        DisplayConfig::from_doc(&doc)
+    }
+
+    #[test]
+    fn without_a_display_block_it_is_an_sdl_window() {
+        let c = cfg("page home { }\n");
+        assert_eq!(c.backend, Backend::Sdl);
+        assert_eq!((c.width, c.height), (800, 480));
+        assert_eq!((c.device, c.touch), (None, None));
+    }
+
+    #[test]
+    fn the_block_sets_backend_devices_and_size() {
+        let c = cfg("display {\n backend = fbdev\n device = /dev/fb1\n touch = /dev/input/event3\n width = 1024\n height = 600\n}\n");
+        assert_eq!(c.backend, Backend::Fbdev);
+        assert_eq!(c.device.as_deref(), Some("/dev/fb1"));
+        assert_eq!(c.touch.as_deref(), Some("/dev/input/event3"));
+        assert_eq!((c.width, c.height), (1024, 600));
+        assert_eq!(cfg("display { backend = drm }\n").backend, Backend::Drm);
+        assert_eq!(cfg("display { device = \"/dev/fb 1\" }\n").device.as_deref(), Some("/dev/fb 1"));
+    }
+
+    #[test]
+    fn later_options_win_and_bad_values_keep_the_default() {
+        let c = cfg("display { backend = fbdev; width = 100 }\ndisplay:backend = drm\ndisplay { width = 200 }\n");
+        assert_eq!(c.backend, Backend::Drm);
+        assert_eq!(c.width, 200);
+        let c = cfg("display { backend = vga; width = wide }\n");
+        assert_eq!(c.backend, Backend::Sdl);
+        assert_eq!(c.width, 800);
+    }
+
+    #[test]
+    fn a_device_that_cannot_open_is_none() {
+        let ui = paneld_ui::Ui::init().unwrap();
+        let c = DisplayConfig { backend: Backend::Fbdev, device: Some("/nonexistent/fb".into()), ..DisplayConfig::default() };
+        assert!(c.open(&ui).is_none());
+    }
 }

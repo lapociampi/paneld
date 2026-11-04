@@ -772,7 +772,7 @@ pub fn config_path(doc: &paneld_config::parse::Document) -> PathBuf {
         if let Item::Assign(a) = item {
             if let AssignTarget::Qualified { category, key } = &a.target {
                 if category.text == "app" && key.text == "state" {
-                    return PathBuf::from(a.value.text.trim());
+                    return PathBuf::from(paneld_config::value::parse_string(&a.value.text));
                 }
             }
         }
@@ -782,7 +782,7 @@ pub fn config_path(doc: &paneld_config::parse::Document) -> PathBuf {
                     if let Item::Assign(a) = inner {
                         if let AssignTarget::Simple { key } = &a.target {
                             if key.text == "state" {
-                                return PathBuf::from(a.value.text.trim());
+                                return PathBuf::from(paneld_config::value::parse_string(&a.value.text));
                             }
                         }
                     }
@@ -1016,5 +1016,104 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0)
+    }
+
+    /// A minimal valid file with `rest` added to the top object.
+    fn file(rest: &str) -> String {
+        format!("{{\"version\": {VERSION}, \"alerts\": {{}}{rest}}}")
+    }
+
+    #[test]
+    fn reads_every_json_escape() {
+        let src = format!(
+            "{{\"version\": {VERSION}, \"alerts\": {{\"a\": {{\"title\": \"q\\\"b\\\\s\\/n\\nr\\rt\\tu\\u00e9\\u0041\"}}}}}}"
+        );
+        let d = parse(&src).expect("parse");
+        assert_eq!(d.alerts["a"].title, "q\"b\\s/n\nr\rt\tu\u{e9}A");
+    }
+
+    #[test]
+    fn refuses_broken_strings() {
+        for (bad, why) in [
+            (r#"{"version": 1, "alerts": {"a": {"title": "x\q"}}}"#, "bad escape"),
+            (r#"{"version": 1, "alerts": {"a": {"title": "\u12"#, "truncated"),
+            (r#"{"version": 1, "alerts": {"a": {"title": "\uzzzz"}}}"#, "bad \\u"),
+            (r#"{"version": 1, "alerts": {"a": {"title": "\ud800"}}}"#, "surrogates"),
+            (r#"{"version": 1, "alerts": {"a": {"title": "open"#, "unterminated string"),
+        ] {
+            let e = parse(bad).unwrap_err();
+            assert!(e.0.contains(why), "{bad}: {}", e.0);
+        }
+    }
+
+    #[test]
+    fn skips_fields_it_does_not_know() {
+        // A newer daemon's extra fields, of every JSON kind, at the
+        // top, in an alert, a reminder and a history entry.
+        let extra = r#""x": {"a": [1, -2, "]}", {"b": null}], "c": true, "d": false, "e": "}"}"#;
+        let src = format!(
+            "{{\"version\": {VERSION}, {extra}, \"alerts\": {{\"k\": {{{extra}, \"rule\": \"r\", \"acked\": true}}}}, \
+             \"reminders\": {{\"m\": {{{extra}, \"first_seen\": 3, \"done\": null}}}}, \
+             \"history\": [{{{extra}, \"id\": \"h\", \"ended\": 9}}], \"tail\": -7}}"
+        );
+        let d = parse(&src).expect("parse");
+        assert_eq!(d.alerts["k"].rule, "r");
+        assert!(d.alerts["k"].acked);
+        assert_eq!(d.reminders["m"], SavedReminder { first_seen: 3, done: None });
+        assert_eq!(d.history[0].id, "h");
+        assert_eq!(d.history[0].ended, 9);
+    }
+
+    #[test]
+    fn refuses_what_is_not_the_state_file() {
+        for bad in [
+            "",
+            "[]",
+            "{\"alerts\": {}}",
+            &file(", \"x\": @"),
+            &file(", \"x\": [1, 2"),
+            &file(", \"x\": nul"),
+            &format!("{{\"version\": {VERSION}, \"alerts\": {{\"a\": {{\"acked\": maybe}}}}}}"),
+            &format!("{{\"version\": {VERSION}, \"alerts\": {{\"a\": {{\"since\": \"x\"}}}}}}"),
+            &format!("{{\"version\": {VERSION}, \"alerts\": {{\"a\": {{}}}}"),
+            "{\"version\": 1 x}",
+        ] {
+            assert!(parse(bad).is_err(), "accepted `{bad}`");
+        }
+        assert!(parse(&file("")).is_ok());
+    }
+
+    #[test]
+    fn a_corrupt_file_is_set_aside_and_a_stale_temp_removed() {
+        let dir = std::env::temp_dir().join(format!("paneld-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state");
+        fs::write(&path, "{ not json").unwrap();
+        fs::write(dir.join("state.tmp"), "half a write").unwrap();
+        let store = Store::open(path.clone());
+        assert_eq!(store.snapshot(), &StateData::default());
+        assert!(!path.exists() && dir.join("state.bad").exists(), "not quarantined");
+        assert!(!dir.join("state.tmp").exists(), "stale temp file kept");
+        // A path that cannot be read as a file opens empty too.
+        fs::create_dir_all(dir.join("adir")).unwrap();
+        assert_eq!(Store::open(dir.join("adir")).snapshot(), &StateData::default());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_state_path_comes_from_app() {
+        let path = |src: &str| {
+            let mut map = paneld_config::SourceMap::new();
+            let id = map.add(PathBuf::from("t.conf"), src.to_string());
+            let (toks, _) = paneld_config::lex::tokenize(id, src);
+            let (doc, _) = paneld_config::parse(&toks, &map);
+            config_path(&doc)
+        };
+        assert_eq!(path("page p { }\n"), PathBuf::from("/var/lib/paneld/state"));
+        assert_eq!(path("app { state = /x/s }\n"), PathBuf::from("/x/s"));
+        assert_eq!(path("app:state = /y/s\n"), PathBuf::from("/y/s"));
+        assert_eq!(path("app { timeout = 5s }\n"), PathBuf::from("/var/lib/paneld/state"));
+        assert_eq!(path("app { state = \"/my dir/s\" }\n"), PathBuf::from("/my dir/s"));
     }
 }

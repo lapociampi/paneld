@@ -123,7 +123,9 @@ fn expand_include(
     stack: &mut Vec<PathBuf>,
     out: &mut Vec<Item>,
 ) {
-    let pat = value.text.trim();
+    // `include = "my file.conf"`: the quotes are not part of the path.
+    let unquoted = crate::value::parse_string(&value.text);
+    let pat = unquoted.trim();
     if pat.is_empty() {
         diagnostics.push(Diagnostic::new(value.span, "empty include path"));
         return;
@@ -594,5 +596,65 @@ mod tests {
         assert!(!diags.is_empty());
         let any_in_bad = diags.iter().any(|dg| map.path(dg.span.file) == bad_canon.as_path());
         assert!(any_in_bad, "diags: {diags:?}");
+    }
+
+    #[test]
+    fn a_missing_main_file_is_an_io_error_with_its_path() {
+        let d = TempDir::new("nomain");
+        let Err(e) = load(&d.path().join("absent.conf")) else { panic!("loaded a missing file") };
+        let LoadError::Io { path, .. } = &e;
+        assert!(path.ends_with("absent.conf"));
+        assert!(e.to_string().contains("absent.conf"), "{e}");
+        let _: &dyn std::error::Error = &e;
+    }
+
+    #[test]
+    fn an_empty_or_unreadable_include_is_a_diagnostic() {
+        let d = TempDir::new("badinc");
+        let root = d.write("root.conf", "include = \"\"\ninclude = adir\n");
+        fs::create_dir_all(d.path().join("adir")).unwrap();
+        let (_, _, diags) = load(&root).unwrap();
+        let msgs: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(msgs.iter().any(|m| m.contains("empty include path")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("include `") && m.contains("adir")), "{msgs:?}");
+    }
+
+    #[test]
+    fn a_quoted_include_path_may_hold_spaces() {
+        let d = TempDir::new("spaces");
+        let root = d.write("root.conf", "include = \"my file.conf\"\n");
+        d.write("my file.conf", "x = 1\n");
+        let (_, doc, diags) = load(&root).unwrap();
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(matches!(&doc.items[0], Item::Assign(_)));
+    }
+
+    #[test]
+    fn a_glob_in_a_missing_folder_is_a_diagnostic() {
+        let d = TempDir::new("globdir");
+        let root = d.write("root.conf", "include = nowhere/*.conf\n");
+        let (_, _, diags) = load(&root).unwrap();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.starts_with("include `nowhere/*.conf`:"), "{diags:?}");
+    }
+
+    #[test]
+    fn includes_resolve_from_the_including_file() {
+        let d = TempDir::new("nested");
+        let root = d.write("root.conf", "include = sub/a.conf\n");
+        d.write("sub/a.conf", "include = b.conf\n");
+        d.write("sub/b.conf", "x = 1\n");
+        let (map, doc, diags) = load(&root).unwrap();
+        assert!(diags.is_empty(), "{diags:?}");
+        let Item::Assign(a) = &doc.items[0] else { panic!() };
+        assert!(map.location(a.span).to_string().contains("b.conf:1"), "{}", map.location(a.span));
+    }
+
+    #[test]
+    fn a_file_that_is_not_utf8_is_an_io_error() {
+        let d = TempDir::new("latin1");
+        let root = d.path().join("root.conf");
+        fs::write(&root, b"k = caf\xe9\n").unwrap();
+        assert!(load(&root).is_err());
     }
 }

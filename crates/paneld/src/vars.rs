@@ -50,8 +50,26 @@ fn parse_default(ty: &str, raw: &str) -> Value {
         "int" => Value::Int(parse_int(trimmed).unwrap_or(0)),
         "number" => Value::Double(parse_number(trimmed).unwrap_or(0.0)),
         "bool" => Value::Bool(parse_bool(trimmed).unwrap_or(false)),
+        // `[1, 2]` is a list, not its text.
+        "list" => match literal(trimmed) {
+            Some(v @ Value::List(_)) => v,
+            _ => Value::List(Vec::new()),
+        },
+        // A number, bool, list or map literal as itself; other text as
+        // a string.
+        "any" => literal(trimmed).unwrap_or_else(|| Value::String(unquote(trimmed))),
         _ => Value::String(unquote(trimmed)),
     }
+}
+
+/// `raw` read as a CEL literal (`5`, `true`, `[1, 'a']`, `{'k': 1}`);
+/// `None` for anything that needs a name to evaluate.
+fn literal(raw: &str) -> Option<Value> {
+    let (e, diags) = paneld_config::cel::parse_fragment(raw, paneld_config::source::FileId::default(), 0);
+    if !diags.is_empty() {
+        return None;
+    }
+    paneld_ui::eval(&e?, &paneld_ui::Context::new()).ok()
 }
 
 /// Coerce a worker-side set RHS (already evaluated to a [`Value`]) to
@@ -144,6 +162,35 @@ mod tests {
         assert_eq!(coerce("number", s("2.5")), Some(Value::Double(2.5)));
         assert_eq!(coerce("bool", s("maybe")), None);
         assert_eq!(coerce("string", s("true")), Some(s("true")));
+    }
+
+    #[test]
+    fn list_and_any_defaults_are_values_not_text() {
+        let src = "var l: list = [1, 'a']\nvar e: list = []\nvar bad: list = 5\nvar a: any = 5\nvar m: any = {'k': true}\nvar t: any = hello\nvar q: string = 'x'\n";
+        let mut map = paneld_config::SourceMap::new();
+        let id = map.add(std::path::PathBuf::from("t.conf"), src.to_string());
+        let (toks, _) = paneld_config::lex::tokenize(id, src);
+        let (doc, _) = paneld_config::parse(&toks, &map);
+        let v = initial_values(&doc);
+        assert_eq!(v["l"], Value::List(vec![Value::Int(1), Value::String("a".into())]));
+        assert_eq!(v["e"], Value::List(Vec::new()));
+        assert_eq!(v["bad"], Value::List(Vec::new()));
+        assert_eq!(v["a"], Value::Int(5));
+        assert_eq!(v["m"], Value::Map(BTreeMap::from([("k".to_string(), Value::Bool(true))])));
+        assert_eq!(v["t"], Value::String("hello".into()));
+        assert_eq!(v["q"], Value::String("x".into()));
+    }
+
+    #[test]
+    fn coerce_refuses_what_does_not_fit() {
+        assert_eq!(coerce("int", Value::List(vec![])), None);
+        assert_eq!(coerce("bool", Value::Int(1)), None);
+        assert_eq!(coerce("list", Value::Int(1)), None);
+        assert_eq!(coerce("number", Value::Bool(true)), None);
+        assert_eq!(coerce("int", Value::String("x".into())), None);
+        assert_eq!(coerce("string", Value::Int(3)), Some(Value::String("3".into())));
+        assert_eq!(coerce("any", Value::Null), Some(Value::Null));
+        assert_eq!(coerce("list", Value::List(vec![Value::Null])), Some(Value::List(vec![Value::Null])));
     }
 
     #[test]

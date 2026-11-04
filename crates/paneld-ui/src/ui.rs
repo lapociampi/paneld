@@ -85,6 +85,10 @@ pub enum EventValue {
 pub struct InlineSetItem {
     pub key: String,
     pub value_raw: String,
+    /// The bindings local to where the node was drawn (`repeat`
+    /// items, component params), so `{{ row.id }}` evaluates when the
+    /// node is tapped.
+    pub locals: Vec<ActionArg>,
 }
 
 /// A single already-evaluated `name = value` arg from an action-call
@@ -153,7 +157,12 @@ pub enum ValueWidget {
 enum ChangeKind {
     Toggle,
     Slider,
+    /// The ask dialog's dropdown: the index, mapped back to the
+    /// options it showed.
     Dropdown,
+    /// A `select` on a page: the selected option's text (schema 8.4,
+    /// `value` is the new value, not its position).
+    Select,
     /// Keypad: READY on the keyboard. The trampoline reads the
     /// attached textarea's typed content and emits it as a
     /// [`EventValue::String`].
@@ -401,6 +410,12 @@ fn widget_value(kind: ChangeKind, target: *mut sys::lv_obj_t) -> Option<EventVal
         }
         ChangeKind::Slider => EventValue::Int(unsafe { sys::lv_slider_get_value(target) } as i64),
         ChangeKind::Dropdown => EventValue::Int(unsafe { sys::lv_dropdown_get_selected(target) } as i64),
+        ChangeKind::Select => {
+            let mut buf = [0 as std::os::raw::c_char; 256];
+            unsafe { sys::lv_dropdown_get_selected_str(target, buf.as_mut_ptr(), buf.len() as u32) };
+            let text = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+            EventValue::String(text.to_string_lossy().into_owned())
+        }
         ChangeKind::Keypad => EventValue::String(keyboard_text(target)),
         ChangeKind::PinEntry => return None,
     })
@@ -1161,7 +1176,7 @@ impl<'ui> Obj<'ui> {
         let (kind, code) = match widget {
             ValueWidget::Toggle => (ChangeKind::Toggle, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Slider => (ChangeKind::Slider, sys::lv_event_code_t_LV_EVENT_RELEASED),
-            ValueWidget::Dropdown => (ChangeKind::Dropdown, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
+            ValueWidget::Dropdown => (ChangeKind::Select, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Keypad => (ChangeKind::Keypad, sys::lv_event_code_t_LV_EVENT_READY),
         };
         let idx = {
@@ -1608,15 +1623,15 @@ impl<'ui> Obj<'ui> {
     }
 
     /// Register a VALUE_CHANGED callback on a dropdown; on pick, the
-    /// trampoline reads the selected option index and pushes an
-    /// [`UiEvent::ChangeInlineSet`] with `event.value` as an int.
+    /// trampoline reads the selected option and pushes an
+    /// [`UiEvent::ChangeInlineSet`] with `event.value` as its text.
     pub fn on_change_dropdown_inline_set(
         &self,
         sink: Sender<UiEvent>,
         assigns: Vec<InlineSetItem>,
     ) {
         self.register_change_binding(
-            ChangeKind::Dropdown,
+            ChangeKind::Select,
             assigns,
             sink,
             sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED,

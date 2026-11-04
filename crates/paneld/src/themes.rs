@@ -255,4 +255,33 @@ mod tests {
         assert!(st.contains_key("button:pressed"));
         assert!(styles(&d, Some("base"))[".card"].len() == 2);
     }
+
+    #[test]
+    fn which_theme_is_active() {
+        // The first theme when nothing picks one; `screen:theme` picks.
+        let first = resolve(&doc("theme a { accent = #000001 }\ntheme b { accent = #000002 }\n"));
+        assert_eq!(tok(&first, "accent"), "#000001");
+        let picked = resolve(&doc("theme a { accent = #000001 }\ntheme b { accent = #000002 }\nscreen:theme = b\n"));
+        assert_eq!(tok(&picked, "accent"), "#000002");
+        // An unknown theme leaves the built-in tokens.
+        let unknown = resolve(&doc("screen { theme = nope }\n"));
+        assert_eq!(tok(&unknown, "accent"), "#2196f3");
+        // `resolve_with` (the night theme) wins over the configured one.
+        let night = resolve_with(&doc("theme a { accent = #000001 }\ntheme n { accent = #000009 }\nscreen:theme = a\n"), Some("n"));
+        assert_eq!(tok(&night, "accent"), "#000009");
+    }
+
+    #[test]
+    fn extends_cycles_and_missing_parents_end_quietly() {
+        let d = doc("theme a { extends = b; accent = #00000a }\ntheme b { extends = a; surface = #00000b }\nscreen:theme = a\n");
+        let m = resolve(&d);
+        assert_eq!(tok(&m, "accent"), "#00000a");
+        assert_eq!(tok(&m, "surface"), "#00000b");
+        let st = styles(&doc("theme a { extends = a\n style .c { radius = 1 } }\n"), None);
+        assert_eq!(st[".c"].len(), 1);
+        let orphan = resolve(&doc("theme a { extends = gone; accent = #00000c }\n"));
+        assert_eq!(tok(&orphan, "accent"), "#00000c");
+        assert!(styles(&doc("page p { }\n"), None).is_empty());
+        assert!(styles(&doc("theme a { }\n"), Some("nope")).is_empty());
+    }
 }
