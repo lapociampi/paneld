@@ -40,7 +40,8 @@ impl Daemon {
             .arg(dir.join("p.conf"))
             .env("SDL_VIDEODRIVER", "dummy")
             .env("PANELD_SOCK", dir.join("ctl.sock"))
-            .stdout(Stdio::null())
+            // LVGL's own log (printf): checked when the daemon is dropped.
+            .stdout(std::fs::File::create(dir.join("lvgl.log")).unwrap())
             .stderr(std::fs::File::create(dir.join("log")).unwrap())
             .spawn()
             .expect("start paneld");
@@ -122,6 +123,12 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         if let Ok(None) = self.child.try_wait() {
             self.shutdown();
+        }
+        // An LVGL error is a bug even when the test's checks pass (not
+        // asserted while already failing: a second panic aborts).
+        let log = std::fs::read_to_string(self.dir.join("lvgl.log")).unwrap_or_default();
+        if !std::thread::panicking() {
+            assert!(!log.contains("[Error]"), "LVGL logged an error:\n{log}");
         }
     }
 }

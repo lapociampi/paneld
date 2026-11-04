@@ -3,7 +3,7 @@
 //! with bindgen (ADR 0011).
 //!
 //! Layout:
-//!   vendor/lvgl/            vendored v9.6.0 (git submodule)
+//!   vendor/lvgl/            vendored release/v9.6 (git submodule)
 //!   vendor/libdrm/          libdrm 2.4.134 (git submodule), for `drm`
 //!   crates/lvgl-sys/
 //!     include/lv_conf.h     paneld's build configuration

@@ -20,12 +20,10 @@
 #define LV_USE_STDLIB_STRING    LV_STDLIB_CLIB
 #define LV_USE_STDLIB_SPRINTF   LV_STDLIB_CLIB
 
-/* OS: SDL2 drives us on a PC build; pthread on a device build. */
-#if PANELD_USE_SDL
-#define LV_USE_OS               LV_OS_SDL2
-#else
+/* OS: pthread, on a PC (SDL window) as on a device. With LV_OS_SDL2
+ * the draw threads are joined through SDL after lv_deinit has already
+ * quit SDL (deleting the window), and LVGL logs an error at exit. */
 #define LV_USE_OS               LV_OS_PTHREAD
-#endif
 
 /* ---------------------------------------------------------------------
  * Rendering

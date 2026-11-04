@@ -78,17 +78,20 @@ fn decode(png: &[u8]) -> Image {
 
 fn shot(config: &Path, extra: &[&str]) -> Image {
     let out = config.with_extension("png");
-    let status = Command::new(env!("CARGO_BIN_EXE_paneld"))
+    let run = Command::new(env!("CARGO_BIN_EXE_paneld"))
         .arg("shot")
         .arg("-c")
         .arg(config)
         .arg("-o")
         .arg(&out)
         .args(extra)
-        .stdout(std::process::Stdio::null())
-        .status()
+        .output()
         .expect("run paneld shot");
-    assert!(status.success(), "paneld shot failed: {status}");
+    assert!(run.status.success(), "paneld shot failed: {}", run.status);
+    // LVGL logs with printf, on stdout: an error there is a bug even
+    // when the picture looks right.
+    let log = String::from_utf8_lossy(&run.stdout);
+    assert!(!log.contains("[Error]"), "LVGL logged an error:\n{log}");
     decode(&std::fs::read(&out).unwrap())
 }
 
@@ -1199,6 +1202,40 @@ fn busy_and_done_read_the_calls_args() {
     // The toast (bottom middle) is wide when it shows the arg.
     let done = shot(&conf, &["--tap", "100,161", "--settle", "300"]);
     assert!(ink(&done, 200, 600, 360, 420) > 150, "done did not show the call's arg");
+}
+
+#[test]
+fn qr_codes_are_freed_without_lvgl_errors() {
+    // LVGL 9.6.0's canvas destructor dropped `&draw_buf` (the field,
+    // not the buffer) from the image cache, and logged "invalid magic"
+    // when the pointer's low byte was under 0x20 (lvgl#10824, fixed on
+    // release/v9.6). Many QR codes rebuilt a few times hit it.
+    let d = tmp("qr-free");
+    let conf = d.join("p.conf");
+    let list: Vec<String> = (0..48).map(|i| i.to_string()).collect();
+    std::fs::write(
+        &conf,
+        format!(
+            "var n: int = 0\n\
+             page home {{\n\
+                 button {{ width = 100; height = 40; label = go; on_tap {{ set {{ n = {{{{ vars.n + 1 }}}} }} }} }}\n\
+                 row {{ wrap = true; width = 100%\n\
+                     repeat i in {{{{ [{}] }}}} {{ qr {{ size = 24; data = {{{{ string(i) + string(vars.n) }}}} }} }}\n\
+                 }}\n\
+             }}\n",
+            list.join(", ")
+        ),
+    )
+    .unwrap();
+    let mut args = vec!["shot", "-c", conf.to_str().unwrap(), "-o", "/dev/null", "--settle", "50"];
+    for _ in 0..6 {
+        args.extend(["--tap", "50,83", "--settle", "50"]);
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_paneld")).args(&args).output().expect("run paneld shot");
+    assert!(out.status.success());
+    // LVGL logs with printf: on stdout.
+    let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!log.contains("invalid magic"), "{log}");
 }
 
 #[test]
