@@ -501,3 +501,25 @@ fn reload_keeps_vars_the_screen_set_and_applies_new_defaults_to_the_rest() {
     d.ok(&["reload"]);
     assert_eq!(d.eval("vars.tab"), "x");
 }
+
+#[test]
+fn a_remote_kind_declares_an_alert_for_each_instance() {
+    let dir = tmp("kind-alert");
+    let d = Daemon::start(
+        &dir,
+        "remote_kind box {\n\
+             param label: string\n\
+             param heat: int\n\
+             via = local\n\
+             value temp { run = echo {{ heat }}; parse = number }\n\
+             alert hot { when = {{ self.temp > 80 }}; severity = critical; title = {{ label }} is hot }\n\
+         }\n\
+         remote a: box { label = Rack; heat = 90 }\n\
+         remote b: box { label = Desk; heat = 10 }\n\
+         page home { text { value = x } }\n",
+    );
+    d.wait_for("alerts.count", "1");
+    assert_eq!(d.eval("alerts.active[0].title"), "Rack is hot");
+    assert_eq!(d.eval("alerts.active[0].rule"), "a.hot");
+    assert_eq!(d.eval("alerts.worst"), "critical");
+}

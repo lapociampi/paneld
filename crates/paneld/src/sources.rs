@@ -98,6 +98,17 @@ pub fn resolve_all(
     })
 }
 
+/// `out` through the source's `value = {{ ... }}` (or as it is),
+/// masked again: `value` can put masked pieces back together.
+fn transformed(b: &Block, out: &Value, mask: &crate::secrets::Mask) -> Value {
+    match find_raw(b, "value") {
+        Some((raw, span)) => mask.apply_value(
+            eval_value_transform(b, raw, span, out).unwrap_or_else(|e| Value::String(format!("[eval error: {e}]"))),
+        ),
+        None => out.clone(),
+    }
+}
+
 /// The value of a source that has no result (yet): `ok = false`,
 /// `value = null` and the reason in `error`, so pages and alerts can
 /// test `ok` for every declared source.
@@ -706,7 +717,8 @@ pub fn resolve_one(
     // secrets (see `secrets::Mask`). Parsed output is masked after
     // parsing, where JSON escapes are undone and numbers are left
     // alone; the raw `stdout` / `stderr` as text.
-    let r = runner::exec(&request.argv, opts).map_err(|e| mask.apply(&format!("run: {e}")))?;
+    let mut r = runner::exec(&request.argv, opts).map_err(|e| mask.apply(&format!("run: {e}")))?;
+    let http_status = crate::remotes::take_http_status(b, r.exit_code, &mut r.stderr);
     if r.timed_out {
         return Err(if crate::remotes::is_remote(b) { "timed out; it may still have run".into() } else { "timed out".into() });
     }
@@ -715,22 +727,24 @@ pub fn resolve_one(
     }
     let ok = r.exit_code == Some(0);
 
-    let out = parse_output(&r.stdout, &parse_mode)
-        .map(|v| mask.apply_value(v))
-        .ok_or_else(|| format!("could not parse output as `{parse_mode}`"))?;
+    // A failed run's output (an HTTP error page, a usage message) need
+    // not parse: it still gets its map, with `error`, `exit` and
+    // `status`, and a null value.
+    let out = match parse_output(&r.stdout, &parse_mode).map(|v| mask.apply_value(v)) {
+        Some(v) => Some(v),
+        None if !ok => None,
+        None => return Err(format!("could not parse output as `{parse_mode}`")),
+    };
 
     // If the source has `value = {{ ... }}`, evaluate it with `out`
     // in scope and use the result as the public value. Otherwise
     // `out` is the value itself.
     // `value` can put masked pieces back together: mask it too.
-    let value = if let Some((raw, span)) = find_raw(b, "value") {
-        mask.apply_value(
-            eval_value_transform(b, raw, span, &out).unwrap_or_else(|e| Value::String(format!("[eval error: {e}]"))),
-        )
+    let value = if let Some(out) = &out {
+        transformed(b, out, &mask)
     } else {
-        out.clone()
+        Value::Null
     };
-
     let mut m: BTreeMap<String, Value> = BTreeMap::new();
     m.insert("value".into(), value);
     m.insert("ok".into(), Value::Bool(ok));
@@ -747,6 +761,9 @@ pub fn resolve_one(
         })
     };
     m.insert("error".into(), Value::String(mask.apply(&error)));
+    if let Some(status) = http_status {
+        m.insert("status".into(), Value::Int(status));
+    }
     Ok(Value::Map(m))
 }
 
@@ -1113,6 +1130,20 @@ mod tests {
         let (doc, diags) = paneld_config::parse(&toks, &map);
         assert!(diags.is_empty(), "parse errors: {diags:?}");
         doc
+    }
+
+    #[test]
+    fn a_failed_run_keeps_its_map_when_its_output_does_not_parse() {
+        let doc = parse_doc("source s { run = /bin/sh -c 'echo \"<html>busy</html>\"; exit 3'\n parse = json }\nsource t { run = /bin/echo nope\n parse = json }\n");
+        let mut blocks = collect_blocks(&doc);
+        let v = resolve_one(&blocks.remove("s").unwrap(), &Context::new(), std::path::Path::new("/"), runner::AppDefaults::default()).unwrap();
+        let Value::Map(m) = v else { panic!() };
+        assert_eq!(m["ok"], Value::Bool(false));
+        assert_eq!(m["value"], Value::Null);
+        assert_eq!(m["exit"], Value::Int(3));
+        assert_eq!(m["error"], Value::String("exit 3".into()));
+        // A run that worked but printed something else is still an error.
+        assert!(resolve_one(&blocks.remove("t").unwrap(), &Context::new(), std::path::Path::new("/"), runner::AppDefaults::default()).is_err());
     }
 
     #[test]

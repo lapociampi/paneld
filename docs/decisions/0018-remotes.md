@@ -27,6 +27,7 @@ A panel mostly watches and drives other machines and services. With only `source
 - Kind params are literals (or `$vars`), read at load; inside the kind they are plain names (`{{ host }}`), and they win over any page name (a `repeat` binding called `host`). Connection keys (`host`, `url`, the kind's `headers`, ...) read the params and `secrets` only, so nothing on screen can change where a request goes. The kind's `timeout` is its members' default. A `secret` param names a `secret` item, so two boxes of one kind can have their own tokens; it is usable only where `secrets` is.
 - In expressions, `device1.temp` is the value; `device1.ok` / `device1.error` the remote as a whole; `device1.status.temp` the full source map (`ok`, `error`, `at`, `history`, ...). `device1.reboot` is an action anywhere an action fits (`on_tap = device1.reboot`, `refresh = device1.temp`, `alert ... from = device1.log`). Dotted members are not in `sources`.
 - `remote[device1]:host = 10.0.0.9` overrides one param, like any named item.
+- A kind can declare `alert <name> { }`: each instance gets its own, `<instance>.<name>`, whose expressions read the kind's params and `self` (the instance's root, `self.temp`). Five boxes of one kind need no five hand-written alerts.
 - Names are `[a-z][a-z0-9_]*`, not a CEL keyword. A kind param may not be named like an expression root (`secrets`, `vars`, ...), which it would hide in its members. An instance name may not be an expression root, nor a `repeat` binding or a param name anywhere (it would shadow the instance).
 
 ### Connections wrap system tools
@@ -55,12 +56,12 @@ Every run keeps the ADR 0013 rules: clean environment, timeout, output limits, `
 
 #### http
 
-- The request is a curl config file on stdin: `url`, `request`, `header` and `data-raw` lines, each value in double quotes with `\`, `"`, CR, LF and tab escaped, plus `fail-with-body`, `path-as-is`, `proto = "=http,https"`, `max-time`, `silent`, `show-error` (and `cacert` / `insecure`). `-q` keeps `~/.curlrc` out. Tokens are never in argv.
+- The request is a curl config file on stdin: `url`, `request`, `header`, `user` (basic auth) and `data-raw` lines, each value in double quotes with `\`, `"`, CR, LF and tab escaped, plus `fail-with-body`, `path-as-is`, `proto = "=http,https"`, `max-time`, `silent`, `show-error` (and `cacert` / `insecure`). `-q` keeps `~/.curlrc` out. Tokens are never in argv.
 - No redirects are followed.
 - A `{{ }}` in a request path (`get = /vms/{{ vm }}/status`) is percent-encoded: everything but RFC 3986 unreserved characters, and a value that is just `.` or `..` whole, so `/`, `?`, `#`, `&`, `%` and dot steps cannot change the request. The rest of the path is used as written; `globoff` keeps `{}` and `[]` literal.
 - CR, LF or NUL in a URL or header value refuse the run. Header names are config keys, so `_` in one is sent as `-` (`X_Api_Key`).
 - `secrets` are allowed in `url`, `headers` and `body`, not in a request path.
-- An HTTP status of 400 or more fails the run (curl exit 22) with the body as output; `result.code` is curl's exit code, not the HTTP status.
+- An HTTP status of 400 or more fails the run (curl exit 22) with the body as output; `result.code` is curl's exit code, and `result.status` (and a value's `status`) the HTTP status, written by curl after the response and taken back out of stderr.
 
 #### socket
 
@@ -83,4 +84,4 @@ After the check, each instance becomes ordinary sources and actions named `<inst
 - A remote member's `run` is argv, not shell text, exactly as a local one: pipes need `sh -c '...'` (run on the remote), and the inline-script lint applies. Free-text params can still start with `-`; write `--` before them (`systemctl restart -- {{ unit }}`) or give them `options`.
 - No native protocol code: no TLS or ssh library in the binary. A future `via` is a new command builder, not a client.
 - Member names `ok`, `error` and `status` are reserved.
-- Open: alerts declared by a kind, a `via` override per instance, ssh connection reuse, the HTTP status in `result`.
+- Open: a `via` override per instance, ssh connection reuse.

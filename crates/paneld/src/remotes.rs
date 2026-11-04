@@ -90,6 +90,29 @@ pub fn bind(block: &Block, ctx: &mut Context) {
     }
 }
 
+/// The line `curl` writes the HTTP status on (stderr, after the body).
+const STATUS_MARK: &str = "paneld-http-status:";
+
+/// For an `http` member: take the HTTP status line out of `stderr` and
+/// return the status. It counts only for a whole answer (curl exit 0,
+/// or 22 for an error status); a transfer cut off after its headers,
+/// or no answer at all, is 0. `None` for anything not `http`.
+pub fn take_http_status(block: &Block, exit: Option<i32>, stderr: &mut String) -> Option<i64> {
+    let remotes = current();
+    let remote = remotes.by_name.get(cr::remote_of(block)?)?;
+    if remote.via != "http" {
+        return None;
+    }
+    let mut code = 0;
+    if let Some(at) = stderr.rfind(STATUS_MARK) {
+        code = stderr[at + STATUS_MARK.len()..].trim().parse().unwrap_or(0);
+        stderr.truncate(at);
+        let kept = stderr.trim_end().len();
+        stderr.truncate(kept);
+    }
+    Some(if matches!(exit, Some(0 | 22)) { code } else { 0 })
+}
+
 /// A clearer `error` for a failed remote run, when the transport
 /// itself failed rather than the command.
 pub fn explain(block: &Block, exit: Option<i32>, stderr: &str) -> Option<String> {
@@ -256,6 +279,9 @@ impl Remotes {
                 ];
                 if !stream {
                     cfg.push(format!("max-time = {}", timeout.as_secs().max(1)));
+                    // The HTTP status, after the response, on stderr (taken
+                    // back out by `take_http_status`).
+                    cfg.push(format!("write-out = \"%{{stderr}}\\n{STATUS_MARK}%{{http_code}}\\n\""));
                 }
                 let q = |s: &str| cr::curl_quote(s).ok_or_else(|| "a request value holds a NUL byte".to_string());
                 cfg.push(format!("url = {}", q(&url)?));
@@ -278,6 +304,13 @@ impl Remotes {
                 }
                 if let Some((raw, span)) = find(member, "body") {
                     cfg.push(format!("data-raw = {}", q(&fill(raw, span, ctx)?)?));
+                }
+                // HTTP basic auth (`user:password`), on stdin like the rest.
+                if let Some(user) = key("user")? {
+                    if !cr::single_line(&user) {
+                        return Err("`user` holds a line break".into());
+                    }
+                    cfg.push(format!("user = {}", q(&user)?));
                 }
                 if let Some(ca) = key("ca")? {
                     cfg.push(format!("cacert = {}", q(&ca)?));
@@ -668,7 +701,8 @@ mod tests {
             format!("remote_kind k {{\n via = http\n url = {url}\n {extra}\n value v {{ get = /s }}\n action a {{ }}\n}}\nremote r: k {{ }}\n")
         };
         let cfg = |r: Request| String::from_utf8(r.stdin.unwrap()).unwrap();
-        let c = cfg(built(&kind("https://x/api/", "ca = /etc/ca.pem\n insecure = true"), "source", "r.v", &[]).unwrap().unwrap());
+        let c = cfg(built(&kind("https://x/api/", "ca = /etc/ca.pem\n insecure = true\n user = \"me:pw\""), "source", "r.v", &[]).unwrap().unwrap());
+        assert!(c.contains("user = \"me:pw\"\n"), "{c}");
         assert!(c.contains("url = \"https://x/api/s\"\n"), "one slash between: {c}");
         assert!(c.contains("cacert = \"/etc/ca.pem\"\n") && c.contains("insecure\n"), "{c}");
         assert!(built(&kind("ftp://x", ""), "source", "r.v", &[]).unwrap_err().contains("not an http(s) URL"));
@@ -727,6 +761,31 @@ mod tests {
         assert_eq!(ex("b.v", 60, "cert").as_deref(), Some("TLS failed: cert"));
         assert_eq!(ex("c.v", 1, "").as_deref(), Some("socat failed"));
         assert_eq!(ex("e.v", 1, ""), None);
+        install(Remotes::default());
+    }
+
+    #[test]
+    fn the_http_status_is_taken_out_of_stderr() {
+        let _g = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+        let d = doc("remote_kind h { via = http\n url = http://x\n value v { get = / } }\nremote b: h { }\n\
+                     remote_kind s { via = ssh\n host = h\n key = /k\n value v { run = x } }\nremote c: s { }\n");
+        install(Remotes::from_doc(&d, Path::new("/s/state")));
+        let mut err = "curl: (22) The requested URL returned error: 503\npaneld-http-status:503\n".to_string();
+        assert_eq!(take_http_status(block(&d, "source", "b.v"), Some(22), &mut err), Some(503));
+        assert_eq!(err, "curl: (22) The requested URL returned error: 503");
+        let mut quiet = "\npaneld-http-status:200\n".to_string();
+        assert_eq!(take_http_status(block(&d, "source", "b.v"), Some(0), &mut quiet), Some(200));
+        assert_eq!(quiet, "");
+        // Cut off after the headers (curl 28): no status to trust.
+        let mut cut = "curl: (28) Operation timed out\npaneld-http-status:200\n".to_string();
+        assert_eq!(take_http_status(block(&d, "source", "b.v"), Some(28), &mut cut), Some(0));
+        // Killed before curl wrote it: 0.
+        let mut none = String::new();
+        assert_eq!(take_http_status(block(&d, "source", "b.v"), None, &mut none), Some(0));
+        // Not http: left alone.
+        let mut other = "paneld-http-status:200".to_string();
+        assert_eq!(take_http_status(block(&d, "source", "c.v"), Some(0), &mut other), None);
+        assert_eq!(other, "paneld-http-status:200");
         install(Remotes::default());
     }
 }

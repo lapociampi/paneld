@@ -34,12 +34,11 @@ ReadOnlyPaths=/etc/paneld
 ReadWritePaths=/var/lib/paneld /run/paneld
 # Devices the daemon needs. The service user must be in `video` /
 # `input` for these to be useful even with DeviceAllow in place.
-DeviceAllow=/dev/dri/card0 rwm
-DeviceAllow=/dev/dri/card1 rwm
-DeviceAllow=/dev/fb0 rwm
-DeviceAllow=/dev/input/event0 rwm
-DeviceAllow=/dev/input/event1 rwm
-DeviceAllow=/dev/input/event2 rwm
+# By class, not by node: card and eventN numbers move between boots
+# when a display or keyboard is plugged in.
+DeviceAllow=char-drm rw
+DeviceAllow=/dev/fb0 rw
+DeviceAllow=char-input rw
 # The Pi firmware mailbox (group `video`): `vcgencmd measure_temp`,
 # `vcgencmd display_power` and friends in sources and actions run
 # inside this unit's device policy too.

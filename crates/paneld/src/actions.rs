@@ -577,6 +577,8 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
     let mut code: Option<i32> = None;
     let mut stdout = String::new();
     let mut stderr = String::new();
+    // A remote `http` member's HTTP status, for `result.status`.
+    let mut http_status: Option<i64> = None;
 
     if had_run {
         let mut ctx = ctx_with_vars_and_args(&wctx.base_ctx, &wctx.source_values, &wctx.vars, &call.args);
@@ -625,6 +627,7 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
         let mask = crate::secrets::Mask::new(&wctx.secrets);
         match request.and_then(|r| runner::exec(&r.argv, opts)) {
             Ok(mut r) => {
+                http_status = def.remote.as_ref().and_then(|b| crate::remotes::take_http_status(b, r.exit_code, &mut r.stderr));
                 r.stdout = mask.apply(&r.stdout);
                 r.stderr = mask.apply(&r.stderr);
                 eprintln!(
@@ -728,7 +731,10 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
         }
     }
 
-    let result = result_value(ok, code, stdout, stderr);
+    let mut result = result_value(ok, code, stdout, stderr);
+    if let (Some(st), Value::Map(m)) = (http_status, &mut result) {
+        m.insert("status".to_string(), Value::Int(st));
+    }
 
     // The main loop does `goto` and the `done` / `failed`
     // message, and frees the action for its next call. Sent

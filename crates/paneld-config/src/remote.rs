@@ -97,6 +97,23 @@ pub fn lower(doc: &mut Document) {
             }));
             added.push(Item::Block(block));
         }
+        // The kind's alerts, one per instance.
+        for it in &kind.items {
+            let Item::Block(a) = it else { continue };
+            if a.kind.text != "alert" {
+                continue;
+            }
+            let Some(alert_name) = &a.name else { continue };
+            let mut block = a.clone();
+            block.name = Some(Ident { text: format!("{}.{}", name.text, alert_name.text), span: alert_name.span });
+            qualify_refs(&mut block.items, &name.text, &siblings);
+            block.items.push(Item::Assign(Assign {
+                target: AssignTarget::Simple { key: Ident { text: REMOTE_KEY.into(), span: name.span } },
+                value: RawValue { text: name.text.clone(), span: name.span },
+                span: name.span,
+            }));
+            added.push(Item::Block(block));
+        }
     }
     doc.items.extend(added);
 }
@@ -111,7 +128,7 @@ fn qualify_refs(items: &mut [Item], inst: &str, siblings: &[&str]) {
             Item::Assign(a) => {
                 let AssignTarget::Simple { key } = &a.target else { continue };
                 match key.text.as_str() {
-                    "then" | "else" => {
+                    "then" | "else" | "from" | "action" => {
                         if let Some(q) = qualify(&a.value.text) {
                             a.value.text = q;
                         }
@@ -275,6 +292,20 @@ mod tests {
         assert_eq!(get("then").as_deref(), Some("d1.done"));
         // The kind's `timeout` reaches members without their own.
         assert_eq!(get("timeout").as_deref(), Some("3s"));
+        // The kind's alerts, one per instance, `from` qualified.
+        let src2 = "remote_kind k { via = local\n value log { run = cat; stream = true }\n alert ev { from = log } }\nremote r1: k { }\n";
+        let mut map2 = crate::SourceMap::new();
+        let id2 = map2.add(std::path::PathBuf::from("u.conf"), src2.to_string());
+        let (toks2, _) = crate::lex::tokenize(id2, src2);
+        let (mut doc2, _) = crate::parse(&toks2, &map2);
+        lower(&mut doc2);
+        let ev = doc2.items.iter().find_map(|it| match it {
+            Item::Block(b) if b.kind.text == "alert" && b.name.as_ref().is_some_and(|n| n.text == "r1.ev") => Some(b.clone()),
+            _ => None,
+        });
+        let ev = ev.expect("alert r1.ev");
+        assert_eq!(remote_of(&ev), Some("r1"));
+        assert!(ev.items.iter().any(|it| matches!(it, Item::Assign(a) if a.value.text == "r1.log")));
         let r = &remotes(&doc)["d1"];
         assert_eq!(r.via, "ssh");
         assert_eq!(r.params, [("host".into(), "string".into(), Some("b".into())), ("port".into(), "int".into(), Some("22".into()))]);

@@ -20,7 +20,7 @@ const RESERVED_MEMBERS: &[&str] = &["ok", "error", "status"];
 /// Expression roots an instance name would shadow (schema 16).
 const RESERVED_ROOTS: &[&str] = &[
     "sources", "vars", "alerts", "theme", "now", "secrets", "page", "nav", "item", "out", "event",
-    "value", "result", "level", "output", "true", "false", "null",
+    "value", "result", "level", "output", "self", "true", "false", "null",
 ];
 
 const fn k(name: &'static str, ty: ExpectedType, required: bool, expr_ok: bool) -> KeyRule {
@@ -138,6 +138,8 @@ macro_rules! kind_schema {
             nested: &[
                 NestedBlock { kind: "value", name_mode: NameMode::Required, schema: $value },
                 NestedBlock { kind: "action", name_mode: NameMode::Required, schema: $action },
+                // One per instance, named `<instance>.<name>`.
+                NestedBlock { kind: "alert", name_mode: NameMode::Required, schema: ALERT_SCHEMA },
                 $($nested),*
             ],
             body_mode: BodyMode::Keyed,
@@ -162,7 +164,12 @@ const KIND_SSH: &BlockSchema = kind_schema!(
 const KIND_HTTP: &BlockSchema = kind_schema!(
     VALUE_HTTP,
     ACTION_HTTP,
-    [k("url", E::Str, true, true), k("ca", E::Path, false, true), k("insecure", E::Bool, false, false)],
+    [
+        k("url", E::Str, true, true),
+        k("user", E::Str, false, true),
+        k("ca", E::Path, false, true),
+        k("insecure", E::Bool, false, false)
+    ],
     [HEADERS]
 );
 const KIND_SOCKET: &BlockSchema = kind_schema!(
@@ -453,7 +460,7 @@ fn check_secret_use(b: &Block, via: &str, diags: &mut Vec<Diagnostic>) {
                     let allowed = in_secret_block
                         || match via {
                             "local" => key == "run",
-                            "http" => matches!(key, "url" | "body"),
+                            "http" => matches!(key, "url" | "user" | "body"),
                             "socket" => key == "send",
                             _ => false,
                         };
@@ -538,7 +545,9 @@ pub(super) fn check_instance(b: &Block, doc: &Document, source: &SourceMap, diag
     if !is_plain_name(&name.text) {
         diags.push(Diagnostic::new(name.span, "a remote name is `[a-z][a-z0-9_]*` and not a CEL keyword"));
     }
-    if let Some(span) = shadowing(doc, &name.text) {
+    // The shipped library's own `repeat a in ...` reads no remote:
+    // only the config's names count.
+    if let Some(span) = shadowing(doc, &name.text).into_iter().find(|s| source.location(*s).path != std::path::Path::new("<library>")) {
         diags.push(Diagnostic::new(
             span,
             format!("`{}` is a remote; a param or `repeat` of that name would hide it in expressions", name.text),
@@ -607,17 +616,48 @@ fn has_secret(doc: &Document, name: &str) -> bool {
 
 /// The first `param` or `repeat` binding named `name` anywhere in
 /// `doc`: inside it, `name.x` would read the param, not the remote.
-fn shadowing(doc: &Document, name: &str) -> Option<Span> {
-    fn walk(items: &[Item], name: &str) -> Option<Span> {
-        items.iter().find_map(|it| match it {
-            Item::Param(p) if p.name.text == name => Some(p.name.span),
-            Item::Repeat(r) if r.binding.text == name => Some(r.binding.span),
-            Item::Repeat(r) => walk(&r.items, name),
-            Item::Block(b) => walk(&b.items, name),
-            _ => None,
-        })
+fn shadowing(doc: &Document, name: &str) -> Vec<Span> {
+    fn walk(items: &[Item], name: &str, out: &mut Vec<Span>) {
+        for it in items {
+            match it {
+                Item::Param(p) if p.name.text == name => out.push(p.name.span),
+                Item::Repeat(r) => {
+                    if r.binding.text == name {
+                        out.push(r.binding.span);
+                    }
+                    walk(&r.items, name, out);
+                }
+                Item::Block(b) => walk(&b.items, name, out),
+                _ => {}
+            }
+        }
     }
-    walk(&doc.items, name)
+    let mut out = Vec::new();
+    walk(&doc.items, name, &mut out);
+    out
+}
+
+/// `self` (the instance) exists only in a remote kind's alerts: refuse
+/// it everywhere else, where it would be an unknown name at run time.
+pub(super) fn check_self_use(doc: &Document, diags: &mut Vec<Diagnostic>) {
+    fn walk(items: &[Item], in_kind: bool, diags: &mut Vec<Diagnostic>) {
+        for it in items {
+            match it {
+                Item::Assign(a) => {
+                    for e in exprs_of(&a.value) {
+                        if let Some(span) = crate::cel::find_ident(&e, "self") {
+                            diags.push(Diagnostic::new(span, "`self` is the instance in a remote kind's alerts only; elsewhere use its name"));
+                        }
+                    }
+                }
+                Item::Block(b) if in_kind && b.kind.text == "alert" => {}
+                Item::Block(b) => walk(&b.items, in_kind || b.kind.text == "remote_kind", diags),
+                Item::Repeat(r) => walk(&r.items, in_kind, diags),
+                _ => {}
+            }
+        }
+    }
+    walk(&doc.items, false, diags);
 }
 
 /// References inside a kind's members: a sibling member by its bare
@@ -631,6 +671,14 @@ pub(super) fn resolve_kind_refs(kind: &Block, names: &Names, diags: &mut Vec<Dia
     for (_, m) in members(kind) {
         if m.kind.text == "action" {
             resolve_refs_in_block(m, "action", &local, diags);
+        }
+    }
+    // A kind's alert: `from` a sibling value, `action` a sibling action.
+    for it in &kind.items {
+        if let Item::Block(b) = it {
+            if b.kind.text == "alert" {
+                resolve_refs_in_block(b, "alert", &local, diags);
+            }
         }
     }
 }
@@ -787,5 +835,30 @@ mod tests {
         assert!(has(&d3, "read once at load"), "{d3:?}");
         // The header itself may hold the secret param.
         assert!(!d.iter().any(|m| m.contains(":18:") && m.contains("is a secret")), "{d:?}");
+    }
+
+    #[test]
+    fn a_kind_may_declare_alerts_reading_its_members() {
+        let src = "remote_kind box {\n param label: string\n via = local\n value temp { run = echo 1; parse = number }\n\
+                   value log { run = cat; stream = true }\n action fix { run = true }\n\
+                   alert hot { when = {{ self.temp > 80 }}; title = {{ label }}; action = fix }\n alert ev { from = log }\n}\n\
+                   remote a: box { label = x }\n";
+        let d = check_text(src);
+        assert!(d.is_empty(), "{d:?}");
+        let d = check_text("remote_kind box { via = local\n alert bad { from = nope } }\nremote self: box { }\n");
+        assert!(has(&d, "unknown source `nope`"), "{d:?}");
+        assert!(has(&d, "a name expressions already use"), "{d:?}");
+        // The library's own `repeat a in ...` does not keep a remote from
+        // being called `a`.
+        assert!(check_text("remote_kind k { via = local }\nremote a: k { }\n").is_empty());
+    }
+
+    #[test]
+    fn self_is_only_for_a_kinds_alerts() {
+        let d = check_text(
+            "remote_kind k { via = local\n value v { run = echo {{ self.x }} }\n alert a { when = {{ self.v > 1 }} } }\n\
+             page p { text { value = {{ self.v }} } }\n",
+        );
+        assert_eq!(d.iter().filter(|m| m.contains("`self` is the instance")).count(), 2, "{d:?}");
     }
 }

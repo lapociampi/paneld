@@ -1249,6 +1249,7 @@ pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
 
     resolve_refs(doc, &names, &mut diags);
     check_ssh_runs(doc, &mut diags);
+    remote::check_self_use(doc, &mut diags);
     check_override_targets(doc, &mut diags);
     check_reminder_schedules(doc, &mut diags);
 
@@ -2539,6 +2540,22 @@ fn validate_theme_sub_block(child: &Block, ctx: &UiContext, diags: &mut Vec<Diag
 /// captured as a raw string by the lexer; validate its shape here,
 /// then accept any key = value entry in the body.
 fn validate_theme_style_block(b: &Block, diags: &mut Vec<Diagnostic>) {
+    // A `:state` body holds styles LVGL keeps per state; size, grow,
+    // visibility and enabled would apply in every state.
+    if b.name.as_ref().is_some_and(|n| n.text.contains(':')) {
+        for it in &b.items {
+            if let Item::Assign(a) = it {
+                if let AssignTarget::Simple { key } = &a.target {
+                    if matches!(key.text.as_str(), "width" | "height" | "grow" | "visible" | "enabled") {
+                        diags.push(Diagnostic::new(
+                            key.span,
+                            format!("`{}` cannot change with a state; set it on the node or in a style without `:state`", key.text),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let Some(selector) = &b.name else {
         diags.push(Diagnostic::new(
             b.kind.span,
@@ -3941,6 +3958,15 @@ mod tests {
         assert_msg(&d, "unknown action `bmup`");
         assert_msg(&d, "`value` is not known yet when `on_change` picks its action");
         assert_eq!(d.len(), 2, "{d:?}");
+    }
+
+    #[test]
+    fn a_state_style_takes_only_what_can_change_with_the_state() {
+        let d = check_text("theme t { style .card:checked { visible = false; background = #000 }\n style button:pressed { width = 400 } }\n");
+        assert_msg(&d, "`visible` cannot change with a state");
+        assert_msg(&d, "`width` cannot change with a state");
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(check_text("theme t { style .card { visible = false; width = 10 } }\n").is_empty());
     }
 
     #[test]

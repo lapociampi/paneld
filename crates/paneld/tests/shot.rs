@@ -743,7 +743,7 @@ fn an_http_remote_polls_and_its_action_posts_through_curl() {
              page home {{\n\
                  button {{ width = 200; height = 100; label = Stop; on_tap = h1.stop }}\n\
                  rect {{ width = 200; height = 100\n\
-                        background = {{{{ h1.info == 7 ? '#00ff00' : '#ff0000' }}}} }}\n\
+                        background = {{{{ h1.info == 7 && h1.status.info.status == 200 && h1.status.info.stderr == '' ? '#00ff00' : '#ff0000' }}}} }}\n\
              }}\n",
             tok = d.join("tok").display()
         ),
@@ -1153,4 +1153,26 @@ fn an_area_chart_fills_under_its_line() {
     };
     assert!(tinted(&shot(&conf("area"), &["--settle", "50"])), "no fill under an area chart");
     assert!(!tinted(&shot(&conf("line"), &["--settle", "50"])), "a line chart got a fill");
+}
+
+#[test]
+fn button_rows_fire_once_per_change_and_values_match_options_first() {
+    let d = tmp("select-fixes");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var n: int = 0\n\
+         var c: string = \"x\"\n\
+         var iv: int = 5\n\
+         page home {\n\
+             title = S\n\
+             select { style = buttons; width = 300; height = 50; options = {{ ['x', 'y', ''] }}; value = {{ vars.c }}; on_change { set { n = {{ vars.n + 1 }}; c = {{ value }} } } }\n\
+             select { style = roller; width = 120; options = {{ [1, 2, 5, 10] }}; value = {{ vars.iv }} }\n\
+             rect { width = 40; height = 40; background = {{ vars.n == 1 ? '#00ff00' : vars.n > 1 ? '#ff0000' : '#0000ff' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    // Tap `y` twice: one change. (Each button is a third of the row.)
+    let img = shot(&conf, &["--tap", "160,90", "--settle", "200", "--tap", "160,90", "--settle", "200"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "not exactly one change");
 }

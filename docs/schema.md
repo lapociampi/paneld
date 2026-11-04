@@ -91,7 +91,7 @@ In expressions, `sources.<name>`:
 | Field | Type |
 | --- | --- |
 | `value` | the value's type |
-| `ok` | bool, last run succeeded; `false` (with `value` null) before the first result. A run with no result (timeout, unparseable output, a stream that stopped or cannot start) changes only `ok` and `error`; the rest of the last result stays |
+| `ok` | bool, last run succeeded; `false` (with `value` null) before the first result, and after a failed run whose output does not parse. A run with no result (timeout, unparseable output, a stream that stopped or cannot start) changes only `ok` and `error`; the rest of the last result stays |
 | `error` | string, stderr or the reason |
 | `at` | timestamp of the last value |
 | `age` | duration since `at` |
@@ -140,7 +140,7 @@ action pause_adblock {
 
 Order: params asked, PIN, confirm, `run`, then on success `set`, `goto`, `refresh`, `then`; on failure `else`. While an action runs, further calls of it with the same args are ignored, also across a reload; calls with other args (another row of a `repeat`, a toggle switched back) wait and run in the order they were made. Different actions run side by side, at most `app:max_running` commands at once.
 
-`result`: `{ok: bool, code: int, stdout: string, stderr: string, out: <parsed>}`.
+`result`: `{ok: bool, code: int, stdout: string, stderr: string, out: <parsed>}`; a remote `http` action adds `status`, the HTTP status of a whole answer (0 for none, or one cut off).
 
 ### Calling an action
 
@@ -523,12 +523,13 @@ page home {
 | `timeout` | duration; default for its members |
 | `value <name> { }` | a source (section 4) |
 | `action <name> { }` | an action (section 5) |
+| `alert <name> { }` | an alert (section 9), one per instance, named `<instance>.<name>`: its expressions read the kind's params and `self`, the instance as pages see it (`when = {{ self.temp > 80 }}`); `from` and `action` can name a sibling member |
 
 | `via` | Keys |
 | --- | --- |
 | `local` | none |
 | `ssh` | `host` (required), `key` (private key file, required), `user`, `port` (22), `known_hosts` (default `known_hosts` in the folder of `app:state`), `host_key` (`check` default, or `accept_new`) |
-| `http` | `url` (base URL, required; `secrets` allowed), `headers { Name = value }` (`secrets` allowed; `_` in a name is sent as `-`: `X_Api_Key`), `ca` (CA file), `insecure` (bool, skip TLS checks) |
+| `http` | `url` (base URL, required; `secrets` allowed), `user` (`user:password` for HTTP basic auth; `secrets` allowed), `headers { Name = value }` (`secrets` allowed; `_` in a name is sent as `-`: `X_Api_Key`), `ca` (CA file), `insecure` (bool, skip TLS checks) |
 | `socket` | `path` (Unix socket), or `host` and `port` (TCP) |
 
 ### 17.2 Members
@@ -546,13 +547,13 @@ A `value` needs its request (`run`, a method, or `send`). Member names `ok`, `er
 
 ### 17.3 Instance
 
-`remote <name>: <kind> { <param> = <value> }`, a literal or `$variable` per param. `remote[device1]:host = ...` overrides one param. Names are `[a-z][a-z0-9_]*`; an instance name may not be an expression root (section 16), a CEL keyword, a `repeat` binding or a param name.
+`remote <name>: <kind> { <param> = <value> }`, a literal or `$variable` per param. `self` is reserved. `remote[device1]:host = ...` overrides one param. Names are `[a-z][a-z0-9_]*`; an instance name may not be an expression root (section 16), a CEL keyword, a `repeat` binding or a param name.
 
 | Expression | Value |
 | --- | --- |
 | `device1.temp` | the value of member `temp` (null before its first result) |
 | `device1.ok` | bool: at least one member value has a result and none has failed since |
 | `device1.error` | the first failing member's `error` in declaration order, or `""` |
-| `device1.status.temp` | the source map of `temp` (section 4: `ok`, `error`, `at`, `history`, ...) |
+| `device1.status.temp` | the source map of `temp` (section 4: `ok`, `error`, `at`, `history`, ...; `status`, the HTTP status, for an `http` member) |
 
 Members are named `device1.temp`, `device1.reboot` wherever a source or action name fits: `on_tap = device1.reboot`, `on_tap device1.restart { unit = nginx }`, `refresh = device1.temp`, `alert ... { from = device1.log }`, `ctl` commands. They are not in `sources`.

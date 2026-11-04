@@ -480,13 +480,15 @@ fn render_node(
             let options = resolve_assign_value(node, "options", ctx)
                 .map(dropdown_options)
                 .unwrap_or_default();
-            let selected = resolve_assign_value(node, "value", ctx).map(|v| match v {
-                Value::Int(n) if n >= 0 => n as usize,
-                Value::Double(d) if d >= 0.0 => d as usize,
-                other => {
-                    let s = other.to_display_string();
-                    options.iter().position(|o| o == &s).unwrap_or(0)
-                }
+            // The option itself first (`value = 5` with options [1, 5]),
+            // else a position.
+            let selected = resolve_assign_value(node, "value", ctx).map(|v| {
+                let text = v.to_display_string();
+                options.iter().position(|o| *o == text).unwrap_or(match v {
+                    Value::Int(n) if n >= 0 && (n as usize) < options.len() => n as usize,
+                    Value::Double(d) if d >= 0.0 && (d as usize) < options.len() => d as usize,
+                    _ => 0,
+                })
             });
             let (obj, widget) = match find_simple(node, "style").map(str::trim) {
                 Some("roller") => {
@@ -981,12 +983,21 @@ fn action_name(raw: &str, span: paneld_config::source::Span, ctx: &Context) -> O
 
 /// Apply `node`'s plain properties (size, spacing, colors, font,
 /// visibility, ...) to `obj`.
+/// Properties that are not styles LVGL keeps per state: in a theme's
+/// `:pressed` (etc.) body they would apply in every state.
+pub const STATELESS_KEYS: &[&str] = &["width", "height", "grow", "visible", "enabled"];
+
 fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
     for item in items {
         let Item::Assign(a) = item else { continue };
         let AssignTarget::Simple { key } = &a.target else {
             continue;
         };
+        // In a `:state` style only what LVGL keeps per state applies
+        // (the check refuses the rest there).
+        if crate::ui::in_state() && STATELESS_KEYS.contains(&key.text.as_str()) {
+            continue;
+        }
         let value = a.value.text.trim();
         match key.text.as_str() {
             "width" => {

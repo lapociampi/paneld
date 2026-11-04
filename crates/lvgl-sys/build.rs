@@ -210,6 +210,10 @@ fn compile_lvgl(manifest_dir: &Path, lvgl_dir: &Path, sdl: bool, drm: bool, libd
         build.file(src);
     }
 
+    // paneld's accessors for LVGL internals (`include/paneld_lv.h`).
+    build.file(manifest_dir.join("csrc/paneld_lv.c"));
+    println!("cargo:rerun-if-changed=csrc/paneld_lv.c");
+    println!("cargo:rerun-if-changed=include/paneld_lv.h");
     build.compile("lvgl");
 
     println!("cargo:include={}", lvgl_dir.display());

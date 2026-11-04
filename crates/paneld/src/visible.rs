@@ -133,6 +133,20 @@ fn analyse(doc: &Document, remotes: &BTreeMap<String, Vec<String>>) -> (BTreeMap
             "action" => walk(&b.items, &components, remotes, &mut Vec::new(), &mut always),
             "alert" => {
                 walk(&b.items, &components, remotes, &mut Vec::new(), &mut always);
+                // A remote kind's alert reads its instance as `self`:
+                // the members it names (`self.temp`), not all of them.
+                if let Some(inst) = paneld_config::remote::remote_of(b) {
+                    let mut with_self = remotes.clone();
+                    with_self.insert("self".into(), remotes.get(inst).cloned().unwrap_or_default());
+                    let mut read = BTreeSet::new();
+                    walk(&b.items, &components, &with_self, &mut Vec::new(), &mut read);
+                    for name in read {
+                        match name.strip_prefix("self.") {
+                            Some(m) => always.insert(format!("{inst}.{m}")),
+                            None => always.insert(name),
+                        };
+                    }
+                }
                 // `from = <source>`: an event alert reads its stream.
                 for inner in &b.items {
                     if let Item::Assign(a) = inner {
@@ -307,7 +321,8 @@ mod tests {
              page c { text { value = {{ sources['idx'].value }} {{ d2.ok }} } }\n\
              page d { text { value = {{ sources[vars.name].value }} } }\n\
              page e { text { value = {{ size(sources) }} } }\n\
-             action ask { param u: string { ask = select; options = {{ sources.units.value }} }\n confirm = {{ sources.vm.value }}? }\n",
+             action ask { param u: string { ask = select; options = {{ sources.units.value }} }\n confirm = {{ sources.vm.value }}? }\n\
+             alert d1.hot { when = {{ self.temp > 80 }}\n remote = d1 }\n",
         );
         let (pages, always) = analyse(&d, &remotes(&[("d1", &["temp", "load"]), ("d2", &["a", "b"])]));
         assert_eq!(pages["a"], set(&["clock", "cpu", "unit"]));
@@ -316,7 +331,8 @@ mod tests {
         assert_eq!(pages["c"], set(&["clock", "d2.a", "d2.b", "idx"]));
         assert_eq!(pages["d"], set(&["*", "clock"]));
         assert_eq!(pages["e"], set(&["*", "clock"]));
-        assert_eq!(always, set(&["log", "temp", "units", "vm"]));
+        // A kind alert: only the member it reads, `self.temp`.
+        assert_eq!(always, set(&["d1.temp", "log", "temp", "units", "vm"]));
     }
 
     #[test]

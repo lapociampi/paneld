@@ -47,6 +47,21 @@ pub struct AlertRule {
     pub link_raw: String,
     pub link_span: paneld_config::source::Span,
     pub action: Option<String>,
+    /// Declared by a remote kind (schema 17): the instance, whose params
+    /// and `self` its expressions read.
+    pub remote: Option<String>,
+}
+
+/// `ctx` for a rule a remote kind declared: its instance's params, and
+/// `self`, the instance as pages see it (`self.temp`, `self.ok`).
+fn rule_ctx(rule: &AlertRule, ctx: &Context) -> Option<Context> {
+    let inst = rule.remote.as_deref()?;
+    let mut c = ctx.clone();
+    crate::remotes::current().bind(inst, &mut c);
+    if let Some(root) = ctx.get(inst) {
+        c.insert("self".into(), root.clone());
+    }
+    Some(c)
 }
 
 /// A firing alert, as held by the engine and exposed through the
@@ -516,7 +531,7 @@ impl Engine {
             if rule.from.as_deref() != Some(source_name) {
                 continue;
             }
-            let mut ctx = base_ctx.clone();
+            let mut ctx = rule_ctx(rule, base_ctx).unwrap_or_else(|| base_ctx.clone());
             ctx.insert("event".into(), event.clone());
 
             if let Some(when_raw) = rule.when_raw.as_deref() {
@@ -580,12 +595,23 @@ impl Engine {
         let mut seen: BTreeMap<String, ()> = BTreeMap::new();
         self.undecided.clear();
 
+        // A remote kind's alerts: one context per instance per tick.
+        let mut by_instance: BTreeMap<String, Context> = BTreeMap::new();
         for rule in &self.rules {
             // Event-mode rules do not fire from `tick`; they will be
             // driven by source updates in a later phase.
             if rule.from.is_some() {
                 continue;
             }
+            let ctx = match &rule.remote {
+                Some(inst) => {
+                    if !by_instance.contains_key(inst) {
+                        by_instance.insert(inst.clone(), rule_ctx(rule, ctx).unwrap_or_else(|| ctx.clone()));
+                    }
+                    &by_instance[inst]
+                }
+                None => ctx,
+            };
             let Some(when_raw) = rule.when_raw.as_deref() else {
                 continue;
             };
@@ -846,6 +872,7 @@ fn collect(doc: &Document) -> Vec<AlertRule> {
             link_raw: String::new(),
             link_span: zero_span(),
             action: None,
+            remote: paneld_config::remote::remote_of(b).map(str::to_string),
         };
         for inner in &b.items {
             let Item::Assign(a) = inner else { continue };

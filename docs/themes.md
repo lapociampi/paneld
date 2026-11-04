@@ -27,7 +27,7 @@ Asset paths in `theme.conf` are relative to the theme's folder.
 | Part | What | Example |
 | --- | --- | --- |
 | Tokens | Colors, fonts, sizes, spacing, radius, shadows, background image; read as `theme.x` | `accent = #44aaff` |
-| Styles | Properties for every node (`*`), per building block and per named class (a node opts in with `class = ...`), applied in that order under what the node sets itself; then per state of either: `:pressed`, `:checked`, `:disabled` (a node with `enabled = false`), `:focused`, `:hover` | `style button:pressed { scale = 0.96 }`, `style .card { radius = 16 }`, `style .card:pressed { background = #333 }` |
+| Styles | Properties for every node (`*`), per building block and per named class (a node opts in with `class = ...`), applied in that order under what the node sets itself (in the default state: a state style wins while the node is in its state); then per state of either: `:pressed`, `:checked`, `:disabled` (a node with `enabled = false`), `:focused`, `:hover`. A state body cannot change `width`, `height`, `grow`, `visible` or `enabled` | `style button:pressed { scale = 0.96 }`, `style .card { radius = 16 }`, `style .card:pressed { background = #333 }` |
 | Components | Replacements for library components, including the page shell (header, navigation, where banners appear): this is how a theme changes the layout | `component stat_tile { ... }` |
 | Motion | Page transitions, tap feedback, animated value changes, alert banner entrance | `page_transition = fade 200ms` |
 | Inheritance | Start from another theme and change a few things | `extends = dark` |

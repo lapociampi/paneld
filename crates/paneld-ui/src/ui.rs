@@ -433,6 +433,10 @@ fn widget_value(kind: ChangeKind, target: *mut sys::lv_obj_t) -> Option<EventVal
         }
         ChangeKind::Buttons => {
             let idx = unsafe { sys::lv_buttonmatrix_get_selected_button(target) };
+            // Tapping the option already chosen changes nothing.
+            if ROW_CHOICE.with(|c| c.borrow_mut().insert(target as usize, Some(idx))) == Some(Some(idx)) {
+                return None;
+            }
             let text = unsafe { sys::lv_buttonmatrix_get_button_text(target, idx) };
             if text.is_null() {
                 return None;
@@ -1088,7 +1092,11 @@ impl<'ui> Obj<'ui> {
                 let mut content: sys::lv_area_t = std::mem::zeroed();
                 sys::lv_obj_get_content_coords(chart, &mut content);
                 let bottom = content.y2;
+                let clip = *sys::lv_paneld_layer_clip_area(layer);
                 let count = sys::lv_chart_get_point_count(chart);
+                // Dense series: a segment at least every 2 px is enough.
+                let width = (content.x2 - content.x1).max(1) as u32;
+                let step = (count / (width / 2).max(1)).max(1);
                 let mut ser = sys::lv_chart_get_series_next(chart, std::ptr::null_mut());
                 while !ser.is_null() {
                     let ys = sys::lv_chart_get_series_y_array(chart, ser);
@@ -1098,12 +1106,31 @@ impl<'ui> Obj<'ui> {
                         sys::lv_chart_get_point_pos_by_id(chart, ser, i, &mut p);
                         (coords.x1 + p.x, coords.y1 + p.y)
                     };
-                    for i in 0..count.saturating_sub(1) {
+                    let mut i = 0;
+                    while i + 1 < count {
+                        let j = (i + step).min(count - 1);
+                        let (a, b) = (i, j);
+                        i = j;
                         let none = |k: u32| *ys.add(k as usize) == sys::LV_CHART_POINT_NONE as i32;
-                        if none(i) || none(i + 1) {
+                        if none(a) || none(b) {
                             continue;
                         }
-                        let ((x0, y0), (x1, y1)) = (at(i), at(i + 1));
+                        let ((x0, y0), (x1, y1)) = (at(a), at(b));
+                        // Only what is being redrawn.
+                        if x1 < clip.x1 || x0 > clip.x2 {
+                            continue;
+                        }
+                        // A narrow segment as a plain column (much cheaper to
+                        // draw in software); a wide one exactly.
+                        if x1 - x0 <= 4 {
+                            let mut dsc: sys::lv_draw_rect_dsc_t = std::mem::zeroed();
+                            sys::lv_draw_rect_dsc_init(&mut dsc);
+                            dsc.bg_color = color;
+                            dsc.bg_opa = 80;
+                            let area = sys::lv_area_t { x1: x0, y1: (y0 + y1) / 2, x2: (x1 - 1).max(x0), y2: bottom };
+                            sys::lv_draw_rect(layer, &dsc, &area);
+                            continue;
+                        }
                         for tri in [[(x0, y0), (x1, y1), (x1, bottom)], [(x0, y0), (x1, bottom), (x0, bottom)]] {
                             let mut dsc: sys::lv_draw_triangle_dsc_t = std::mem::zeroed();
                             sys::lv_draw_triangle_dsc_init(&mut dsc);
@@ -1311,7 +1338,11 @@ impl<'ui> Obj<'ui> {
         assert!(!raw.is_null());
         // LVGL keeps pointers to the labels: they live with the widget
         // and are freed when LVGL deletes it.
-        let labels: Vec<CString> = options.iter().map(|o| CString::new(o.as_str()).unwrap_or_default()).collect();
+        // An empty label is LVGL's end of the map: show it as a space.
+        let labels: Vec<CString> = options
+            .iter()
+            .map(|o| CString::new(if o.is_empty() { " " } else { o.as_str() }).unwrap_or_default())
+            .collect();
         let mut map: Vec<*const std::os::raw::c_char> = labels.iter().map(|c| c.as_ptr()).collect();
         map.push(c"".as_ptr());
         let owned: Box<ButtonLabels> = Box::new((labels, map));
@@ -1325,11 +1356,22 @@ impl<'ui> Obj<'ui> {
         }
         unsafe {
             sys::lv_buttonmatrix_set_map(raw, owned.1.as_ptr());
-            sys::lv_buttonmatrix_set_button_ctrl_all(raw, sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_CHECKABLE);
+            // On release (not on press, not repeated while held), like a
+            // tap anywhere else.
+            sys::lv_buttonmatrix_set_button_ctrl_all(
+                raw,
+                sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_CHECKABLE
+                    | sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_CLICK_TRIG
+                    | sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_NO_REPEAT,
+            );
+            // Room for the buttons in a short row.
+            sys::lv_obj_set_style_pad_all(raw, 4, 0);
+            sys::lv_obj_set_style_pad_gap(raw, 4, 0);
             sys::lv_buttonmatrix_set_one_checked(raw, true);
             if let Some(i) = selected {
                 sys::lv_buttonmatrix_set_button_ctrl(raw, i as u32, sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_CHECKED);
             }
+            ROW_CHOICE.with(|c| c.borrow_mut().insert(raw as usize, selected.map(|i| i as u32)));
             sys::lv_obj_add_event_cb(raw, Some(free_map), sys::lv_event_code_t_LV_EVENT_DELETE, Box::into_raw(owned).cast());
         }
         Obj { raw, _ui: PhantomData }
@@ -1780,7 +1822,7 @@ impl<'ui> Obj<'ui> {
             sys::lv_obj_set_style_text_align(
                 self.raw,
                 sys::lv_text_align_t_LV_TEXT_ALIGN_CENTER,
-                0,
+                sel(),
             )
         };
     }
@@ -1789,7 +1831,7 @@ impl<'ui> Obj<'ui> {
             sys::lv_obj_set_style_text_align(
                 self.raw,
                 sys::lv_text_align_t_LV_TEXT_ALIGN_RIGHT,
-                0,
+                sel(),
             )
         };
     }
@@ -2119,6 +2161,12 @@ pub enum Size {
     Content,
 }
 
+thread_local! {
+    /// Each button row's chosen option, so a tap on it again is no
+    /// change. Keyed by the widget's address; a new row there resets it.
+    static ROW_CHOICE: std::cell::RefCell<std::collections::HashMap<usize, Option<u32>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// A button row's labels and the pointer map LVGL reads.
 type ButtonLabels = (Vec<CString>, Vec<*const std::os::raw::c_char>);
 
@@ -2136,6 +2184,12 @@ thread_local! {
 
 fn sel() -> sys::lv_style_selector_t {
     SELECTOR.with(|s| s.get())
+}
+
+/// A state style is being applied: properties LVGL cannot hold per
+/// state (size, grow, visibility, enabled) must not be set.
+pub fn in_state() -> bool {
+    sel() != 0
 }
 
 /// The LVGL state for a style selector's `:state`.
