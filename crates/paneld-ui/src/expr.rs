@@ -465,7 +465,20 @@ fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Res
             Some((Expr { kind: ExprKind::Ident(v), .. }, rest)) if !rest.is_empty() && rest.len() <= 2 => (v, rest),
             _ => return Err(EvalError::new(format!(".{name}() takes a name and an expression"))),
         };
-        let mut scope = ctx.clone();
+        // Only what the body reads (not every source with its history),
+        // so a macro inside a macro stays cheap.
+        let mut scope = Context::new();
+        // `theme` is read without being named (`color('accent')`).
+        if let Some(t) = ctx.get("theme") {
+            scope.insert("theme".into(), t.clone());
+        }
+        for e in rest {
+            for (name, _) in paneld_config::cel::idents(e) {
+                if let Some(v) = ctx.get(&name) {
+                    scope.entry(name).or_insert_with(|| v.clone());
+                }
+            }
+        }
         let mut with = |item: &Value, e: &Expr| {
             scope.insert(var.clone(), item.clone());
             eval(e, &scope)
@@ -1252,5 +1265,33 @@ mod more_tests {
         for e in ["format(inf, 'C')", "duration(nan)", "clamp(nan, 0, 1)", "mix('#000', '#fff', nan)", "timestamp(inf)"] {
             assert!(try_ev(e, &ctx).is_err(), "{e} gave {:?}", try_ev(e, &ctx));
         }
+    }
+
+    #[test]
+    fn nested_macros_see_outer_names_and_stay_cheap_beside_big_sources() {
+        let mut ctx = Context::new();
+        // Twenty sources with a 2000-sample history each.
+        let history = Value::List((0..2000).map(|i| Value::Map(BTreeMap::from([("at".to_string(), I(i)), ("value".to_string(), D(i as f64))]))).collect());
+        let sources: BTreeMap<String, Value> =
+            (0..20).map(|i| (format!("s{i}"), Value::Map(BTreeMap::from([("history".to_string(), history.clone())])))).collect();
+        ctx.insert("sources".into(), Value::Map(sources));
+        ctx.insert("rows".into(), Value::List((0..50).map(I).collect()));
+        ctx.insert("k".into(), I(3));
+        let t = std::time::Instant::now();
+        let v = try_ev("rows.map(r, rows.filter(c, c < r && c % k == 0).size()).filter(n, n > 10).size()", &ctx).unwrap();
+        // For r in 0..50: multiples of 3 below r (0 counts), more than
+        // 10 of them from r = 31 on: 19 rows.
+        assert_eq!(v, I(19));
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "nested macros took {:?}", t.elapsed());
+        // An inner macro's name does not hide the outer one's.
+        assert_eq!(try_ev("rows.exists(x, [x].exists(y, y == x && x == 49))", &ctx).unwrap(), B(true));
+    }
+
+    #[test]
+    fn theme_colors_work_inside_a_macro() {
+        let mut ctx = Context::new();
+        ctx.insert("theme".into(), Value::Map(BTreeMap::from([("accent".to_string(), S("#112233".into()))])));
+        ctx.insert("l".into(), Value::List(vec![I(1)]));
+        assert_eq!(try_ev("l.map(x, color('accent'))", &ctx).unwrap(), Value::List(vec![S("#112233".into())]));
     }
 }

@@ -15,7 +15,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc;
+// Sends wake the UI thread's pump, which waits in `poll`.
+use paneld_ui::WakingSender as Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -72,7 +74,8 @@ impl Request {
 /// Spawn a background thread that polls the config file's mtime
 /// every `interval` and sends [`ControlMsg::Reload`] on `tx` when
 /// it changes.
-pub fn watch_config(path: &Path, interval: Duration, tx: Sender<ControlMsg>) {
+pub fn watch_config(path: &Path, interval: Duration, tx: impl Into<Sender<ControlMsg>>) {
+    let tx = tx.into();
     let path = path.to_path_buf();
     let mut last = mtime(&path);
     thread::spawn(move || loop {
@@ -139,7 +142,8 @@ fn check_private_dir(dir: &Path) -> std::io::Result<()> {
 /// requests on `tx`. The socket file is unlinked on bind so a
 /// leftover from a crashed daemon doesn't block startup; it is made
 /// owner and group only (ADR 0007).
-pub fn serve(path: &Path, tx: Sender<ControlMsg>) -> std::io::Result<()> {
+pub fn serve(path: &Path, tx: impl Into<Sender<ControlMsg>>) -> std::io::Result<()> {
+    let tx = tx.into();
     use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = path.parent() {
         if parent == fallback_dir() {
@@ -246,7 +250,11 @@ fn read_line_by(reader: &mut BufReader<&UnixStream>, stream: &UnixStream, line: 
             return Err(std::io::ErrorKind::TimedOut.into());
         }
         stream.set_read_timeout(Some(left))?;
-        let buf = reader.fill_buf()?;
+        let buf = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if buf.is_empty() {
             break;
         }
@@ -284,7 +292,7 @@ fn answer(line: &str, tx: &Sender<ControlMsg>) -> String {
         return reply_line(&id, &Ok(Value::String("pong".into())));
     }
     let (reply_tx, reply_rx) = mpsc::channel();
-    if tx.send(ControlMsg::Request(Request { cmd, args, reply: reply_tx })).is_err() {
+    if tx.send(ControlMsg::Request(Request { cmd, args, reply: reply_tx.into() })).is_err() {
         return reply_line(&id, &Err(CtlError::msg("daemon is shutting down")));
     }
     // A reload can take a moment (it runs every source once).

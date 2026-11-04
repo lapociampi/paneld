@@ -1248,6 +1248,7 @@ pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     }
 
     resolve_refs(doc, &names, &mut diags);
+    check_ssh_runs(doc, &mut diags);
     check_override_targets(doc, &mut diags);
     check_reminder_schedules(doc, &mut diags);
 
@@ -1383,44 +1384,136 @@ fn shell_script_interpolates(cmd: &str) -> bool {
     false
 }
 
-/// True if `cmd` runs `ssh` (also behind `sudo`, `timeout`, ...) and a
-/// `{{ }}` is in the remote command: ssh joins those words into one
-/// line for the remote shell, so the value would be code there.
-fn ssh_command_interpolates(cmd: &str) -> bool {
-    /// ssh options that take the next word.
-    const TAKES_ARG: &[&str] = &[
-        "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R",
-        "-S", "-W", "-w",
+/// Where a `{{ }}` sits in a hand-written ssh command line.
+#[derive(Debug, PartialEq)]
+enum SshSlot {
+    /// In the remote command: ssh joins it into one line for the
+    /// remote shell, so the value is code there.
+    RemoteCommand,
+    /// In ssh's options or its host before `--`: a value starting with
+    /// `-` is read as an option (`-oProxyCommand=...` runs a command
+    /// on the panel).
+    OptionOrHost,
+}
+
+/// The words of `cmd` holding `{{ }}` that ssh would treat as shell
+/// code or options, when `cmd` runs `ssh` or `autossh` (also behind
+/// `sudo`, `timeout`, `sshpass`, `flock <file>`, ...).
+fn ssh_risks(cmd: &str) -> Vec<(SshSlot, String)> {
+    /// ssh (and autossh) options that take an argument.
+    const TAKES_ARG: &str = "BbcDEeFIiJLlmMOoPpQRSWw";
+    const WRAPPERS: &[&str] = &[
+        "env", "sudo", "doas", "nice", "ionice", "timeout", "nohup", "stdbuf", "setsid", "exec", "flock", "command",
+        "xargs", "runuser", "chpst", "sshpass",
     ];
-    const WRAPPERS: &[&str] = &["env", "sudo", "doas", "nice", "ionice", "timeout", "nohup", "stdbuf", "setsid", "exec", "flock"];
     let words = split_words(cmd);
     let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
-    let is_ssh = |w: &str| w == "ssh" || (w.starts_with('/') && base(w) == "ssh");
-    let Some(at) = words.iter().position(|w| is_ssh(w)) else { return false };
-    // It is the program, or follows a wrapper and its options.
-    let wrapped = at == 0
-        || (WRAPPERS.contains(&base(&words[0]).as_str())
-            && words[1..at].iter().all(|w| WRAPPERS.contains(&base(w).as_str()) || w.starts_with('-') || w.contains('=') || w.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))));
-    if !wrapped {
-        return false;
+    let is_ssh = |w: &str| matches!(base(w).as_str(), "ssh" | "autossh");
+    // ssh is the program, or comes after a wrapper (with whatever
+    // options and arguments the wrapper takes in between).
+    let Some(at) = words.iter().position(|w| is_ssh(w)) else { return Vec::new() };
+    if at > 0 && !WRAPPERS.contains(&base(&words[0]).as_str()) {
+        return Vec::new();
     }
+    let mut out = Vec::new();
     let mut j = at + 1;
-    // Options, then the host; what follows is the remote command.
     while j < words.len() {
         let w = &words[j];
         j += 1;
         if w == "--" {
-            j += 1; // the host
+            j += 1; // the host: past `--`, never an option
             break;
         }
-        if !w.starts_with('-') {
-            break; // the host
+        if w.starts_with('-') && w.len() > 1 {
+            if w.contains("{{") {
+                out.push((SshSlot::OptionOrHost, w.clone()));
+            }
+            // `-vp 22`: the letter that takes an argument takes the
+            // rest of the word, or the next word.
+            let letters = &w[1..];
+            if let Some(k) = letters.find(|c| TAKES_ARG.contains(c)) {
+                if k + 1 == letters.len() {
+                    if let Some(arg) = words.get(j) {
+                        if arg.contains("{{") {
+                            out.push((SshSlot::OptionOrHost, arg.clone()));
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            continue;
         }
-        if TAKES_ARG.contains(&w.as_str()) {
-            j += 1;
+        if w.contains("{{") {
+            out.push((SshSlot::OptionOrHost, w.clone()));
+        }
+        break; // the host
+    }
+    for w in words.iter().skip(j) {
+        if w.contains("{{") {
+            out.push((SshSlot::RemoteCommand, w.clone()));
         }
     }
-    words.get(j..).is_some_and(|rest| rest.iter().any(|w| w.contains("{{")))
+    out
+}
+
+/// Every `run` in `doc` that is a hand-written ssh command with a
+/// value where ssh would read it as code or an option. A value that
+/// cannot carry either is fine: built from params typed int, number,
+/// bool or duration, or held to `options` or a `pattern`.
+fn check_ssh_runs(doc: &Document, diags: &mut Vec<Diagnostic>) {
+    fn safe_params(b: &Block) -> std::collections::HashSet<String> {
+        b.items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Param(p)
+                    if matches!(p.ty.text.as_str(), "int" | "number" | "bool" | "duration")
+                        || p.options.as_ref().is_some_and(|o| {
+                            o.items.iter().any(|i| matches!(i, Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "options" || key.text == "pattern")))
+                        }) =>
+                {
+                    Some(p.name.text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    fn walk(items: &[Item], safe: &std::collections::HashSet<String>, diags: &mut Vec<Diagnostic>) {
+        for it in items {
+            match it {
+                Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "run") && a.value.text.contains("{{") => {
+                    for (slot, word) in ssh_risks(&a.value.text) {
+                        let (exprs, _) = crate::cel::parse_interp(&word, a.value.span.file, a.value.span.start);
+                        let names: Vec<String> = exprs.iter().flat_map(crate::cel::idents).map(|(n, _)| n).collect();
+                        if !names.is_empty() && names.iter().all(|n| safe.contains(n)) {
+                            continue;
+                        }
+                        diags.push(Diagnostic::new(
+                            a.value.span,
+                            match slot {
+                                SshSlot::RemoteCommand => format!(
+                                    "`{word}` in the command of an `ssh` is shell code on the far side: ssh hands it to the remote shell. \
+                                     Use a `remote_kind` with `via = ssh`, which quotes each argument (schema 17), or hold the value to \
+                                     a type, `options` or a `pattern`"
+                                ),
+                                SshSlot::OptionOrHost => format!(
+                                    "`{word}` in ssh's options or host could be read as an option (`-oProxyCommand=...` runs a command \
+                                     here); put `--` before the host, or hold the value to a type, `options` or a `pattern`"
+                                ),
+                            },
+                        ));
+                    }
+                }
+                Item::Block(b) => {
+                    let mut inner = safe.clone();
+                    inner.extend(safe_params(b));
+                    walk(&b.items, &inner, diags);
+                }
+                Item::Repeat(r) => walk(&r.items, safe, diags),
+                _ => {}
+            }
+        }
+    }
+    walk(&doc.items, &Default::default(), diags);
 }
 
 /// `cmd` split into words the way the runner does (quotes removed,
@@ -1951,7 +2044,7 @@ fn validate_param_in_body(p: &Param, parent_kind: &str, diags: &mut Vec<Diagnost
         }
     }
     if let (Some(d), Some(pat)) = (&p.default, option("pattern")) {
-        let pattern = crate::value::parse_string(&pat.value.text);
+        let pattern = crate::value::unquote_pattern(&pat.value.text);
         if !d.text.contains("{{") && crate::value::pattern_matches(&pattern, &crate::value::parse_string(&d.text)) == Ok(false) {
             diags.push(Diagnostic::new(d.span, format!("the default of `{}` does not match its `pattern`", p.name.text)));
         }
@@ -1989,7 +2082,7 @@ fn validate_param_options(opts: &OptionsBlock, diags: &mut Vec<Diagnostic>) {
             }
             "pattern" => {
                 check_value_type(&a.value.text, a.value.span, ExpectedType::Str, false, diags);
-                let pattern = crate::value::parse_string(&a.value.text);
+                let pattern = crate::value::unquote_pattern(&a.value.text);
                 if let Err(e) = crate::value::pattern_matches(&pattern, "") {
                     diags.push(Diagnostic::new(a.value.span, format!("`pattern` is not a valid regex: {e}")));
                 }
@@ -2044,14 +2137,6 @@ fn check_value_type(
                 span,
                 "`{{ }}` inside an inline script (`sh -c`, `python -c`, `perl -e`, ...) pastes the value \
                  into code; pass it as an argument (`sh -c '... \"$$1\"' sh {{ x }}`) or in `env { }`"
-                    .to_string(),
-            ));
-        }
-        _ if matches!(ty, ExpectedType::Command) && raw.contains("{{") && ssh_command_interpolates(raw) => {
-            diags.push(Diagnostic::new(
-                span,
-                "`{{ }}` in the command of an `ssh` is shell code on the far side: ssh hands it to the remote \
-                 shell. Use a `remote_kind` with `via = ssh`, which quotes each argument (schema 17)"
                     .to_string(),
             ));
         }
@@ -2413,12 +2498,12 @@ fn validate_theme_assign(a: &Assign, diags: &mut Vec<Diagnostic>) {
     if key.text == "dialog_backdrop" {
         let v = a.value.text.trim();
         let ok = v == "transparent"
-            || v.strip_prefix("blur").is_some_and(|px| px.trim().trim_end_matches("px").parse::<u32>().is_ok_and(|n| n <= 64))
+            || v.strip_prefix("blur").is_some_and(|px| px.trim().trim_end_matches("px").parse::<u32>().is_ok_and(|n| n <= 20))
             || (v.starts_with('#') && matches!(v.len(), 7 | 9) && v[1..].bytes().all(|b| b.is_ascii_hexdigit()));
         if !ok {
             diags.push(Diagnostic::new(
                 a.value.span,
-                format!("`dialog_backdrop` is `transparent`, `#rrggbb[aa]` or `blur <px>` (0 to 64), not `{v}`"),
+                format!("`dialog_backdrop` is `transparent`, `#rrggbb[aa]` or `blur <px>` (0 to 20), not `{v}`"),
             ));
         }
         return;
@@ -3396,6 +3481,28 @@ fn resolve_refs_in_assign(
         Some(k) => k,
         None => return,
     };
+    // A handler expression (`on_tap = {{ tap }}`): drawn once, so the
+    // event's value is not there yet; and every action it can name
+    // must exist.
+    if let (RefKind::Action, crate::value::ValueShape::Expression(body)) = (kind, crate::value::classify(&a.value.text)) {
+        let open = a.value.text.find("{{").unwrap_or(0) as u32;
+        if let (Some(e), _) = crate::cel::parse_fragment(body, a.value.span.file, a.value.span.start + open + 2) {
+            for (name, span) in crate::cel::idents(&e) {
+                if matches!(name.as_str(), "event" | "value") {
+                    diags.push(Diagnostic::new(span, format!(
+                        "`{name}` is not known yet when `{}` picks its action (when the page is drawn); pick it from vars or params",
+                        key.text
+                    )));
+                }
+            }
+            for (lit, span) in crate::cel::string_literals(&e) {
+                if lit != "none" && !names.actions.contains(&lit) {
+                    diags.push(Diagnostic::new(span, format!("unknown action `{lit}`")));
+                }
+            }
+        }
+        return;
+    }
     // Expressions and interpolated text are opaque at this layer.
     if matches!(
         crate::value::classify(&a.value.text),
@@ -3757,20 +3864,42 @@ mod tests {
     #[test]
     fn a_value_in_a_hand_written_ssh_command_is_refused() {
         let flagged = |run: &str| {
-            let d = check_text(&format!("action a {{ param x: string\n run = {run} }}\n"));
-            d.iter().any(|m| m.contains("shell code on the far side"))
+            let d = check_text(&format!(
+                "action a {{ param x: string\n param n: int\n param u: string {{ options = [a, b] }}\n param p: string {{ pattern = \"[a-z]+\" }}\n run = {run} }}\n"
+            ));
+            d.iter().find(|m| m.contains("in the command of an `ssh`") || m.contains("in ssh's options or host")).cloned()
         };
-        assert!(flagged("ssh host systemctl restart {{ x }}"));
-        assert!(flagged("ssh -p 22 -i /k -o BatchMode=yes admin@h echo {{ x }}"));
-        assert!(flagged("sudo -n ssh -- h rm {{ x }}"));
-        assert!(flagged("sudo -u panel timeout 5 ssh h rm {{ x }}"));
-        assert!(flagged("/usr/bin/ssh h {{ x }}"));
-        // The host or an option from a value is not pasted into a shell.
-        assert!(!flagged("ssh {{ x }} uptime"));
-        assert!(!flagged("ssh -l {{ x }} h uptime"));
-        assert!(!flagged("ssh h uptime"));
-        assert!(!flagged("echo ssh h {{ x }}"));
-        assert!(!flagged("scp {{ x }} h:/tmp"));
+        // In the remote command.
+        for run in [
+            "ssh host systemctl restart {{ x }}",
+            "ssh -p 22 -i /k -o BatchMode=yes admin@h echo {{ x }}",
+            "sudo -n ssh -- h rm {{ x }}",
+            "sudo -u panel timeout 5 ssh h rm {{ x }}",
+            "/usr/bin/ssh h {{ x }}",
+            "sshpass -f /k ssh h rm {{ x }}",
+            "autossh -M 0 h rm {{ x }}",
+            "command ssh h rm {{ x }}",
+            "flock /tmp/l ssh h rm {{ x }}",
+        ] {
+            assert!(flagged(run).is_some_and(|m| m.contains("shell code")), "{run}");
+        }
+        // In the host or options: read as an option.
+        for run in ["ssh {{ x }} uptime", "ssh -l {{ x }} h uptime", "ssh -vl{{ x }} h uptime", "ssh -o{{ x }} h uptime"] {
+            assert!(flagged(run).is_some_and(|m| m.contains("read as an option")), "{run}");
+        }
+        // Fine: no value, a host after `--`, values that cannot carry
+        // code, and commands that are not ssh.
+        for run in [
+            "ssh h uptime",
+            "ssh -- {{ x }} uptime",
+            "ssh h renice -n {{ n }} 1",
+            "ssh -vp 22 h systemctl restart {{ u }}",
+            "ssh h systemctl restart {{ p }}",
+            "echo ssh h {{ x }}",
+            "scp {{ x }} h:/tmp",
+        ] {
+            assert_eq!(flagged(run), None, "{run}");
+        }
     }
 
     #[test]
@@ -3779,7 +3908,7 @@ mod tests {
             let d = check_text(&format!("theme t {{ dialog_backdrop = {ok} }}\n"));
             assert!(d.is_empty(), "{ok}: {d:?}");
         }
-        for bad in ["red", "#12", "blur", "blur 100", "fog"] {
+        for bad in ["red", "#12", "blur", "blur 21", "fog"] {
             let d = check_text(&format!("theme t {{ dialog_backdrop = {bad} }}\n"));
             assert!(d.iter().any(|m| m.contains("`dialog_backdrop` is")), "{bad}: {d:?}");
         }
@@ -3792,6 +3921,17 @@ mod tests {
         let d = check_text("action a { param p: string = Bad { pattern = \"[a-z]+\" }\n run = x }\n");
         assert_msg(&d, "the default of `p` does not match its `pattern`");
         assert!(check_text("action a { param p: string = ok { pattern = \"[a-z]+\" }\n run = x }\n").is_empty());
+    }
+
+    #[test]
+    fn a_handler_expression_names_known_actions_and_no_event_value() {
+        let d = check_text(
+            "action bump { }\npage p {\n button { on_tap = {{ vars.x ? 'bmup' : 'bump' }} }\n\
+             slider { on_change = {{ value > 5 ? 'bump' : 'none' }} }\n button { on_tap = {{ true ? 'bump' : 'none' }} }\n}\n",
+        );
+        assert_msg(&d, "unknown action `bmup`");
+        assert_msg(&d, "`value` is not known yet when `on_change` picks its action");
+        assert_eq!(d.len(), 2, "{d:?}");
     }
 
     #[test]
@@ -4210,7 +4350,9 @@ reminder restore_test {
         assert_msg(&check_text("screen { dim = /bin/bash -c 'echo {{ level }}' }\n"), "pastes the value");
         // As an argument after the script, or with no shell: fine.
         assert!(check_text("action a { run = sh -c 'echo \"$$1\" > /tmp/f' sh {{ vars.x }} }\n").is_empty());
-        assert!(check_text("action a { run = ssh -c aes128-ctr {{ vars.x }} }\n").is_empty());
+        // (Not an inline script: ssh's `-c` is a cipher; `--` keeps the
+        // host from being read as an option.)
+        assert!(check_text("action a { run = ssh -c aes128-ctr -- {{ vars.x }} }\n").is_empty());
         // Review round 7: ways around the first version.
         for cmd in [
             "sh -ec 'echo {{ vars.x }}'",

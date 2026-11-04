@@ -463,6 +463,16 @@ pub fn split_list(text: &str) -> Option<Vec<String>> {
 
 // --- pattern ---
 
+/// A `pattern` value: in double quotes (escapes resolved) or single
+/// quotes (as written), else as written.
+pub fn unquote_pattern(text: &str) -> String {
+    let t = text.trim();
+    match t.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        Some(inner) => inner.to_string(),
+        None => parse_string(t),
+    }
+}
+
 /// Whether `text` matches param `pattern` as a whole (schema 6): the
 /// regex is anchored at both ends. `Err` for a pattern that does not
 /// compile (or is too large), with the reason.

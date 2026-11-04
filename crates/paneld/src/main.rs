@@ -927,9 +927,9 @@ fn setup_live_state(
             vars: vars_shared.clone(),
             source_values: source_values.clone(),
             var_types: var_types.clone(),
-            event_tx: event_tx.clone(),
+            event_tx: event_tx.clone().into(),
             source_blocks,
-            source_tx,
+            source_tx: source_tx.into(),
             config_dir: config_dir.clone(),
             app_defaults,
         },
@@ -1404,7 +1404,10 @@ fn action_title(live: &LiveState, name: &str) -> String {
     let Some(t) = &def.title else { return String::new() };
     let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
     def.bind(&mut ctx);
-    paneld_ui::interpolate(&t.raw, t.span.file, t.span.start, &ctx).trim().to_string()
+    let text = paneld_ui::interpolate(&t.raw, t.span.file, t.span.start, &ctx);
+    // An expression that does not evaluate comes back as written: no
+    // title then, not `{{ ... }}` on screen.
+    if text.contains("{{") { String::new() } else { text.trim().to_string() }
 }
 
 /// A dialog over the page: the page stays on screen, under a backdrop

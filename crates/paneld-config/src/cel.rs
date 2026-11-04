@@ -1158,6 +1158,27 @@ pub fn check_calls(expr: &Expr, diags: &mut Vec<Diagnostic>) {
     }
 }
 
+/// The string literals `expr` can evaluate to whole (itself, or a
+/// branch of `? :`), with their spans: the names a handler
+/// expression can give.
+pub fn string_literals(expr: &Expr) -> Vec<(String, Span)> {
+    let mut out = Vec::new();
+    fn walk(e: &Expr, out: &mut Vec<(String, Span)>) {
+        match &e.kind {
+            ExprKind::StringLit(s) => out.push((s.clone(), e.span)),
+            // The branches give the name, not the condition; a name
+            // built from parts (`'dev' + x`) is not checked.
+            ExprKind::Conditional(_, a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            _ => {}
+        }
+    }
+    walk(expr, &mut out);
+    out
+}
+
 /// Every bare identifier in `expr` with its span: the roots an
 /// expression reads (`a` in `a.b[c]`, and `c`).
 pub fn idents(expr: &Expr) -> Vec<(String, Span)> {

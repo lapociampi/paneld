@@ -9,7 +9,9 @@
 //! `confirm`, `pin`, secret resolution: later phases.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
+// Sends wake the UI thread's pump, which waits in `poll`.
+use paneld_ui::WakingSender as Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -126,7 +128,7 @@ impl ParamDef {
                 "max" => def.max = paneld_config::value::parse_number(text),
                 "options" => def.options = Some(ConfirmPrompt { raw: a.value.text.clone(), span: a.value.span }),
                 "ask" => def.ask = Some(text.to_string()),
-                "pattern" => def.pattern = Some(paneld_config::value::parse_string(&a.value.text)),
+                "pattern" => def.pattern = Some(paneld_config::value::unquote_pattern(&a.value.text)),
                 "label" => def.label = Some(text.trim_matches('"').to_string()),
                 _ => {}
             }
@@ -538,7 +540,7 @@ pub fn spawn_worker(wctx: WorkerCtx, rx: Receiver<Call>) {
                         run_call(&wctx, call, def, key);
                     }
                 });
-                tx
+                tx.into()
             });
             let _ = lane.send((call, def, key));
         }
@@ -825,7 +827,17 @@ fn apply_set(
         };
         {
             let mut guard = vars.lock().unwrap();
-            guard.insert(a.key.clone(), coerced);
+            // A run from before a reload: its var may be gone, or have
+            // another type now. Leave those alone.
+            match guard.get(&a.key) {
+                Some(old) if std::mem::discriminant(old) == std::mem::discriminant(&coerced) || matches!(old, Value::Null) => {
+                    guard.insert(a.key.clone(), coerced);
+                }
+                _ => {
+                    eprintln!("paneld: action `{action_name}`: `set {}`: the var changed with a reload; not set", a.key);
+                    continue;
+                }
+            }
         }
         changed = true;
     }
@@ -1053,15 +1065,15 @@ mod tests {
                 vars: vars.clone(),
                 source_values: Arc::new(Mutex::new(BTreeMap::new())),
                 var_types: crate::vars::types(doc),
-                event_tx,
+                event_tx: event_tx.into(),
                 source_blocks: BTreeMap::new(),
-                source_tx,
+                source_tx: source_tx.into(),
                 config_dir: std::env::temp_dir(),
                 app_defaults: runner::AppDefaults::default(),
             },
             rx,
         );
-        (tx, event_rx, vars)
+        (tx.into(), event_rx, vars)
     }
 
     #[test]

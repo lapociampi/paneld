@@ -1055,3 +1055,24 @@ fn a_dialog_shows_over_the_page_as_the_theme_says() {
     // A blur keeps its colors but softens its edges: still green somewhere.
     assert!(green(&shot(&conf("dialog_backdrop = blur 8"), &["--tap", "100,90", "--settle", "100"])));
 }
+
+#[test]
+fn one_dialog_replaces_the_one_before() {
+    // An asked param, then a confirm: the confirm replaces the ask
+    // dialog. Stacked, two half-black backdrops would darken the page
+    // twice.
+    let d = tmp("one-dialog");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t { dialog_backdrop = #00000080 }\nscreen { theme = t }\n\
+         action go { param m: int { ask = select; options = [5, 30] }\n confirm = Sure? }\n\
+         page home { button { width = 200; height = 60; label = go; on_tap = go } }\n",
+    )
+    .unwrap();
+    // Open the ask dialog, take its OK (the confirm then opens).
+    let img = shot(&conf, &["--tap", "100,90", "--settle", "150", "--tap", "463,295", "--settle", "150"]);
+    let [r, _, _] = img.px(780, 470);
+    // The page background is about 0xf4; under one backdrop about 0x7a.
+    assert!((0x6a..=0x8a).contains(&r), "background at {r:#x}: dialogs stacked, or none");
+}

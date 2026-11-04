@@ -2,7 +2,7 @@
 title: "Config format"
 description: "The hypr-style syntax of paneld config files."
 date: 2026-10-29
-updated: 2026-11-03
+updated: 2026-11-04
 tags: [paneld, config]
 series: paneld
 order: 3
@@ -136,6 +136,7 @@ page home {
 - `run = curl -sf -u {{ secrets.adguard }} http://localhost:8080/control/status` is split into argv like a shell would split it (single and double quotes, backslash escapes), but no shell ever runs it.
 - `$vars` and `{{ }}` are filled in inside each argument separately, so a value can never become a second argument or a shell command.
 - Pipes and redirections need an explicit shell: `run = sh -c 'curl -sf ... | jq .data'`. Values reach that script as arguments after it (`sh -c 'echo "$$1"' sh {{ x }}`) or as environment variables, never pasted into it: `paneld check` rejects `{{ }}` inside an inline script (`sh -c`, `bash -ec`, `python -c`, `perl -e`, also behind `env`, `sudo` or `timeout`).
+- `ssh host cmd {{ x }}` hands `cmd` to the remote shell, and a value before the host can be read as an option: `paneld check` rejects both, unless the value is a typed int, number, bool or duration param or held to `options` or a `pattern`. A `remote_kind` with `via = ssh` quotes each argument instead ([Schema](schema.md), section 17).
 
 ## Structure
 

@@ -19,7 +19,8 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+// Sends wake the UI thread's pump, which waits in `poll`.
+use paneld_ui::WakingSender as Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -132,8 +133,9 @@ pub fn resolve_all_in_background(
     ctx: Context,
     base_cwd: std::path::PathBuf,
     app_defaults: runner::AppDefaults,
-    tx: Sender<SourceUpdate>,
+    tx: impl Into<Sender<SourceUpdate>>,
 ) {
+    let tx = tx.into();
     thread::spawn(move || {
         let started = Instant::now();
         for (name, value) in resolve_all(&doc, &ctx, &base_cwd, app_defaults) {
@@ -154,10 +156,11 @@ pub fn resolve_all_in_background(
 pub fn spawn_pollers(
     doc: &Document,
     ctx: &Context,
-    tx: Sender<SourceUpdate>,
+    tx: impl Into<Sender<SourceUpdate>>,
     base_cwd: &std::path::Path,
     app_defaults: runner::AppDefaults,
 ) -> ShutdownHandle {
+    let tx: Sender<SourceUpdate> = tx.into();
     let shutdown = Arc::new(AtomicBool::new(false));
     let stream_pgids: Arc<Mutex<Vec<runner::Pid>>> = Arc::new(Mutex::new(Vec::new()));
     for item in &doc.items {

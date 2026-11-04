@@ -587,14 +587,11 @@ impl Ui {
     /// `/dev/input/event0`). Returns `false` if the device can't be
     /// opened.
     pub fn add_evdev_pointer(&self, device: &str) -> bool {
-        let c_dev = match CString::new(device) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        let indev = unsafe {
-            sys::lv_evdev_create(sys::lv_indev_type_t_LV_INDEV_TYPE_POINTER, c_dev.as_ptr())
-        };
-        !indev.is_null()
+        use std::os::unix::io::IntoRawFd;
+        match std::fs::File::open(device) {
+            Ok(f) => add_pointer_fd(f.into_raw_fd()),
+            Err(_) => false,
+        }
     }
 
     /// A display that renders into memory instead of a screen, with a
@@ -672,6 +669,105 @@ impl Ui {
     }
 }
 
+thread_local! {
+    /// Touch devices read on demand: their fd and LVGL input device.
+    static TOUCH: std::cell::RefCell<Vec<(std::os::raw::c_int, *mut sys::lv_indev_t)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Read pointer events from `fd` (an evdev device), in LVGL's event
+/// mode: no read timer runs while nobody touches the screen; the pump
+/// reads when the fd has data ([`Pump::step`]). LVGL owns `fd` after.
+fn add_pointer_fd(fd: std::os::raw::c_int) -> bool {
+    let indev = unsafe { sys::lv_evdev_create_fd(sys::lv_indev_type_t_LV_INDEV_TYPE_POINTER, fd) };
+    if indev.is_null() {
+        return false;
+    }
+    unsafe extern "C" fn forget(e: *mut sys::lv_event_t) {
+        // SAFETY: the target is the input device being deleted (LVGL
+        // does that on a read error, and closes its fd).
+        let indev = unsafe { sys::lv_event_get_target(e) } as *mut sys::lv_indev_t;
+        TOUCH.with(|t| t.borrow_mut().retain(|(_, i)| *i != indev));
+    }
+    unsafe {
+        sys::lv_indev_set_mode(indev, sys::lv_indev_mode_t_LV_INDEV_MODE_EVENT);
+        sys::lv_indev_add_event_cb(indev, Some(forget), sys::lv_event_code_t_LV_EVENT_DELETE, std::ptr::null_mut());
+    }
+    TOUCH.with(|i| i.borrow_mut().push((fd, indev)));
+    true
+}
+
+/// The read and write ends of the pipe that wakes the pump.
+static WAKE_PIPE: std::sync::OnceLock<(std::os::raw::c_int, std::os::raw::c_int)> = std::sync::OnceLock::new();
+
+fn wake_pipe() -> (std::os::raw::c_int, std::os::raw::c_int) {
+    *WAKE_PIPE.get_or_init(|| {
+        let mut fds = [-1 as std::os::raw::c_int; 2];
+        // O_NONBLOCK | O_CLOEXEC: a full pipe already says "wake up".
+        let ok = unsafe { pipe2(fds.as_mut_ptr(), 0o4000 | 0o2000000) } == 0;
+        if ok { (fds[0], fds[1]) } else { (-1, -1) }
+    })
+}
+
+/// Wake the UI thread's pump now (from any thread): something for the
+/// main loop arrived (a source value, a ctl request, an action's
+/// result).
+pub fn wake() {
+    let (_, w) = wake_pipe();
+    if w >= 0 {
+        let b = 1u8;
+        unsafe { write(w, (&b as *const u8).cast(), 1) };
+    }
+}
+
+/// A channel sender that wakes the pump after each send, for threads
+/// that report to the main loop.
+pub struct WakingSender<T>(std::sync::mpsc::Sender<T>);
+
+impl<T> WakingSender<T> {
+    pub fn send(&self, v: T) -> Result<(), std::sync::mpsc::SendError<T>> {
+        let r = self.0.send(v);
+        wake();
+        r
+    }
+}
+
+impl<T> Clone for WakingSender<T> {
+    fn clone(&self) -> Self {
+        WakingSender(self.0.clone())
+    }
+}
+
+impl<T> From<std::sync::mpsc::Sender<T>> for WakingSender<T> {
+    fn from(s: std::sync::mpsc::Sender<T>) -> Self {
+        WakingSender(s)
+    }
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: std::os::raw::c_int,
+    events: std::os::raw::c_short,
+    revents: std::os::raw::c_short,
+}
+
+const POLLIN: std::os::raw::c_short = 1;
+
+const POLLERR: std::os::raw::c_short = 8;
+const POLLHUP: std::os::raw::c_short = 16;
+const POLLNVAL: std::os::raw::c_short = 32;
+
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, nfds: std::os::raw::c_ulong, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn pipe2(fds: *mut std::os::raw::c_int, flags: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn read(fd: std::os::raw::c_int, buf: *mut std::ffi::c_void, n: usize) -> isize;
+    fn write(fd: std::os::raw::c_int, buf: *const std::ffi::c_void, n: usize) -> isize;
+}
+
+/// The longest the pump sleeps when LVGL has nothing scheduled: how
+/// often the main loop looks at its channels (sources, ctl, actions)
+/// while idle.
+const IDLE_STEP_MS: u32 = 200;
+
 /// One iteration of the LVGL tick loop. See [`Ui::pump`].
 pub struct Pump<'ui> {
     last: Instant,
@@ -687,16 +783,48 @@ impl<'ui> Pump<'ui> {
     /// the hint it returned (capped at 100ms). Returns the hint so
     /// the caller can use it as its own idle timeout.
     pub fn step(&mut self) -> Duration {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last).as_millis() as u32;
-        if elapsed > 0 {
-            unsafe { sys::lv_tick_inc(elapsed) };
-            self.last = now;
+        self.tick();
+        let sleep_ms = unsafe { sys::lv_timer_handler() }.min(IDLE_STEP_MS);
+        let sleep = Duration::from_millis(sleep_ms as u64);
+        // Sleep in `poll` on the touch devices and the wake pipe: a touch
+        // is read at once, news for the main loop wakes it at once, and
+        // an idle screen costs no wakeups beyond the idle step.
+        let (wake_fd, _) = wake_pipe();
+        let inputs = TOUCH.with(|i| i.borrow().clone());
+        let mut fds: Vec<PollFd> = inputs.iter().map(|(fd, _)| PollFd { fd: *fd, events: POLLIN, revents: 0 }).collect();
+        fds.push(PollFd { fd: wake_fd, events: POLLIN, revents: 0 });
+        let ready = unsafe { poll(fds.as_mut_ptr(), fds.len() as std::os::raw::c_ulong, sleep_ms as std::os::raw::c_int) };
+        if ready <= 0 {
+            return sleep;
         }
-        let sleep_ms = unsafe { sys::lv_timer_handler() };
-        let sleep = Duration::from_millis(sleep_ms.min(100) as u64);
-        std::thread::sleep(sleep);
+        // Read with the clock at the touch's time, not the step's start:
+        // a long press is timed from the real press.
+        self.tick();
+        for (pfd, (_, indev)) in fds.iter().zip(&inputs) {
+            if pfd.revents & (POLLHUP | POLLERR | POLLNVAL) != 0 {
+                // Unplugged or failing: stop reading it (deleting the
+                // input device closes its fd and drops it from TOUCH).
+                eprintln!("paneld: touch device lost (poll {:#x}); no more touch input from it", pfd.revents);
+                unsafe { sys::lv_indev_delete(*indev) };
+            } else if pfd.revents & POLLIN != 0 {
+                unsafe { sys::lv_indev_read(*indev) };
+            }
+        }
+        if fds.last().is_some_and(|w| w.revents & POLLIN != 0) {
+            let mut buf = [0u8; 64];
+            while unsafe { read(wake_fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        }
         sleep
+    }
+
+    /// Advance LVGL's clock by the whole milliseconds since the last
+    /// tick (the rest carries over, so the clock does not drift).
+    fn tick(&mut self) {
+        let ms = self.last.elapsed().as_millis() as u32;
+        if ms > 0 {
+            unsafe { sys::lv_tick_inc(ms) };
+            self.last += Duration::from_millis(ms as u64);
+        }
     }
 }
 
@@ -1190,15 +1318,29 @@ impl<'ui> Obj<'ui> {
         }
     }
 
-    /// A modal message box (schema's action `confirm`). Call
-    /// `add_title`, `add_text` and `add_confirm_button` / `add_cancel_button`
-    /// to flesh it out. `parent = screen` makes it an overlay.
     /// A full-screen layer for a dialog, on top of what is drawn: it
     /// takes every tap (the page under it stays as it is, inert), and
     /// looks as the theme's `dialog_backdrop` says ([`set_dialog_backdrop`]).
     /// The dialog goes inside it.
     pub fn new_dialog_layer(&self) -> Obj<'ui> {
+        // One dialog at a time: the next (ask, then PIN, then confirm;
+        // a wrong PIN asked again) replaces the one before.
+        let old = DIALOG.with(|d| d.replace(std::ptr::null_mut()));
+        if !old.is_null() {
+            unsafe { sys::lv_obj_delete(old) };
+        }
         let layer = self.new_container();
+        DIALOG.with(|d| d.set(layer.raw));
+        unsafe extern "C" fn forget(e: *mut sys::lv_event_t) {
+            // SAFETY: the target is the layer being deleted.
+            let target = unsafe { sys::lv_event_get_target(e) } as *mut sys::lv_obj_t;
+            DIALOG.with(|d| {
+                if d.get() == target {
+                    d.set(std::ptr::null_mut());
+                }
+            });
+        }
+        unsafe { sys::lv_obj_add_event_cb(layer.raw, Some(forget), sys::lv_event_code_t_LV_EVENT_DELETE, std::ptr::null_mut()) };
         layer.set_size(Size::Percent(100), Size::Percent(100));
         layer.set_padding(0);
         layer.set_radius(0);
@@ -1228,6 +1370,9 @@ impl<'ui> Obj<'ui> {
         layer
     }
 
+    /// A modal message box (schema's action `confirm`). Call
+    /// `add_title`, `add_text` and `add_confirm_button` / `add_cancel_button`
+    /// to flesh it out. `parent = screen` makes it an overlay.
     pub fn new_msgbox(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_msgbox_create(self.raw) };
         assert!(!raw.is_null());
@@ -1826,6 +1971,10 @@ pub enum Size {
     Content,
 }
 
+/// The largest backdrop blur: the Pi draws it in software, over the
+/// whole screen, on every change under the dialog.
+pub const BLUR_MAX: i32 = 20;
+
 /// How a dialog's backdrop looks (theme token `dialog_backdrop`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backdrop {
@@ -1847,7 +1996,7 @@ impl Backdrop {
         }
         if let Some(px) = s.strip_prefix("blur") {
             let px: i32 = px.trim().trim_end_matches("px").parse().ok()?;
-            return (0..=64).contains(&px).then_some(Backdrop::Blur(px));
+            return (0..=BLUR_MAX).contains(&px).then_some(Backdrop::Blur(px));
         }
         let hex = s.strip_prefix('#')?;
         if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1863,6 +2012,9 @@ impl Backdrop {
 }
 
 thread_local! {
+    /// The open dialog's layer, null when none (cleared when LVGL
+    /// deletes it, as a page redraw does).
+    static DIALOG: std::cell::Cell<*mut sys::lv_obj_t> = const { std::cell::Cell::new(std::ptr::null_mut()) };
     static DIALOG_BACKDROP: std::cell::Cell<Backdrop> = const { std::cell::Cell::new(Backdrop::Transparent) };
 }
 
@@ -1891,5 +2043,78 @@ impl Size {
             }
             Size::Content => LV_SIZE_CONTENT_LOCAL,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::io::IntoRawFd;
+
+    /// One `struct input_event` (64-bit Linux): time, type, code, value.
+    fn event(ty: u16, code: u16, value: i32) -> Vec<u8> {
+        let mut e = vec![0u8; 16];
+        e.extend_from_slice(&ty.to_ne_bytes());
+        e.extend_from_slice(&code.to_ne_bytes());
+        e.extend_from_slice(&value.to_ne_bytes());
+        e
+    }
+
+    #[test]
+    fn touch_is_read_when_it_arrives_and_idle_steps_sleep() {
+        let ui = Ui::init().unwrap();
+        let _display = ui.open_memory_display(320, 240);
+        // `shot`'s scripted pointer reads on a timer; the panel has none.
+        let scripted = unsafe { sys::lv_indev_get_next(std::ptr::null_mut()) };
+        unsafe { sys::lv_indev_set_mode(scripted, sys::lv_indev_mode_t_LV_INDEV_MODE_EVENT) };
+        // A socket stands in for the evdev device.
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(add_pointer_fd(theirs.into_raw_fd()));
+        let indev = TOUCH.with(|t| t.borrow()[0].1);
+        let mut pump = ui.pump();
+        // Settle LVGL's start-up work, then an idle step takes the
+        // full idle time: no read timer runs in event mode.
+        for _ in 0..5 {
+            pump.step();
+        }
+        let t = Instant::now();
+        pump.step();
+        assert!(t.elapsed() >= Duration::from_millis(150), "an idle step woke early: {:?}", t.elapsed());
+        // A press: read as soon as it is written.
+        let (ev_syn, ev_key, ev_abs) = (0u16, 1u16, 3u16);
+        let mut press = Vec::new();
+        press.extend(event(ev_abs, 0, 100));
+        press.extend(event(ev_abs, 1, 50));
+        press.extend(event(ev_key, 0x14a, 1));
+        press.extend(event(ev_syn, 0, 0));
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            (&ours).write_all(&press).unwrap();
+            ours
+        });
+        let t = Instant::now();
+        pump.step();
+        let ours = writer.join().unwrap();
+        assert!(t.elapsed() < Duration::from_millis(150), "the touch did not wake the step: {:?}", t.elapsed());
+        assert_eq!(unsafe { sys::lv_indev_get_state(indev) }, sys::lv_indev_state_t_LV_INDEV_STATE_PRESSED);
+        // News for the main loop from another thread wakes the step.
+        let waker = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            wake();
+        });
+        let t = Instant::now();
+        pump.step();
+        waker.join().unwrap();
+        assert!(t.elapsed() < Duration::from_millis(150), "wake() did not wake the step: {:?}", t.elapsed());
+        // The device going away: dropped, not polled in a busy loop.
+        drop(ours);
+        pump.step();
+        assert!(TOUCH.with(|t| t.borrow().is_empty()), "a hung-up device is still polled");
+        let t = Instant::now();
+        for _ in 0..3 {
+            pump.step();
+        }
+        assert!(t.elapsed() >= Duration::from_millis(300), "the loop spins after the device went away");
     }
 }
