@@ -414,15 +414,14 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
             Ok(Value::String(hex_text(rgb, alpha)))
         }
         "mix" if argc == 3 => {
-            let (a, _) = color_arg(&eval(&args[0], ctx)?, ctx)?;
-            let (b, _) = color_arg(&eval(&args[1], ctx)?, ctx)?;
-            let t = number_arg(&eval(&args[2], ctx)?, "mix")?;
-            let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
-            let blend = |shift: u32| {
-                let (x, y) = (((a >> shift) & 0xff) as f64, ((b >> shift) & 0xff) as f64);
-                ((x + (y - x) * t).round() as u32) << shift
-            };
-            Ok(Value::String(hex_text(blend(16) | blend(8) | blend(0), None)))
+            let (a, aa) = color_arg(&eval(&args[0], ctx)?, ctx)?;
+            let (b, ba) = color_arg(&eval(&args[1], ctx)?, ctx)?;
+            let t = number_arg(&eval(&args[2], ctx)?, "mix")?.clamp(0.0, 1.0);
+            let lerp = |x: u32, y: u32| (x as f64 + (y as f64 - x as f64) * t).round() as u32;
+            let blend = |shift: u32| lerp((a >> shift) & 0xff, (b >> shift) & 0xff) << shift;
+            // Alpha blends too when either color has one.
+            let alpha = (aa.is_some() || ba.is_some()).then(|| lerp(aa.unwrap_or(255).into(), ba.unwrap_or(255).into()) as u8);
+            Ok(Value::String(hex_text(blend(16) | blend(8) | blend(0), alpha)))
         }
         "double" if argc == 1 => call_builtin("number", args, ctx),
         "size" if argc == 1 => call_builtin("len", args, ctx),
@@ -430,8 +429,9 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
         // text CEL prints for one, in UTC.
         "timestamp" if argc == 1 => match eval(&args[0], ctx)? {
             Value::Int(n) => Ok(Value::String(rfc3339(n))),
-            Value::Double(d) if d.is_finite() => Ok(Value::String(rfc3339(d as i64))),
-            Value::String(s) => Ok(Value::String(s)),
+            Value::Double(d) if d.is_finite() && d.abs() < 1e15 => Ok(Value::String(rfc3339(d.floor() as i64))),
+            Value::String(s) if is_rfc3339(&s) => Ok(Value::String(s)),
+            Value::String(s) => Err(EvalError::new(format!("`{s}` is not a time like 2026-11-04T18:30:00Z"))),
             other => Err(EvalError::new(format!("timestamp({}) is not supported", type_name(&other)))),
         },
         "has" if argc == 1 => {
@@ -535,7 +535,13 @@ fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Res
         ("upperAscii", Value::String(s), []) => Ok(Value::String(s.to_ascii_uppercase())),
         ("trim", Value::String(s), []) => Ok(Value::String(s.trim().to_string())),
         ("split", Value::String(s), [sep]) => {
-            Ok(Value::List(s.split(text(sep)?.as_str()).map(|p| Value::String(p.to_string())).collect()))
+            let sep = text(sep)?;
+            Ok(Value::List(if sep.is_empty() {
+                // CEL: the characters.
+                s.chars().map(|c| Value::String(c.to_string())).collect()
+            } else {
+                s.split(sep.as_str()).map(|p| Value::String(p.to_string())).collect()
+            }))
         }
         ("join", Value::List(l), []) | ("join", Value::List(l), [_]) => {
             let sep = match args.first() {
@@ -551,6 +557,45 @@ fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Res
             type_name(&receiver)
         ))),
     }
+}
+
+/// `2026-11-04T18:30:00Z`, with optional fractions and an offset.
+fn is_rfc3339(s: &str) -> bool {
+    let b = s.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b.get(r).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
+    b.len() >= 20
+        && digits(0..4)
+        && b[4] == b'-'
+        && digits(5..7)
+        && b[7] == b'-'
+        && digits(8..10)
+        && matches!(b[10], b'T' | b't')
+        && digits(11..13)
+        && b[13] == b':'
+        && digits(14..16)
+        && b[16] == b':'
+        && digits(17..19)
+        && (1..=12).contains(&((b[5] - b'0') * 10 + (b[6] - b'0')))
+        && (1..=31).contains(&((b[8] - b'0') * 10 + (b[9] - b'0')))
+        && {
+            // Optional fraction, then `Z` or `+hh:mm` / `-hh:mm`.
+            let mut i = 19;
+            if b.get(i) == Some(&b'.') {
+                i += 1;
+                let start = i;
+                while b.get(i).is_some_and(u8::is_ascii_digit) {
+                    i += 1;
+                }
+                if i == start {
+                    return false;
+                }
+            }
+            match b.get(i) {
+                Some(b'Z' | b'z') => i + 1 == b.len(),
+                Some(b'+' | b'-') => i + 6 == b.len() && digits(i + 1..i + 3) && b[i + 3] == b':' && digits(i + 4..i + 6),
+                _ => false,
+            }
+        }
 }
 
 /// Unix seconds as `2026-11-04T18:30:00Z`.
@@ -573,7 +618,8 @@ fn rfc3339(secs: i64) -> String {
 fn number_arg(v: &Value, f: &str) -> Result<f64, EvalError> {
     match v {
         Value::Int(n) => Ok(*n as f64),
-        Value::Double(d) => Ok(*d),
+        Value::Double(d) if d.is_finite() => Ok(*d),
+        Value::Double(_) => Err(EvalError::new(format!("{f}() needs a finite number"))),
         other => Err(EvalError::new(format!("{f}() needs a number, got {}", type_name(other)))),
     }
 }
@@ -595,7 +641,9 @@ fn format_unit(x: f64, unit: &str) -> String {
     let scaled = |step: f64, names: &[&str]| {
         let mut v = x;
         let mut i = 0;
-        while v.abs() >= step && i + 1 < names.len() {
+        // Compared as shown, so 1023.96 B is `1 KiB`, not `1024 B`.
+        let shown = |v: f64| (v * 10.0).round().abs() / 10.0;
+        while shown(v) >= step && i + 1 < names.len() {
             v /= step;
             i += 1;
         }
@@ -613,8 +661,8 @@ fn format_unit(x: f64, unit: &str) -> String {
 
 /// Seconds as the two largest units: `45s`, `5m 3s`, `1h 5m`, `3d 4h`.
 fn duration_text(secs: f64) -> String {
-    let sign = if secs < 0.0 { "-" } else { "" };
     let s = secs.abs().round() as u64;
+    let sign = if secs < 0.0 && s > 0 { "-" } else { "" };
     let units = [("d", 86_400), ("h", 3_600), ("m", 60), ("s", 1)];
     // The largest unit that fits, then the next one if it is not 0.
     let i = units.iter().position(|(_, size)| s >= *size).unwrap_or(3);
@@ -1180,5 +1228,29 @@ mod more_tests {
         assert_eq!(e("pools.filter(p, p.health != 'ONLINE').map(p, p.name + ' ' + p.health).join(', ')"), S("fast DEGRADED".into()));
         assert_eq!(e("pools.filter(p, double(p.alloc) > 0.8 * double(p.size)).map(p, p.name).join(', ')"), S("tank".into()));
         assert_eq!(e("string(int(100.0 * double(pools[0].alloc) / double(pools[0].size))) + '%'"), S("90%".into()));
+    }
+
+    #[test]
+    fn edge_values_of_the_display_helpers() {
+        assert_eq!(ev("format(1023.96, 'bytes')"), S("1 KiB".into()));
+        assert_eq!(ev("format(999999, 'si')"), S("1 M".into()));
+        assert_eq!(ev("format(1e300, 'bytes')"), S(format!("{} PiB", short_number(1e300 / 1024f64.powi(5)))));
+        assert_eq!(ev("duration(-0.4)"), S("0s".into()));
+        assert_eq!(ev("timestamp(-0.5)"), S("1969-12-31T23:59:59Z".into()));
+        assert_eq!(err("timestamp('garbage')"), "`garbage` is not a time like 2026-11-04T18:30:00Z");
+        for bad in ["2026-13-45T10:00:00Z", "2026-01-01T10:00:00garbage", "2026-01-01T10:00:00.Z", "2026-01-01T10:00:00+0100"] {
+            assert!(err(&format!("timestamp('{bad}')")).contains("is not a time"), "{bad}");
+        }
+        assert_eq!(ev("timestamp('2026-01-01t10:00:00z')"), S("2026-01-01t10:00:00z".into()));
+        assert_eq!(ev("timestamp('2026-01-01T10:00:00.5+01:00')"), S("2026-01-01T10:00:00.5+01:00".into()));
+        assert_eq!(ev("'héllo'.split('')"), Value::List("héllo".chars().map(|c| S(c.to_string())).collect()));
+        assert_eq!(ev("mix('#00000000', '#ffffffff', 0.5)"), S("#80808080".into()));
+        assert_eq!(ev("mix('#000000', '#ffffff00', 1)"), S("#ffffff00".into()));
+        let mut ctx = Context::new();
+        ctx.insert("inf".into(), D(f64::INFINITY));
+        ctx.insert("nan".into(), D(f64::NAN));
+        for e in ["format(inf, 'C')", "duration(nan)", "clamp(nan, 0, 1)", "mix('#000', '#fff', nan)", "timestamp(inf)"] {
+            assert!(try_ev(e, &ctx).is_err(), "{e} gave {:?}", try_ev(e, &ctx));
+        }
     }
 }

@@ -264,6 +264,8 @@ pub struct ShutdownHandle {
 impl ShutdownHandle {
     pub fn stop(&self) {
         self.flag.store(true, Ordering::SeqCst);
+        // Pollers wait on the visibility signal: wake them to see it.
+        crate::visible::notify();
         let pgids = {
             let g = self.stream_pgids.lock().unwrap();
             g.clone()
@@ -287,14 +289,33 @@ fn poll_loop(
 ) {
     let max_delay = backoff_ceiling(interval);
     let mut delay = interval;
+    // `active = visible`: only while a page that shows it is on
+    // screen; back on screen, at once if the last run is 5s old.
+    let when_visible = find_simple(&block, "active").map(str::trim) == Some("visible");
+    let mut next = Instant::now() + delay;
+    let mut last_run = Instant::now();
+    let mut was_shown = true;
     while !shutdown.load(Ordering::SeqCst) {
-        thread::sleep(delay);
+        let (seen_shown, generation) = crate::visible::is_shown(&name);
+        let shown = !when_visible || seen_shown;
+        let back = shown && !was_shown && last_run.elapsed() >= Duration::from_secs(5);
+        was_shown = shown;
+        if !shown || (Instant::now() < next && !back) {
+            // Until it is due, or (hidden) until what is shown changes;
+            // a page change and a shutdown wake it at once.
+            let until = if shown { next } else { Instant::now() + Duration::from_secs(3600) };
+            crate::visible::wait(until, generation);
+            continue;
+        }
+        last_run = Instant::now();
+        let result = resolve_one(&block, &ctx, &cwd, app_defaults);
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        match resolve_one(&block, &ctx, &cwd, app_defaults) {
+        match result {
             Ok(v) => {
                 delay = interval;
+                next = Instant::now() + delay;
                 if tx.send(SourceUpdate { name: name.clone(), value: v, status: false }).is_err() {
                     // Receiver dropped; the daemon is shutting down.
                     return;
@@ -303,6 +324,7 @@ fn poll_loop(
             Err(e) => {
                 eprintln!("paneld: source `{name}`: {e}");
                 delay = next_backoff(delay, max_delay);
+                next = Instant::now() + delay;
                 // `ok` turns false; the main loop keeps the last value.
                 if tx.send(SourceUpdate { name: name.clone(), value: not_ok(&e), status: true }).is_err() {
                     return;
@@ -968,24 +990,25 @@ impl<'a> JsonParser<'a> {
                     b'u' => {
                         let hi = self.hex4()?;
                         if (0xd800..0xdc00).contains(&hi) {
-                            // A surrogate pair: `😀`.
+                            // A surrogate pair: `😀`. Only a
+                            // low half is taken with it; anything else
+                            // is read on its own next.
+                            let back = self.pos;
                             let lo = if self.bytes.get(self.pos..self.pos + 2) == Some(b"\\u") {
                                 self.pos += 2;
-                                Some(self.hex4()?)
+                                match self.hex4() {
+                                    Some(lo) if (0xdc00..0xe000).contains(&lo) => Some(lo),
+                                    _ => None,
+                                }
                             } else {
                                 None
                             };
                             match lo {
-                                Some(lo) if (0xdc00..0xe000).contains(&lo) => {
-                                    let c = char::from_u32(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00));
-                                    push(&mut out, c.unwrap_or('\u{fffd}'));
-                                }
-                                // A lone half, then whatever followed.
-                                Some(other) => {
+                                Some(lo) => push(&mut out, char::from_u32(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)).unwrap_or('\u{fffd}')),
+                                None => {
+                                    self.pos = back;
                                     push(&mut out, '\u{fffd}');
-                                    push(&mut out, char::from_u32(other).unwrap_or('\u{fffd}'));
                                 }
-                                None => push(&mut out, '\u{fffd}'),
                             }
                         } else {
                             push(&mut out, char::from_u32(hi).unwrap_or('\u{fffd}'));
@@ -1382,6 +1405,9 @@ mod json_tests {
         // A lone surrogate becomes the replacement character.
         assert_eq!(parse_json(r#""\ud800x""#), Some(Value::String("\u{fffd}x".into())));
         assert_eq!(parse_json(r#""\ud800A""#), Some(Value::String("\u{fffd}A".into())));
+        // A lone high half, then a whole pair: the pair survives.
+        assert_eq!(parse_json(r#""\ud800😀""#), Some(Value::String("\u{fffd}😀".into())));
+        assert_eq!(parse_json(r#""\udc00x""#), Some(Value::String("\u{fffd}x".into())));
     }
 
     #[test]

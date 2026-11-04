@@ -1309,4 +1309,37 @@ mod tests {
         assert!(!TokenKind::DollarIdent.is_structural());
         assert!(!TokenKind::Eof.is_structural());
     }
+
+    fn lex_errors(src: &str) -> Vec<String> {
+        let mut map = crate::SourceMap::new();
+        let id = map.add(std::path::PathBuf::from("t.conf"), src.to_string());
+        tokenize(id, src).1.into_iter().map(|e| e.message).collect()
+    }
+
+    #[test]
+    fn every_lex_error_has_its_message() {
+        for (src, needle) in [
+            ("a = {{ 'open }}\n", "unterminated string in `{{ }}` expression"),
+            ("a = x 'open\n", "unterminated single-quoted string in value"),
+            ("theme t { style .card\n", "a `style` selector must be followed by `{` on the same line"),
+            ("theme t { style .card", "expected `{` after `style` selector"),
+            ("a é = 1\n", "unexpected character `é`"),
+        ] {
+            let e = lex_errors(src);
+            assert!(e.iter().any(|m| m.contains(needle)), "`{src}`: no `{needle}` in {e:?}");
+        }
+    }
+
+    #[test]
+    fn expressions_with_escapes_and_braces_lex_as_one_value() {
+        assert!(lex_errors("a = {{ 'it\\'s' + \"}}\" + {'k': {'v': 1}}['k'] }}\n").is_empty());
+        // A header may wrap with `\` at the end of the line, also with CRLF.
+        assert!(lex_errors("page \\\nhome { }\n").is_empty());
+        assert!(lex_errors("page \\\r\nhome { }\r\n").is_empty());
+        // A dot that does not start a name stays out of the identifier.
+        let mut map = crate::SourceMap::new();
+        let id = map.add(std::path::PathBuf::from("t.conf"), "a. = 1\n".into());
+        let (toks, errs) = tokenize(id, "a. = 1\n");
+        assert!(!errs.is_empty() || toks.iter().all(|t| map.slice(t.span) != "a."));
+    }
 }

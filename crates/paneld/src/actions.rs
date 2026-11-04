@@ -840,8 +840,9 @@ pub fn apply_inline_set(
             ctx
         } else {
             local = ctx.clone();
-            for l in &a.locals {
-                local.entry(l.name.clone()).or_insert_with(|| l.value.clone());
+            // Where it was drawn wins, except for the event's own value.
+            for l in a.locals.iter().filter(|l| !matches!(l.name.as_str(), "event" | "value")) {
+                local.insert(l.name.clone(), l.value.clone());
             }
             &local
         };
@@ -1327,8 +1328,8 @@ mod tests {
         assert!(!apply_inline_set(&[item("n", "{{ nope }}", vec![])], &ctx, &types, &vars));
         assert!(!apply_inline_set(&[item("n", "{{ [1] }}", vec![])], &ctx, &types, &vars));
         assert!(vars.lock().unwrap().is_empty());
-        // A local binding (a repeat item) is in scope; a global of the
-        // same name wins.
+        // A local binding (a repeat item) is in scope, and wins over a
+        // global of the same name (a remote called like the item).
         let row = ActionArg { name: "row".into(), value: Value::Map(BTreeMap::from([("id".to_string(), Value::Int(7))])) };
         assert!(apply_inline_set(&[item("n", "{{ row.id * 2 }}", vec![row])], &ctx, &types, &vars));
         assert_eq!(vars.lock().unwrap()["n"], Value::Int(14));
@@ -1336,6 +1337,12 @@ mod tests {
         g.insert("who".into(), Value::String("global".into()));
         let local = ActionArg { name: "who".into(), value: Value::String("local".into()) };
         assert!(apply_inline_set(&[item("s", "{{ who }}", vec![local])], &g, &types, &vars));
-        assert_eq!(vars.lock().unwrap()["s"], Value::String("global".into()));
+        assert_eq!(vars.lock().unwrap()["s"], Value::String("local".into()));
+        // Not over the event's value.
+        let mut e = Context::new();
+        e.insert("value".into(), Value::String("new".into()));
+        let stale = ActionArg { name: "value".into(), value: Value::String("old".into()) };
+        assert!(apply_inline_set(&[item("s", "{{ value }}", vec![stale])], &e, &types, &vars));
+        assert_eq!(vars.lock().unwrap()["s"], Value::String("new".into()));
     }
 }

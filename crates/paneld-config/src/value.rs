@@ -613,4 +613,59 @@ mod tests {
         );
         assert_eq!(split_list("[a,]"), Some(vec!["a".into()]));
     }
+
+    #[test]
+    fn expression_shapes_with_quotes_and_braces() {
+        // Quotes and nested braces inside one expression keep it one.
+        assert!(matches!(classify(r#"{{ "}}" + 'a' }}"#), ValueShape::Expression(_)));
+        assert!(matches!(classify(r#"{{ "a\"}}" }}"#), ValueShape::Expression(_)));
+        assert!(matches!(classify("{{ {'a': {'b': 1}} }}"), ValueShape::Expression(_)));
+        assert!(matches!(classify("{{ a }} and {{ b }}"), ValueShape::Interp(_)));
+        // A `{{` inside quotes is text, `\\{{` opens a real one.
+        assert!(matches!(classify(r#""{{ x }}""#), ValueShape::Literal(_)));
+        assert!(matches!(classify(r#"say "a\" {{" now"#), ValueShape::Literal(_)));
+        assert!(matches!(classify(r"\\{{ x }}"), ValueShape::Interp(_)));
+        assert!(matches!(classify("{{ x"), ValueShape::Interp(_)));
+    }
+
+    #[test]
+    fn string_escapes() {
+        assert_eq!(parse_string(r#""a\"b\\c\nd\te\rf""#), "a\"b\\c\nd\te\rf");
+        assert_eq!(parse_string(r#""keep \q and trailing \""#), "keep \\q and trailing \\");
+        assert_eq!(parse_string("  bare  "), "bare");
+        assert_eq!(parse_string("\"\""), "");
+        assert_eq!(parse_string("\""), "\"", "a lone quote is not a quoted string");
+    }
+
+    #[test]
+    fn lists_split_at_the_top_level_only() {
+        assert_eq!(split_list("[a, [b, c], {d: e, f: g}, 'h, i', \"j]\"]").unwrap(), ["a", "[b, c]", "{d: e, f: g}", "'h, i'", "\"j]\""]);
+        assert_eq!(split_list("[{{ [1, 2] }}, x]").unwrap(), ["{{ [1, 2] }}", "x"]);
+        assert_eq!(split_list("[{{ {'a': 1} }}, y]").unwrap(), ["{{ {'a': 1} }}", "y"]);
+        assert_eq!(split_list("[a, b, ]").unwrap(), ["a", "b"], "a trailing comma");
+        assert_eq!(split_list("[]").unwrap(), Vec::<String>::new());
+        assert_eq!(split_list("[ ]").unwrap(), Vec::<String>::new());
+        assert_eq!(split_list("a, b"), None);
+        assert_eq!(split_list("[a, 'b\\'c', d]").unwrap(), ["a", "'b\\'c'", "d"]);
+    }
+
+    #[test]
+    fn byte_counts_refuse_what_does_not_fit() {
+        assert_eq!(parse_bytes("1TiB"), Some(1 << 40));
+        assert_eq!(parse_bytes("2B"), Some(2));
+        assert_eq!(parse_bytes("1PiB"), None);
+        assert_eq!(parse_bytes("-1KiB"), None);
+        assert_eq!(parse_bytes("99999999TiB"), None);
+        assert_eq!(parse_bytes("KiB"), None);
+    }
+
+    #[test]
+    fn colors_in_every_form() {
+        assert_eq!(parse_color("#f80"), Some(Color { r: 0xff, g: 0x88, b: 0, a: 0xff }));
+        assert_eq!(parse_color("#11223344"), Some(Color { r: 0x11, g: 0x22, b: 0x33, a: 0x44 }));
+        assert_eq!(parse_color("#AbCdEf").map(|c| c.g), Some(0xcd));
+        for bad in ["#", "#12", "#1234", "#12345", "#ggg", "123456", "#é12"] {
+            assert_eq!(parse_color(bad), None, "{bad}");
+        }
+    }
 }

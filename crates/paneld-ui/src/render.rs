@@ -1275,7 +1275,14 @@ fn collect_action_args(call: &Block, ctx: &Context) -> Vec<ActionArg> {
 }
 
 fn collect_inline_set(set_block: &Block, ctx: &Context) -> Vec<InlineSetItem> {
-    let locals = local_args(ctx);
+    // `page` and `nav` too: only a drawn page has them (they are not
+    // action args, which would change what counts as the same call).
+    let mut locals = local_args(ctx);
+    for k in ["page", "nav"] {
+        if let Some(v) = ctx.get(k) {
+            locals.push(ActionArg { name: k.into(), value: v.clone() });
+        }
+    }
     let mut out = Vec::new();
     for item in &set_block.items {
         let Item::Assign(a) = item else { continue };

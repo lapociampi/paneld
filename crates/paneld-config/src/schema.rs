@@ -2795,6 +2795,12 @@ fn validate_arg_body(
     let is_component = kind_label == "component";
     let mut seen: HashMap<String, Span> = HashMap::new();
     for item in &b.items {
+        // A call's body is its args. (A component call's child nodes
+        // go to its slot and are checked by the caller.)
+        if !is_component && !matches!(item, Item::Assign(_)) {
+            diags.push(Diagnostic::new(item.span(), "an action call only takes `key = value` args"));
+            continue;
+        }
         let Item::Assign(a) = item else { continue };
         let AssignTarget::Simple { key } = &a.target else {
             diags.push(Diagnostic::new(
@@ -3616,6 +3622,57 @@ mod tests {
             diags.iter().any(|m| m.contains(needle)),
             "no diagnostic contained `{needle}`; diags: {diags:?}"
         );
+    }
+
+    /// Each misplaced or malformed item, and the message it gets.
+    #[test]
+    fn every_structural_error_has_its_message() {
+        let cases: &[(&str, &str)] = &[
+            ("source a.b { run = x }\n", "a `source` name cannot contain `.`"),
+            ("action a { var v: int = 1 }\n", "`var` is only allowed at the top level, not inside `action`"),
+            ("action a { repeat x in {{ [1] }} { } }\n", "`repeat` is not allowed inside `action`"),
+            ("action a { $v = 1 }\n", "`$var` definitions are only allowed at the top level"),
+            ("action a { app:x = 1 }\n", "`category:key` shorthand is only allowed at the top level"),
+            ("action a { theme[x]:k = 1 }\n", "`kind[name]:key` shorthand is only allowed at the top level"),
+            ("action a { env { x { } } }\n", "nested blocks are not allowed here"),
+            ("action a { set foo { } }\n", "`set` does not take a name here"),
+            ("source s { run = x\n param p: int }\n", "`param` is only allowed inside `action` or `component`, not `source`"),
+            ("action a { param p: int { x { } } }\n", "`param` options block only accepts `key = value` entries"),
+            ("action a { param p: int { app:x = 1 } }\n", "`param` options block entries must be simple `key = value`"),
+            ("app { timeout = soon }\n", "expected a duration"),
+            ("app { max_running = x }\n", "an integer"),
+            ("app { max_output = lots }\n", "a byte count"),
+            ("action a { goto = 1x }\n", "expected an identifier, got `1x`"),
+            ("action a { refresh = 1x }\n", "expected an identifier or a list of identifiers, got `1x`"),
+            ("page p { param x: int }\n", "`param` is not allowed in a `page` body (use a `component`)"),
+            ("page p { var v: int = 1 }\n", "`var` declarations are only allowed at the top level"),
+            ("page p { app:x = 1 }\n", "qualified assignments are only allowed at the top level"),
+            ("component c { title = x\n text { value = y } }\n", "a `component` body only accepts `param` and a single UI root node"),
+            ("theme t { param p: int }\n", "`param` is only allowed inside a `component` body"),
+            ("theme t { repeat x in {{ [1] }} { } }\n", "`repeat` is not allowed inside a `theme` body"),
+            ("theme t { style .c { x { } } }\n", "a `style` body does not contain nested blocks"),
+            ("theme t { style .c { param p: int } }\n", "`param` is not allowed in a `style` body"),
+            ("theme t { style .c { repeat x in {{ [1] }} { } } }\n", "`repeat` is not allowed in a `style` body"),
+            ("theme t { style .1 { radius = 1 } }\n", "expected a class name after `.`"),
+            ("theme t { style 1:pressed { radius = 1 } }\n", "expected a node kind before `:`"),
+            ("theme t { style a b { radius = 1 } }\n", "invalid style selector"),
+            ("page p { text foo { value = x } }\n", "`text` does not take a name"),
+            ("component c { column { param p: int } }\n", "`param` is only allowed at the start of a `component` body"),
+            ("page p { repeat x in {{ [1] }} { value = 1 } }\n", "`repeat` body only contains UI nodes, not property assignments"),
+            ("page p { repeat x in {{ [1] }} { param q: int } }\n", "`param` is not allowed inside a `repeat` body"),
+            ("action a { }\npage p { button { on_tap a { x { } } } }\n", "an action call only takes `key = value` args"),
+            ("page p { button { on_tap { app:x = 1 } } }\n", "an action-call body only contains simple `key = value`"),
+            ("page p { button { on_tap { goto { } } } }\n", "is not valid inside an inline action; use `set` or `env`"),
+            ("component c { param v: int\n text { value = x } }\npage p { c { v = 1\n app:x = 2 } }\n", "an action/component call only contains simple `key = value` args"),
+        ];
+        let mut missing = Vec::new();
+        for (src, needle) in cases {
+            let d = check_text(src);
+            if !d.iter().any(|m| m.contains(needle)) {
+                missing.push(format!("`{}` -> wanted `{needle}`, got {d:?}", src.trim()));
+            }
+        }
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
     }
 
     #[test]

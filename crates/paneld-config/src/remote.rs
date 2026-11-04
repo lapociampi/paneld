@@ -4,14 +4,14 @@
 //! socket address rules).
 
 use crate::parse::{Assign, AssignTarget, Block, Document, Ident, Item, RawValue};
-use crate::schema::remote::{find_kind, members, via_of};
+use crate::schema::remote::{find_kind, via_of};
 
 /// The key a lowered source or action carries: the instance it
 /// belongs to. Only lowering writes it; the check refuses it in a
 /// config.
 pub const REMOTE_KEY: &str = "remote";
 
-pub use crate::schema::remote::METHODS;
+pub use crate::schema::remote::{members, METHODS};
 
 /// One instance, as the daemon needs it to run its members.
 #[derive(Clone, Debug)]

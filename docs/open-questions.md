@@ -21,7 +21,9 @@ order: 6
 - [x] Name of the program: paneld.
 - [ ] `ssh host cmd {{ x }}` written by hand: ssh hands its command to a remote shell, so a value there is shell code on the far side. A `remote_kind` with `via = ssh` quotes it ([ADR 0018](decisions/0018-remotes.md)); `paneld check` does not flag the hand-written form yet.
 - [ ] Remotes, later: alerts declared by a kind, a `via` override per instance, ssh connection reuse (ControlMaster), the HTTP status in `result` ([ADR 0018](decisions/0018-remotes.md)).
-- [ ] `active = visible` on a source is accepted but not applied yet: every source polls.
+- [x] `active = visible` on a source: applied ([Schema](schema.md), section 4).
 - [ ] A `secret` with a relative `file` is read from the daemon's working directory, not the config folder.
 - [ ] Reload: a source's background refresh can land after the new poller's first sample and briefly show the older value; `set` and `refresh` of a run started before the reload go to the old config's vars and sources.
 - [ ] ctl limits: the idle timeout is per read, so 16 clients sending a byte a minute hold every slot. The service's socket is group-only, so only local admins can do it.
+- [ ] The UI thread wakes on LVGL's own timers even when nothing changes: every 5 ms with the SDL driver, about every 33 ms (input read, display refresh) on the device. Truly idle would need LVGL's event-driven input mode and pausing the refresh timer while asleep.
+- [ ] A CEL macro (`l.map(x, ...)`) copies the expression context once per call, and a nested one once per outer item: fine for page-sized lists, costly for long ones with big source histories.

@@ -24,6 +24,7 @@ mod state;
 mod themes;
 mod tz;
 mod vars;
+mod visible;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -647,6 +648,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             paneld_ui::restore_inputs(&typed);
         }
         live.rendered_page = live.current_page.clone();
+        visible::show(&live.current_page);
     }
 }
 
@@ -799,6 +801,19 @@ fn setup_live_state(
     // `<instance>.<member>` (ADR 0018), after the overrides so
     // `remote[x]:host` counts.
     paneld_config::remote::lower(&mut doc);
+    visible::install(
+        &doc,
+        &paneld_config::remote::remotes(&doc)
+            .into_iter()
+            .map(|(name, r)| {
+                let values = paneld_config::remote::members(&r.kind)
+                    .filter(|(_, b)| b.kind.text == "value")
+                    .map(|(m, _)| m.to_string())
+                    .collect();
+                (name, values)
+            })
+            .collect(),
+    );
     remotes::install(remotes::Remotes::from_doc(
         &doc,
         &state_path.map(std::path::Path::to_path_buf).unwrap_or_else(|| state::config_path(&doc)),
@@ -951,6 +966,7 @@ fn setup_live_state(
     screen.top_layer().clear_children();
     paneld_ui::reset_action_bindings();
     paneld_ui::render_page(&doc, &current_page, &ctx, &event_tx, screen);
+    visible::show(&current_page);
 
     let screen_state =
         screen::Screen::new(screen::Config::from_doc(&doc), tz::Zone::local(), config_dir.clone());
@@ -1151,9 +1167,12 @@ fn screen_step(live: &mut LiveState) -> bool {
             screen::Effect::Sleep { absorb } => {
                 screen_command(&live.screen, live.screen.cfg.off.clone(), None);
                 paneld_ui::show_sleep_cover(absorb, live.event_tx.clone());
+                // Nothing is on screen: `active = visible` sources rest.
+                visible::set_asleep(true);
             }
             screen::Effect::Wake => {
                 paneld_ui::hide_sleep_cover();
+                visible::set_asleep(false);
                 // An alert wake has no touch: restart the idle clock.
                 paneld_ui::trigger_activity();
                 screen_command(&live.screen, live.screen.cfg.on.clone(), None);

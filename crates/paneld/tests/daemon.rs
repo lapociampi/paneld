@@ -450,3 +450,37 @@ fn the_screen_dims_at_night_sleeps_when_idle_and_wakes_for_a_critical_alert() {
     d.ok(&["alert", "fire", "c", "severity=critical"]);
     wait_log("dim 20\noff\non\ndim 20\n");
 }
+
+#[test]
+fn a_visible_only_source_polls_while_its_page_is_on_screen() {
+    let dir = tmp("visible");
+    let count = |name: &str| dir.join(name);
+    let d = Daemon::start(
+        &dir,
+        &format!(
+            "source shown {{\n poll = 1s\n active = visible\n run = sh -c 'echo x >> \"$$0\"; wc -l < \"$$0\"' {}\n parse = number\n}}\n\
+             source watched {{\n poll = 1s\n active = visible\n run = sh -c 'echo x >> \"$$0\"; wc -l < \"$$0\"' {}\n parse = number\n}}\n\
+             alert many {{ when = {{{{ sources.watched.value > 1000 }}}}; title = many }}\n\
+             page home {{ nav = 1; text {{ value = {{{{ sources.shown.value }}}} }} }}\n\
+             page other {{ nav = 2; text {{ value = elsewhere }} }}\n",
+            count("shown").display(),
+            count("watched").display()
+        ),
+    );
+    let runs = |name: &str| std::fs::read_to_string(count(name)).unwrap_or_default().lines().count();
+    // On its page: it polls.
+    let start = runs("shown");
+    std::thread::sleep(Duration::from_millis(2300));
+    assert!(runs("shown") >= start + 2, "did not poll on its page");
+    // Elsewhere: it rests; the one an alert reads goes on.
+    d.ok(&["goto", "other"]);
+    std::thread::sleep(Duration::from_millis(300));
+    let (hidden, watched) = (runs("shown"), runs("watched"));
+    std::thread::sleep(Duration::from_millis(2300));
+    assert_eq!(runs("shown"), hidden, "polled while not on screen");
+    assert!(runs("watched") >= watched + 2, "an alert's source stopped");
+    // Back on its page: polling again.
+    d.ok(&["goto", "home"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(runs("shown") > hidden, "did not resume on its page");
+}

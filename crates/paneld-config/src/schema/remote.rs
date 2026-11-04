@@ -190,7 +190,7 @@ pub(crate) fn find_kind<'a>(doc: &'a Document, name: &str) -> Option<&'a Block> 
 }
 
 /// The `value` and `action` members of a kind, with their names.
-pub(crate) fn members(kind: &Block) -> impl Iterator<Item = (&str, &Block)> {
+pub fn members(kind: &Block) -> impl Iterator<Item = (&str, &Block)> {
     kind.items.iter().filter_map(|it| match it {
         Item::Block(b) if matches!(b.kind.text.as_str(), "value" | "action") => {
             b.name.as_ref().map(|n| (n.text.as_str(), b))

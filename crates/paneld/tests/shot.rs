@@ -971,3 +971,20 @@ fn one_wrong_pin_asks_again_and_the_right_one_then_runs() {
     let img = pin_shot(&[&[GO], &WRONG, &PIN_1234]);
     assert!(img.any(|p| close(p, [0, 0, 0xff], 16)), "the second try did not run it once");
 }
+
+#[test]
+fn an_inline_set_can_read_the_page_it_was_tapped_on() {
+    let d = tmp("page-set");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var last: string = \"\"\n\
+         page home {\n\
+             button { width = 200; height = 100; label = go; on_tap { set { last = {{ page.name }} } } }\n\
+             rect { width = 200; height = 100; background = {{ vars.last == 'home' ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--tap", "100,120", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "page.name was not in scope");
+}

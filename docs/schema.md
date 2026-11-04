@@ -82,7 +82,7 @@ source cpu_temp {
 | `value` | expr | `out` | Turns `out` into the value |
 | `timeout` | duration | `app:timeout` | Not for streams |
 | `history` | duration | none | Keep past values in memory for charts: numbers, bools and text up to 64 bytes (pick one with `value`); at most 2000 |
-| `active` | `always`, `visible` | `always` | `visible`: poll only while a page using it is on screen (never for sources used by alerts) |
+| `active` | `always`, `visible` | `always` | `visible`: poll only while a page that reads it (directly, through a component or the shell) is on screen and the screen is awake; back on screen it runs at once if its last run is 5s old. A page that reads `sources` whole or by a computed name (`sources[x]`) reads them all. A source an alert or an action reads always polls |
 | `env { }` | block | | `KEY = value` pairs passed to the command |
 | `cwd` | path | config folder | Working directory ([ADR 0013](decisions/0013-command-runner.md)) |
 

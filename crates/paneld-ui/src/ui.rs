@@ -411,10 +411,11 @@ fn widget_value(kind: ChangeKind, target: *mut sys::lv_obj_t) -> Option<EventVal
         ChangeKind::Slider => EventValue::Int(unsafe { sys::lv_slider_get_value(target) } as i64),
         ChangeKind::Dropdown => EventValue::Int(unsafe { sys::lv_dropdown_get_selected(target) } as i64),
         ChangeKind::Select => {
-            let mut buf = [0 as std::os::raw::c_char; 256];
-            unsafe { sys::lv_dropdown_get_selected_str(target, buf.as_mut_ptr(), buf.len() as u32) };
-            let text = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-            EventValue::String(text.to_string_lossy().into_owned())
+            // The selected line of the options text, whatever its length.
+            let idx = unsafe { sys::lv_dropdown_get_selected(target) } as usize;
+            let all = unsafe { sys::lv_dropdown_get_options(target) };
+            let text = if all.is_null() { Default::default() } else { unsafe { std::ffi::CStr::from_ptr(all) }.to_string_lossy() };
+            EventValue::String(text.split('\n').nth(idx).unwrap_or_default().to_string())
         }
         ChangeKind::Keypad => EventValue::String(keyboard_text(target)),
         ChangeKind::PinEntry => return None,
