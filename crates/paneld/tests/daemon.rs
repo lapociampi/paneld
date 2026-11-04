@@ -402,3 +402,51 @@ fn a_poll_that_stops_answering_keeps_its_last_value_and_says_why() {
     d.wait_for("sources.c.ok", "true");
     assert_eq!(d.eval("sources.c.error == ''"), "true");
 }
+
+/// The local hour, from `date`, so a night window can be put around now.
+fn local_hour() -> u32 {
+    let o = Command::new("date").arg("+%H").output().unwrap();
+    text(&o.stdout).trim().parse().unwrap()
+}
+
+#[test]
+fn the_screen_dims_at_night_sleeps_when_idle_and_wakes_for_a_critical_alert() {
+    let dir = tmp("screen");
+    let log = dir.join("screen.log");
+    let h = local_hour();
+    let (from, to) = ((h + 23) % 24, (h + 2) % 24);
+    let d = Daemon::start(
+        &dir,
+        &format!(
+            "theme night_theme {{ accent = #123456 }}\n\
+             screen {{\n\
+                 idle = 1s\n\
+                 brightness = 40\n\
+                 off = sh -c 'echo off >> \"$$0\"' {log}\n\
+                 on = sh -c 'echo on >> \"$$0\"' {log}\n\
+                 dim = sh -c 'echo \"dim $$1\" >> \"$$0\"' {log} {{{{ level }}}}\n\
+                 night {{ from = {from:02}:00; to = {to:02}:00; theme = night_theme; brightness = 20 }}\n\
+             }}\n\
+             page home {{ text {{ value = x }} }}\n",
+            log = log.display()
+        ),
+    );
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let wait_log = |want: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // A prefix: after a wake it idles off again a second later.
+        while !read().starts_with(want) {
+            assert!(Instant::now() < deadline, "screen log `{}`, not `{want}`", read());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    // Night: its brightness and theme; then off after a second idle.
+    wait_log("dim 20\noff\n");
+    assert_eq!(d.eval("theme.accent"), "#123456");
+    // A critical alert wakes it (warnings do not).
+    d.ok(&["alert", "fire", "w", "severity=warning"]);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(read(), "dim 20\noff\n");
+    d.ok(&["alert", "fire", "c", "severity=critical"]);
+    wait_log("dim 20\noff\non\ndim 20\n");
+}

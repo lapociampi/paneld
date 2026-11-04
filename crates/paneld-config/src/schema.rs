@@ -3488,6 +3488,7 @@ fn check_cel_in_item(item: &Item, names: &Names, in_env: bool, diags: &mut Vec<D
             diags.append(&mut ds);
             if let Some(e) = &expr {
                 crate::cel::walk_source_refs(e, &names.sources, diags);
+                crate::cel::check_calls(e, diags);
                 flag_secrets(e, false, diags);
             }
             for inner in &r.items {
@@ -3534,6 +3535,7 @@ fn check_cel_in_raw_value(
             diags.append(&mut ds);
             if let Some(e) = expr {
                 crate::cel::walk_source_refs(&e, &names.sources, diags);
+                crate::cel::check_calls(&e, diags);
                 flag_secrets(&e, secrets_ok, diags);
             }
         }
@@ -3547,6 +3549,7 @@ fn check_cel_in_raw_value(
             diags.append(&mut ds);
             for e in &exprs {
                 crate::cel::walk_source_refs(e, &names.sources, diags);
+                crate::cel::check_calls(e, diags);
                 flag_secrets(e, secrets_ok, diags);
             }
         }
@@ -3613,6 +3616,22 @@ mod tests {
             diags.iter().any(|m| m.contains(needle)),
             "no diagnostic contained `{needle}`; diags: {diags:?}"
         );
+    }
+
+    #[test]
+    fn function_calls_are_checked_at_load() {
+        let d = check_text(
+            "page p {\n text { value = {{ rond(1.5) }} }\n text { value = {{ round(1, 2, 3) }} }\n\
+             text { value = A {{ [1].sizes() }} }\n text { value = {{ [1].map(1, 2) }} }\n text { value = {{ 'a'.split() }} }\n text { value = {{ format(1536, 'bytes') + duration(5) }} }\n\
+             text { color = {{ mix(color('accent'), '#000', clamp(0.2, 0, 1)) }} }\n}\n",
+        );
+        assert_msg(&d, ":2:");
+        assert_msg(&d, "unknown function `rond`; known: string, int");
+        assert_msg(&d, "`round` takes 1 or 2 argument(s), not 3");
+        assert_msg(&d, "unknown method `.sizes()`");
+        assert_msg(&d, "`.map()` takes a name first");
+        assert_msg(&d, "`.split()` takes 1 argument(s), not 0");
+        assert_eq!(d.len(), 5, "the known functions pass: {d:?}");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! the PNG and look at what was drawn.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static N: AtomicUsize = AtomicUsize::new(0);
@@ -889,4 +889,85 @@ fn a_missing_start_page_is_said_on_screen() {
     std::fs::write(&conf, "page home { text { value = hi } }\n").unwrap();
     let img = shot(&conf, &["--page", "nope", "--settle", "50"]);
     assert_eq!((img.w, img.h), (800, 480));
+}
+
+/// A config with a PIN-guarded action that counts its runs, and a
+/// square that is green after two of them, blue after one.
+fn pin_conf(label: &str) -> PathBuf {
+    let d = tmp(label);
+    let hash = Command::new(env!("CARGO_BIN_EXE_paneld"))
+        .arg("hash-pin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            c.stdin.take().unwrap().write_all(b"1234\n")?;
+            c.wait_with_output()
+        })
+        .unwrap();
+    assert!(hash.status.success());
+    std::fs::write(d.join("pin.hash"), &hash.stdout).unwrap();
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "secret pin_hash {{ file = {} }}\n\
+             security {{ pin = pin_hash; attempts = 2; lockout = 5m; unlock_for = 1m }}\n\
+             var n: int = 0\n\
+             action guarded {{ pin = true; set {{ n = {{{{ vars.n + 1 }}}} }} }}\n\
+             page home {{\n\
+                 button {{ width = 200; height = 100; label = go; on_tap = guarded }}\n\
+                 rect {{ width = 200; height = 100; background = {{{{ vars.n == 2 ? '#00ff00' : vars.n == 1 ? '#0000ff' : '#ff0000' }}}} }}\n\
+             }}\n",
+            d.join("pin.hash").display()
+        ),
+    )
+    .unwrap();
+    conf
+}
+
+const GO: &str = "100,120";
+const PIN_1234: [&str; 5] = ["137,274", "400,274", "662,274", "137,331", "662,445"];
+const WRONG: [&str; 2] = ["662,388", "662,445"];
+const NOTICE_OK: &str = "399,269";
+
+fn taps(seq: &[&[&str]]) -> Vec<String> {
+    let mut out = Vec::new();
+    for group in seq {
+        for t in *group {
+            out.push("--tap".to_string());
+            out.push(t.to_string());
+        }
+    }
+    out.extend(["--settle".to_string(), "150".to_string()]);
+    out
+}
+
+fn pin_shot(seq: &[&[&str]]) -> Image {
+    let conf = pin_conf("pin");
+    let args = taps(seq);
+    shot(&conf, &args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+#[test]
+fn the_right_pin_runs_the_action_and_unlocks_for_a_while() {
+    // PIN, then a second tap with no PIN asked: two runs.
+    let img = pin_shot(&[&[GO], &PIN_1234, &[GO]]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "not two runs");
+}
+
+#[test]
+fn wrong_pins_lock_the_action_out() {
+    // Two wrong PINs: the lockout notice; after it, another tap meets
+    // the lockout again, so the right PIN cannot even be entered.
+    let img = pin_shot(&[&[GO], &WRONG, &WRONG, &[NOTICE_OK], &[GO], &[NOTICE_OK], &[GO], &PIN_1234]);
+    assert!(img.any(|p| close(p, [0xff, 0, 0], 16)), "the page is not back");
+    assert!(!img.any(|p| close(p, [0, 0, 0xff], 16) || close(p, [0, 0xff, 0], 16)), "it ran while locked out");
+}
+
+#[test]
+fn one_wrong_pin_asks_again_and_the_right_one_then_runs() {
+    let img = pin_shot(&[&[GO], &WRONG, &PIN_1234]);
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 16)), "the second try did not run it once");
 }

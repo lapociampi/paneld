@@ -1050,6 +1050,114 @@ pub fn find_ident(expr: &Expr, name: &str) -> Option<Span> {
     }
 }
 
+/// The functions expressions can call, with how many arguments each
+/// takes (schema 16). The evaluator implements exactly these.
+pub const FUNCTIONS: &[(&str, &[usize])] = &[
+    ("string", &[1]),
+    ("int", &[1]),
+    ("number", &[1]),
+    ("round", &[1, 2]),
+    ("len", &[1]),
+    ("ago", &[1]),
+    ("has", &[1]),
+    ("format", &[2]),
+    ("duration", &[1]),
+    ("clamp", &[3]),
+    ("color", &[1]),
+    ("mix", &[3]),
+    ("double", &[1]),
+    ("size", &[1]),
+    ("timestamp", &[1]),
+];
+
+/// The methods (`.name(...)`) the evaluator implements, with their
+/// argument counts. The macros take a name first.
+pub const METHODS: &[(&str, &[usize])] = &[
+    ("all", &[2]),
+    ("exists", &[2]),
+    ("exists_one", &[2]),
+    ("map", &[2, 3]),
+    ("filter", &[2]),
+    ("size", &[0]),
+    ("contains", &[1]),
+    ("startsWith", &[1]),
+    ("endsWith", &[1]),
+    ("lowerAscii", &[0]),
+    ("upperAscii", &[0]),
+    ("trim", &[0]),
+    ("split", &[1]),
+    ("join", &[0, 1]),
+];
+
+/// Flag calls the evaluator would refuse when the page is drawn: an
+/// unknown function, the wrong number of arguments, a method.
+pub fn check_calls(expr: &Expr, diags: &mut Vec<Diagnostic>) {
+    match &expr.kind {
+        ExprKind::Call(name, args) => {
+            match FUNCTIONS.iter().find(|(n, _)| n == name) {
+                None => diags.push(Diagnostic::new(
+                    expr.span,
+                    format!(
+                        "unknown function `{name}`; known: {}",
+                        FUNCTIONS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+                    ),
+                )),
+                Some((_, arities)) if !arities.contains(&args.len()) => {
+                    let want = arities.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(" or ");
+                    diags.push(Diagnostic::new(
+                        expr.span,
+                        format!("`{name}` takes {want} argument(s), not {}", args.len()),
+                    ));
+                }
+                _ => {}
+            }
+            args.iter().for_each(|a| check_calls(a, diags));
+        }
+        ExprKind::Method(inner, name, args) => {
+            match METHODS.iter().find(|(n, _)| n == name) {
+                None => diags.push(Diagnostic::new(
+                    expr.span,
+                    format!(
+                        "unknown method `.{name}()`; known: {}",
+                        METHODS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+                    ),
+                )),
+                Some((_, arities)) if !arities.contains(&args.len()) => {
+                    let want = arities.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(" or ");
+                    diags.push(Diagnostic::new(
+                        expr.span,
+                        format!("`.{name}()` takes {want} argument(s), not {}", args.len()),
+                    ));
+                }
+                Some(_) if matches!(name.as_str(), "all" | "exists" | "exists_one" | "map" | "filter")
+                    && !matches!(args.first().map(|a| &a.kind), Some(ExprKind::Ident(_))) =>
+                {
+                    diags.push(Diagnostic::new(expr.span, format!("`.{name}()` takes a name first: `.{name}(x, ...)`")));
+                }
+                _ => {}
+            }
+            check_calls(inner, diags);
+            args.iter().for_each(|a| check_calls(a, diags));
+        }
+        ExprKind::Field(inner, _) | ExprKind::Unary(_, inner) => check_calls(inner, diags),
+        ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) => {
+            check_calls(a, diags);
+            check_calls(b, diags);
+        }
+        ExprKind::Conditional(a, b, c) => {
+            check_calls(a, diags);
+            check_calls(b, diags);
+            check_calls(c, diags);
+        }
+        ExprKind::List(items) => items.iter().for_each(|a| check_calls(a, diags)),
+        ExprKind::Map(pairs) => pairs.iter().for_each(|(k, v)| {
+            check_calls(k, diags);
+            check_calls(v, diags);
+        }),
+        _ => {}
+    }
+}
+
 /// Every bare identifier in `expr` with its span: the roots an
 /// expression reads (`a` in `a.b[c]`, and `c`).
 pub fn idents(expr: &Expr) -> Vec<(String, Span)> {

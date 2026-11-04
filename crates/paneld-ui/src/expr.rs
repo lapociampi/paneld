@@ -139,18 +139,7 @@ pub fn eval(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
             }
         }
         ExprKind::Call(name, args) => call_builtin(name, args, ctx),
-        ExprKind::Method(inner, name, args) => {
-            // No method lookup yet; evaluate the receiver so a user
-            // error (e.g. a missing field in the receiver) still
-            // surfaces at this call site.
-            let _ = eval(inner, ctx)?;
-            for a in args {
-                let _ = eval(a, ctx)?;
-            }
-            Err(EvalError::new(format!(
-                "method `.{name}(...)` is not supported yet"
-            )))
-        }
+        ExprKind::Method(inner, name, args) => call_method(eval(inner, ctx)?, name, args, ctx),
         ExprKind::List(items) => {
             let mut vals = Vec::with_capacity(items.len());
             for i in items {
@@ -394,6 +383,57 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
                 .map_or(0, |d| d.as_secs() as i64);
             Ok(Value::String(ago_text(now.saturating_sub(t))))
         }
+        // Schema 16: display helpers.
+        "format" if argc == 2 => {
+            let x = number_arg(&eval(&args[0], ctx)?, "format")?;
+            let Value::String(unit) = eval(&args[1], ctx)? else {
+                return Err(EvalError::new("format(x, unit) needs a text unit"));
+            };
+            Ok(Value::String(format_unit(x, &unit)))
+        }
+        "duration" if argc == 1 => {
+            let secs = number_arg(&eval(&args[0], ctx)?, "duration")?;
+            Ok(Value::String(duration_text(secs)))
+        }
+        "clamp" if argc == 3 => {
+            let x = eval(&args[0], ctx)?;
+            let (lo, hi) = (eval(&args[1], ctx)?, eval(&args[2], ctx)?);
+            match (&x, &lo, &hi) {
+                (Value::Int(x), Value::Int(lo), Value::Int(hi)) if lo <= hi => Ok(Value::Int(*x.max(lo).min(hi))),
+                _ => {
+                    let (x, lo, hi) = (number_arg(&x, "clamp")?, number_arg(&lo, "clamp")?, number_arg(&hi, "clamp")?);
+                    if lo > hi || lo.is_nan() || hi.is_nan() {
+                        return Err(EvalError::new("clamp(x, a, b) needs a <= b"));
+                    }
+                    Ok(Value::Double(x.clamp(lo, hi)))
+                }
+            }
+        }
+        "color" if argc == 1 => {
+            let (rgb, alpha) = color_arg(&eval(&args[0], ctx)?, ctx)?;
+            Ok(Value::String(hex_text(rgb, alpha)))
+        }
+        "mix" if argc == 3 => {
+            let (a, _) = color_arg(&eval(&args[0], ctx)?, ctx)?;
+            let (b, _) = color_arg(&eval(&args[1], ctx)?, ctx)?;
+            let t = number_arg(&eval(&args[2], ctx)?, "mix")?;
+            let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+            let blend = |shift: u32| {
+                let (x, y) = (((a >> shift) & 0xff) as f64, ((b >> shift) & 0xff) as f64);
+                ((x + (y - x) * t).round() as u32) << shift
+            };
+            Ok(Value::String(hex_text(blend(16) | blend(8) | blend(0), None)))
+        }
+        "double" if argc == 1 => call_builtin("number", args, ctx),
+        "size" if argc == 1 => call_builtin("len", args, ctx),
+        // There is no timestamp type: Unix seconds as the RFC 3339
+        // text CEL prints for one, in UTC.
+        "timestamp" if argc == 1 => match eval(&args[0], ctx)? {
+            Value::Int(n) => Ok(Value::String(rfc3339(n))),
+            Value::Double(d) if d.is_finite() => Ok(Value::String(rfc3339(d as i64))),
+            Value::String(s) => Ok(Value::String(s)),
+            other => Err(EvalError::new(format!("timestamp({}) is not supported", type_name(&other)))),
+        },
         "has" if argc == 1 => {
             // `has(a.b)` in CEL tests field presence without erroring
             // on absence. Our Field eval returns Err on missing, so
@@ -406,6 +446,230 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
         _ => Err(EvalError::new(format!(
             "unknown function `{name}` with {argc} args"
         ))),
+    }
+}
+
+pub use paneld_config::cel::FUNCTIONS;
+
+/// `receiver.name(args)`: the CEL macros (`all`, `exists`,
+/// `exists_one`, `map`, `filter`) over a list or a map's keys, and the
+/// string and list methods.
+fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalError> {
+    if matches!(name, "all" | "exists" | "exists_one" | "map" | "filter") {
+        let items = match receiver {
+            Value::List(l) => l,
+            Value::Map(m) => m.into_keys().map(Value::String).collect(),
+            other => return Err(EvalError::new(format!(".{name}() on a {} is not supported", type_name(&other)))),
+        };
+        let (var, rest) = match args.split_first() {
+            Some((Expr { kind: ExprKind::Ident(v), .. }, rest)) if !rest.is_empty() && rest.len() <= 2 => (v, rest),
+            _ => return Err(EvalError::new(format!(".{name}() takes a name and an expression"))),
+        };
+        let mut scope = ctx.clone();
+        let mut with = |item: &Value, e: &Expr| {
+            scope.insert(var.clone(), item.clone());
+            eval(e, &scope)
+        };
+        let pred = |v: Value| to_bool(&v);
+        return match (name, rest) {
+            ("all", [p]) => {
+                for i in &items {
+                    if !pred(with(i, p)?)? {
+                        return Ok(Value::Bool(false));
+                    }
+                }
+                Ok(Value::Bool(true))
+            }
+            ("exists", [p]) => {
+                for i in &items {
+                    if pred(with(i, p)?)? {
+                        return Ok(Value::Bool(true));
+                    }
+                }
+                Ok(Value::Bool(false))
+            }
+            ("exists_one", [p]) => {
+                let mut n = 0;
+                for i in &items {
+                    if pred(with(i, p)?)? {
+                        n += 1;
+                    }
+                }
+                Ok(Value::Bool(n == 1))
+            }
+            ("filter", [p]) => {
+                let mut out = Vec::new();
+                for i in items {
+                    if pred(with(&i, p)?)? {
+                        out.push(i);
+                    }
+                }
+                Ok(Value::List(out))
+            }
+            ("map", [e]) => items.iter().map(|i| with(i, e)).collect::<Result<_, _>>().map(Value::List),
+            ("map", [p, e]) => {
+                let mut out = Vec::new();
+                for i in &items {
+                    if pred(with(i, p)?)? {
+                        out.push(with(i, e)?);
+                    }
+                }
+                Ok(Value::List(out))
+            }
+            _ => Err(EvalError::new(format!(".{name}() takes a name and one expression"))),
+        };
+    }
+    let args = args.iter().map(|a| eval(a, ctx)).collect::<Result<Vec<_>, _>>()?;
+    let text = |v: &Value| match v {
+        Value::String(s) => Ok(s.clone()),
+        other => Err(EvalError::new(format!(".{name}() needs text, got {}", type_name(other)))),
+    };
+    match (name, &receiver, args.as_slice()) {
+        ("size", Value::String(s), []) => Ok(Value::Int(s.chars().count() as i64)),
+        ("size", Value::List(l), []) => Ok(Value::Int(l.len() as i64)),
+        ("size", Value::Map(m), []) => Ok(Value::Int(m.len() as i64)),
+        ("contains", Value::String(s), [x]) => Ok(Value::Bool(s.contains(&text(x)?))),
+        ("startsWith", Value::String(s), [x]) => Ok(Value::Bool(s.starts_with(&text(x)?))),
+        ("endsWith", Value::String(s), [x]) => Ok(Value::Bool(s.ends_with(&text(x)?))),
+        ("lowerAscii", Value::String(s), []) => Ok(Value::String(s.to_ascii_lowercase())),
+        ("upperAscii", Value::String(s), []) => Ok(Value::String(s.to_ascii_uppercase())),
+        ("trim", Value::String(s), []) => Ok(Value::String(s.trim().to_string())),
+        ("split", Value::String(s), [sep]) => {
+            Ok(Value::List(s.split(text(sep)?.as_str()).map(|p| Value::String(p.to_string())).collect()))
+        }
+        ("join", Value::List(l), []) | ("join", Value::List(l), [_]) => {
+            let sep = match args.first() {
+                Some(x) => text(x)?,
+                None => String::new(),
+            };
+            let parts = l.iter().map(text).collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::String(parts.join(&sep)))
+        }
+        _ => Err(EvalError::new(format!(
+            "`.{name}()` with {} argument(s) is not supported on a {}",
+            args.len(),
+            type_name(&receiver)
+        ))),
+    }
+}
+
+/// Unix seconds as `2026-11-04T18:30:00Z`.
+fn rfc3339(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3_600, rem % 3_600 / 60, rem % 60)
+}
+
+fn number_arg(v: &Value, f: &str) -> Result<f64, EvalError> {
+    match v {
+        Value::Int(n) => Ok(*n as f64),
+        Value::Double(d) => Ok(*d),
+        other => Err(EvalError::new(format!("{f}() needs a number, got {}", type_name(other)))),
+    }
+}
+
+/// A number with at most one decimal, none when it is whole.
+fn short_number(x: f64) -> String {
+    let r = (x * 10.0).round() / 10.0;
+    if r.fract() == 0.0 && r.abs() < 1e15 {
+        format!("{}", r as i64)
+    } else {
+        format!("{r:.1}")
+    }
+}
+
+/// `format(x, unit)`: `bytes` in steps of 1024 (`1.5 KiB`), `si` in
+/// steps of 1000 (`2.3 M`), `%` as a percentage, any other unit put
+/// after the number (`21.5 C`).
+fn format_unit(x: f64, unit: &str) -> String {
+    let scaled = |step: f64, names: &[&str]| {
+        let mut v = x;
+        let mut i = 0;
+        while v.abs() >= step && i + 1 < names.len() {
+            v /= step;
+            i += 1;
+        }
+        let n = short_number(v);
+        if names[i].is_empty() { n } else { format!("{n} {}", names[i]) }
+    };
+    match unit {
+        "bytes" => scaled(1024.0, &["B", "KiB", "MiB", "GiB", "TiB", "PiB"]),
+        "si" => scaled(1000.0, &["", "k", "M", "G", "T", "P"]),
+        "%" => format!("{}%", short_number(x)),
+        "" => short_number(x),
+        u => format!("{} {u}", short_number(x)),
+    }
+}
+
+/// Seconds as the two largest units: `45s`, `5m 3s`, `1h 5m`, `3d 4h`.
+fn duration_text(secs: f64) -> String {
+    let sign = if secs < 0.0 { "-" } else { "" };
+    let s = secs.abs().round() as u64;
+    let units = [("d", 86_400), ("h", 3_600), ("m", 60), ("s", 1)];
+    // The largest unit that fits, then the next one if it is not 0.
+    let i = units.iter().position(|(_, size)| s >= *size).unwrap_or(3);
+    let (name, size) = units[i];
+    let mut out = format!("{sign}{}{name}", s / size);
+    if let Some((next, next_size)) = units.get(i + 1) {
+        let rest = (s % size) / next_size;
+        if rest > 0 {
+            out.push_str(&format!(" {rest}{next}"));
+        }
+    }
+    out
+}
+
+/// A color value: `#rgb`, `#rrggbb`, `#rrggbbaa`, or the name of a
+/// theme color token. Its RGB and alpha.
+fn color_arg(v: &Value, ctx: &Context) -> Result<(u32, Option<u8>), EvalError> {
+    let Value::String(s) = v else {
+        return Err(EvalError::new(format!("a color is text, got {}", type_name(v))));
+    };
+    let text = s.trim();
+    let hex = if text.starts_with('#') {
+        text.to_string()
+    } else {
+        match ctx.get("theme") {
+            Some(Value::Map(t)) => match t.get(text) {
+                Some(Value::String(h)) if h.trim().starts_with('#') => h.trim().to_string(),
+                _ => return Err(EvalError::new(format!("`{text}` is not a theme color"))),
+            },
+            _ => return Err(EvalError::new(format!("`{text}` is not a color"))),
+        }
+    };
+    let digits = &hex[1..];
+    let byte = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).ok();
+    let bad = || EvalError::new(format!("`{hex}` is not a color"));
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    match digits.len() {
+        3 => {
+            let d: Vec<u32> = digits.chars().map(|c| c.to_digit(16).unwrap() * 17).collect();
+            Ok(((d[0] << 16) | (d[1] << 8) | d[2], None))
+        }
+        6 | 8 => {
+            let rgb = ((byte(0).ok_or_else(bad)? as u32) << 16) | ((byte(2).ok_or_else(bad)? as u32) << 8) | byte(4).ok_or_else(bad)? as u32;
+            Ok((rgb, if digits.len() == 8 { byte(6) } else { None }))
+        }
+        _ => Err(bad()),
+    }
+}
+
+fn hex_text(rgb: u32, alpha: Option<u8>) -> String {
+    match alpha {
+        Some(a) => format!("#{rgb:06x}{a:02x}"),
+        None => format!("#{rgb:06x}"),
     }
 }
 
@@ -715,10 +979,53 @@ mod more_tests {
     }
 
     #[test]
-    fn methods_are_refused_after_their_parts_evaluate() {
-        assert_eq!(err("l.size()"), "method `.size(...)` is not supported yet");
+    fn macros_over_lists_and_map_keys() {
+        let ctx = sample_ctx();
+        let e = |s: &str| try_ev(s, &ctx).unwrap_or_else(|e| panic!("`{s}`: {e}"));
+        assert_eq!(e("l.exists(x, x > 15)"), B(true));
+        assert_eq!(e("l.all(x, x > 15)"), B(false));
+        assert_eq!(e("l.exists_one(x, x > 5)"), B(false));
+        assert_eq!(e("l.filter(x, x > 15)"), Value::List(vec![I(20)]));
+        assert_eq!(e("l.map(x, x * 2)"), Value::List(vec![I(20), I(40)]));
+        assert_eq!(e("l.map(x, x > 15, x + 1)"), Value::List(vec![I(21)]));
+        assert_eq!(e("m.exists(k, k == 'a')"), B(true));
+        assert_eq!(e("[].all(x, x)"), B(true));
+        // The macro's name does not leak, and a name from outside is kept.
+        assert_eq!(e("l.map(s, s)[0] == 10 && s == 'text'"), B(true));
+        assert_eq!(err("l.map(1, 2)"), ".map() takes a name and an expression");
+        assert_eq!(err("l.exists(x, 1)"), "expected a bool, got int");
+        assert_eq!(err("s.exists(x, true)"), ".exists() on a string is not supported");
         assert_eq!(err("nope.size()"), "unknown identifier `nope`");
-        assert_eq!(err("l.exists(nope)"), "unknown identifier `nope`");
+    }
+
+    #[test]
+    fn string_and_list_methods() {
+        let e = ev;
+        assert_eq!(e("'Hello'.size()"), I(5));
+        assert_eq!(e("[1, 2].size()"), I(2));
+        assert_eq!(e("{'a': 1}.size()"), I(1));
+        assert_eq!(e("'abc'.contains('b')"), B(true));
+        assert_eq!(e("'abc'.startsWith('ab') && 'abc'.endsWith('bc')"), B(true));
+        assert_eq!(e("'Ab'.lowerAscii() + 'Ab'.upperAscii()"), S("abAB".into()));
+        assert_eq!(e("'  x '.trim()"), S("x".into()));
+        assert_eq!(e("'a,b'.split(',')"), Value::List(vec![S("a".into()), S("b".into())]));
+        assert_eq!(e("['a', 'b'].join(', ')"), S("a, b".into()));
+        assert_eq!(e("['a', 'b'].join()"), S("ab".into()));
+        assert_eq!(err("[1].join(',')"), ".join() needs text, got int");
+        assert_eq!(err("'a'.contains(1)"), ".contains() needs text, got int");
+        assert_eq!(err("l.nope()"), "`.nope()` with 0 argument(s) is not supported on a list");
+    }
+
+    #[test]
+    fn double_size_and_timestamp() {
+        assert_eq!(ev("double(2)"), D(2.0));
+        assert_eq!(ev("size('abc')"), I(3));
+        assert_eq!(ev("timestamp(0)"), S("1970-01-01T00:00:00Z".into()));
+        assert_eq!(ev("timestamp(1762281000)"), S("2025-11-04T18:30:00Z".into()));
+        assert_eq!(ev("timestamp(951782400.5)"), S("2000-02-29T00:00:00Z".into()));
+        assert_eq!(ev("timestamp(-86400)"), S("1969-12-31T00:00:00Z".into()));
+        assert_eq!(ev("timestamp('2026-01-01T00:00:00Z')"), S("2026-01-01T00:00:00Z".into()));
+        assert_eq!(err("timestamp(true)"), "timestamp(bool) is not supported");
     }
 
     #[test]
@@ -781,5 +1088,97 @@ mod more_tests {
         assert_eq!(Value::Null.to_display_string(), "null");
         assert_eq!(B(false).to_display_string(), "false");
         assert_eq!(EvalError::new("boom").to_string(), "boom");
+    }
+
+    #[test]
+    fn format_scales_and_labels() {
+        assert_eq!(ev("format(1536, 'bytes')"), S("1.5 KiB".into()));
+        assert_eq!(ev("format(512, 'bytes')"), S("512 B".into()));
+        assert_eq!(ev("format(3.5 * 1024.0 * 1024.0 * 1024.0, 'bytes')"), S("3.5 GiB".into()));
+        assert_eq!(ev("format(2345678, 'si')"), S("2.3 M".into()));
+        assert_eq!(ev("format(999, 'si')"), S("999".into()));
+        assert_eq!(ev("format(41.96, '%')"), S("42%".into()));
+        assert_eq!(ev("format(21.54, 'C')"), S("21.5 C".into()));
+        assert_eq!(ev("format(-0.04, '')"), S("0".into()));
+        assert_eq!(err("format('a', 'C')"), "format() needs a number, got string");
+        assert_eq!(err("format(1, 2)"), "format(x, unit) needs a text unit");
+    }
+
+    #[test]
+    fn duration_takes_the_two_largest_units() {
+        assert_eq!(ev("duration(0)"), S("0s".into()));
+        assert_eq!(ev("duration(45)"), S("45s".into()));
+        assert_eq!(ev("duration(303)"), S("5m 3s".into()));
+        assert_eq!(ev("duration(3600)"), S("1h".into()));
+        assert_eq!(ev("duration(3900.4)"), S("1h 5m".into()));
+        assert_eq!(ev("duration(273600)"), S("3d 4h".into()));
+        assert_eq!(ev("duration(86400 + 59)"), S("1d".into()), "seconds under a day's minutes drop");
+        assert_eq!(ev("duration(-90)"), S("-1m 30s".into()));
+        assert_eq!(err("duration('x')"), "duration() needs a number, got string");
+    }
+
+    #[test]
+    fn clamp_keeps_within_bounds() {
+        assert_eq!(ev("clamp(5, 0, 3)"), I(3));
+        assert_eq!(ev("clamp(-1, 0, 3)"), I(0));
+        assert_eq!(ev("clamp(2, 0, 3)"), I(2));
+        assert_eq!(ev("clamp(1.5, 0, 1)"), D(1.0));
+        assert_eq!(ev("clamp(5, 0.5, 2.5)"), D(2.5));
+        assert_eq!(err("clamp(1, 3, 0)"), "clamp(x, a, b) needs a <= b");
+        assert_eq!(err("clamp('a', 0, 1)"), "clamp() needs a number, got string");
+    }
+
+    #[test]
+    fn colors_and_mixing() {
+        let mut ctx = Context::new();
+        ctx.insert("theme".into(), Value::Map(BTreeMap::from([
+            ("accent".to_string(), S("#2196F3".into())),
+            ("font".to_string(), S("roboto 16".into())),
+        ])));
+        let c = |e: &str| try_ev(e, &ctx);
+        assert_eq!(c("color('accent')").unwrap(), S("#2196f3".into()));
+        assert_eq!(c("color('#abc')").unwrap(), S("#aabbcc".into()));
+        assert_eq!(c("color('#11223344')").unwrap(), S("#11223344".into()));
+        assert_eq!(c("mix('#000000', '#ffffff', 0.5)").unwrap(), S("#808080".into()));
+        assert_eq!(c("mix('accent', '#000', 1)").unwrap(), S("#000000".into()));
+        assert_eq!(c("mix('#ff0000', '#0000ff', 2)").unwrap(), S("#0000ff".into()), "t is clamped");
+        assert_eq!(c("color('font')").unwrap_err().message, "`font` is not a theme color");
+        assert_eq!(c("color('nope')").unwrap_err().message, "`nope` is not a theme color");
+        assert_eq!(c("color('#12')").unwrap_err().message, "`#12` is not a color");
+        assert_eq!(c("color('#zzzzzz')").unwrap_err().message, "`#zzzzzz` is not a color");
+        assert_eq!(c("color(1)").unwrap_err().message, "a color is text, got int");
+        assert_eq!(err("color('accent')"), "`accent` is not a color", "no theme in scope");
+    }
+
+    #[test]
+    fn every_listed_function_exists_at_its_arities() {
+        for (name, arities) in FUNCTIONS {
+            for n in *arities {
+                let args = vec!["1"; *n].join(", ");
+                let e = try_ev(&format!("{name}({args})"), &sample_ctx());
+                if let Err(e) = e {
+                    assert!(!e.message.starts_with("unknown function"), "{name}/{n}: {}", e.message);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_list_of_pools_filtered_mapped_and_joined() {
+        let pool = |name: &str, health: &str, alloc: i64, size: i64| {
+            Value::Map(BTreeMap::from([
+                ("name".to_string(), S(name.into())),
+                ("health".to_string(), S(health.into())),
+                ("alloc".to_string(), I(alloc)),
+                ("size".to_string(), I(size)),
+            ]))
+        };
+        let mut ctx = Context::new();
+        ctx.insert("pools".into(), Value::List(vec![pool("tank", "ONLINE", 90, 100), pool("fast", "DEGRADED", 10, 100)]));
+        let e = |s: &str| try_ev(s, &ctx).unwrap_or_else(|e| panic!("`{s}`: {e}"));
+        assert_eq!(e("pools.exists(p, p.health != 'ONLINE')"), B(true));
+        assert_eq!(e("pools.filter(p, p.health != 'ONLINE').map(p, p.name + ' ' + p.health).join(', ')"), S("fast DEGRADED".into()));
+        assert_eq!(e("pools.filter(p, double(p.alloc) > 0.8 * double(p.size)).map(p, p.name).join(', ')"), S("tank".into()));
+        assert_eq!(e("string(int(100.0 * double(pools[0].alloc) / double(pools[0].size))) + '%'"), S("90%".into()));
     }
 }

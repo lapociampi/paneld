@@ -450,7 +450,23 @@ Secret values (4 characters or more) are replaced with `****` in everything comm
 
 `ago(t)` is worked out when the page is drawn; an idle screen is not redrawn, so the text can lag until something changes.
 
-Extra functions on top of CEL: `round(x, n)`, `format(x, unit)`, `duration(x)` and `ago(t)` for display, `clamp(x, a, b)`, `color(token or hex)`, `mix(color, color, t)`.
+Functions (`paneld check` refuses any other name, or a wrong number of arguments):
+
+| Function | Result |
+| --- | --- |
+| `string(x)`, `int(x)`, `number(x)` / `double(x)` | conversions; `int` drops the fraction, reads text and bools |
+| `len(x)` / `size(x)` | characters of text, items of a list or map |
+| `round(x)`, `round(x, n)` | to a whole number, or `n` decimals |
+| `has(a.b)` | `true` when the field exists |
+| `ago(t)` | Unix seconds as `just now`, `5m ago`, `3h ago`, `2d ago` |
+| `duration(x)` | seconds as the two largest units: `45s`, `5m 3s`, `1h 5m`, `3d 4h` |
+| `format(x, unit)` | `bytes` in steps of 1024 (`1.5 KiB`), `si` in steps of 1000 (`2.3 M`), `%` (`42%`), any other unit after the number (`21.5 C`); at most one decimal |
+| `timestamp(t)` | Unix seconds as `2026-11-04T18:30:00Z` (UTC) |
+| `clamp(x, a, b)` | `x` kept within `a`..`b` |
+| `color(c)` | a theme color token or `#rgb` / `#rrggbb` / `#rrggbbaa`, as `#rrggbb[aa]` |
+| `mix(a, b, t)` | colors `a` and `b` blended, `t` from 0 to 1 |
+
+Methods: `l.all(x, p)`, `l.exists(x, p)`, `l.exists_one(x, p)`, `l.filter(x, p)`, `l.map(x, e)` and `l.map(x, p, e)` over a list (or a map's keys); `size()`, `contains(s)`, `startsWith(s)`, `endsWith(s)`, `lowerAscii()`, `upperAscii()`, `trim()`, `split(sep)` on text; `join()` / `join(sep)` on a list of text.
 
 ## 17. Remotes
 
