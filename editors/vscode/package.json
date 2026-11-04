@@ -1,0 +1,38 @@
+{
+  "name": "paneld-config",
+  "displayName": "paneld config",
+  "description": "Syntax highlighting for paneld config files.",
+  "version": "0.1.0",
+  "publisher": "paneld",
+  "license": "MIT OR Apache-2.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "paneld",
+        "aliases": ["paneld", "paneld config"],
+        "filenames": ["paneld.conf"],
+        "filenamePatterns": ["**/paneld/**/*.conf"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "paneld",
+        "scopeName": "source.paneld",
+        "path": "./syntaxes/paneld.tmLanguage.json"
+      }
+    ]
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  }
+}

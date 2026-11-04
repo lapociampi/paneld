@@ -14,7 +14,7 @@ order: 6
 - [x] Display and touch: DRM/KMS with fbdev fallback, evdev ([ADR 0012](decisions/0012-display-input.md)).
 - [x] Concurrency: plain threads and channels ([ADR 0010](decisions/0010-threads.md)).
 - [x] Config parser: hand-written ([ADR 0009](decisions/0009-config-parser.md)).
-- [ ] Syntax-highlighting grammar for editors (tree-sitter or TextMate).
+- [x] Syntax-highlighting grammar for editors: TextMate, packaged for VS Code (`editors/vscode` in the repo). tree-sitter only if an editor that needs it is asked for.
 - [x] PIN levels: one in v1. Actions without `pin` are for everyone, `pin = true` for the admin; a later `pin = <level>` can add levels without breaking configs.
 - [ ] Remote view from a phone or desktop: not in v1; how, if ever.
 - [ ] Docker image: deferred. Commands run inside the container, so host actions would need ssh to the host or a privileged container.

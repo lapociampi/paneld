@@ -153,4 +153,5 @@ page home {
 
 ## Editor support
 
-None ready-made (the price of an own format). Planned: a syntax-highlighting grammar; a language server only if it proves worth it. Until then `paneld check` is the tool.
+- Syntax highlighting: a TextMate grammar, packaged for VS Code in `editors/vscode` in the repo (its README says how to install it); other editors that read TextMate grammars can use it too.
+- Checking: `paneld check`, which reports every error with file, line and column. A language server only if it proves worth it.
