@@ -1110,7 +1110,7 @@ const UI_SPINNER: &UiNode = &UiNode {
 const UI_BUTTON: &UiNode = &UiNode {
     kind: "button",
     keys: &[
-        KeyRule { name: "action", ty: ExpectedType::Ident, required: false, expr_ok: false },
+        KeyRule { name: "action", ty: ExpectedType::Ident, required: false, expr_ok: true },
         KeyRule { name: "label", ty: ExpectedType::Str, required: false, expr_ok: true },
         KeyRule { name: "icon", ty: ExpectedType::Any, required: false, expr_ok: true },
     ],
@@ -2622,9 +2622,9 @@ fn validate_style_selector(sel: &str) -> Result<(), String> {
     if let Some(rest) = s.strip_prefix('.') {
         let (class, state) = rest.split_once(':').map_or((rest, None), |(c, st)| (c, Some(st)));
         if let Some(state) = state {
-            if !matches!(state, "pressed" | "checked" | "disabled" | "focused" | "hover") {
+            if !matches!(state, "pressed" | "checked" | "disabled" | "focused" | "hover" | "running" | "failed") {
                 return Err(format!(
-                    "unknown pseudo-state `:{state}`; valid: `:pressed`, `:checked`, `:disabled`, `:focused`, `:hover`"
+                    "unknown pseudo-state `:{state}`; valid: `:pressed`, `:checked`, `:disabled`, `:focused`, `:hover`, `:running`, `:failed`"
                 ));
             }
         }
@@ -2643,9 +2643,9 @@ fn validate_style_selector(sel: &str) -> Result<(), String> {
                 "expected a node kind before `:` (identifier), got `{s}`"
             ));
         }
-        if !matches!(state, "pressed" | "checked" | "disabled" | "focused" | "hover") {
+        if !matches!(state, "pressed" | "checked" | "disabled" | "focused" | "hover" | "running" | "failed") {
             return Err(format!(
-                "unknown pseudo-state `:{state}`; valid: `:pressed`, `:checked`, `:disabled`, `:focused`, `:hover`"
+                "unknown pseudo-state `:{state}`; valid: `:pressed`, `:checked`, `:disabled`, `:focused`, `:hover`, `:running`, `:failed`"
             ));
         }
         return Ok(());
@@ -5133,6 +5133,25 @@ page home {
     }
 
     #[test]
+    fn button_action_takes_an_expression() {
+        let text = r#"
+action go { run = cat }
+component big {
+    param tap: action = none
+    button { label = Go; action = {{ tap }} }
+}
+page home {
+    big { tap = go }
+    button { label = Pick; action = {{ vars.x ? 'go' : 'gone' }} }
+}
+var x: bool = false
+"#;
+        let diags = check_text(text);
+        assert_msg(&diags, "unknown action `gone`");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+    }
+
+    #[test]
     fn component_call_unknown_action_ref_arg_is_flagged() {
         let text = r#"
 component button_x {
@@ -5375,6 +5394,8 @@ theme dark {
         let text = r#"
 theme dark {
     style button:pressed { scale = 0.96; background = {{ theme.accent }} }
+    style button:running { background = {{ theme.muted }} }
+    style .card:failed { background = #330000 }
 }
 "#;
         let diags = check_text(text);

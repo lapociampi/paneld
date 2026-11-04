@@ -347,7 +347,9 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         match rx.try_recv() {
             Ok(paneld_ui::UiEvent::ActionDone { name, key, ok, result }) => {
                 live.running.remove(&key);
-                dirty |= action_done(live, screen, &name, ok, result);
+                let args = live.calls.get(&key).map(|c| c.args.clone()).unwrap_or_default();
+                dirty |= call_done(live, &key, ok);
+                dirty |= action_done(live, screen, &name, &args, ok, result);
             }
             Ok(paneld_ui::UiEvent::Chained { name, args }) => {
                 live.deferred.push_back(actions::Call::new(name, args));
@@ -475,7 +477,10 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             paneld_ui::UiEvent::Wake => live.touched = true,
             paneld_ui::UiEvent::ActionDone { name, key, ok, result } => {
                 live.running.remove(&key);
-                if action_done(live, screen, &name, ok, result) {
+                let args = live.calls.get(&key).map(|c| c.args.clone()).unwrap_or_default();
+                // Its buttons leave `:running`.
+                dirty |= call_done(live, &key, ok);
+                if action_done(live, screen, &name, &args, ok, result) {
                     dirty = true;
                 }
             }
@@ -567,7 +572,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 value = paneld_ui::Value::Map(merged);
             }
             values.insert(update.name.clone(), value);
-            dirty = true;
+            dirty |= visible::on_page(&update.name);
             continue;
         }
         let event_value = value.clone();
@@ -588,7 +593,9 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             &event_ctx,
             std::time::SystemTime::now(),
         );
-        dirty = true;
+        // Only a page that reads the source changes (an alert it
+        // raises marks the frame dirty in the tick below).
+        dirty |= visible::on_page(&update.name);
     }
 
     // Tick the alert engine against the latest sources + vars. A
@@ -622,6 +629,9 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         live.toast_until = None;
     }
 
+    // A call dispatched in this pass, shown on the page: its buttons
+    // show `:running`.
+    dirty |= std::mem::take(&mut live.redraw);
     if screen_step(live) {
         dirty = true;
     }
@@ -645,6 +655,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         let same_page = live.rendered_page == live.current_page;
         screen.clear_children();
         paneld_ui::reset_action_bindings();
+        paneld_ui::set_call_states(live.calls.values().cloned().collect());
         paneld_ui::render_page(
             &live.doc,
             &live.current_page,
@@ -703,6 +714,9 @@ struct LiveState {
     /// Calls handed to the worker and not yet done, by
     /// [`actions::run_key`], with the action's name.
     running: std::collections::HashMap<String, String>,
+    /// Calls running or whose last run failed, by run key, for the
+    /// buttons that make them (`:running`, `:failed`).
+    calls: std::collections::HashMap<String, paneld_ui::CallState>,
     /// Event queues of configs replaced by a reload, kept until their
     /// worker has reported the runs it still had (see `reload`).
     stale_events: Vec<std::sync::mpsc::Receiver<paneld_ui::UiEvent>>,
@@ -1026,6 +1040,7 @@ fn setup_live_state(
         pending: None,
         deferred: std::collections::VecDeque::new(),
         running: std::collections::HashMap::new(),
+        calls: std::collections::HashMap::new(),
         stale_events: Vec::new(),
         previous_page: None,
         toast_until: None,
@@ -1293,8 +1308,57 @@ fn dispatch(live: &mut LiveState, call: actions::Call) {
         eprintln!("paneld: action `{}` is still running; call ignored", call.name);
         return;
     }
-    live.running.insert(key, call.name.clone());
+    live.running.insert(key.clone(), call.name.clone());
+    // A new run of the action clears its failed mark. Only a page
+    // with a button for it changes.
+    let mut shown = paneld_ui::shows_call(&call.name, &call.args);
+    live.calls.retain(|_, c| {
+        let cleared = c.name == call.name && c.state == paneld_ui::RunState::Failed;
+        shown |= cleared && paneld_ui::shows_call(&c.name, &c.args);
+        !cleared
+    });
+    let busy = live.actions.get(&call.name).and_then(|def| {
+        let b = def.busy.as_ref()?;
+        Some(paneld_ui::interpolate(&b.raw, b.span.file, b.span.start, &call_ctx(live, def, &call.args)))
+    });
+    live.calls.insert(
+        key,
+        paneld_ui::CallState {
+            name: call.name.clone(),
+            args: call.args.clone(),
+            state: paneld_ui::RunState::Running,
+            busy,
+        },
+    );
+    if shown {
+        live.redraw = true;
+    }
     let _ = live.action_tx.send(call);
+}
+
+/// A call finished: off its buttons when it succeeded, `:failed` on
+/// them until the action runs again when it did not. True when a
+/// button on screen shows it.
+fn call_done(live: &mut LiveState, key: &str, ok: bool) -> bool {
+    let shown = live.calls.get(key).is_some_and(|c| paneld_ui::shows_call(&c.name, &c.args));
+    if ok {
+        live.calls.remove(key);
+    } else if let Some(c) = live.calls.get_mut(key) {
+        c.state = paneld_ui::RunState::Failed;
+    }
+    shown
+}
+
+/// The context an action's messages (`busy`, `done`, `failed`) read:
+/// the page's, the call's args, and a remote kind's params.
+fn call_ctx(live: &LiveState, def: &actions::ActionDef, args: &[paneld_ui::ActionArg]) -> paneld_ui::Context {
+    let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+    for a in args {
+        ctx.insert(a.name.clone(), a.value.clone());
+    }
+    // Bound last, as when the command runs: a kind's params win.
+    def.bind(&mut ctx);
+    ctx
 }
 
 /// Switch to `page` (`back` = the previous one). Returns true when the
@@ -1322,6 +1386,7 @@ fn action_done(
     live: &mut LiveState,
     screen: &paneld_ui::ui::Obj<'_>,
     name: &str,
+    args: &[paneld_ui::ActionArg],
     ok: bool,
     result: paneld_ui::Value,
 ) -> bool {
@@ -1334,8 +1399,7 @@ fn action_done(
     };
     let message = if ok {
         def.done.as_ref().map(|d| {
-            let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
-            def.bind(&mut ctx);
+            let mut ctx = call_ctx(live, &def, args);
             ctx.insert("output".into(), paneld_ui::Value::String(field("stdout").trim().to_string()));
             ctx.insert("result".into(), result.clone());
             paneld_ui::interpolate(&d.raw, d.span.file, d.span.start, &ctx)
@@ -1343,8 +1407,7 @@ fn action_done(
     } else {
         Some(match &def.failed {
             Some(f) => {
-                let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
-                def.bind(&mut ctx);
+                let mut ctx = call_ctx(live, &def, args);
                 ctx.insert("result".into(), result.clone());
                 paneld_ui::interpolate(&f.raw, f.span.file, f.span.start, &ctx)
             }
@@ -1755,6 +1818,7 @@ fn reload(
             // A sleeping screen's cover must wake through the new queue.
             paneld_ui::set_wake_sink(fresh.event_tx.clone());
             fresh.running = std::mem::take(&mut live.running);
+            fresh.calls = std::mem::take(&mut live.calls);
             fresh.stale_events = std::mem::take(&mut live.stale_events);
             let (tx, rx) = std::sync::mpsc::channel();
             drop(tx);

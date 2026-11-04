@@ -20,10 +20,11 @@ order: 6
 - [ ] Docker image: deferred. Commands run inside the container, so host actions would need ssh to the host or a privileged container.
 - [x] Name of the program: paneld.
 - [x] `ssh host cmd {{ x }}` written by hand: `paneld check` rejects a value in the remote command or before the host unless it is typed or held to `options` / `pattern` ([Config format](config-format.md)).
-- [ ] Remotes, later: alerts declared by a kind, a `via` override per instance, ssh connection reuse (ControlMaster), the HTTP status in `result` ([ADR 0018](decisions/0018-remotes.md)).
+- [ ] Remotes, later: a `via` override per instance, ssh connection reuse (ControlMaster) ([ADR 0018](decisions/0018-remotes.md)).
+- [x] A running action on its caller: the button's `:running` / `:failed` states and the action's `busy` text or a spinner ([Schema](schema.md), section 8).
 - [x] `active = visible` on a source: applied ([Schema](schema.md), section 4).
 - [x] A `secret` with a relative `file` is read from the main config file's folder.
 - [x] Reload: a value from a run that started before the one shown is dropped, and vars are the same map across a reload, so a run started before it sets them where the screen reads. (A `refresh` from such a run is lost; the next poll brings it.)
 - [x] ctl limits: a request line must arrive whole within 60s of the last reply, so a client sending a byte now and then cannot hold a slot.
-- [x] An idle panel sleeps: touch is read in LVGL's event mode when the device has data (the main loop waits in `poll` on it), the display refresh pauses itself when nothing changed, and news for the main loop (a source value, a ctl request, an action's result) wakes it through a pipe; with nothing at all it wakes every 200 ms. The SDL window on a PC still wakes every 5 ms (SDL's own event timer).
+- [x] An idle panel sleeps: touch is read in LVGL's event mode when the device has data (the main loop waits in `poll` on it), the display refresh pauses itself when nothing changed, and news for the main loop (a source value, a ctl request, an action's result) wakes it through a pipe; with nothing at all it wakes once a second, for its clocks (screen idle, toasts, alert `for`), and every 50 ms while a finger rests on the screen, so a long press fires on time. A new source value redraws only a page that reads the source. On the Pi 3B+ with the rack config this idles at about 0.3% CPU. The SDL window on a PC still wakes every 5 ms (SDL's own event timer).
 - [x] A CEL macro (`l.map(x, ...)`) copies only the names its body reads, not the whole context, so nested macros beside big source histories stay cheap.

@@ -62,6 +62,8 @@ pub struct ActionDef {
     pub goto: Option<String>,
     /// `done = <text>`: shown briefly on success (`output` = stdout).
     pub done: Option<ConfirmPrompt>,
+    /// `busy = <text>`: on the button that made the call while it runs.
+    pub busy: Option<ConfirmPrompt>,
     /// `failed = <text>`: shown on failure; default stderr.
     pub failed: Option<ConfirmPrompt>,
     /// `param name: type [= default] [{ options }]` (schema 6).
@@ -370,6 +372,9 @@ fn parse_def(b: &Block) -> ActionDef {
             if !t.is_empty() {
                 def.goto = Some(t.to_string());
             }
+        }
+        if let Some((raw, span)) = find_simple_with_span(b, "busy") {
+            def.busy = Some(ConfirmPrompt { raw: raw.to_string(), span });
         }
         if let Some((raw, span)) = find_simple_with_span(b, "done") {
             def.done = Some(ConfirmPrompt { raw: raw.to_string(), span });

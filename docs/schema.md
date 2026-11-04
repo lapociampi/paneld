@@ -134,7 +134,7 @@ action pause_adblock {
 | `refresh` | list of sources | Run them now, after the run |
 | `then` | action call | After success; can read `result` |
 | `else` | action call | After failure; can read `result` |
-| `busy` | string | Shown while it runs (default: a spinner on the caller) |
+| `busy` | string, expr | Shown on the button that made the call while it runs (default: a spinner). `busy`, `done` and `failed` read the call's params |
 | `done` | string, expr | Shown briefly on success; `output` shows stdout |
 | `failed` | string, expr | Shown on failure (default: stderr) |
 
@@ -288,7 +288,7 @@ Value changes of `arc`, `bar` and `chart` animate when the theme's motion allows
 
 | Block | Keys |
 | --- | --- |
-| `button` | `action` (action), plus children or `label` / `icon` shortcuts. Shows the action's state: `:running`, `:failed` styles, `busy` and `done` texts |
+| `button` | `action` (action: a name, or an expression giving one like `on_tap`, e.g. `{{ tap }}`; run on a tap, unless the button has an `on_tap` too, which wins), plus children or `label` / `icon` shortcuts. Shows the call its tap makes (`action`, or `on_tap`): while it runs, the `:running` state and the action's `busy` text or a spinner in place of its content; after it failed, the `:failed` state until the action runs again. A call from a dialog or a row matches when it carries every arg the button passes. A component whose root is a button shows its call's `on_tap` there, and that `on_tap` wins over the root's `action` |
 | `toggle` | `value` (bool, expr), `on_change` (action; `value` = the new state) |
 | `slider` | `value`, `min`, `max`, `step` (expr), `direction`, `on_change` (on release) |
 | `select` | `options` (list, expr), `value` (expr; the option, or its position), `style` (`dropdown` default, `roller`, `buttons`: a row with one checked), `on_change` (`value` = the option) |

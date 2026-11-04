@@ -264,6 +264,9 @@ pub fn show_sleep_cover(absorb: bool, sink: Sender<UiEvent>) {
             );
         }
         SLEEP_COVER.with(|c| c.set(cover));
+        // Nothing animates under the cover (a running button's
+        // spinner): the wake redraws the page with fresh ones.
+        sys::lv_anim_delete_all();
     }
 }
 
@@ -790,10 +793,16 @@ unsafe extern "C" {
     fn write(fd: std::os::raw::c_int, buf: *const std::ffi::c_void, n: usize) -> isize;
 }
 
-/// The longest the pump sleeps when LVGL has nothing scheduled: how
-/// often the main loop looks at its channels (sources, ctl, actions)
-/// while idle.
-const IDLE_STEP_MS: u32 = 200;
+/// The longest the pump sleeps when LVGL has nothing scheduled. News
+/// on the channels (sources, ctl, actions) wakes it through the pipe,
+/// so this only paces the clocks the main loop keeps (screen idle and
+/// dim, toasts, alert `for`, reminders).
+const IDLE_STEP_MS: u32 = 1000;
+
+/// The longest step while a finger is down. A resting finger sends no
+/// touch events, so the pump reads the device each step itself: LVGL
+/// times a long press in its input read.
+const PRESSED_STEP_MS: u32 = 50;
 
 /// One iteration of the LVGL tick loop. See [`Ui::pump`].
 pub struct Pump<'ui> {
@@ -812,17 +821,27 @@ impl<'ui> Pump<'ui> {
     pub fn step(&mut self) -> Duration {
         RETIRED_LABELS.with(|r| r.borrow_mut().clear());
         self.tick();
-        let sleep_ms = unsafe { sys::lv_timer_handler() }.min(IDLE_STEP_MS);
+        let inputs = TOUCH.with(|i| i.borrow().clone());
+        let pressed = inputs
+            .iter()
+            .any(|(_, indev)| unsafe { sys::lv_indev_get_state(*indev) } == sys::lv_indev_state_t_LV_INDEV_STATE_PRESSED);
+        let cap = if pressed { PRESSED_STEP_MS } else { IDLE_STEP_MS };
+        let sleep_ms = unsafe { sys::lv_timer_handler() }.min(cap);
         let sleep = Duration::from_millis(sleep_ms as u64);
         // Sleep in `poll` on the touch devices and the wake pipe: a touch
         // is read at once, news for the main loop wakes it at once, and
         // an idle screen costs no wakeups beyond the idle step.
         let (wake_fd, _) = wake_pipe();
-        let inputs = TOUCH.with(|i| i.borrow().clone());
         let mut fds: Vec<PollFd> = inputs.iter().map(|(fd, _)| PollFd { fd: *fd, events: POLLIN, revents: 0 }).collect();
         fds.push(PollFd { fd: wake_fd, events: POLLIN, revents: 0 });
         let ready = unsafe { poll(fds.as_mut_ptr(), fds.len() as std::os::raw::c_ulong, sleep_ms as std::os::raw::c_int) };
         if ready <= 0 {
+            if pressed {
+                self.tick();
+                for (_, indev) in &inputs {
+                    unsafe { sys::lv_indev_read(*indev) };
+                }
+            }
             return sleep;
         }
         // Read with the clock at the touch's time, not the step's start:
@@ -1934,6 +1953,40 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_state(self.raw, sys::lv_state_t_LV_STATE_DISABLED as _, disabled) };
     }
 
+    /// Put a button in its `:running` or `:failed` state (its action
+    /// call runs, or its last run failed).
+    pub fn set_run_state(&self, running: bool, failed: bool) {
+        unsafe {
+            sys::lv_obj_set_state(self.raw, sys::lv_state_t_LV_STATE_USER_1 as _, running);
+            sys::lv_obj_set_state(self.raw, sys::lv_state_t_LV_STATE_USER_2 as _, failed);
+        }
+    }
+
+    /// A spinner in place of a running button's content: as tall as
+    /// the button's text and in its color (as styled now, so in its
+    /// `:running` state), centered, over a faint track.
+    pub fn new_busy_spinner(&self) -> Obj<'ui> {
+        let main = sys::lv_part_t_LV_PART_MAIN as sys::lv_part_t;
+        let (color, size) = unsafe {
+            let font = sys::lv_obj_get_style_text_font(self.raw, main);
+            let size = if font.is_null() { 24 } else { (*font).line_height };
+            (sys::lv_obj_get_style_text_color(self.raw, main), size)
+        };
+        let raw = unsafe { sys::lv_spinner_create(self.raw) };
+        assert!(!raw.is_null());
+        let indicator = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
+        unsafe {
+            sys::lv_obj_set_size(raw, size, size);
+            sys::lv_obj_center(raw);
+            sys::lv_obj_set_style_arc_width(raw, 3, 0);
+            sys::lv_obj_set_style_arc_width(raw, 3, indicator);
+            sys::lv_obj_set_style_arc_color(raw, color, 0);
+            sys::lv_obj_set_style_arc_opa(raw, sys::_lv_opacity_level_t_LV_OPA_30 as sys::lv_opa_t, 0);
+            sys::lv_obj_set_style_arc_color(raw, color, indicator);
+        }
+        Obj { raw, _ui: PhantomData }
+    }
+
     /// On `trigger`, push a [`UiEvent::Action`] carrying `args`
     /// (already evaluated at render time; empty for `on_tap = name`).
     pub fn bind_action(
@@ -2200,12 +2253,16 @@ fn state_of(name: &str) -> Option<sys::lv_style_selector_t> {
         "disabled" => sys::lv_state_t_LV_STATE_DISABLED,
         "focused" => sys::lv_state_t_LV_STATE_FOCUSED,
         "hover" => sys::lv_state_t_LV_STATE_HOVERED,
+        // A button's action call: running, or its last run failed.
+        "running" => sys::lv_state_t_LV_STATE_USER_1,
+        "failed" => sys::lv_state_t_LV_STATE_USER_2,
         _ => return None,
     } as sys::lv_style_selector_t)
 }
 
 /// Run `f` with the property setters writing to state `state`
-/// (`pressed`, `checked`, `disabled`, `focused`, `hover`); does nothing
+/// (`pressed`, `checked`, `disabled`, `focused`, `hover`, `running`,
+/// `failed`); does nothing
 /// for an unknown state.
 pub fn with_state(state: &str, f: impl FnOnce()) {
     let Some(s) = state_of(state) else { return };

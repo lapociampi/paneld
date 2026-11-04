@@ -69,6 +69,11 @@ pub fn render_page(
     sink: &Sender<UiEvent>,
     screen: &Obj<'_>,
 ) {
+    let critical = match ctx.get("theme") {
+        Some(Value::Map(t)) => t.get("critical").and_then(|c| parse_hex_color(&c.to_display_string())),
+        _ => None,
+    };
+    FAILED_BORDER.with(|c| c.set(critical.unwrap_or(0xf85149)));
     for item in &doc.items {
         if let Item::Block(b) = item {
             if b.kind.text == "page"
@@ -326,15 +331,21 @@ fn render_node(
         }
         "button" => {
             let obj = parent.new_button();
-            apply_props(node, ctx, sink, &obj);
-            // Shortcut: `button { label = "Save" }` renders a label
-            // child so the simplest button only takes one line. If
-            // the button also has child nodes, those render after
-            // the shortcut label.
-            if let Some(label) = resolve_assign_value(node, "label", ctx) {
-                obj.new_label(&label.to_display_string());
+            // A failed call's default look, under the theme's
+            // `button:failed`: a border in the theme's critical color.
+            let critical = FAILED_BORDER.with(|c| c.get());
+            crate::ui::with_state("failed", || obj.set_border(3, Some(critical)));
+            let tap_call = apply_props(node, ctx, sink, &obj);
+            if !show_call_state(&obj, tap_call.as_ref()) {
+                // Shortcut: `button { label = "Save" }` renders a label
+                // child so the simplest button only takes one line. If
+                // the button also has child nodes, those render after
+                // the shortcut label.
+                if let Some(label) = resolve_assign_value(node, "label", ctx) {
+                    obj.new_label(&label.to_display_string());
+                }
+                render_item_list(&node.items, doc, ctx, slot, sink, &obj);
             }
-            render_item_list(&node.items, doc, ctx, slot, sink, &obj);
         }
         "rect" => {
             let obj = parent.new_container();
@@ -598,13 +609,23 @@ fn expand_component(
         .collect();
     let slot = SlotCtx { children: &child_items, outer_ctx };
     let before = parent.child_count();
+    // The call's `on_tap` wins over its root button's `action`.
+    ROOT_TAP.with(|t| t.set(has_handler(call, "on_tap")));
     render_item_list(&comp.items, doc, &inner_ctx, Some(&slot), sink, parent);
+    ROOT_TAP.with(|t| t.set(false));
     // The call's own `on_tap` / `on_hold` act on the component's root
     // object, with args evaluated in the caller's scope (`item`, ...).
     // So do its common properties (schema 7), over the component's
     // own: everything on the call that is not one of its params.
     if let Some(root) = parent.child(before) {
-        bind_handlers(call, outer_ctx, sink, &root);
+        let tap_call = bind_handlers(call, outer_ctx, sink, &root);
+        let root_kind = comp.items.iter().find_map(|it| match it {
+            Item::Block(b) => Some(b.kind.text.as_str()),
+            _ => None,
+        });
+        if root_kind == Some("button") {
+            show_call_state(&root, tap_call.as_ref());
+        }
         let params: Vec<&str> = comp
             .items
             .iter()
@@ -811,16 +832,18 @@ fn splice(raw: &str, fragments: &[cel::Expr], ctx: &Context, show_errors: bool) 
     out
 }
 
-fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_>) {
+/// Returns the action call a tap on the node makes, if any.
+fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_>) -> Option<(String, Vec<ActionArg>)> {
     // Inline-action block form, with or without a name:
     //   `on_tap { goto = settings }`
     //   `on_tap { set { k = v; ... } }`
     //   `on_tap vm_stop { vm = {{ item.id }} }`
     // Only one gets wired per tap: the first form found wins,
     // matching schema semantics (one action per handler).
-    bind_handlers(node, ctx, sink, obj);
+    let tap_call = bind_handlers(node, ctx, sink, obj);
     apply_styles(&node.kind.text, &node.items, true, ctx, obj);
     apply_plain_props(&node.kind.text, &node.items, ctx, obj);
+    tap_call
 }
 
 thread_local! {
@@ -828,6 +851,106 @@ thread_local! {
     /// (see [`set_styles`]). Read on the UI thread while drawing.
     static STYLES: std::cell::RefCell<std::collections::BTreeMap<String, Vec<Item>>> =
         Default::default();
+}
+
+/// Where an action call stands, for the buttons that make it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunState {
+    Running,
+    /// Its last run failed (until the action runs again).
+    Failed,
+}
+
+/// An action call the main loop has running, or whose last run
+/// failed: what [`set_call_states`] takes.
+#[derive(Clone, Debug)]
+pub struct CallState {
+    pub name: String,
+    pub args: Vec<ActionArg>,
+    pub state: RunState,
+    /// The action's `busy` text for this call, evaluated with its args.
+    pub busy: Option<String>,
+}
+
+thread_local! {
+    /// The calls running or failed, as of the page being drawn.
+    static CALL_STATES: std::cell::RefCell<Vec<CallState>> = Default::default();
+    /// The action calls the buttons on screen make (see [`shows_call`]).
+    static DRAWN_CALLS: std::cell::RefCell<Vec<(String, Vec<ActionArg>)>> = Default::default();
+    /// A `:failed` button's default border color: the theme's
+    /// `critical`, resolved once per page.
+    static FAILED_BORDER: std::cell::Cell<u32> = const { std::cell::Cell::new(0xf85149) };
+    /// The component call being expanded has its own `on_tap`, which
+    /// wins over its root button's `action`: taken by the root.
+    static ROOT_TAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Install the action calls running or failed now, before drawing a
+/// page: its buttons show them (`:running`, `:failed`).
+pub fn set_call_states(states: Vec<CallState>) {
+    CALL_STATES.with(|s| *s.borrow_mut() = states);
+    DRAWN_CALLS.with(|d| d.borrow_mut().clear());
+}
+
+/// Whether a button on the page drawn last makes call `name(args)`,
+/// so a change in that call's state needs a redraw.
+pub fn shows_call(name: &str, args: &[ActionArg]) -> bool {
+    DRAWN_CALLS.with(|d| d.borrow().iter().any(|(n, a)| n == name && covers(args, a)))
+}
+
+/// `call` carries every arg in `button` with the same value.
+fn covers(call: &[ActionArg], button: &[ActionArg]) -> bool {
+    button.iter().all(|a| call.iter().any(|b| b.name == a.name && same_value(&b.value, &a.value)))
+}
+
+/// Equal values, scalars compared as shown: a call's args were
+/// converted to their param types (`1` in the config is `"1"` until
+/// then). Maps and lists compare by their items.
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Map(x), Value::Map(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same_value(v, w))),
+        (Value::List(x), Value::List(y)) => x.len() == y.len() && x.iter().zip(y).all(|(v, w)| same_value(v, w)),
+        (Value::Map(_) | Value::List(_), _) | (_, Value::Map(_) | Value::List(_)) => false,
+        _ => a.to_display_string() == b.to_display_string(),
+    }
+}
+
+/// The state of a button's call `name(args)`: a known call of the
+/// same action with every arg the button passes (a dialog may have
+/// added more). Running wins over failed.
+fn call_state(name: &str, args: &[ActionArg]) -> Option<CallState> {
+    CALL_STATES.with(|s| {
+        let s = s.borrow();
+        let matching = s.iter().filter(|c| c.name == name && covers(&c.args, args));
+        matching.min_by_key(|c| c.state != RunState::Running).cloned()
+    })
+}
+
+/// Show on button `obj` where the call its tap makes stands: the
+/// `:running` / `:failed` state, and while it runs the call's `busy`
+/// text or a spinner in place of its content. Returns true when the
+/// content was replaced.
+fn show_call_state(obj: &Obj<'_>, tap_call: Option<&(String, Vec<ActionArg>)>) -> bool {
+    let Some((name, args)) = tap_call else {
+        return false;
+    };
+    DRAWN_CALLS.with(|d| d.borrow_mut().push((name.clone(), args.clone())));
+    let call = call_state(name, args);
+    let state = call.as_ref().map(|c| c.state);
+    obj.set_run_state(state == Some(RunState::Running), state == Some(RunState::Failed));
+    let Some(CallState { state: RunState::Running, busy, .. }) = call else {
+        return false;
+    };
+    obj.clear_children();
+    match busy.filter(|t| !t.trim().is_empty()) {
+        Some(text) => {
+            obj.new_label(&text);
+        }
+        None => {
+            obj.new_busy_spinner();
+        }
+    }
+    true
 }
 
 /// Install the active theme's styles: selector (`*`, `button`,
@@ -882,7 +1005,7 @@ fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Context, obj: &
         // Then the states (`button:pressed`, `.card:checked`): the
         // same properties, for when the node is in that state.
         for sel in &selectors {
-            for state in ["pressed", "checked", "disabled", "focused", "hover"] {
+            for state in ["pressed", "checked", "disabled", "focused", "hover", "running", "failed"] {
                 if let Some(body) = styles.get(&format!("{sel}:{state}")) {
                     crate::ui::with_state(state, || apply_plain_props(kind, body, ctx, obj));
                 }
@@ -891,18 +1014,25 @@ fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Context, obj: &
     });
 }
 
+/// `node` has a `handler` (`on_tap`, `on_hold`), block or `= name`.
+fn has_handler(node: &Block, handler: &str) -> bool {
+    node.items.iter().any(|it| match it {
+        Item::Block(b) => b.kind.text == handler,
+        Item::Assign(a) => matches!(&a.target, AssignTarget::Simple { key } if key.text == handler),
+        _ => false,
+    })
+}
+
 /// Wire `node`'s `on_tap` / `on_hold` handlers (block and `= name`
 /// forms) to `obj`. Action-call args are evaluated against `ctx` now.
-fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_>) {
+/// Returns the action call a tap makes, if any (name and args).
+fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_>) -> Option<(String, Vec<ActionArg>)> {
+    let mut tap_call = None;
     // A node with an `on_hold` gets short taps only for `on_tap`, so a
     // long press does not fire both.
-    let has_hold = node.items.iter().any(|it| match it {
-        Item::Block(b) => b.kind.text == "on_hold",
-        Item::Assign(a) => {
-            matches!(&a.target, AssignTarget::Simple { key } if key.text == "on_hold")
-        }
-        _ => false,
-    });
+    let has_hold = has_handler(node, "on_hold");
+    // Set for a component's root: its call has an `on_tap`.
+    let call_taps = ROOT_TAP.with(|t| t.replace(false));
     let tap = if has_hold { Trigger::ShortTap } else { Trigger::Tap };
     for (handler, trigger) in [("on_tap", tap), ("on_hold", Trigger::Hold)] {
         for item in &node.items {
@@ -916,6 +1046,9 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
             if let Some(name) = &child.name {
                 let args = collect_action_args(child, ctx);
                 obj.set_clickable();
+                if handler == "on_tap" {
+                    tap_call = Some((name.text.clone(), args.clone()));
+                }
                 obj.bind_action(trigger, sink.clone(), &name.text, args);
                 break;
             }
@@ -925,7 +1058,11 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
             // (`item`, component params) go along as args.
             if child.is_inline_action() {
                 obj.set_clickable();
-                obj.bind_action(trigger, sink.clone(), &child.inline_action_name(), local_args(ctx));
+                let (name, args) = (child.inline_action_name(), local_args(ctx));
+                if handler == "on_tap" {
+                    tap_call = Some((name.clone(), args.clone()));
+                }
+                obj.bind_action(trigger, sink.clone(), &name, args);
                 break;
             }
             // `goto = page` or `goto = {{ expr }}` (e.g. a nav entry
@@ -949,7 +1086,9 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
             }
         }
     }
-    // `on_tap = <action>` / `on_hold = <action>`.
+    // `on_tap = <action>` / `on_hold = <action>`, and a button's
+    // `action`, its tap unless it has an `on_tap` too.
+    let has_tap = call_taps || has_handler(node, "on_tap");
     for item in &node.items {
         let Item::Assign(a) = item else { continue };
         let AssignTarget::Simple { key } = &a.target else {
@@ -958,13 +1097,18 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
         let trigger = match key.text.as_str() {
             "on_tap" => tap,
             "on_hold" => Trigger::Hold,
+            "action" if node.kind.text == "button" && !has_tap => tap,
             _ => continue,
         };
         if let Some(name) = action_name(&a.value.text, a.value.span, ctx) {
             obj.set_clickable();
+            if key.text != "on_hold" {
+                tap_call = Some((name.clone(), Vec::new()));
+            }
             obj.bind_action(trigger, sink.clone(), &name, Vec::new());
         }
     }
+    tap_call
 }
 
 /// The action an `on_tap = ...` names: a bare name, or an expression

@@ -104,6 +104,17 @@ pub fn is_shown(name: &str) -> (bool, u64) {
     })
 }
 
+/// Whether the page on screen (with its shell) reads source `name`,
+/// so a new value needs a redraw. Before any page is drawn, yes;
+/// asleep, no (the wake redraws).
+pub fn on_page(name: &str) -> bool {
+    with(|s| match &s.shown {
+        None => true,
+        Some(_) if s.asleep => false,
+        Some(p) => s.pages.get(p).is_some_and(|set| set.contains(name) || set.contains(ALL)),
+    })
+}
+
 fn analyse(doc: &Document, remotes: &BTreeMap<String, Vec<String>>) -> (BTreeMap<String, BTreeSet<String>>, BTreeSet<String>) {
     let components: BTreeMap<&str, &Block> = doc
         .items
@@ -353,6 +364,13 @@ mod tests {
         set_asleep(false);
         show("nope");
         assert!(!is_shown("x").0);
+        // A redraw follows the page alone: an alert's source is polled
+        // but not on it.
+        show("a");
+        assert!(on_page("x") && !on_page("z") && !on_page("y"));
+        set_asleep(true);
+        assert!(!on_page("x"), "asleep, the wake redraws");
+        set_asleep(false);
         // A whole-`sources` read by an alert keeps every source going.
         install(&doc("alert a { when = {{ size(sources) > 1 }} }\npage p { }\n"), &BTreeMap::new());
         show("p");

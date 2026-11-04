@@ -1028,6 +1028,180 @@ fn an_action_named_by_an_expression_runs() {
 }
 
 #[test]
+fn a_button_runs_its_action() {
+    // `action` on a button: a name, or `{{ tap }}` from a param; an
+    // `on_tap` on the same button wins over it.
+    let d = tmp("button-action");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var n: int = 0\n\
+         action bump { set { n = {{ vars.n + 1 }} } }\n\
+         action jump { set { n = {{ vars.n + 10 }} } }\n\
+         component big {\n\
+             param tap: action = none\n\
+             button { width = 200; height = 60; label = go; action = {{ tap }} }\n\
+         }\n\
+         page home {\n\
+             big { tap = bump }\n\
+             button { width = 200; height = 60; label = jump; action = jump }\n\
+             button { width = 200; height = 60; label = both; action = jump; on_tap = bump }\n\
+             rect { width = 200; height = 40; background = {{ vars.n == 1 ? '#00ff00' : vars.n == 10 ? '#0000ff' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--tap", "100,90", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "action = {{ tap }} did nothing");
+    let img = shot(&conf, &["--tap", "100,158", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 16)), "action = jump did nothing");
+    let img = shot(&conf, &["--tap", "100,226", "--settle", "100"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "on_tap did not win over action");
+}
+
+#[test]
+fn a_button_shows_its_call_running_and_failed() {
+    // `button:running` while the call runs, `button:failed` after it
+    // failed, neither once it succeeds; a row button matches its args.
+    let d = tmp("button-running");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t {\n\
+             style button:running { background = #00ff00 }\n\
+             style button:failed { background = #0000ff }\n\
+         }\n\
+         screen { theme = t }\n\
+         action slow { param v: int = 0; run = sleep 2 }\n\
+         action bad { run = false }\n\
+         action good { run = true }\n\
+         page home {\n\
+             button { width = 200; height = 60; label = a; on_tap slow { v = 1 } }\n\
+             button { width = 200; height = 60; label = b; on_tap slow { v = 2 } }\n\
+             button { width = 200; height = 60; label = c; action = bad }\n\
+             button { width = 200; height = 60; label = d; action = good }\n\
+         }\n",
+    )
+    .unwrap();
+    // Buttons at y 63, 131, 199, 267 under the shell's header, 60 high.
+    let img = shot(&conf, &["--tap", "100,93", "--settle", "300"]);
+    assert!(close(img.px(40, 70), [0, 0xff, 0], 16), "the running call's button is not :running");
+    assert!(!close(img.px(40, 138), [0, 0xff, 0], 16), "another row's button shows :running");
+    let img = shot(&conf, &["--tap", "100,229", "--settle", "500"]);
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 16)), "the failed call's button is not :failed");
+    let img = shot(&conf, &["--tap", "100,297", "--settle", "500"]);
+    assert!(!img.any(|p| close(p, [0, 0xff, 0], 16) || close(p, [0, 0, 0xff], 16)), "a good call left a state");
+}
+
+#[test]
+fn a_running_button_shows_the_busy_text_or_a_spinner() {
+    let d = tmp("button-busy");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t { critical = #ff00ff }\n\
+         screen { theme = t }\n\
+         action slow { busy = WORKING; run = sleep 2 }\n\
+         action spin { run = sleep 2 }\n\
+         action bad { run = false }\n\
+         page home {\n\
+             button { width = 200; height = 60; label = go; action = slow }\n\
+             button { width = 200; height = 60; label = go; action = spin }\n\
+             button { width = 200; height = 60; label = go; action = bad }\n\
+         }\n",
+    )
+    .unwrap();
+    let idle = shot(&conf, &["--settle", "100"]);
+    let busy = shot(&conf, &["--tap", "100,93", "--settle", "300"]);
+    // The busy text is wider than `go`: more text pixels in the button.
+    let ink = |img: &Image, y0: usize| {
+        // Inside the button (x 12..212), clear of its rounded corners.
+        (y0 + 6..y0 + 54).flat_map(|y| (24..200).map(move |x| (x, y))).filter(|&(x, y)| img.px(x, y)[0] > 200 && img.px(x, y)[1] > 200).count()
+    };
+    assert!(ink(&busy, 63) > ink(&idle, 63) * 2, "no busy text");
+    let spin = shot(&conf, &["--tap", "100,161", "--settle", "300"]);
+    assert_ne!(ink(&spin, 131), ink(&idle, 131), "no spinner in place of the label");
+    // A failed call's default look: a border in the theme's critical color.
+    let failed = shot(&conf, &["--tap", "100,229", "--settle", "500"]);
+    assert!(failed.any(|p| close(p, [0xff, 0, 0xff], 24)), "no critical border on the failed button");
+}
+
+#[test]
+fn a_button_state_matches_its_own_row_and_its_component_call() {
+    // Rows of maps tell their calls apart; a component call's own
+    // `on_tap` shows on its root button.
+    let d = tmp("button-rows");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t { style button:running { background = #00ff00 } }\n\
+         screen { theme = t }\n\
+         action slow { run = sleep 2 }\n\
+         component tile { button { width = 200; height = 60; label = go } }\n\
+         page home {\n\
+             repeat vm in {{ [{'id': 'a'}, {'id': 'b'}] }} {\n\
+                 button { width = 200; height = 60; label = {{ vm.id }}; on_tap { run = sleep 2 } }\n\
+             }\n\
+             tile { on_tap = slow }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--tap", "100,93", "--settle", "300"]);
+    assert!(close(img.px(40, 70), [0, 0xff, 0], 16), "the tapped row is not :running");
+    assert!(!close(img.px(40, 138), [0, 0xff, 0], 16), "the other row is :running too");
+    let img = shot(&conf, &["--tap", "100,229", "--settle", "300"]);
+    assert!(close(img.px(40, 206), [0, 0xff, 0], 16), "the component call's tap is not shown on its root");
+}
+
+#[test]
+fn a_call_site_on_tap_wins_over_the_root_buttons_action() {
+    let d = tmp("button-callsite");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var n: int = 0\n\
+         action bump { set { n = {{ vars.n + 1 }} } }\n\
+         action jump { set { n = {{ vars.n + 10 }} } }\n\
+         component big {\n\
+             param tap: action = none\n\
+             button { width = 200; height = 60; label = go; action = {{ tap }} }\n\
+         }\n\
+         page home {\n\
+             big { tap = bump; on_tap = jump }\n\
+             rect { width = 200; height = 40; background = {{ vars.n == 10 ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--tap", "100,93", "--settle", "200"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "not only the call's on_tap ran");
+}
+
+#[test]
+fn busy_and_done_read_the_calls_args() {
+    let d = tmp("button-args");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "action slow { param v: string = \"\"; busy = {{ v }}; run = sleep 2 }\n\
+         action quick { param v: string = \"\"; done = {{ v }}; run = true }\n\
+         page home {\n\
+             button { width = 200; height = 60; label = go; on_tap slow { v = MMMMMMMM } }\n\
+             button { width = 200; height = 60; label = go; on_tap quick { v = MMMMMMMMMMMMMMMMMMMM } }\n\
+         }\n",
+    )
+    .unwrap();
+    let white = |p: [u8; 3]| p[0] > 200 && p[1] > 200 && p[2] > 200;
+    let ink = |img: &Image, x0: usize, x1: usize, y0: usize, y1: usize| {
+        (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| white(img.px(x, y))).count()
+    };
+    let idle = shot(&conf, &["--settle", "100"]);
+    let busy = shot(&conf, &["--tap", "100,93", "--settle", "300"]);
+    assert!(ink(&busy, 24, 200, 69, 117) > ink(&idle, 24, 200, 69, 117) * 3, "busy did not show the call's arg");
+    // The toast (bottom middle) is wide when it shows the arg.
+    let done = shot(&conf, &["--tap", "100,161", "--settle", "300"]);
+    assert!(ink(&done, 200, 600, 360, 420) > 150, "done did not show the call's arg");
+}
+
+#[test]
 fn a_dialog_shows_over_the_page_as_the_theme_says() {
     let d = tmp("backdrop");
     let conf = |backdrop: &str| {
