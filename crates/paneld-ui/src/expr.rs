@@ -372,10 +372,25 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
                 Value::Double(d) => d as i64,
                 other => return Err(EvalError::new(format!("ago({}) is not supported", type_name(&other)))),
             };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i64);
-            Ok(Value::String(ago_text(now.saturating_sub(t))))
+            // The same moment as `now.unix` when the ctx has it.
+            let now = match ctx.get("now") {
+                Some(Value::Map(m)) => match m.get("unix") {
+                    Some(Value::Int(n)) => Some(*n),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let now = now.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64)
+            });
+            let secs = now.saturating_sub(t);
+            AGO_NEXT.with(|n| {
+                let next = now + ago_changes_in(secs);
+                n.set(Some(n.get().map_or(next, |m: i64| m.min(next))));
+            });
+            Ok(Value::String(ago_text(secs)))
         }
         // Schema 16: display helpers.
         "format" if argc == 2 => {
@@ -726,6 +741,29 @@ fn hex_text(rgb: u32, alpha: Option<u8>) -> String {
         Some(a) => format!("#{rgb:06x}{a:02x}"),
         None => format!("#{rgb:06x}"),
     }
+}
+
+thread_local! {
+    /// The Unix second the soonest `ago()` text evaluated since
+    /// [`take_ago_next`] changes.
+    static AGO_NEXT: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// When the soonest `ago()` evaluated (on this thread) since the last
+/// call shows another text, in Unix seconds; and start over.
+pub fn take_ago_next() -> Option<i64> {
+    AGO_NEXT.with(|n| n.take())
+}
+
+/// Seconds until `ago_text(secs)` changes.
+fn ago_changes_in(secs: i64) -> i64 {
+    let unit = match secs {
+        s if s < 0 => return 60 - s,
+        s if s < 3_600 => 60,
+        s if s < 86_400 => 3_600,
+        _ => 86_400,
+    };
+    unit - secs % unit
 }
 
 /// `secs` ago in the largest whole unit: `just now`, `5m ago`,
@@ -1147,6 +1185,27 @@ mod more_tests {
         assert_eq!(try_ev("ago(t)", &ctx).unwrap(), S("2h ago".into()));
         assert_eq!(try_ev("ago(d)", &ctx).unwrap(), S("2m ago".into()));
         assert_eq!(err("ago('x')"), "ago(string) is not supported");
+        // Counted from `now.unix` when there is one.
+        let mut now_map = BTreeMap::new();
+        now_map.insert("unix".to_string(), I(1_000_000));
+        ctx.insert("now".into(), Value::Map(now_map));
+        ctx.insert("t".into(), I(1_000_000 - 300));
+        assert_eq!(try_ev("ago(t)", &ctx).unwrap(), S("5m ago".into()));
+        assert_eq!(try_ev("ago(now.unix)", &ctx).unwrap(), S("just now".into()));
+        // The soonest change of what was shown: `5m ago` turns `6m ago`
+        // 60 s after it was 5m.
+        take_ago_next();
+        ctx.insert("t".into(), I(1_000_000 - 330));
+        try_ev("ago(t)", &ctx).unwrap();
+        ctx.insert("t".into(), I(1_000_000 - 7_200));
+        try_ev("ago(t)", &ctx).unwrap();
+        assert_eq!(take_ago_next(), Some(1_000_000 + 30));
+        assert_eq!(take_ago_next(), None);
+        assert_eq!(ago_changes_in(0), 60);
+        assert_eq!(ago_changes_in(59), 1);
+        assert_eq!(ago_changes_in(3_599), 1);
+        assert_eq!(ago_changes_in(3_600), 3_600);
+        assert_eq!(ago_changes_in(90_000), 86_400 - 3_600);
     }
 
     #[test]

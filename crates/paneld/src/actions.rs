@@ -799,6 +799,7 @@ fn ctx_with_vars_and_args(
     crate::remotes::expose(&mut ctx, sources_snapshot);
     let snapshot = vars.lock().unwrap().clone();
     ctx.insert("vars".into(), Value::Map(snapshot));
+    crate::clock::insert(&mut ctx);
     for a in args {
         ctx.insert(a.name.clone(), a.value.clone());
     }

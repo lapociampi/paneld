@@ -861,7 +861,7 @@ fn bg_forget(obj: *mut sys::lv_obj_t, selector: Option<sys::lv_style_selector_t>
         let mut o = o.borrow_mut();
         let mut gone = Vec::new();
         o.retain(|b| {
-            let hit = b.obj == obj && selector.map_or(true, |s| s == b.selector);
+            let hit = b.obj == obj && selector.is_none_or(|s| s == b.selector);
             if hit {
                 gone.push(b.buf);
             }
@@ -1269,6 +1269,16 @@ pub fn idle_hint_ms() -> u32 {
     IDLE_HINT_MS.load(Ordering::Relaxed)
 }
 
+/// The longest the next pump step may sleep, set by [`wake_within`];
+/// `u32::MAX` when nothing asked.
+static WAKE_WITHIN_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Wake the main loop within `ms` (the next pump step only): a clock
+/// on the page changes then. Shorter than the idle step only.
+pub fn wake_within(ms: u64) {
+    WAKE_WITHIN_MS.fetch_min(ms.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+}
+
 /// One iteration of the LVGL tick loop. See [`Ui::pump`].
 pub struct Pump<'ui> {
     last: Instant,
@@ -1291,7 +1301,7 @@ impl<'ui> Pump<'ui> {
             .iter()
             .any(|(_, indev)| unsafe { sys::lv_indev_get_state(*indev) } == sys::lv_indev_state_t_LV_INDEV_STATE_PRESSED);
         let cap = if pressed { PRESSED_STEP_MS } else { IDLE_STEP_MS };
-        let sleep_ms = unsafe { sys::lv_timer_handler() }.min(cap);
+        let sleep_ms = unsafe { sys::lv_timer_handler() }.min(cap).min(WAKE_WITHIN_MS.swap(u32::MAX, Ordering::Relaxed));
         let hint = DRIVER_TIMERS.with(|d| {
             let d = d.borrow();
             unsafe { sys::lv_paneld_timers_idle_ms(d.as_ptr(), d.len() as u32, IDLE_STEP_MS) }
@@ -1530,6 +1540,10 @@ impl<'ui> Obj<'ui> {
             let opa = sys::lv_obj_get_style_text_opa(self.raw, 0);
             sys::lv_obj_set_style_text_color(obj.raw, color, 0);
             sys::lv_obj_set_style_text_opa(obj.raw, opa, 0);
+            // Only a `scroll` scrolls ([`Self::set_scroll`]); what
+            // overflows another layout block is clipped, with no
+            // scrollbar inside a card.
+            sys::lv_obj_set_scrollable(obj.raw, false);
         }
         obj
     }
@@ -1631,6 +1645,11 @@ impl<'ui> Obj<'ui> {
     pub fn new_button(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_button_create(self.raw) };
         assert!(!raw.is_null());
+        // The theme's accent, not LVGL's blue, with text that reads on
+        // it; a style or the node wins.
+        let c = input_colors();
+        paint_bg(raw, c.accent, 0);
+        paint_text(raw, c.on_accent, 0);
         Obj { raw, _ui: PhantomData }
     }
 
@@ -2027,6 +2046,10 @@ impl<'ui> Obj<'ui> {
     pub fn new_toggle(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_switch_create(self.raw) };
         assert!(!raw.is_null());
+        // Off: the track; on: the accent. The knob stays white.
+        let c = input_colors();
+        paint_bg(raw, c.track, 0);
+        paint_bg(raw, c.accent, PART_INDICATOR | CHECKED);
         Obj { raw, _ui: PhantomData }
     }
 
@@ -2070,6 +2093,32 @@ impl<'ui> Obj<'ui> {
     pub fn new_dropdown(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_dropdown_create(self.raw) };
         assert!(!raw.is_null());
+        unsafe extern "C" fn open_close(e: *mut sys::lv_event_t) {
+            // SAFETY: registered below on a dropdown for these codes.
+            let (code, target) = unsafe { (sys::lv_event_get_code(e), sys::lv_event_get_target(e) as usize) };
+            OPEN_LISTS.with(|o| {
+                let mut o = o.borrow_mut();
+                o.retain(|&t| t != target);
+                if code == sys::lv_event_code_t_LV_EVENT_READY {
+                    o.push(target);
+                }
+            });
+        }
+        unsafe {
+            for code in [sys::lv_event_code_t_LV_EVENT_READY, sys::lv_event_code_t_LV_EVENT_CANCEL, sys::lv_event_code_t_LV_EVENT_DELETE] {
+                sys::lv_obj_add_event_cb(raw, Some(open_close), code, std::ptr::null_mut());
+            }
+        }
+        let c = input_colors();
+        paint_box(raw, &c);
+        // The list it opens (made with it, on the screen).
+        let list = unsafe { sys::lv_dropdown_get_list(raw) };
+        if !list.is_null() {
+            paint_box(list, &c);
+            paint_bg(list, c.track, PART_SELECTED);
+            paint_bg(list, c.accent, PART_SELECTED | CHECKED);
+            paint_text(list, c.on_accent, PART_SELECTED | CHECKED);
+        }
         Obj { raw, _ui: PhantomData }
     }
 
@@ -2091,6 +2140,10 @@ impl<'ui> Obj<'ui> {
             sys::lv_roller_set_options(raw, c.as_ptr(), sys::lv_roller_mode_t_LV_ROLLER_MODE_NORMAL);
             sys::lv_roller_set_visible_row_count(raw, rows);
         }
+        let c = input_colors();
+        paint_box(raw, &c);
+        paint_bg(raw, c.accent, PART_SELECTED);
+        paint_text(raw, c.on_accent, PART_SELECTED);
         Obj { raw, _ui: PhantomData }
     }
 
@@ -2135,6 +2188,12 @@ impl<'ui> Obj<'ui> {
             sys::lv_obj_set_style_pad_all(raw, 4, 0);
             sys::lv_obj_set_style_pad_gap(raw, 4, 0);
             sys::lv_buttonmatrix_set_one_checked(raw, true);
+            let c = input_colors();
+            paint_box(raw, &c);
+            paint_bg(raw, c.track, PART_ITEMS);
+            paint_text(raw, c.text, PART_ITEMS);
+            paint_bg(raw, c.accent, PART_ITEMS | CHECKED);
+            paint_text(raw, c.on_accent, PART_ITEMS | CHECKED);
             if let Some(i) = selected {
                 sys::lv_buttonmatrix_set_button_ctrl(raw, i as u32, sys::lv_buttonmatrix_ctrl_t_LV_BUTTONMATRIX_CTRL_CHECKED);
             }
@@ -2167,6 +2226,10 @@ impl<'ui> Obj<'ui> {
                 sys::lv_textarea_set_max_length(raw, max_length);
             }
         }
+        let c = input_colors();
+        paint_box(raw, &c);
+        paint_border(raw, c.accent, FOCUSED);
+        paint_border(raw, c.accent, PART_CURSOR | FOCUSED);
         Obj { raw, _ui: PhantomData }
     }
 
@@ -2218,6 +2281,7 @@ impl<'ui> Obj<'ui> {
         let c = CString::new(label).unwrap_or_else(|_| CString::new("").unwrap());
         let raw = unsafe { sys::lv_msgbox_add_footer_button(self.raw, c.as_ptr()) };
         assert!(!raw.is_null());
+        paint_footer_button(raw);
         let idx = {
             let mut g = bindings().lock().unwrap();
             g.push(Binding::AskButton { accept, sink });
@@ -2310,12 +2374,19 @@ impl<'ui> Obj<'ui> {
     pub fn new_msgbox(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_msgbox_create(self.raw) };
         assert!(!raw.is_null());
+        paint_box(raw, &input_colors());
         Obj { raw, _ui: PhantomData }
     }
 
     pub fn msgbox_add_title(&self, text: &str) {
         let c = CString::new(text).unwrap_or_else(|_| CString::new("").unwrap());
         unsafe { sys::lv_msgbox_add_title(self.raw, c.as_ptr()) };
+        // The header in the track's tint, not LVGL's grey.
+        let header = unsafe { sys::lv_msgbox_get_header(self.raw) };
+        if !header.is_null() {
+            paint_bg(header, input_colors().track, 0);
+            paint_text(header, input_colors().text, 0);
+        }
     }
 
     /// The msgbox's content area, for adding custom children (the
@@ -2343,6 +2414,7 @@ impl<'ui> Obj<'ui> {
         let c = CString::new(label).unwrap_or_else(|_| CString::new("").unwrap());
         let raw = unsafe { sys::lv_msgbox_add_footer_button(self.raw, c.as_ptr()) };
         assert!(!raw.is_null());
+        paint_footer_button(raw);
         let btn = Obj { raw, _ui: PhantomData };
         let idx = {
             let mut g = bindings().lock().unwrap();
@@ -2375,6 +2447,13 @@ impl<'ui> Obj<'ui> {
             );
             sys::lv_keyboard_set_mode(raw, sys::lv_keyboard_mode_t_LV_KEYBOARD_MODE_NUMBER);
         }
+        // Keys in the track on a `surface` panel; OK in the accent.
+        let c = input_colors();
+        paint_bg(raw, c.surface, 0);
+        paint_bg(raw, c.track, PART_ITEMS);
+        paint_text(raw, c.text, PART_ITEMS);
+        paint_bg(raw, c.accent, PART_ITEMS | CHECKED);
+        paint_text(raw, c.on_accent, PART_ITEMS | CHECKED);
         Obj { raw, _ui: PhantomData }
     }
 
@@ -2389,6 +2468,10 @@ impl<'ui> Obj<'ui> {
     pub fn new_slider(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_slider_create(self.raw) };
         assert!(!raw.is_null());
+        let c = input_colors();
+        paint_bg(raw, c.track, 0);
+        paint_bg(raw, c.accent, PART_INDICATOR);
+        paint_bg(raw, c.accent, PART_KNOB);
         Obj { raw, _ui: PhantomData }
     }
 
@@ -2484,6 +2567,45 @@ impl<'ui> Obj<'ui> {
             sys::lv_obj_set_style_arc_color(self.raw, sys::lv_color_hex(rgb), sel() | indicator);
             sys::lv_obj_set_style_arc_opa(self.raw, opa, sel() | indicator);
         }
+    }
+
+    /// A toggle's color when on: its indicator, checked (or in the
+    /// state a style sets).
+    pub fn set_toggle_on_color(&self, rgb: u32, opa: u8) {
+        let state = match sel() {
+            0 => CHECKED,
+            s => s,
+        };
+        paint_bg(self.raw, (rgb, opa), state | PART_INDICATOR);
+    }
+
+    /// A slider's indicator and knob in `rgb` at `opa`.
+    pub fn set_slider_color(&self, rgb: u32, opa: u8) {
+        paint_bg(self.raw, (rgb, opa), sel() | PART_INDICATOR);
+        paint_bg(self.raw, (rgb, opa), sel() | PART_KNOB);
+    }
+
+    /// Where a `:state` style (`checked`, `pressed`, ...) goes on this
+    /// object: the state itself, except on a `select`: its options
+    /// (`buttons`), the chosen row (`roller`, `:checked`), or the
+    /// chosen row of the list it opens (`dropdown`, `:checked`).
+    pub fn state_target(&self, state: &str) -> Option<(Obj<'ui>, Selector)> {
+        let st = state_of(state)?;
+        let same = Obj { raw: self.raw, _ui: PhantomData };
+        let is = |class: *const sys::lv_obj_class_t| unsafe { sys::lv_obj_check_type(self.raw, class) };
+        if is(&raw const sys::lv_buttonmatrix_class) {
+            return Some((same, Selector(PART_ITEMS | st)));
+        }
+        if st == CHECKED && is(&raw const sys::lv_roller_class) {
+            return Some((same, Selector(PART_SELECTED)));
+        }
+        if st == CHECKED && is(&raw const sys::lv_dropdown_class) {
+            let list = unsafe { sys::lv_dropdown_get_list(self.raw) };
+            if !list.is_null() {
+                return Some((Obj { raw: list, _ui: PhantomData }, Selector(PART_SELECTED | CHECKED)));
+            }
+        }
+        Some((same, Selector(st)))
     }
 
     /// A bar's track (the unfilled part) in `rgb` at `opa`.
@@ -2750,6 +2872,7 @@ impl<'ui> Obj<'ui> {
             ScrollSnap::Center => sys::lv_scroll_snap_t_LV_SCROLL_SNAP_CENTER,
         };
         unsafe {
+            sys::lv_obj_set_scrollable(self.raw, true);
             if horizontal {
                 sys::lv_obj_set_scroll_dir(self.raw, sys::lv_dir_t_LV_DIR_HOR as sys::lv_dir_t);
                 sys::lv_obj_set_scroll_snap_x(self.raw, snap);
@@ -3725,6 +3848,132 @@ pub fn with_state(state: &str, f: impl FnOnce()) {
     SELECTOR.with(|c| c.set(before));
 }
 
+/// Where a state style goes on a widget: a part and state of it, or of
+/// an object of its own (a dropdown's list). See [`Obj::state_target`].
+#[derive(Clone, Copy, Debug)]
+pub struct Selector(sys::lv_style_selector_t);
+
+/// Run `f` with the property setters writing to `selector`.
+pub fn with_selector(selector: Selector, f: impl FnOnce()) {
+    let before = SELECTOR.with(|c| c.replace(selector.0));
+    f();
+    SELECTOR.with(|c| c.set(before));
+}
+
+/// The colors of the inputs (toggle, slider, select, keypad) and of
+/// the dialogs, from the theme: drawn in these at creation, under what
+/// a node or a style sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputColors {
+    /// What is on, chosen or filled: a toggle that is on, a slider's
+    /// indicator and knob, the chosen option, a keypad's OK, a
+    /// dialog's buttons.
+    pub accent: (u32, u8),
+    /// What is off or empty: a toggle's and a slider's track, keys,
+    /// option rows, a dialog's header.
+    pub track: (u32, u8),
+    pub text: (u32, u8),
+    /// The box of a select, a keypad's display line and keys' panel,
+    /// a dialog.
+    pub surface: (u32, u8),
+    /// Text on `accent`: the theme's `on_accent`, else white or black,
+    /// whichever contrasts more with it ([`on_color`]).
+    pub on_accent: (u32, u8),
+}
+
+impl Default for InputColors {
+    fn default() -> Self {
+        InputColors {
+            accent: (0x2196f3, 255),
+            track: (0x757575, 0x40),
+            text: (0x212121, 255),
+            surface: (0xffffff, 255),
+            on_accent: (0xffffff, 255),
+        }
+    }
+}
+
+/// WCAG relative luminance of `rgb`.
+fn luminance(rgb: u32) -> f64 {
+    let lin = |c: u32| {
+        let c = c as f64 / 255.0;
+        if c <= 0.039_28 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(rgb >> 16 & 0xff) + 0.7152 * lin(rgb >> 8 & 0xff) + 0.0722 * lin(rgb & 0xff)
+}
+
+/// WCAG contrast ratio of two colors (1 to 21).
+pub fn contrast(a: u32, b: u32) -> f64 {
+    let (x, y) = (luminance(a), luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// The text color for a background of `rgb`: white while it reaches
+/// 3:1 there (WCAG's floor for large text and controls; a saturated
+/// accent such as `#2196f3` keeps white text), else white or black,
+/// whichever contrasts more.
+pub fn on_color(rgb: u32) -> u32 {
+    let white = contrast(rgb, 0xffffff);
+    if white >= 3.0 || white >= contrast(rgb, 0x000000) { 0xffffff } else { 0x000000 }
+}
+
+thread_local! {
+    static INPUT_COLORS: std::cell::Cell<InputColors> = std::cell::Cell::new(InputColors::default());
+}
+
+/// Use `colors` for the inputs and dialogs created from here on.
+pub fn set_input_colors(colors: InputColors) {
+    INPUT_COLORS.with(|c| c.set(colors));
+}
+
+fn input_colors() -> InputColors {
+    INPUT_COLORS.with(|c| c.get())
+}
+
+const PART_INDICATOR: sys::lv_style_selector_t = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
+const PART_KNOB: sys::lv_style_selector_t = sys::lv_part_t_LV_PART_KNOB as sys::lv_style_selector_t;
+const PART_SELECTED: sys::lv_style_selector_t = sys::lv_part_t_LV_PART_SELECTED as sys::lv_style_selector_t;
+const PART_ITEMS: sys::lv_style_selector_t = sys::lv_part_t_LV_PART_ITEMS as sys::lv_style_selector_t;
+const PART_CURSOR: sys::lv_style_selector_t = sys::lv_part_t_LV_PART_CURSOR as sys::lv_style_selector_t;
+const CHECKED: sys::lv_style_selector_t = sys::lv_state_t_LV_STATE_CHECKED as sys::lv_style_selector_t;
+const FOCUSED: sys::lv_style_selector_t = sys::lv_state_t_LV_STATE_FOCUSED as sys::lv_style_selector_t;
+
+/// `obj`'s background at `selector` in `(rgb, opa)`.
+fn paint_bg(obj: *mut sys::lv_obj_t, (rgb, opa): (u32, u8), selector: sys::lv_style_selector_t) {
+    unsafe {
+        sys::lv_obj_set_style_bg_color(obj, sys::lv_color_hex(rgb), selector);
+        sys::lv_obj_set_style_bg_opa(obj, opa, selector);
+    }
+}
+
+fn paint_text(obj: *mut sys::lv_obj_t, (rgb, opa): (u32, u8), selector: sys::lv_style_selector_t) {
+    unsafe {
+        sys::lv_obj_set_style_text_color(obj, sys::lv_color_hex(rgb), selector);
+        sys::lv_obj_set_style_text_opa(obj, opa, selector);
+    }
+}
+
+fn paint_border(obj: *mut sys::lv_obj_t, (rgb, opa): (u32, u8), selector: sys::lv_style_selector_t) {
+    unsafe {
+        sys::lv_obj_set_style_border_color(obj, sys::lv_color_hex(rgb), selector);
+        sys::lv_obj_set_style_border_opa(obj, opa, selector);
+    }
+}
+
+/// A dialog's button: the accent.
+fn paint_footer_button(obj: *mut sys::lv_obj_t) {
+    let c = input_colors();
+    paint_bg(obj, c.accent, 0);
+    paint_text(obj, c.on_accent, 0);
+}
+
+/// A box of the theme's: `surface`, `text`, a `track` border.
+fn paint_box(obj: *mut sys::lv_obj_t, c: &InputColors) {
+    paint_bg(obj, c.surface, 0);
+    paint_text(obj, c.text, 0);
+    paint_border(obj, c.track, 0);
+}
+
 /// The largest backdrop blur: the Pi draws it in software, over the
 /// whole screen, on every change under the dialog.
 pub const BLUR_MAX: i32 = 20;
@@ -4204,6 +4453,28 @@ pub fn finish_motion() {
     FINISHING.with(|f| f.set(false));
 }
 
+thread_local! {
+    /// Dropdowns whose list is open.
+    static OPEN_LISTS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The user is in the middle of something a redraw would undo: a
+/// finger (or the mouse) is down (a press, a slider or roller being
+/// dragged), or a dropdown's list is open.
+pub fn interacting() -> bool {
+    if OPEN_LISTS.with(|o| !o.borrow().is_empty()) {
+        return true;
+    }
+    let mut indev = unsafe { sys::lv_indev_get_next(std::ptr::null_mut()) };
+    while !indev.is_null() {
+        if unsafe { sys::lv_indev_get_state(indev) } == sys::lv_indev_state_t_LV_INDEV_STATE_PRESSED {
+            return true;
+        }
+        indev = unsafe { sys::lv_indev_get_next(indev) };
+    }
+    false
+}
+
 /// Animations running now (LVGL's, the style transitions included).
 pub fn running_animations() -> u32 {
     unsafe { sys::lv_anim_count_running() as u32 }
@@ -4212,6 +4483,20 @@ pub fn running_animations() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_on_a_color_is_white_or_black_by_contrast() {
+        // Pale accents get black text, deep ones white.
+        assert_eq!(on_color(0x5eead4), 0x000000);
+        assert_eq!(on_color(0x4aa3ff), 0x000000);
+        assert_eq!(on_color(0xe040fb), 0xffffff);
+        assert_eq!(on_color(0x2196f3), 0xffffff);
+        assert_eq!(on_color(0xffeb3b), 0x000000);
+        assert_eq!(on_color(0x1565c0), 0xffffff);
+        assert_eq!(on_color(0x212121), 0xffffff);
+        assert!((contrast(0x5eead4, 0xffffff) - 1.48).abs() < 0.02);
+        assert!((contrast(0xffffff, 0x000000) - 21.0).abs() < 0.01);
+    }
 
     #[test]
     fn arc_spans_keep_a_full_circle() {

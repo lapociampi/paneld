@@ -99,7 +99,7 @@ pub fn suggest(name: &str) -> Option<&'static str> {
     let mut best: Option<(usize, &'static str)> = None;
     for (n, _) in BUILTIN {
         let d = distance(name, n);
-        if d <= 2 && best.map_or(true, |(b, _)| d < b) {
+        if d <= 2 && best.is_none_or(|(b, _)| d < b) {
             best = Some((d, n));
         }
     }

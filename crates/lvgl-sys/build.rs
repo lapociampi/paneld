@@ -259,6 +259,8 @@ fn generate_bindings(manifest_dir: &Path, lvgl_dir: &Path, sdl: bool, drm: bool)
         .allowlist_var("LV_.*")
         .allowlist_var("_LV_.*")
         .allowlist_var("lv_font_.*")
+        // Widget classes the UI tells apart (where a state style goes).
+        .allowlist_var("lv_(roller|dropdown|buttonmatrix)_class")
         .size_t_is_usize(true)
         .derive_default(true)
         .layout_tests(false)

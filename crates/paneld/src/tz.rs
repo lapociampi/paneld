@@ -35,12 +35,40 @@ struct When {
 }
 
 impl Zone {
+    /// The local zone as libc finds it: `TZ` when set, else
     /// `/etc/localtime`, else UTC.
     pub fn local() -> Self {
-        std::fs::read("/etc/localtime")
-            .ok()
-            .and_then(|b| Self::parse(&b))
-            .unwrap_or_default()
+        Self::from_tz(std::env::var("TZ").ok().as_deref(), std::path::Path::new("/usr/share/zoneinfo"))
+    }
+
+    /// The zone `TZ` names (libc's rules): unset, `/etc/localtime`;
+    /// empty, UTC; a POSIX rule (`UTC0`, `CET-1CEST,M3.5.0,M10.5.0/3`);
+    /// else a TZif file, `:` in front optional: an absolute path, or a
+    /// name under `zoneinfo` (`Europe/Rome`, `UTC`). Anything that does
+    /// not read is UTC.
+    pub fn from_tz(tz: Option<&str>, zoneinfo: &std::path::Path) -> Self {
+        let read = |p: &std::path::Path| std::fs::read(p).ok().and_then(|b| Self::parse(&b));
+        let Some(tz) = tz else {
+            return read(std::path::Path::new("/etc/localtime")).unwrap_or_default();
+        };
+        let name = tz.strip_prefix(':').unwrap_or(tz);
+        if name.is_empty() {
+            return Zone::default();
+        }
+        if !tz.starts_with(':') {
+            if let Some(rule) = parse_rule(tz) {
+                return Zone { footer: Some(rule), ..Zone::default() };
+            }
+        }
+        let path = std::path::Path::new(name);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else if path.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+            zoneinfo.join(path)
+        } else {
+            return Zone::default();
+        };
+        read(&path).unwrap_or_default()
     }
 
     pub fn parse(b: &[u8]) -> Option<Self> {
@@ -262,6 +290,22 @@ impl Zone {
 }
 
 impl Zone {
+    /// A zone that follows POSIX TZ rule `rule` alone
+    /// (`CET-1CEST,M3.5.0,M10.5.0/3`), for tests.
+    #[cfg(test)]
+    pub fn from_rule(rule: &str) -> Option<Self> {
+        Some(Zone { footer: Some(parse_rule(rule)?), ..Zone::default() })
+    }
+
+    /// The local date, weekday (0 = Sunday) and seconds of day at
+    /// Unix time `t`.
+    pub fn local_parts(&self, t: i64) -> ((i64, u32, u32), u32, u32) {
+        let local = t + self.offset_at(t) as i64;
+        let days = local.div_euclid(86_400);
+        // 1970-01-01 was a Thursday.
+        (civil_from_days(days), (days + 4).rem_euclid(7) as u32, local.rem_euclid(86_400) as u32)
+    }
+
     /// The local calendar date at Unix time `t`.
     pub fn local_date(&self, t: i64) -> (i64, u32, u32) {
         civil_from_days((t + self.offset_at(t) as i64).div_euclid(86_400))
@@ -353,6 +397,28 @@ mod tests {
         b.extend(b"CET\0CEST\0");
         b.extend(format!("\n{footer}\n").bytes());
         b
+    }
+
+    #[test]
+    fn tz_is_read_as_libc_reads_it() {
+        let dir = std::env::temp_dir().join(format!("paneld-tz-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Europe")).unwrap();
+        let summer = utc(2026, 7, 1, 12);
+        std::fs::write(dir.join("Europe/Rome"), tzif(utc(2026, 3, 29, 1), EU)).unwrap();
+        let at = |tz: Option<&str>| Zone::from_tz(tz, &dir).offset_at(summer);
+        assert_eq!(at(Some("Europe/Rome")), 7200);
+        assert_eq!(at(Some(":Europe/Rome")), 7200);
+        let abs = dir.join("Europe/Rome").display().to_string();
+        assert_eq!(at(Some(&format!(":{abs}"))), 7200);
+        assert_eq!(at(Some(EU)), 7200, "a POSIX rule");
+        assert_eq!(at(Some("<+0530>-5:30")), 19_800);
+        assert_eq!(at(Some("UTC0")), 0);
+        // UTC without a zoneinfo file, empty, unknown and `..` are UTC.
+        assert_eq!(at(Some("UTC")), 0);
+        assert_eq!(at(Some("")), 0);
+        assert_eq!(at(Some("Mars/Base")), 0);
+        assert_eq!(at(Some("../Europe/Rome")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

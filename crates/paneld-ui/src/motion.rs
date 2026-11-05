@@ -309,7 +309,7 @@ fn shifted(shown: &[Option<i32>], was: &[Option<i32>], to: &[Option<i32>]) -> Ve
         if was[k..] == to[..n - k] && was[k..].iter().any(Option::is_some) {
             let last = shown.last().copied().flatten();
             let mut v: Vec<Option<i32>> = shown[k..].to_vec();
-            v.extend(std::iter::repeat(last).take(k));
+            v.extend(std::iter::repeat_n(last, k));
             return v;
         }
     }

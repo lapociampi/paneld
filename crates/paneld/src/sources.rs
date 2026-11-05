@@ -378,6 +378,8 @@ fn stream_loop(
     let mut ctx = ctx;
     crate::remotes::bind(&block, &mut ctx);
     while !shutdown.load(Ordering::SeqCst) {
+        // A restarted stream reads the clock as of its start.
+        crate::clock::insert(&mut ctx);
         let request = match crate::remotes::request(&block, &ctx, Duration::from_secs(10), true) {
             Ok(Some(r)) => Ok(r),
             Ok(None) => {
@@ -681,6 +683,7 @@ pub fn resolve_one(
     let mask = crate::secrets::Mask::from_ctx(ctx);
     // A remote member's params (schema 17) are plain names here.
     let mut bound = ctx.clone();
+    crate::clock::insert(&mut bound);
     crate::remotes::bind(b, &mut bound);
     let ctx = &bound;
     let timeout = find_simple(b, "timeout")
@@ -792,6 +795,7 @@ fn eval_value_transform(
 
     // `out`, and a remote member's params (schema 17).
     let mut ctx: Context = Context::new();
+    crate::clock::insert(&mut ctx);
     crate::remotes::bind(b, &mut ctx);
     ctx.insert("out".into(), out.clone());
 

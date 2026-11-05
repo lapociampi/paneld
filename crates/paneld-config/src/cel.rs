@@ -1219,8 +1219,28 @@ pub fn idents(expr: &Expr) -> Vec<(String, Span)> {
     out
 }
 
+/// The fields of `now` (schema 16).
+pub const NOW_FIELDS: &[&str] = &[
+    "unix", "year", "month", "day", "hour", "minute", "second", "weekday", "weekday_short", "month_name",
+    "month_short", "date", "iso_date", "time", "time12",
+];
+
+/// The fields of `now` that change every second; the others change
+/// at most once a minute.
+pub const NOW_SECOND_FIELDS: &[&str] = &["second", "unix"];
+
+fn check_now_field(name: &str, span: Span, written: &str, diags: &mut Vec<Diagnostic>) {
+    if !NOW_FIELDS.contains(&name) {
+        diags.push(Diagnostic::new(
+            span,
+            format!("unknown field `{name}` in `{written}`; `now` has {}", NOW_FIELDS.join(", ")),
+        ));
+    }
+}
+
 /// Walk a parsed CEL expression and append diagnostics for any
-/// `sources.<name>` whose `<name>` is not in `known_sources`. Other
+/// `sources.<name>` whose `<name>` is not in `known_sources`, and any
+/// `now.<field>` that `now` does not have. Other
 /// identifier roots are left alone -- they may be component / action
 /// params, `item` from a `repeat`, or `theme` tokens that a theme
 /// adds freely.
@@ -1237,6 +1257,9 @@ pub fn walk_source_refs(
                         expr.span,
                         format!("unknown source `{name}` in `sources.{name}`"),
                     ));
+                }
+                if root == "now" {
+                    check_now_field(name, expr.span, &format!("now.{name}"), diags);
                 }
             }
             walk_source_refs(inner, known_sources, diags);
@@ -1259,6 +1282,9 @@ pub fn walk_source_refs(
                         expr.span,
                         format!("unknown source `{name}` in `sources[\"{name}\"]`"),
                     ));
+                }
+                if root == "now" {
+                    check_now_field(name, expr.span, &format!("now[\"{name}\"]"), diags);
                 }
             }
             walk_source_refs(inner, known_sources, diags);

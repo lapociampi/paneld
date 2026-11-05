@@ -2559,3 +2559,134 @@ fn the_alert_banner_comes_in_with_the_theme_transition() {
     let img = shot(&conf, &["--tap", "100,95", "--settle", "20", "--wait", "200"]);
     assert!(close(img.px(700, y + 4), critical, 16), "banner faded under `motion = none`");
 }
+
+/// Whether a pixel in rows `ys` passes `f`.
+fn any_in_rows(img: &Image, ys: std::ops::Range<usize>, f: impl Fn([u8; 3]) -> bool) -> bool {
+    ys.into_iter().any(|y| (0..img.w).any(|x| f(img.px(x, y))))
+}
+
+#[test]
+fn now_renders_in_local_time() {
+    let d = tmp("now");
+    let conf = d.join("p.conf");
+    // The green square shows only when `now.time` agrees with its
+    // fields and the date fields are there.
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             text { value = {{ now.weekday }}, {{ now.date }} {{ now.time }} }\n\
+             rect {\n\
+                 width = 40; height = 40; background = #00ff00\n\
+                 visible = {{ now.time == (now.hour < 10 ? '0' : '') + string(now.hour) + ':' + (now.minute < 10 ? '0' : '') + string(now.minute) && size(now.iso_date) == 10 && now.month_name.startsWith(now.month_short) && now.weekday.startsWith(now.weekday_short) }}\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 8)), "now.time did not render as its fields say");
+}
+
+#[test]
+fn inputs_and_dialogs_take_the_theme_accent_in_a_dark_theme() {
+    let d = tmp("accent");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "screen:theme = t\n\
+         theme t {\n\
+             extends = dark\n\
+             accent = #e040fb\n\
+             style .alt:checked { color = #00ff00 }\n\
+         }\n\
+         action sure { confirm = Sure?; run = true }\n\
+         page home {\n\
+             column {\n\
+                 row { toggle { value = true }  toggle { value = true; class = alt }  toggle { value = false } }\n\
+                 slider { width = 300; value = 60 }\n\
+                 button { label = Go; action = sure }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let accent = |p| close(p, [0xe0, 0x40, 0xfb], 10);
+    let lvgl_blue = |p| close(p, [0x21, 0x96, 0xf3], 24) || close(p, [0x1e, 0x88, 0xe5], 24);
+    let img = shot(&conf, &["--settle", "50"]);
+    // The toggle that is on, and a slider's indicator, in the accent.
+    assert!(any_in_rows(&img, 100..140, accent), "the toggle is not in the accent");
+    assert!(any_in_rows(&img, 150..180, accent), "the slider is not in the accent");
+    // A `:checked` style reaches the toggle's on color.
+    assert!(any_in_rows(&img, 100..140, |p| close(p, [0, 0xff, 0], 8)), "the toggle's :checked style did not apply");
+    assert!(!img.any(lvgl_blue), "LVGL's blue is still drawn");
+    // The confirm dialog's buttons too.
+    // The confirm dialog: its box in `surface`, its buttons in the
+    // accent (the page under it is dimmed).
+    let img = shot(&conf, &["--settle", "50", "--tap", "60,208"]);
+    assert!(any_in_rows(&img, 225..260, |p| close(p, [0x1e, 0x1e, 0x1e], 4)), "the dialog is not on `surface`");
+    assert!(any_in_rows(&img, 265..300, accent), "the dialog's buttons are not in the accent");
+    assert!(!img.any(lvgl_blue), "a dialog drew LVGL's blue");
+}
+
+#[test]
+fn a_seconds_clock_does_not_close_an_open_dropdown() {
+    let d = tmp("open-list");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home { column {\n\
+             text { value = {{ now.second }} }\n\
+             select { width = 140; options = {{ ['a', 'b', 'c'] }}; value = b }\n\
+         } }\n",
+    )
+    .unwrap();
+    // The list (its chosen row in the accent) is under the select.
+    let open = |img: &Image| any_in_rows(img, 160..290, |p| close(p, [0x21, 0x96, 0xf3], 12));
+    // Open, then two and a half seconds of the clock: still open.
+    let img = shot(&conf, &["--tap", "100,135", "--wait", "2500"]);
+    assert!(open(&img), "the clock's redraw closed the list");
+    // Picked: the list closes and the page is redrawn.
+    let img = shot(&conf, &["--tap", "100,135", "--wait", "1200", "--tap", "100,188", "--wait", "1200"]);
+    assert!(!open(&img), "the list stayed open after a pick");
+}
+
+#[test]
+fn only_a_scroll_scrolls_and_other_blocks_clip() {
+    let d = tmp("clip");
+    let conf = d.join("p.conf");
+    // Text in the box's own blue, overflowing it: anything else drawn
+    // inside is a scrollbar.
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             column { width = 200; height = 60; padding = 0; radius = 0; border = 0; background = #0000ff; color = #0000ff\n\
+                 text { value = one } text { value = two } text { value = three } text { value = four } text { value = five } }\n\
+             scroll { width = 200; height = 60; grow = 0; padding = 0; radius = 0; border = 0; background = #00ff00; color = #00ff00\n\
+                 text { value = one } text { value = two } text { value = three } text { value = four } text { value = five } }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let inside = |c: [u8; 3]| {
+        let b = bbox(&img, |p| close(p, c, 8)).expect("box not drawn");
+        (b.1 + 2..b.3 - 2).flat_map(|y| (b.0 + 2..b.2 - 2).map(move |x| (x, y))).any(|(x, y)| !close(img.px(x, y), c, 8))
+    };
+    assert!(!inside([0, 0, 0xff]), "a column drew a scrollbar");
+    assert!(inside([0, 0xff, 0]), "a scroll lost its scrollbar");
+}
+
+#[test]
+fn text_on_the_accent_reads_and_on_accent_sets_it() {
+    let d = tmp("on-accent");
+    let conf = d.join("p.conf");
+    let page = "page home { button { width = 200; height = 60; label = WWWWWW } }\n";
+    // A pale accent: black text, not white (1.48:1).
+    std::fs::write(&conf, format!("screen:theme = t\ntheme t {{ extends = dark; accent = #5eead4 }}\n{page}")).unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let b = bbox(&img, |p| close(p, [0x5e, 0xea, 0xd4], 8)).expect("no button");
+    let on_button = |f: &dyn Fn([u8; 3]) -> bool| (b.1..b.3).any(|y| (b.0..b.2).any(|x| f(img.px(x, y))));
+    assert!(on_button(&|p| p.iter().all(|&c| c < 0x30)), "no dark text on a pale accent");
+    assert!(!on_button(&|p| p == [0xff, 0xff, 0xff]), "white text on a pale accent");
+    // The theme's `on_accent` wins.
+    std::fs::write(&conf, format!("screen:theme = t\ntheme t {{ extends = dark; accent = #5eead4; on_accent = #ff0000 }}\n{page}")).unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    assert!(img.any(|p| close(p, [0xff, 0, 0], 40)), "on_accent not used");
+}

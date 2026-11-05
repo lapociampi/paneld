@@ -35,6 +35,12 @@ static CHANGED: Condvar = Condvar::new();
 /// by a computed name.
 const ALL: &str = "*";
 
+/// Marks a page that reads a field of `now` that changes each minute
+/// (`now.time`). Not a source name: those have no `:`.
+const NOW_MINUTE: &str = "now:minute";
+/// Marks a page that reads `now.second`, `now.unix`, or `now` whole.
+const NOW_SECOND: &str = "now:second";
+
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(State::default))
@@ -112,6 +118,26 @@ pub fn on_page(name: &str) -> bool {
         None => true,
         Some(_) if s.asleep => false,
         Some(p) => s.pages.get(p).is_some_and(|set| set.contains(name) || set.contains(ALL)),
+    })
+}
+
+/// How often the clock must redraw the page on screen: what it (with
+/// its shell) reads of `now` (`ago()` texts are timed by the main loop). `None` when it reads no
+/// time, before any page is drawn, and asleep (the wake redraws).
+pub fn clock_on_page() -> Option<crate::clock::Tick> {
+    use crate::clock::Tick;
+    with(|s| match &s.shown {
+        Some(p) if !s.asleep => {
+            let set = s.pages.get(p)?;
+            if set.contains(NOW_SECOND) {
+                Some(Tick::Second)
+            } else if set.contains(NOW_MINUTE) {
+                Some(Tick::Minute)
+            } else {
+                None
+            }
+        }
+        _ => None,
     })
 }
 
@@ -240,10 +266,25 @@ fn expr_refs(e: &Expr, remotes: &BTreeMap<String, Vec<String>>, out: &mut BTreeS
             out.insert(format!("{r}.{m}"));
         }
     };
+    let now_field = |f: &str, out: &mut BTreeSet<String>| {
+        let second = paneld_config::cel::NOW_SECOND_FIELDS.contains(&f);
+        out.insert(if second { NOW_SECOND } else { NOW_MINUTE }.to_string());
+    };
     match &e.kind {
         ExprKind::Ident(n) if n == "sources" => {
             out.insert(ALL.to_string());
         }
+        ExprKind::Ident(n) if n == "now" => {
+            out.insert(NOW_SECOND.to_string());
+        }
+        ExprKind::Field(inner, field) if ident(inner).as_deref() == Some("now") => now_field(field, out),
+        ExprKind::Index(inner, idx) if ident(inner).as_deref() == Some("now") => match &idx.kind {
+            ExprKind::StringLit(f) => now_field(f, out),
+            _ => {
+                out.insert(NOW_SECOND.to_string());
+                expr_refs(idx, remotes, out);
+            }
+        },
         ExprKind::Ident(n) if remotes.contains_key(n) => all_of(n, out),
         ExprKind::Field(inner, field) if ident(inner).as_deref() == Some("sources") => {
             out.insert(field.clone());
@@ -311,6 +352,9 @@ mod tests {
         d
     }
 
+    /// The tests that use the global state, one at a time.
+    static GLOBAL: Mutex<()> = Mutex::new(());
+
     fn set(xs: &[&str]) -> BTreeSet<String> {
         xs.iter().map(|s| s.to_string()).collect()
     }
@@ -347,7 +391,48 @@ mod tests {
     }
 
     #[test]
+    fn pages_that_read_the_clock_are_marked_by_how_often_it_changes() {
+        use crate::clock::Tick;
+        let d = doc(
+            "component shell { column { slot { } } }\n\
+             component clock { text { value = {{ now.time }} } }\n\
+             page plain { text { value = {{ sources.x.value }} } }\n\
+             page minute { clock { } }\n\
+             page date { text { value = {{ now['iso_date'] }} } }\n\
+             page since { text { value = {{ ago(sources.x.at) }} } }\n\
+             page second { text { value = {{ now.second }} } }\n\
+             page unix { text { value = {{ now.unix - 1 }} {{ now.time }} } }\n\
+             page whole { text { value = {{ size(now) }} } }\n",
+        );
+        let (pages, _) = analyse(&d, &BTreeMap::new());
+        assert_eq!(pages["plain"], set(&["x"]));
+        assert_eq!(pages["minute"], set(&[NOW_MINUTE]));
+        assert_eq!(pages["date"], set(&[NOW_MINUTE]));
+        // `ago()` alone: the main loop times it by the texts shown.
+        assert_eq!(pages["since"], set(&["x"]));
+        assert_eq!(pages["second"], set(&[NOW_SECOND]));
+        assert!(pages["unix"].contains(NOW_SECOND));
+        assert_eq!(pages["whole"], set(&[NOW_SECOND]));
+        // What the clock redraws follows the page shown and sleep.
+        let _g = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        install(&d, &BTreeMap::new());
+        set_asleep(false);
+        with(|s| s.shown = None);
+        assert_eq!(clock_on_page(), None, "before a page is drawn");
+        show("plain");
+        assert_eq!(clock_on_page(), None);
+        show("minute");
+        assert_eq!(clock_on_page(), Some(Tick::Minute));
+        show("unix");
+        assert_eq!(clock_on_page(), Some(Tick::Second));
+        set_asleep(true);
+        assert_eq!(clock_on_page(), None, "asleep");
+        set_asleep(false);
+    }
+
+    #[test]
     fn what_is_shown_follows_the_page_and_sleep() {
+        let _g = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
         let d = doc("page a { text { value = {{ sources.x.value }} } }\npage b { text { value = y } }\nalert al { when = {{ sources.z.value > 1 }} }\n");
         install(&d, &BTreeMap::new());
         with(|s| s.shown = None);

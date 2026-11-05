@@ -124,7 +124,7 @@ action pause_adblock {
 | `param` | repeatable | Typed parameters (section 6); passed by the caller or asked for |
 | `pin` | bool | Ask the PIN first (section 14) |
 | `confirm` | string, expr | Ask for confirmation with this text |
-| `title` | string, expr | How the action is named in its dialogs and messages (`PIN for <title>`, `<title> failed`); without it they name no action |
+| `title` | string, expr | How the action is named in its dialogs and messages (`PIN for <title>`, `<title> failed`); reads the call's params (`title = Stop {{ name }}`); without it they name no action |
 | `run` | command | Optional: an action may only change the UI |
 | `timeout` | duration | |
 | `env { }` | block | |
@@ -274,7 +274,7 @@ Cost on the Pi (software rendering): a vertical or horizontal gradient costs abo
 
 ### 8.2 Layout
 
-Layout blocks are transparent and borderless: only a `background`, `border` or theme style draws them.
+Layout blocks are transparent and borderless: only a `background`, `border` or theme style draws them. Only `scroll` scrolls: what overflows any other block is clipped, with no scrollbar. The shipped shell puts the page body in a `scroll`, so a long page scrolls.
 
 | Block | Keys | Notes |
 | --- | --- | --- |
@@ -293,8 +293,8 @@ Layout blocks are transparent and borderless: only a `background`, `border` or t
 | `icon` | `name` (built-in icon or theme icon, expr), `size` (px, expr; default the theme's `font` size), `color` (default the text color). A built-in is a glyph of the compiled Montserrat font nearest to `size` (12, 14, 16, 20, 24, 32); above 32 the 32 px glyph is scaled up, to at most 128. With the theme's `icons` set to a folder (relative to the config folder, or to the theme folder for a theme folder's `theme.conf`), `<folder>/<name>.png` replaces the built-in of that name or adds a new one: sized to `size` x `size`, tinted with `color`; decoded once and kept at that size (up to 1 MiB of them, past that read as a plain `image`). A literal name found in neither is a check error when no folder is set; at render an unknown name draws nothing (logged once) |
 | `image` | `src` (path to a PNG, expr; relative to the config folder, or in a theme folder's component to the theme folder and inside it), `fit` (`contain`, `cover`, `fill`, `none`), `recolor` (color) |
 | `rect` | none beyond the common ones: a shape |
-| `arc` | `value`, `min` = 0, `max` = 100 (expr), `start` = 135, `end` = 45 (degrees: 0 at 3 o'clock, clockwise, so the default leaves the gap at the bottom; a span of 360, e.g. `0` to `360`, is a full circle), `thickness` (px, at least 1), `track` (color; default the theme's `muted`, faint), `rounded` (bool, default false), `color` (the value; default the theme's `accent`). For display: no knob, and a press never changes the value |
-| `bar` | `value`, `min` = 0, `max` = 100 (expr), `direction` (`horizontal` default, `vertical`: fills from the bottom), `track` (color; default the theme's `muted`, faint), `color` (the value; default the theme's `accent`) |
+| `arc` | `value`, `min` = 0, `max` = 100 (expr), `start` = 135, `end` = 45 (degrees: 0 at 3 o'clock, clockwise, so the default leaves the gap at the bottom; a span of 360, e.g. `0` to `360`, is a full circle), `thickness` (px, at least 1), `track` (color; default the theme's `track` token when it has one, else its `muted`, faint), `rounded` (bool, default false), `color` (the value; default the theme's `accent`). For display: no knob, and a press never changes the value |
+| `bar` | `value`, `min` = 0, `max` = 100 (expr), `direction` (`horizontal` default, `vertical`: fills from the bottom), `track` (color; default as on `arc`), `color` (the value; default the theme's `accent`) |
 | `line` | `points` (list of `[x, y]` in px, expr), `thickness` (px, at least 1, default 2), `rounded`, `color` (default the theme's `text`) |
 | `chart` | `type` (`line`, `bar`, `area`: a line with the space under it filled, translucent), `min`, `max` (default: the data's range), `points` (count, default: the longest series), `divisions` (`<h> <v>`, default `3 0`), `series { values = {{ }}; color = ... }` repeatable (`color` default the theme's `accent`). `values` is a list of numbers or of `{value}` maps, such as a source's `history`; the newest `points` are shown, against the right edge. A `line` or `area` chart draws no dot on each point. No box of its own: transparent and borderless unless `background` / `border` are set; the division lines in the theme's `muted`, faint |
 | `qr` | `data` (string, expr), `size` |
@@ -309,12 +309,12 @@ Built-in icons: `home`, `settings`, `power`, `refresh`, `ok`, `close`, `plus`, `
 | Block | Keys |
 | --- | --- |
 | `button` | `action` (action: a name, or an expression giving one like `on_tap`, e.g. `{{ tap }}`; run on a tap, unless the button has an `on_tap` too, which wins), plus children or `label` / `icon` shortcuts (both set: the icon, then the label, side by side; centered, the label on one line cut with `...` when the button is narrower, and left out beside the icon when less than two lines' height of room is left). Layout blocks and `rect` inside a button take no taps of their own unless they have `on_tap` / `on_hold`: the tap goes to the button. Shows the call its tap makes (`action`, or `on_tap`): while it runs, the `:running` state and the action's `busy` text or a spinner in place of its content; after it failed, the `:failed` state until the action runs again. A call from a dialog or a row matches when it carries every arg the button passes. A component whose root is a button shows its call's `on_tap` there, and that `on_tap` wins over the root's `action` |
-| `toggle` | `value` (bool, expr), `on_change` (action; `value` = the new state) |
-| `slider` | `value`, `min`, `max`, `step` (expr), `direction`, `on_change` (on release) |
-| `select` | `options` (list, expr), `value` (expr; the option, or its position), `style` (`dropdown` default, `roller`, `buttons`: a row with one checked), `on_change` (`value` = the option) |
+| `toggle` | `value` (bool, expr), `on_change` (action; `value` = the new state), `color` (when on; default the theme's `accent`), `track` (when off; default as on `arc`) |
+| `slider` | `value`, `min`, `max`, `step` (expr), `direction`, `on_change` (on release), `color` (the value and the knob; default the theme's `accent`), `track` (default as on `arc`) |
+| `select` | `options` (list, expr), `value` (expr; the option, or its position), `style` (`dropdown` default, `roller`, `buttons`: a row with one checked), `on_change` (`value` = the option). A box in the theme's `surface` and `text`; the chosen option in its `accent` |
 | `keypad` | `length` (max digits), `masked` (bool), `on_submit` (action; `value` = the digits) |
 
-Inputs show the value from their `value` expression; a change runs `on_change` and the display follows the source of `value` (for example a `var` set by the action, or a refreshed source).
+Inputs, buttons and the dialogs (PIN, `confirm`, `ask`, notices) are drawn in the theme's colors: `accent` for what is on or chosen (and a button, a keypad's OK, a dialog's buttons), the track for what is off (keys, option rows, a dialog's header), `surface` and `text` for boxes ([Themes](themes.md), "Inputs"). Inputs show the value from their `value` expression; a change runs `on_change` and the display follows the source of `value` (for example a `var` set by the action, or a refreshed source).
 
 `on_change` and `on_submit` take the same forms as `on_tap`: `= action`, `action { args }`, or an inline block. The new value arrives as `value` and `event.value`. An inline block with action keys (`run`, `pin`, `confirm`, `then`, ...) is an action of its own, gates included; one with only `set { }` just sets.
 
@@ -390,7 +390,7 @@ See [Themes](themes.md) for styles, components and motion. A theme is a `theme <
 | Colors | `background`, `surface`, `text`, `muted`, `accent`, `ok`, `info`, `warning`, `critical` |
 | Fonts | `font_small`, `font`, `font_big`, `font_huge`: font values, e.g. `roboto 16`, `inter 24 bold`; built in `roboto` 12, 16, 24, 32. `font` is the text font of every node that sets none |
 | Sizes | `gap`, `padding`, `radius`, `tap_min` (smallest touch target) |
-| Other | `shadow` (a `shadow` value, default `none`: what `shadow = shadow` draws), `background_image` (optional: a PNG drawn behind every page, `cover`, over the `background` token, which may itself be a color, gradient or image; the shipped shell draws no background of its own), `icons` (`builtin`, or a folder of `<name>.png` icons, section 8.3), `motion` (`full`, `reduced` (default), `none`), `page_transition` (`fade 200ms`), `banner_transition` (`fade 200ms`), `value_transition` (`300ms`), `tap_transition` (`80ms`): see [Themes](themes.md#motion), `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
+| Other | `track` (optional color: the track of `arc`, `bar`, `toggle` and `slider`, keys and option rows; default the `muted` color, faint), `on_accent` (optional color: text on the accent; default white while it reaches 3:1 contrast there, else black when that contrasts more), `shadow` (a `shadow` value, default `none`: what `shadow = shadow` draws), `background_image` (optional: a PNG drawn behind every page, `cover`, over the `background` token, which may itself be a color, gradient or image; the shipped shell draws no background of its own), `icons` (`builtin`, or a folder of `<name>.png` icons, section 8.3), `motion` (`full`, `reduced` (default), `none`), `page_transition` (`fade 200ms`), `banner_transition` (`fade 200ms`), `value_transition` (`300ms`), `tap_transition` (`80ms`): see [Themes](themes.md#motion), `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
 
 A theme may add any other token; they are read as `theme.<name>`.
 
@@ -487,7 +487,31 @@ Rotation: `fbdev` rotates each drawn area in LVGL's driver; `drm` draws into one
 
 Secret values (4 characters or more) are replaced with `****` in everything commands print before it is logged, shown, or put in `result` or a source's value: in parsed output each string, and each number whose digits hold a secret, then once more in the source's `value` (a masked number becomes the text `****`). Shorter secrets, and encoded forms (base64, URL escapes), are not caught. Prefer `env { TOKEN = {{ secrets.token }} }` over putting a secret in `run`: argv items are visible to every local user in `/proc/<pid>/cmdline`, the environment is not.
 
-`ago(t)` is worked out when the page is drawn; an idle screen is not redrawn, so the text can lag until something changes.
+`now` is the wall clock in local time, taken when the expression is evaluated. The zone is found as libc finds it: `TZ` when set (empty: UTC; a POSIX rule such as `UTC0` or `CET-1CEST,M3.5.0,M10.5.0/3`; else a zone file, `:` in front optional: `Europe/Rome` under `/usr/share/zoneinfo`, or an absolute path), else `/etc/localtime`, else UTC; a zone that does not read is UTC. It is read at start and on reload: after changing the system time zone, reload (`paneld ctl reload`). Night hours and reminders use the same zone. `now` is reserved: a `param` or `repeat` named `now` is a check error.
+
+| Field | Example | Field | Example |
+| --- | --- | --- | --- |
+| `unix` | `1793883909` (int, seconds) | `weekday` | `Thursday` |
+| `year` | `2026` | `weekday_short` | `Thu` |
+| `month` | `11` (1-12) | `month_name` | `November` |
+| `day` | `5` | `month_short` | `Nov` |
+| `hour` | `14` (0-23) | `date` | `5 November` |
+| `minute` | `5` | `iso_date` | `2026-11-05` |
+| `second` | `9` | `time` | `14:05` (24-hour) |
+| | | `time12` | `2:05 PM` |
+
+`paneld check` refuses any other field (`now.clock`, `now['hours']`). English names only; a page that wants another language maps them (`{{ {'Monday': 'Lunedi', ...}[now.weekday] }}`).
+
+Redraws: a page whose expressions (its own, its components' and the shell's) read `now` is drawn again when what they read changes, and no other page is redrawn by the clock:
+
+| The page reads | Redrawn |
+| --- | --- |
+| no `now`, no `ago()` | never by the clock |
+| any field but `second` and `unix` | at the start of each minute |
+| `ago(t)` | when a text it shows would change (`5m ago` to `6m ago`): each minute under an hour, then each hour, then each day |
+| `now.second`, `now.unix`, or `now` whole (`size(now)`, `now[k]`) | every second |
+
+While the screen sleeps nothing is redrawn; it is drawn as it is on waking. No redraw of the page shown (the clock, a new source value) happens while the user is in the middle of something on it: a finger down (a press, a slider or roller dragged) or a dropdown's list open. It waits until that ends, then follows at once; a navigation goes ahead. Each redraw rebuilds the whole page: a seconds clock costs about 0.3% of an x86 core on a simple page (measured over 30 s, 34 redraws), roughly 10 times that on the Pi 3B+ and more on a busy page, and keeps the loop waking each second. Prefer `now.time` unless the seconds matter. `ago(t)` counts from `now.unix` (`ago(now.unix)` is `just now`); a page with `ago()` costs one redraw per change of a text it shows, no more.
 
 Functions (`paneld check` refuses any other name, or a wrong number of arguments):
 

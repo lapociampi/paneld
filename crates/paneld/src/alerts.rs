@@ -416,7 +416,7 @@ impl Engine {
     pub fn shown(&self, now: SystemTime) -> Vec<(String, String)> {
         self.active
             .iter()
-            .filter(|(_, a)| !a.acked && a.snoozed_until.map_or(true, |t| t <= now))
+            .filter(|(_, a)| !a.acked && a.snoozed_until.is_none_or(|t| t <= now))
             .map(|(k, a)| (k.clone(), a.severity.clone()))
             .collect()
     }
@@ -747,7 +747,7 @@ impl Engine {
         let now = SystemTime::now();
         let shown: Vec<Value> = sorted
             .iter()
-            .filter(|a| !a.acked && a.snoozed_until.map_or(true, |t| t <= now))
+            .filter(|a| !a.acked && a.snoozed_until.is_none_or(|t| t <= now))
             .map(|a| a.to_value())
             .collect();
 

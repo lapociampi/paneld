@@ -1155,6 +1155,7 @@ const UI_TOGGLE: &UiNode = &UiNode {
     kind: "toggle",
     keys: &[
         KeyRule { name: "value", ty: ExpectedType::Bool, required: false, expr_ok: true },
+        KeyRule { name: "track", ty: ExpectedType::Color, required: false, expr_ok: true },
         KeyRule { name: "on_change", ty: ExpectedType::Ident, required: false, expr_ok: true },
     ],
     accepts_children: false,
@@ -1169,6 +1170,7 @@ const UI_SLIDER: &UiNode = &UiNode {
         KeyRule { name: "min", ty: ExpectedType::Number, required: false, expr_ok: true },
         KeyRule { name: "max", ty: ExpectedType::Number, required: false, expr_ok: true },
         KeyRule { name: "step", ty: ExpectedType::Number, required: false, expr_ok: true },
+        KeyRule { name: "track", ty: ExpectedType::Color, required: false, expr_ok: true },
         KeyRule {
             name: "direction",
             ty: ExpectedType::OneOf(&["horizontal", "vertical"]),
@@ -1632,6 +1634,7 @@ fn check_inner(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     remote::check_self_use(doc, &mut diags);
     check_override_targets(doc, &mut diags);
     check_reminder_schedules(doc, &mut diags);
+    check_reserved_bindings(&doc.items, &mut diags);
 
     // Phase 10: parse every `{{ ... }}` fragment as CEL, surface parse
     // errors, and cross-reference `sources.<name>` against the collected
@@ -1961,6 +1964,37 @@ fn split_words(cmd: &str) -> Vec<String> {
 /// and the source watchdog. A config alert with one of them would
 /// share their ids.
 const RESERVED_ALERT_NAMES: &[&str] = &["ctl", "reminder", "source_down"];
+
+/// Names a `param` or a `repeat` cannot take: they would hide what
+/// every expression reads (schema 16).
+const RESERVED_BINDINGS: &[&str] = &["now"];
+
+fn check_reserved_bindings(items: &[Item], diags: &mut Vec<Diagnostic>) {
+    let refuse = |name: &crate::parse::Ident, what: &str, diags: &mut Vec<Diagnostic>| {
+        if RESERVED_BINDINGS.contains(&name.text.as_str()) {
+            diags.push(Diagnostic::new(
+                name.span,
+                format!("`{}` is reserved (the clock, read everywhere); name the {what} differently", name.text),
+            ));
+        }
+    };
+    for item in items {
+        match item {
+            Item::Block(b) => check_reserved_bindings(&b.items, diags),
+            Item::Repeat(r) => {
+                refuse(&r.binding, "repeat", diags);
+                check_reserved_bindings(&r.items, diags);
+            }
+            Item::Param(p) => {
+                refuse(&p.name, "param", diags);
+                if let Some(o) = &p.options {
+                    check_reserved_bindings(&o.items, diags);
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 /// A reminder needs exactly one of `every` and `once` (schema 10);
 /// `start` only makes sense with `every`.
@@ -5662,6 +5696,29 @@ alert a { from = ntfy; severity = warning; title = Up }
 "#;
         let diags = check_text(text);
         assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn now_fields_are_checked_with_file_and_line() {
+        let ok = check_text(
+            "page p {\n text { value = {{ now.time }} {{ now.weekday }}, {{ now.date }} {{ now['iso_date'] }} }\n text { value = {{ now.second + now.unix }} {{ ago(now.unix) }} } }\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        let diags = check_text("page p {\n text { value = x }\n text { value = {{ now.clock }} }\n}\nalert a { when = {{ now['hours'] > 1 }} }\n");
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert!(diags[0].contains(":3:") && diags[0].contains("unknown field `clock` in `now.clock`"), "{diags:?}");
+        assert!(diags[0].contains("now` has unix, year"), "{diags:?}");
+        assert!(diags[1].contains(":5:") && diags[1].contains("unknown field `hours`"), "{diags:?}");
+    }
+
+    #[test]
+    fn now_cannot_be_shadowed() {
+        let diags = check_text("page p {\n repeat now in {{ [1] }} { text { value = x } } }\n");
+        assert!(diags.iter().any(|d| d.contains(":2:") && d.contains("`now` is reserved") && d.contains("the repeat")), "{diags:?}");
+        let diags = check_text("component c {\n param now: any\n text { value = x } }\npage p { c { now = 1 } }\n");
+        assert!(diags.iter().any(|d| d.contains(":2:") && d.contains("`now` is reserved") && d.contains("the param")), "{diags:?}");
+        let diags = check_text("action a {\n param now: int\n run = true }\n");
+        assert_msg(&diags, "`now` is reserved");
     }
 
     #[test]

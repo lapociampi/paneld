@@ -9,6 +9,7 @@
 
 mod actions;
 mod alerts;
+mod clock;
 mod ctl;
 mod display;
 mod history;
@@ -235,6 +236,7 @@ Usage:
       eval '<cel>'                    Evaluate against the live values
       set vars.<name>=<value>         Set a var
       goto <page>                     Show a page (`back` = previous)
+      theme <name> | theme --reset    Switch the theme until restart
       alert fire <id> [severity=..] [title=..] [text=..] [link=..]
       alert resolve <id>
       alert ack <id> | alert snooze <id> [duration]
@@ -424,7 +426,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                             );
                             show_pin_modal(
                                 screen,
-                                &action_title(live, &call.name),
+                                &action_title(live, &call.name, &call.args),
                                 Some(&format!(
                                     "Wrong PIN, {remaining} tr{} left",
                                     if remaining == 1 { "y" } else { "ies" }
@@ -470,7 +472,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                         }
                         None if accept => {
                             // OK on an empty keypad: ask again.
-                            show_ask_modal(screen, &action_title(live, &call.name), &asked.param, &asked.options, &live.event_tx);
+                            show_ask_modal(screen, &action_title(live, &call.name, &call.args), &asked.param, &asked.options, &live.event_tx);
                             live.pending = Some(Pending { call, stage: Stage::Ask(asked) });
                         }
                         None => {}
@@ -653,6 +655,32 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     if screen_step(live) {
         dirty = true;
     }
+    // A page that reads `now` (or `ago()`): redrawn when the minute
+    // (or second) it shows is over. Wakes the loop then, not earlier;
+    // none of this while asleep or on a page without the clock.
+    if let Some(tick) = visible::clock_on_page() {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        if live.clock_drawn != Some((tick, tick.key(since_epoch.as_secs() as i64))) {
+            dirty = true;
+        }
+        // A little past the change, so the clock has moved when we look.
+        paneld_ui::wake_within(tick.ms_to_next(since_epoch) + 2);
+    }
+    // An `ago()` text on the page: redrawn when it would read otherwise
+    // (`5m ago` turning `6m ago`), and the loop wakes then. Not asleep.
+    if let Some(due) = live.ago_due.filter(|_| !live.screen.asleep()) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        let due_ms = due.saturating_mul(1000);
+        if now_ms >= due_ms {
+            dirty = true;
+        } else {
+            paneld_ui::wake_within((due_ms - now_ms) as u64 + 2);
+        }
+    }
     // Asleep: no redraws (ADR 0001, idle means asleep); render once
     // on wake instead.
     if dirty && live.screen.asleep() {
@@ -665,8 +693,17 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         live.redraw = true;
         dirty = false;
     }
+    // Nor while the user is in the middle of something on it (a finger
+    // down, a slider or roller dragged, a dropdown open): a redraw would
+    // drop the press or close the list. It follows as soon as that ends
+    // (a release wakes the loop). A navigation goes ahead.
+    if dirty && live.current_page == live.rendered_page && paneld_ui::interacting() {
+        live.redraw = true;
+        dirty = false;
+    }
 
     if dirty && live.pending.is_none() {
+        let drawn_at = clock::unix_now();
         let ctx = build_ctx(
             &live.source_values,
             &live.theme,
@@ -705,6 +742,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         }
         paneld_ui::reset_action_bindings();
         paneld_ui::set_call_states(live.calls.values().cloned().collect());
+        paneld_ui::take_ago_next();
         paneld_ui::render_page(
             &live.ui_doc,
             &live.current_page,
@@ -712,6 +750,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             &live.event_tx,
             screen,
         );
+        live.ago_due = paneld_ui::take_ago_next();
         if same_page {
             paneld_ui::restore_inputs(&typed);
         }
@@ -725,7 +764,9 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         }
         live.went_back = false;
         live.rendered_page = live.current_page.clone();
+        RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         visible::show(&live.current_page);
+        live.clock_drawn = visible::clock_on_page().map(|t| (t, t.key(drawn_at)));
     }
 }
 
@@ -804,6 +845,12 @@ struct LiveState {
     /// The last navigation was `goto = back` (a slide comes from the
     /// left).
     went_back: bool,
+    /// What the page drawn last reads of the clock, and the minute or
+    /// second it was drawn in: a new one redraws it.
+    clock_drawn: Option<(clock::Tick, i64)>,
+    /// When the soonest `ago()` text on the page drawn last changes
+    /// (Unix seconds): it is redrawn then.
+    ago_due: Option<i64>,
     pin_gate: pin::Gate,
 }
 
@@ -911,6 +958,8 @@ fn setup_live_state(
     // place of the config's and the library's.
     let ui_doc = themes::ui_doc(&doc, None);
     install_visible(&doc, &ui_doc);
+    // `now` in local time; a reload reads the zone again.
+    clock::set_zone(tz::Zone::local());
     remotes::install(remotes::Remotes::from_doc(
         &doc,
         &state_path.map(std::path::Path::to_path_buf).unwrap_or_else(|| state::config_path(&doc)),
@@ -1073,6 +1122,7 @@ fn setup_live_state(
     alerts_engine.forget_unfired();
     alerts_engine.restore_history(state_store.snapshot().history.clone());
     alerts_engine.note_resolved_while_down(&state_store.snapshot().alerts, std::time::SystemTime::now());
+    let drawn_at = clock::unix_now();
     let ctx = build_ctx(
         &source_values,
         &theme,
@@ -1088,8 +1138,12 @@ fn setup_live_state(
     paneld_ui::reset_action_bindings();
     // A reload: what the old config drew is no guide to the new one.
     paneld_ui::motion::forget();
+    paneld_ui::take_ago_next();
     paneld_ui::render_page(&ui_doc, &current_page, &ctx, &event_tx, screen);
+    let ago_due = paneld_ui::take_ago_next();
+    RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     visible::show(&current_page);
+    let clock_drawn = visible::clock_on_page().map(|t| (t, t.key(drawn_at)));
 
     let screen_state =
         screen::Screen::new(screen::Config::from_doc(&doc), tz::Zone::local(), config_dir.clone());
@@ -1129,6 +1183,8 @@ fn setup_live_state(
         touched: false,
         instant: false,
         went_back: false,
+        clock_drawn,
+        ago_due,
         pin_gate,
     })
 }
@@ -1191,7 +1247,7 @@ fn route_call(
         actions::Prepared::Ready(args) => call.args = args,
         actions::Prepared::Ask(param) => {
             let options = param.option_values(&ctx);
-            show_ask_modal(screen, &action_title(live, &call.name), &param, &options, &live.event_tx);
+            show_ask_modal(screen, &action_title(live, &call.name, &call.args), &param, &options, &live.event_tx);
             live.pending = Some(Pending { call, stage: Stage::Ask(Box::new(Asking { param: *param, options })) });
             return;
         }
@@ -1231,7 +1287,7 @@ fn route_call(
             live.pending = Some(Pending { call, stage: Stage::Notice });
             return;
         }
-        show_pin_modal(screen, &action_title(live, &call.name), None, &live.event_tx);
+        show_pin_modal(screen, &action_title(live, &call.name, &call.args), None, &live.event_tx);
         live.pending = Some(Pending { call, stage: Stage::Pin });
         return;
     }
@@ -1250,7 +1306,7 @@ fn route_call(
         }
         def.bind(&mut ctx);
         let message = paneld_ui::interpolate(&cp.raw, cp.span.file, cp.span.start, &ctx);
-        show_confirm_modal(screen, &action_title(live, &call.name), &message, &live.event_tx);
+        show_confirm_modal(screen, &action_title(live, &call.name, &call.args), &message, &live.event_tx);
         live.pending = Some(Pending { call, stage: Stage::Confirm });
         return;
     }
@@ -1559,7 +1615,7 @@ fn action_done(
                 let err = field("stderr");
                 let err = err.trim();
                 if err.is_empty() {
-                    match action_title(live, name) {
+                    match action_title(live, name, args) {
                         t if t.is_empty() => "Failed".to_string(),
                         t => format!("{t} failed"),
                     }
@@ -1600,13 +1656,13 @@ fn apply_theme_ui(
 }
 
 /// The action's `title` (schema 5), filled in against the current
-/// state; empty without one. Dialogs and messages never show the
-/// action's own name, which is for the config.
-fn action_title(live: &LiveState, name: &str) -> String {
+/// state and the call's args (as `busy`, `done` and `failed`); empty
+/// without one. Dialogs and messages never show the action's own
+/// name, which is for the config.
+fn action_title(live: &LiveState, name: &str, args: &[paneld_ui::ActionArg]) -> String {
     let Some(def) = live.actions.get(name) else { return String::new() };
     let Some(t) = &def.title else { return String::new() };
-    let mut ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
-    def.bind(&mut ctx);
+    let ctx = call_ctx(live, def, args);
     let text = paneld_ui::interpolate(&t.raw, t.span.file, t.span.start, &ctx);
     // An expression that does not evaluate comes back as written: no
     // title then, not `{{ ... }}` on screen.
@@ -2191,6 +2247,8 @@ fn handle_request(
             // loop's last sleep could be (1000 ms when nothing moves).
             m.insert("animations".to_string(), Value::Int(paneld_ui::running_animations() as i64));
             m.insert("idle_ms".to_string(), Value::Int(paneld_ui::idle_hint_ms() as i64));
+            // Full page renders since start: what the panel redrew.
+            m.insert("renders".to_string(), Value::Int(RENDERS.load(std::sync::atomic::Ordering::Relaxed) as i64));
             Ok(Value::Map(m))
         }
         other => Err(ctl::CtlError::msg(format!("unknown command `{other}`"))),
@@ -2227,8 +2285,12 @@ fn build_ctx(
     if let Some(engine) = alerts {
         ctx.insert("alerts".into(), engine.context_value());
     }
+    clock::insert(&mut ctx);
     ctx
 }
+
+/// Full page renders since start, for `ctl status` (`renders`).
+static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {

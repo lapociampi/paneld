@@ -74,6 +74,8 @@ pub fn render_page(
 ) {
     let critical = color_of("critical", ctx);
     FAILED_BORDER.with(|c| c.set(critical.unwrap_or((0xf85149, 255))));
+    // The inputs and the dialogs over this page in the theme's colors.
+    crate::ui::set_input_colors(input_colors(ctx));
     for item in &doc.items {
         if let Item::Block(b) = item {
             if b.kind.text == "page"
@@ -1223,7 +1225,7 @@ fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Context, obj: &
         for sel in &selectors {
             if let Some(body) = styles.get(sel) {
                 // `*`'s `color` is the text color, not a gauge's.
-                let kind = if sel == "*" && matches!(kind, "arc" | "bar") { "" } else { kind };
+                let kind = if sel == "*" && matches!(kind, "arc" | "bar" | "toggle" | "slider") { "" } else { kind };
                 apply_plain_props(kind, body, ctx, obj);
             }
         }
@@ -1232,7 +1234,10 @@ fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Context, obj: &
         for sel in &selectors {
             for state in ["pressed", "checked", "disabled", "focused", "hover", "running", "failed"] {
                 if let Some(body) = styles.get(&format!("{sel}:{state}")) {
-                    crate::ui::with_state(state, || apply_plain_props(kind, body, ctx, obj));
+                    // On a select, the part that shows the state.
+                    if let Some((target, selector)) = obj.state_target(state) {
+                        crate::ui::with_selector(selector, || apply_plain_props(kind, body, ctx, &target));
+                    }
                 }
             }
         }
@@ -1441,11 +1446,12 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
                     obj.set_text_overflow(mode);
                 }
             }
-            "track" if matches!(kind, "arc" | "bar") => {
+            "track" if matches!(kind, "arc" | "bar" | "toggle" | "slider") => {
                 if let Some((rgb, opa)) = resolve_color(value, a.value.span, ctx) {
                     if kind == "arc" {
                         obj.set_arc_track(rgb, opa);
                     } else {
+                        // A bar's, toggle's and slider's track is its box.
                         obj.set_bar_track(rgb, opa);
                     }
                 }
@@ -1459,7 +1465,18 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
                 let flag = resolve_expr_value(value, a.value.span, ctx).is_some_and(|v| value_truthy(&v));
                 obj.set_arc_rounded(flag);
             }
-            "background" => apply_background(&resolve_scalar(value, a.value.span, ctx), ctx, obj),
+            "background" => {
+                let text = resolve_scalar(value, a.value.span, ctx);
+                apply_background(&text, ctx, obj);
+                // A button's text reads on the color it was given, unless
+                // the same body sets `color` too.
+                let sets_color = items.iter().any(|i| matches!(i, Item::Assign(b) if matches!(&b.target, AssignTarget::Simple { key } if key.text == "color")));
+                if kind == "button" && !sets_color {
+                    if let Some((rgb, _)) = color_of(text.trim(), ctx).filter(|c| c.1 > 0x80) {
+                        obj.set_text_color_hex(crate::ui::on_color(rgb), 255);
+                    }
+                }
+            }
             "shadow" => apply_shadow(&resolve_scalar(value, a.value.span, ctx), ctx, obj),
             "color" => {
                 if let Some((rgb, opa)) = resolve_color(value, a.value.span, ctx) {
@@ -1467,6 +1484,9 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
                     match kind {
                         "arc" => obj.set_arc_indicator(rgb, opa),
                         "bar" => obj.set_bar_indicator(rgb, opa),
+                        // A toggle's on color, a slider's value.
+                        "toggle" => obj.set_toggle_on_color(rgb, opa),
+                        "slider" => obj.set_slider_color(rgb, opa),
                         _ => obj.set_text_color_hex(rgb, opa),
                     }
                 }
@@ -1977,11 +1997,39 @@ fn resolve_scalar(value: &str, span: paneld_config::source::Span, ctx: &Context)
 const FAINT: u8 = 0x40;
 
 /// A gauge's default indicator (the theme's `accent`) and track (its
-/// `muted`, faint).
+/// `track` when it has one, else its `muted`, faint).
 fn gauge_colors(ctx: &Context) -> ((u32, u8), (u32, u8)) {
     let accent = color_of("accent", ctx).unwrap_or((0x2196f3, 255));
-    let muted = color_of("muted", ctx).unwrap_or((0x757575, 255)).0;
-    (accent, (muted, FAINT))
+    (accent, track_color(ctx))
+}
+
+/// The theme's `track` color, else its `muted`, faint.
+fn track_color(ctx: &Context) -> (u32, u8) {
+    let theme = theme_of(ctx);
+    theme
+        .and_then(|t| t.get("track"))
+        .and_then(|v| theme_color(&v.to_display_string(), theme))
+        .unwrap_or_else(|| (color_of("muted", ctx).unwrap_or((0x757575, 255)).0, FAINT))
+}
+
+/// The inputs' and dialogs' colors (themes.md): `accent`, the track,
+/// `text`, `surface`, and the text on the accent.
+fn input_colors(ctx: &Context) -> crate::ui::InputColors {
+    let d = crate::ui::InputColors::default();
+    let accent = color_of("accent", ctx).unwrap_or(d.accent);
+    // `on_accent` when the theme sets it, else what reads best.
+    let theme = theme_of(ctx);
+    let on_accent = theme
+        .and_then(|t| t.get("on_accent"))
+        .and_then(|v| theme_color(&v.to_display_string(), theme))
+        .unwrap_or((crate::ui::on_color(accent.0), 255));
+    crate::ui::InputColors {
+        accent,
+        track: track_color(ctx),
+        text: color_of("text", ctx).unwrap_or(d.text),
+        surface: color_of("surface", ctx).unwrap_or(d.surface),
+        on_accent,
+    }
 }
 
 /// A grid's `columns` / `rows`: a count, or a list of tracks (`[120,

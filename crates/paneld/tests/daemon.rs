@@ -775,3 +775,46 @@ fn animations_end_and_the_loop_sleeps_again_and_none_run_while_asleep() {
     assert_eq!(status_num(&d, "animations"), 0, "a reload replayed something");
     wait_idle(&d);
 }
+
+#[test]
+fn the_clock_redraws_only_pages_that_read_it_and_as_often_as_they_read() {
+    let dir = tmp("clock");
+    let d = Daemon::start(
+        &dir,
+        "page plain { nav = 1; text { value = no clock } }\n\
+         page minutes { nav = 2; text { value = {{ now.weekday }}, {{ now.date }} {{ now.time }} } }\n\
+         page seconds { nav = 3; text { value = {{ now.time }}:{{ now.second }} } }\n",
+    );
+    // `now` is the daemon's clock, in the same zone everywhere.
+    let unix: i64 = d.eval("now.unix").parse().unwrap();
+    let mine = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    assert!((unix - mine).abs() <= 2, "now.unix {unix}, the clock {mine}");
+    assert_eq!(d.eval("ago(now.unix)"), "just now");
+    assert_eq!(d.eval("size(now.iso_date) == 10 && size(now.time) == 5"), "true");
+    let renders = || status_num(&d, "renders");
+    // A page without the clock: not redrawn as time passes, and the
+    // loop sleeps its whole idle step.
+    wait_idle(&d);
+    let before = renders();
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(renders(), before, "the clock redrew a page that does not read it");
+    // Minutes: not redrawn within a minute (unless one ended meanwhile).
+    d.ok(&["goto", "minutes"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let (minute, before) = (d.eval("now.minute"), renders());
+    std::thread::sleep(Duration::from_millis(2_000));
+    let after = renders();
+    if d.eval("now.minute") == minute {
+        assert_eq!(after, before, "a page that reads the minute was redrawn within it");
+    } else {
+        assert_eq!(after, before + 1, "a new minute redraws the page once");
+    }
+    // Seconds: redrawn each second.
+    d.ok(&["goto", "seconds"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let before = renders();
+    std::thread::sleep(Duration::from_millis(3_000));
+    let n = renders() - before;
+    assert!((2..=4).contains(&n), "{n} redraws in 3 s of a seconds clock");
+    d.stop();
+}

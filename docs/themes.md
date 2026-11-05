@@ -92,6 +92,18 @@ Measured on x86 (one core, release build), a page with 12 cards on a 4-column gr
 
 The Pi 3B+ is about 10 times slower. Shadows are capped at 32 px, and LVGL keeps the blurred corner of the last shadow drawn (`LV_DRAW_SW_SHADOW_CACHE_SIZE` 64: shadow plus radius up to 64 px), so cards with the same shadow and radius blur once per frame (12 cards with 32 px shadows: 2.78 ms without it). A gradient is computed again on every redraw; a fitted image is not decoded again. A page with a full-screen background image, 8 shadowed cards and values changing every second held its RSS (15.97 to 15.99 MB over 60 s, +1.7 MB for the fitted image) at 1.5% of one x86 core (1.2% without the image and shadows).
 
+## Inputs
+
+Toggles, sliders, selects, keypads, buttons and the dialogs follow the active theme, under what a style or the node sets:
+
+| Part | Color |
+| --- | --- |
+| A toggle that is on, a slider's value and knob, the chosen option, a keypad's OK, a button, a dialog's buttons | `accent`; text on it `on_accent` when the theme sets it, else white while that reaches 3:1 contrast (WCAG luminance; `#2196f3` keeps white), else black when that contrasts more (a pale `#5eead4` gets black) |
+| A toggle that is off, a slider's track, keys, option rows, a dialog's header, box borders | the `track` token when the theme has one, else `muted`, faint |
+| A select's box and the list it opens, a keypad's line and keys' panel, a dialog | `surface`, with `text` |
+
+A button given a solid `background` (on the node or in a style) without a `color` in the same body gets its text by the same rule, for that background. A style changes them like any other property: on a `toggle` `color` is the on color and `track` the off one (`style toggle:checked { color = #00c853 }`), on a `slider` `color` is the value and knob, `track` the rest. On a `select`, a state style goes where that state shows: `:checked` on the chosen option (the button of `buttons`, the middle row of `roller`, the chosen row of the list a `dropdown` opens), and on `buttons` each state on the buttons (`style select:pressed { background = #333 }`). A keypad's styles apply to its line of digits.
+
 ## Precedence
 
 | Order (later wins) | Source |
