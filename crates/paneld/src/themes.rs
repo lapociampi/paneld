@@ -1,9 +1,12 @@
 //! Resolve the active theme's token map and splice it into the eval
 //! context under the key `theme`.
 //!
-//! Tokens (colors, fonts, sizes, free extras) and, through
-//! [`styles`], the `style <selector> { }` bodies. Theme-local
-//! replacement `component NAME { }` blocks are deferred.
+//! Tokens (colors, fonts, sizes, free extras), through [`styles`]
+//! the `style <selector> { }` bodies, and through [`ui_doc`] the
+//! theme's `component NAME { }` blocks, which replace the config's or
+//! the library's component of that name. Themes from theme folders
+//! (ADR 0021) are in the document already, loaded by
+//! `paneld_config::load`.
 //!
 //! Resolution order:
 //!
@@ -42,19 +45,9 @@ pub fn resolve_with(doc: &Document, theme: Option<&str>) -> BTreeMap<String, Val
 /// and the themes it extends, parents first: per selector, a key the
 /// child sets replaces the parent's.
 pub fn styles(doc: &Document, theme: Option<&str>) -> BTreeMap<String, Vec<Item>> {
-    let mut chain = Vec::new();
-    let mut name = theme.map(str::to_string).or_else(|| active_theme_name(doc));
-    while let Some(n) = name.take() {
-        if chain.contains(&n) {
-            break;
-        }
-        let Some(t) = find_theme(doc, &n) else { break };
-        chain.push(n);
-        name = find_simple(t, "extends").map(|p| p.trim().to_string());
-    }
+    let chain = chain(doc, theme);
     let mut out: BTreeMap<String, Vec<Item>> = BTreeMap::new();
-    for n in chain.iter().rev() {
-        let Some(t) = find_theme(doc, n) else { continue };
+    for t in chain.iter().rev() {
         for item in &t.items {
             let Item::Block(b) = item else { continue };
             let (true, Some(sel)) = (b.kind.text == "style", &b.name) else { continue };
@@ -70,6 +63,50 @@ pub fn styles(doc: &Document, theme: Option<&str>) -> BTreeMap<String, Vec<Item>
     out
 }
 
+/// The active theme (or `theme`) and the themes it extends, nearest
+/// first; an `extends` cycle or a missing parent ends it.
+fn chain<'a>(doc: &'a Document, theme: Option<&str>) -> Vec<&'a Block> {
+    let mut chain: Vec<&Block> = Vec::new();
+    let mut name = theme.map(str::to_string).or_else(|| active_theme_name(doc));
+    while let Some(n) = name.take() {
+        let Some(t) = find_theme(doc, &n) else { break };
+        if chain.iter().any(|c| std::ptr::eq(*c, t)) {
+            break;
+        }
+        chain.push(t);
+        name = find_simple(t, "extends").map(|p| p.trim().to_string());
+    }
+    chain
+}
+
+/// The document the pages are drawn from under the active theme (or
+/// `theme`): the components of the theme and the themes it extends
+/// (nearest first wins) in place of the config's or library's
+/// component of the same name (themes.md, "Precedence").
+pub fn ui_doc(doc: &Document, theme: Option<&str>) -> Document {
+    let mut comps: Vec<Item> = Vec::new();
+    for t in chain(doc, theme) {
+        for it in &t.items {
+            let Item::Block(b) = it else { continue };
+            let (true, Some(name)) = (b.kind.text == "component", &b.name) else { continue };
+            let taken = comps.iter().any(|c| matches!(c, Item::Block(o) if o.name.as_ref().is_some_and(|n| n.text == name.text)));
+            if !taken {
+                comps.push(it.clone());
+            }
+        }
+    }
+    if comps.is_empty() {
+        return doc.clone();
+    }
+    let replaced = |b: &Block| {
+        b.kind.text == "component"
+            && comps.iter().any(|c| matches!(c, Item::Block(o) if o.name.as_ref().map(|n| &n.text) == b.name.as_ref().map(|n| &n.text)))
+    };
+    let mut items: Vec<Item> = doc.items.iter().filter(|it| !matches!(it, Item::Block(b) if replaced(b))).cloned().collect();
+    items.extend(comps);
+    Document { items }
+}
+
 /// The built-in token set: every token schema section 11 requires.
 /// Light, matching LVGL's default theme so widgets that are not
 /// themed yet still fit in. Fonts are Roboto (ADR 0015) at 12, 16, 24
@@ -81,7 +118,7 @@ fn builtin_tokens() -> BTreeMap<String, Value> {
         .collect()
 }
 
-fn active_theme_name(doc: &Document) -> Option<String> {
+pub fn active_theme_name(doc: &Document) -> Option<String> {
     // 1. Explicit `screen { theme = ... }` or `screen:theme = ...`.
     for item in &doc.items {
         if let Item::Block(b) = item {
@@ -263,5 +300,54 @@ mod tests {
         assert_eq!(tok(&orphan, "accent"), "#00000c");
         assert!(styles(&doc("page p { }\n"), None).is_empty());
         assert!(styles(&doc("theme a { }\n"), Some("nope")).is_empty());
+    }
+
+    fn component_root(doc: &Document, name: &str) -> String {
+        doc.items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Block(b) if b.kind.text == "component" && b.name.as_ref().is_some_and(|n| n.text == name) => {
+                    b.items.iter().find_map(|i| match i {
+                        Item::Block(r) => Some(r.kind.text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[test]
+    fn theme_components_replace_config_and_library_ones() {
+        let mut d = doc(
+            "component tile { text { value = config } }
+             component other { text { value = o } }
+             theme base { component tile { row { } }
+ component shell { column { slot { } } } }
+             theme mine { extends = base
+ component tile { column { } } }
+             theme plain { }
+             screen:theme = mine
+",
+        );
+        // The library's `shell`, as `paneld_config::load` merges it.
+        d.items.push(doc("component shell { row { slot { } } }
+").items.remove(0));
+        // The nearest theme wins, then its parent, then the config, then
+        // the library; each name is there once.
+        let ui = ui_doc(&d, None);
+        assert_eq!(component_root(&ui, "tile"), "column");
+        assert_eq!(component_root(&ui, "shell"), "column");
+        assert_eq!(component_root(&ui, "other"), "text");
+        let ui = ui_doc(&d, Some("base"));
+        assert_eq!(component_root(&ui, "tile"), "row");
+        // A theme with no components (the night one, say) keeps the
+        // config's and the library's.
+        let ui = ui_doc(&d, Some("plain"));
+        assert_eq!(component_root(&ui, "tile"), "text");
+        assert_eq!(component_root(&ui, "shell"), "row");
+        // Pages and the rest are kept.
+        assert_eq!(ui_doc(&d, None).items.len(), d.items.len());
     }
 }

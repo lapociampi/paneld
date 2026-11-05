@@ -103,12 +103,20 @@ fn render_page_body(
     // the dialogs on the top layer included; a node's `font` wins.
     apply_font(screen, "font", theme_of(ctx));
     apply_font(&screen.top_layer(), "font", theme_of(ctx));
+    // And `text` its text color (a dark theme's light text); widgets
+    // with a box of their own keep theirs.
+    if let Some((rgb, opa)) = color_of("text", ctx) {
+        screen.set_text_color_hex(rgb, opa);
+    }
 
     let page_root = screen.new_container();
     page_root.set_size(Size::Percent(100), Size::Percent(100));
     page_root.set_flex_column();
     page_root.set_border(0, None);
     page_root.set_radius(0);
+    if let Some((rgb, opa)) = color_of("text", ctx) {
+        page_root.set_text_color_hex(rgb, opa);
+    }
 
     match find_component(doc, "shell") {
         // Schema 8: the `shell` component wraps every page; the page's
@@ -643,8 +651,9 @@ const UNKNOWN_ICONS_MAX: usize = 32;
 
 /// Draw icon `name` into `parent` at `size` px (default: the theme's
 /// `font` size): the theme's `icons/<name>.png` when its `icons`
-/// token is a folder (relative to the config folder) holding that
-/// file, else the built-in glyph. An unknown name draws nothing and is
+/// token is a folder (relative to the config folder; a theme folder's
+/// is `themes/<name>/...`, ADR 0021) holding that file, else the
+/// built-in glyph. An unknown name draws nothing and is
 /// logged once; an empty one draws nothing.
 /// Returns the object and whether it is an image.
 fn new_icon<'ui>(parent: &Obj<'ui>, name: &str, size: Option<u16>, ctx: &Context) -> Option<(Obj<'ui>, bool)> {

@@ -78,6 +78,10 @@ impl fmt::Display for Location {
 #[derive(Default)]
 pub struct SourceMap {
     files: Vec<File>,
+    /// Files of theme folders nothing names (ADR 0021), with the
+    /// theme's name: a problem in one is a warning that leaves the
+    /// theme out, not an error.
+    unused_themes: Vec<(FileId, String)>,
 }
 
 impl SourceMap {
@@ -102,6 +106,25 @@ impl SourceMap {
 
     pub fn path(&self, id: FileId) -> &Path {
         &self.files[id.0 as usize].path
+    }
+
+    /// Mark the files from `from` on as theme `name`'s, a theme folder
+    /// nothing names.
+    pub(crate) fn mark_unused_theme(&mut self, from: usize, name: &str) {
+        for i in from..self.files.len() {
+            self.unused_themes.push((FileId(i as u32), name.to_string()));
+        }
+    }
+
+    /// The unused theme folder `id` belongs to, if any.
+    pub fn unused_theme(&self, id: FileId) -> Option<&str> {
+        self.unused_themes.iter().find(|(f, _)| *f == id).map(|(_, n)| n.as_str())
+    }
+
+    /// Every file loaded, in the order added, with its id (the
+    /// library's path is `<library>`, not a file on disk).
+    pub fn files(&self) -> impl Iterator<Item = (FileId, &Path)> {
+        self.files.iter().enumerate().map(|(i, f)| (FileId(i as u32), f.path.as_path()))
     }
 
     /// The folder of the first file added (the root config): where a

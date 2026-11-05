@@ -30,3 +30,4 @@ order: 7
 | [0018](0018-remotes.md) | Remotes |
 | [0019](0019-param-patterns.md) | regex-lite for param patterns |
 | [0020](0020-musl-static-link.md) | Static musl builds link Rust's musl with rust-lld |
+| [0021](0021-theme-folders.md) | Theme folders are found by name beside the config |

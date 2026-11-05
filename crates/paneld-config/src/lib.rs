@@ -4,6 +4,7 @@
 //! `docs/schema.md`. The parser is hand-written (ADR 0009): a lexer
 //! producing tokens with spans, then a recursive-descent parser.
 
+pub mod assets;
 pub mod cel;
 pub mod fonts;
 pub mod icons;
@@ -18,11 +19,11 @@ pub mod source;
 pub mod value;
 
 pub use lex::{LexError, Lexer, Token, TokenKind};
-pub use load::{load, LoadError};
+pub use load::{load, split_warnings, LoadError};
 pub use overrides::apply_overrides;
 pub use parse::{
     parse, Assign, AssignTarget, Block, Diagnostic, Document, Expr, Ident, Item, OptionsBlock,
     Param, RawValue, Repeat, VarDecl,
 };
-pub use schema::check;
+pub use schema::{check, check_theme_switch};
 pub use source::{FileId, Location, SourceMap, Span};

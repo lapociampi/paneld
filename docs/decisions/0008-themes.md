@@ -2,12 +2,13 @@
 title: "ADR 0008: Themes: folders with tokens, styles, components and motion"
 description: "Themes as folders of tokens, styles, components and motion."
 date: 2026-10-29
+updated: 2026-11-05
 tags: [paneld, adr]
 series: paneld
 order: 15
 ---
 
-- Status: Accepted
+- Status: Accepted. The folder lookup, asset paths and theme components: [ADR 0021](0021-theme-folders.md).
 - Date: 2026-10-29
 
 ## Context

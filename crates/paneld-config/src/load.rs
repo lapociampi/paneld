@@ -26,7 +26,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::lex::tokenize;
-use crate::parse::{parse, AssignTarget, Diagnostic, Document, Item, RawValue};
+use crate::parse::{parse, AssignTarget, Block, Diagnostic, Document, Item, RawValue};
 use crate::{SourceMap, Span};
 
 #[derive(Debug)]
@@ -56,8 +56,17 @@ pub fn load(root: &Path) -> Result<(SourceMap, Document, Vec<Diagnostic>), LoadE
     let mut stack = Vec::new();
     let items = load_file(root, &mut source, &mut diagnostics, &mut stack, None)?;
     let mut doc = Document { items };
-    substitute_vars(&mut doc, &mut diagnostics);
+    let vars = substitute_vars(&mut doc, &mut diagnostics);
+    let dir = root.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let folders = load_theme_folders(&mut doc, dir, &vars, &mut source, &mut diagnostics);
     crate::library::merge(&mut doc, &mut source, &mut diagnostics);
+    // Folder themes last: with no `screen:theme`, the active theme is
+    // the config's first, else the shipped `light`, never a folder's.
+    let (mut items, last): (Vec<Item>, Vec<Item>) = doc.items.into_iter().partition(|it| {
+        !matches!(it, Item::Block(b) if b.kind.text == "theme" && b.name.as_ref().is_some_and(|n| folders.contains(&n.text)))
+    });
+    items.extend(last);
+    doc.items = items;
     Ok((source, doc, diagnostics))
 }
 
@@ -244,11 +253,228 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+// --- theme folders (ADR 0021) ---
+
+/// The themes the config names, each with where: the screen's and the
+/// night's `theme`, `screen:theme`, and every theme's `extends`.
+fn theme_refs(items: &[Item]) -> Vec<(String, Span)> {
+    fn in_screen(items: &[Item], out: &mut Vec<(String, Span)>) {
+        for it in items {
+            match it {
+                Item::Assign(a) => {
+                    if let AssignTarget::Simple { key } = &a.target {
+                        if key.text == "theme" {
+                            out.push((a.value.text.trim().to_string(), a.value.span));
+                        }
+                    }
+                }
+                Item::Block(b) => in_screen(&b.items, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for it in items {
+        match it {
+            Item::Block(b) if b.kind.text == "screen" => in_screen(&b.items, &mut out),
+            Item::Block(b) if b.kind.text == "theme" => {
+                for i in &b.items {
+                    if let Item::Assign(a) = i {
+                        if matches!(&a.target, AssignTarget::Simple { key } if key.text == "extends") {
+                            out.push((a.value.text.trim().to_string(), a.value.span));
+                        }
+                    }
+                }
+            }
+            Item::Assign(a) => {
+                let theme_key = match &a.target {
+                    AssignTarget::Qualified { category, key } => category.text == "screen" && key.text == "theme",
+                    // `theme[glass]:accent = ...` changes a theme that may
+                    // live in a folder.
+                    AssignTarget::Indexed { kind, name, key } if kind.text == "theme" => {
+                        out.push((name.text.clone(), name.span));
+                        key.text == "extends"
+                    }
+                    _ => false,
+                };
+                if theme_key {
+                    out.push((a.value.text.trim().to_string(), a.value.span));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Load `<dir>/themes/<name>/theme.conf` for every theme the config
+/// names but does not define, and for the themes those extend. A
+/// theme defined in the config wins over a folder of the same name; a
+/// name with neither is left to the check ("unknown theme").
+fn load_theme_folders(
+    doc: &mut Document,
+    dir: &Path,
+    vars: &HashMap<String, String>,
+    source: &mut SourceMap,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<String> {
+    let mut loaded = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+    // Every theme folder, named or not: each is checked with the config,
+    // so `paneld ctl theme <name>` can switch to any of them. The named
+    // ones first (popped first), so a problem is said where it is named.
+    let mut listed: Vec<String> = fs::read_dir(dir.join(crate::assets::THEMES_DIR))
+        .map(|rd| rd.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect())
+        .unwrap_or_default();
+    listed.sort();
+    let mut todo: Vec<(String, Option<Span>)> = listed.into_iter().rev().map(|n| (n, None)).collect();
+    todo.extend(theme_refs(&doc.items).into_iter().map(|(n, s)| (n, Some(s))));
+    while let Some((name, span)) = todo.pop() {
+        let defined = doc.items.iter().any(|it| {
+            matches!(it, Item::Block(b) if b.kind.text == "theme" && b.name.as_ref().is_some_and(|n| n.text == name))
+        });
+        if defined || tried.contains(&name) || !crate::icons::is_file_name(&name) {
+            continue;
+        }
+        tried.push(name.clone());
+        let path = dir.join(crate::assets::THEMES_DIR).join(&name).join(crate::assets::THEME_FILE);
+        if !path.is_file() {
+            continue;
+        }
+        let first_file = source.files().count();
+        let mut items = match load_file(&path, source, diagnostics, &mut Vec::new(), span) {
+            Ok(items) => items,
+            Err(e) => {
+                // Unreadable: said at the reference, else at the config's start.
+                let at = span.unwrap_or_else(|| Span::new(crate::source::FileId::default(), 0, 0));
+                diagnostics.push(Diagnostic::new(at, format!("theme `{name}`: {e}")));
+                continue;
+            }
+        };
+        if span.is_none() {
+            source.mark_unused_theme(first_file, &name);
+        }
+        // Where to say what is wrong with the file as a whole.
+        let file_start = fs::canonicalize(&path)
+            .ok()
+            .and_then(|c| source.files().find(|(_, p)| *p == c).map(|(id, _)| Span::new(id, 0, 0)));
+        let span = span.or(file_start).unwrap_or_else(|| Span::new(crate::source::FileId::default(), 0, 0));
+        let mut vars = vars.clone();
+        substitute_items(&mut items, &mut vars, diagnostics);
+        let rel = format!("{}/{name}/{}", crate::assets::THEMES_DIR, crate::assets::THEME_FILE);
+        let mut found = false;
+        for item in items {
+            match item {
+                Item::Block(mut b) if b.kind.text == "theme" && b.name.as_ref().is_some_and(|n| n.text == name) && !found => {
+                    found = true;
+                    rewrite_theme_assets(&mut b, &crate::assets::theme_prefix(&name));
+                    todo.extend(theme_refs(std::slice::from_ref(&Item::Block(b.clone()))).into_iter().map(|(n, s)| (n, Some(s))));
+                    doc.items.push(Item::Block(b));
+                    loaded.push(name.clone());
+                }
+                Item::Block(b) if b.kind.text == "theme" => {
+                    let at = b.name.as_ref().map_or(b.kind.span, |n| n.span);
+                    diagnostics.push(Diagnostic::new(
+                        at,
+                        format!("`{rel}` holds one `theme {name} {{ }}` (the folder's name); another theme goes in its own folder"),
+                    ));
+                }
+                other => {
+                    let (at, what) = match &other {
+                        Item::Block(b) => (b.kind.span, format!("`{}`", b.kind.text)),
+                        Item::Assign(a) => (a.span, "a setting".to_string()),
+                        Item::Repeat(r) => (r.span, "`repeat`".to_string()),
+                        Item::Param(p) => (p.span, "`param`".to_string()),
+                        Item::Var(v) => (v.span, "`var`".to_string()),
+                    };
+                    diagnostics.push(Diagnostic::new(
+                        at,
+                        format!("`{rel}` holds only `theme {name} {{ }}`; {what} belongs in the config"),
+                    ));
+                }
+            }
+        }
+        if !found {
+            diagnostics.push(Diagnostic::new(span, format!("`{rel}` does not define `theme {name} {{ }}`")));
+        }
+    }
+    loaded
+}
+
+/// Make the asset paths of a theme loaded from its folder relative to
+/// the config folder by putting `prefix` (`themes/<name>/`) in front:
+/// font files (a token or a `font` that is a `<file>.ttf <size>` font), the
+/// `icons` folder, `background_image` (and `background` when it is a
+/// path), and every literal `src` in its components (an expression is
+/// left alone: its value, a param say, is relative to the config folder).
+fn rewrite_theme_assets(theme: &mut Block, prefix: &str) {
+    fn font_file(text: &str) -> bool {
+        !text.contains("{{")
+            && matches!(crate::fonts::parse(text), Ok(crate::fonts::Font { family: crate::fonts::Family::File(_), .. }))
+    }
+    fn rewrite(items: &mut [Item], prefix: &str, top: bool) {
+        for it in items {
+            match it {
+                Item::Assign(a) => {
+                    let AssignTarget::Simple { key } = &a.target else { continue };
+                    let v = a.value.text.trim();
+                    // Only paths written here: a value from an expression
+                    // (a component param, say) is the caller's, relative
+                    // to the config folder.
+                    let path_key = !v.contains("{{")
+                        && match key.text.as_str() {
+                            "src" => !top,
+                            "icons" => top && v != "builtin",
+                            "background_image" => top,
+                            "background" => top && !v.starts_with('#') && (v.contains('/') || v.contains('.')),
+                            _ => false,
+                        };
+                    // A font file: in a token (`font_title = fonts/x.ttf 20`) or a `font`.
+                    let font_key = top || key.text == "font";
+                    if (path_key && !v.is_empty()) || (font_key && font_file(v)) {
+                        a.value.text = format!("{prefix}{}", v.trim_start_matches("./"));
+                    }
+                }
+                Item::Block(b) => rewrite(&mut b.items, prefix, false),
+                Item::Repeat(r) => rewrite(&mut r.items, prefix, false),
+                Item::Param(_) | Item::Var(_) => {}
+            }
+        }
+    }
+    rewrite(&mut theme.items, prefix, true);
+}
+
+/// Split the diagnostics of a load and check into errors and warnings:
+/// a problem in a theme folder nothing names (ADR 0021) is a warning,
+/// and that theme is taken out of `doc`, so `paneld ctl theme` cannot
+/// switch to it. Everything else is an error.
+pub fn split_warnings(doc: &mut Document, source: &SourceMap, diags: Vec<Diagnostic>) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+    let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+    let mut broken: Vec<String> = Vec::new();
+    for mut d in diags {
+        match source.unused_theme(d.span.file) {
+            Some(name) => {
+                d.message = format!("{} (theme `{name}` is named nowhere: left out)", d.message);
+                if !broken.iter().any(|b| b == name) {
+                    broken.push(name.to_string());
+                }
+                warnings.push(d);
+            }
+            None => errors.push(d),
+        }
+    }
+    doc.items.retain(|it| {
+        !matches!(it, Item::Block(b) if b.kind.text == "theme" && b.name.as_ref().is_some_and(|n| broken.contains(&n.text)))
+    });
+    (errors, warnings)
+}
+
 // --- $var substitution ---
 
-fn substitute_vars(doc: &mut Document, diagnostics: &mut Vec<Diagnostic>) {
+fn substitute_vars(doc: &mut Document, diagnostics: &mut Vec<Diagnostic>) -> HashMap<String, String> {
     let mut vars: HashMap<String, String> = HashMap::new();
     substitute_items(&mut doc.items, &mut vars, diagnostics);
+    vars
 }
 
 fn substitute_items(

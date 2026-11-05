@@ -38,7 +38,8 @@ pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     Builtin(Builtin),
-    /// A `.ttf` path, relative to the config folder.
+    /// A `.ttf` path, relative to the config folder (a theme folder's
+    /// paths are rewritten to `themes/<name>/...` when it is loaded).
     File(String),
 }
 
@@ -99,15 +100,10 @@ pub fn family(name: &str) -> Result<Family, String> {
 }
 
 /// The real path of font file `rel` under `dir` (the config folder):
-/// a file that, with symlinks resolved, is still inside `dir`.
+/// with symlinks resolved, still inside the folder it is named in
+/// ([`crate::assets::resolve`]).
 pub fn resolve_file(dir: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
-    let root = std::fs::canonicalize(if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir })
-        .map_err(|e| format!("font file `{rel}`: config folder {}: {e}", dir.display()))?;
-    let full = std::fs::canonicalize(root.join(rel))
-        .map_err(|_| format!("font file `{rel}` not found (relative to the config folder `{}`)", root.display()))?;
-    if !full.starts_with(&root) {
-        return Err(format!("font file `{rel}` leads outside the config folder (to {})", full.display()));
-    }
+    let full = crate::assets::resolve(dir, rel, "font file")?;
     if !full.is_file() {
         return Err(format!("font file `{rel}` is not a file"));
     }
@@ -162,7 +158,7 @@ mod tests {
         std::fs::write(dir.join("fonts/in.ttf"), b"x").unwrap();
         std::os::unix::fs::symlink(base.join("outside.ttf"), dir.join("fonts/link.ttf")).unwrap();
         assert!(resolve_file(&dir, "fonts/in.ttf").is_ok());
-        assert!(resolve_file(&dir, "fonts/link.ttf").unwrap_err().contains("outside the config folder"));
+        assert!(resolve_file(&dir, "fonts/link.ttf").unwrap_err().contains("leads outside its folder `fonts`"));
         assert!(resolve_file(&dir, "fonts/none.ttf").unwrap_err().contains("not found"));
         std::fs::write(dir.join("big.ttf"), vec![0u8; MAX_FILE_BYTES as usize + 1]).unwrap();
         assert!(read_file(&dir.join("big.ttf")).unwrap_err().contains("larger than"));

@@ -16,6 +16,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Mutex;
 // Sends wake the UI thread's pump, which waits in `poll`.
 use paneld_ui::WakingSender as Sender;
 use std::thread;
@@ -71,27 +72,143 @@ impl Request {
     }
 }
 
-/// Spawn a background thread that polls the config file's mtime
-/// every `interval` and sends [`ControlMsg::Reload`] on `tx` when
-/// it changes.
-pub fn watch_config(path: &Path, interval: Duration, tx: impl Into<Sender<ControlMsg>>) {
+/// Spawn a background thread that sleeps on inotify until the config
+/// file or a file the last load read ([`watch_files`]) changes, waits
+/// for the burst of events a save makes to end, and sends
+/// [`ControlMsg::Reload`] on `tx`. `settle` is how quiet it must be.
+/// Without inotify (an odd kernel), the config is reloaded only on
+/// `paneld ctl reload`.
+pub fn watch_config(path: &Path, settle: Duration, tx: impl Into<Sender<ControlMsg>>) {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use nix::sys::inotify::{InitFlags, Inotify};
+    use std::os::fd::AsFd;
     let tx = tx.into();
-    let path = path.to_path_buf();
-    let mut last = mtime(&path);
-    thread::spawn(move || loop {
-        thread::sleep(interval);
-        let now = mtime(&path);
-        if now != last {
-            last = now;
-            if tx.send(ControlMsg::Reload).is_err() {
-                return;
+    let inotify = match Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("paneld: inotify: {e}; saved config edits apply on `paneld ctl reload` only");
+            return;
+        }
+    };
+    let root = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let state = std::sync::Arc::new(Mutex::new(Watcher { inotify, root, dirs: Vec::new() }));
+    *WATCHER.lock().unwrap() = Some(state.clone());
+    let files = WATCHED.lock().unwrap().clone();
+    state.lock().unwrap().rewatch(&files);
+    let settle = PollTimeout::try_from(settle).unwrap_or(PollTimeout::MAX);
+    thread::spawn(move || {
+        // The fd is shared with `watch_files` (adding watches); only
+        // this thread reads it.
+        let fd = state.lock().unwrap().inotify.as_fd().try_clone_to_owned();
+        let Ok(fd) = fd else { return };
+        let mut changed = false;
+        loop {
+            let timeout = if changed { settle } else { PollTimeout::NONE };
+            let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, timeout) {
+                Ok(0) => {
+                    // Quiet for `settle` after a change: reload.
+                    changed = false;
+                    if tx.send(ControlMsg::Reload).is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => changed |= state.lock().unwrap().drain(),
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(_) => return,
             }
         }
     });
 }
 
-fn mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+/// The inotify watches: each watched folder and the names in it that
+/// count (`None`: any change, for theme folders and their asset folders).
+struct Watcher {
+    inotify: nix::sys::inotify::Inotify,
+    root: PathBuf,
+    dirs: Vec<(nix::sys::inotify::WatchDescriptor, PathBuf, Option<Vec<std::ffi::OsString>>)>,
+}
+
+impl Watcher {
+    /// Watch the folders of `files` (for those names), the config's,
+    /// and the `themes` folder: each theme folder and its subfolders
+    /// whole, and `themes` itself for a theme folder added or removed.
+    fn rewatch(&mut self, files: &[PathBuf]) {
+        use nix::sys::inotify::AddWatchFlags as F;
+        let mut want: Vec<(PathBuf, Option<Vec<std::ffi::OsString>>)> = Vec::new();
+        let mut add = |dir: PathBuf, name: Option<std::ffi::OsString>| match want.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, filter)) => match (filter.as_mut(), name) {
+                (Some(names), Some(n)) => names.push(n),
+                _ => *filter = None,
+            },
+            None => want.push((dir, name.map(|n| vec![n]))),
+        };
+        let root = self.root.clone();
+        for f in std::iter::once(&root).chain(files.iter().filter(|f| f.is_file())) {
+            if let (Some(dir), Some(name)) = (f.parent(), f.file_name()) {
+                add(dir.to_path_buf(), Some(name.to_os_string()));
+            }
+        }
+        let subdirs = |d: &Path| -> Vec<PathBuf> {
+            std::fs::read_dir(d)
+                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect())
+                .unwrap_or_default()
+        };
+        if let Some(themes) = root.parent().map(|d| d.join(paneld_config::assets::THEMES_DIR)).filter(|t| t.is_dir()) {
+            for theme in subdirs(&themes) {
+                for sub in subdirs(&theme) {
+                    add(std::fs::canonicalize(&sub).unwrap_or(sub), None);
+                }
+                add(std::fs::canonicalize(&theme).unwrap_or(theme), None);
+            }
+            add(themes, None);
+        }
+        for (wd, _, _) in self.dirs.drain(..) {
+            let _ = self.inotify.rm_watch(wd);
+        }
+        let mask = F::IN_CLOSE_WRITE | F::IN_MOVED_TO | F::IN_MOVED_FROM | F::IN_CREATE | F::IN_DELETE | F::IN_ATTRIB;
+        for (dir, filter) in want {
+            if let Ok(wd) = self.inotify.add_watch(&dir, mask | F::IN_ONLYDIR) {
+                self.dirs.push((wd, dir, filter));
+            }
+        }
+    }
+
+    /// Read what is pending; whether any of it counts.
+    fn drain(&mut self) -> bool {
+        let mut hit = false;
+        while let Ok(events) = self.inotify.read_events() {
+            if events.is_empty() {
+                break;
+            }
+            for e in events {
+                hit |= self.dirs.iter().any(|(wd, _, filter)| {
+                    *wd == e.wd
+                        && match (filter, &e.name) {
+                            (None, _) => true,
+                            (Some(names), Some(n)) => names.contains(n),
+                            (Some(_), None) => false,
+                        }
+                });
+            }
+        }
+        hit
+    }
+}
+
+static WATCHER: Mutex<Option<std::sync::Arc<Mutex<Watcher>>>> = Mutex::new(None);
+
+/// What the watcher watches besides the config file: the files the
+/// last load read (includes, theme folders' `theme.conf` and theirs).
+static WATCHED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Watch `files` (the last load's) from now on.
+pub fn watch_files(files: Vec<PathBuf>) {
+    let watcher = WATCHER.lock().unwrap().clone();
+    if let Some(w) = watcher {
+        w.lock().unwrap().rewatch(&files);
+    }
+    *WATCHED.lock().unwrap() = files;
 }
 
 /// Default socket path. Can be overridden via the `PANELD_SOCK`
@@ -374,7 +491,7 @@ pub fn parse_cli(args: &[String]) -> Result<(String, BTreeMap<String, Value>), S
     let s = |v: &str| Value::String(v.to_string());
     let mut a = BTreeMap::new();
     let Some(cmd) = args.first() else {
-        return Err("missing command (ping, reload, check, eval, set, goto, alert, status, exit)".into());
+        return Err("missing command (ping, reload, check, eval, set, goto, theme, alert, reminder, status, exit)".into());
     };
     let rest = &args[1..];
     let cmd = match cmd.as_str() {
@@ -437,6 +554,15 @@ pub fn parse_cli(args: &[String]) -> Result<(String, BTreeMap<String, Value>), S
                 other => return Err(format!("unknown alert verb `{other}` (fire, resolve, ack, snooze)")),
             }
         }
+        "theme" => match rest {
+            [] => "theme".into(),
+            [r] if r == "--reset" => "theme_reset".into(),
+            [name] if !name.starts_with('-') => {
+                a.insert("name".into(), s(name));
+                "theme".into()
+            }
+            _ => return Err("`theme [<name> | --reset]`".into()),
+        },
         "reminder" => {
             let [verb, id] = rest else { return Err("`reminder done <name>`".into()) };
             if verb != "done" {
@@ -671,6 +797,11 @@ mod tests {
         assert_eq!(cli(&["alert", "resolve", "disk"]).unwrap().0, "alert_resolve");
         assert!(cli(&["alert", "fire", "x", "color=red"]).is_err());
         assert!(cli(&["goto"]).is_err());
+        let (c, a) = cli(&["theme", "dark"]).unwrap();
+        assert_eq!((c.as_str(), &a["name"]), ("theme", &Value::String("dark".into())));
+        assert_eq!(cli(&["theme"]).unwrap().0, "theme");
+        assert_eq!(cli(&["theme", "--reset"]).unwrap().0, "theme_reset");
+        assert!(cli(&["theme", "a", "b"]).is_err() && cli(&["theme", "--x"]).is_err());
         assert!(cli(&["frobnicate"]).is_err());
         let (c, a) = cli(&["reminder", "done", "restore_test"]).unwrap();
         assert_eq!((c.as_str(), &a["id"]), ("reminder_done", &Value::String("restore_test".into())));

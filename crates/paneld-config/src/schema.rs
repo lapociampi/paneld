@@ -1290,6 +1290,24 @@ fn theme_blocks(applied: &Document) -> Vec<Block> {
 /// Built-ins, then `name`'s `extends` chain from its base down, the
 /// child winning (cycle-safe).
 fn chain_tokens(themes: &[Block], name: &str) -> TokenMap {
+    let chain = theme_chain(themes, name);
+    let mut out: TokenMap = BUILTIN_THEME_TOKENS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    for t in chain.iter().rev() {
+        for it in &t.items {
+            if let Item::Assign(a) = it {
+                if let AssignTarget::Simple { key } = &a.target {
+                    if key.text != "extends" {
+                        out.insert(key.text.clone(), a.value.text.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Theme `name` and the themes it extends, nearest first (cycle-safe).
+fn theme_chain<'a>(themes: &'a [Block], name: &str) -> Vec<&'a Block> {
     let mut chain: Vec<&Block> = Vec::new();
     let mut next = Some(name.to_string());
     while let Some(n) = next.take() {
@@ -1305,19 +1323,7 @@ fn chain_tokens(themes: &[Block], name: &str) -> TokenMap {
             _ => None,
         });
     }
-    let mut out: TokenMap = BUILTIN_THEME_TOKENS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    for t in chain.iter().rev() {
-        for it in &t.items {
-            if let Item::Assign(a) = it {
-                if let AssignTarget::Simple { key } = &a.target {
-                    if key.text != "extends" {
-                        out.insert(key.text.clone(), a.value.text.trim().to_string());
-                    }
-                }
-            }
-        }
-    }
-    out
+    chain
 }
 
 /// The maps a page's color names resolve in: the active theme's chain
@@ -1454,7 +1460,8 @@ fn check_inner(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     // param tables used by the Phase 8 arg type-checker.
     let user_components = collect_user_components(doc);
     let names = collect_names(doc);
-    let params = collect_params(doc, source, &mut diags);
+    let mut params = collect_params(doc, source, &mut diags);
+    check_theme_component_params(doc, source, &mut params, &mut diags);
 
     let ctx = UiContext {
         user_components: &user_components,
@@ -1481,6 +1488,7 @@ fn check_inner(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     }
 
     resolve_refs(doc, &names, &mut diags);
+    check_theme_only_calls(doc, &applied, &mut diags);
     check_ssh_runs(doc, &mut diags);
     remote::check_self_use(doc, &mut diags);
     check_override_targets(doc, &mut diags);
@@ -1859,7 +1867,227 @@ fn collect_user_components(doc: &Document) -> std::collections::HashSet<String> 
             }
         }
     }
+    // A component only a theme defines can be called too.
+    for (_, b) in theme_components(doc) {
+        if let Some(name) = &b.name {
+            set.insert(name.text.clone());
+        }
+    }
     set
+}
+
+/// The `component` blocks inside `theme` blocks, with their theme's name.
+fn theme_components(doc: &Document) -> Vec<(&str, &Block)> {
+    let mut out = Vec::new();
+    for item in &doc.items {
+        let Item::Block(t) = item else { continue };
+        let (true, Some(theme)) = (t.kind.text == "theme", &t.name) else { continue };
+        for it in &t.items {
+            if let Item::Block(c) = it {
+                if c.kind.text == "component" && c.name.is_some() {
+                    out.push((theme.text.as_str(), c));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A component's params as a call sees them: name, type and whether
+/// it may be left out, by name.
+fn component_signature(b: &Block) -> Vec<(String, String, bool)> {
+    let mut sig: Vec<(String, String, bool)> = b
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Param(p) => Some((
+                p.name.text.clone(),
+                p.ty.text.clone(),
+                p.default.is_some() || p.options.as_ref().is_some_and(options_has_ask),
+            )),
+            _ => None,
+        })
+        .collect();
+    sig.sort();
+    sig
+}
+
+fn signature_text(sig: &[(String, String, bool)]) -> String {
+    if sig.is_empty() {
+        return "no params".to_string();
+    }
+    sig.iter()
+        .map(|(n, t, opt)| format!("`{n}: {t}{}`", if *opt { " = ..." } else { "" }))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A theme's component takes the same params (name, type, optional or
+/// not) as the one it replaces, so a call checked once fits every
+/// theme: the config's or library's component of that name, else the
+/// first theme that defines it. Also: the params of a component only
+/// themes define are the ones calls are checked against.
+fn check_theme_component_params(doc: &Document, source: &SourceMap, params: &mut Params, diags: &mut Vec<Diagnostic>) {
+    let top: HashMap<&str, &Block> = doc
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Block(b) if b.kind.text == "component" => b.name.as_ref().map(|n| (n.text.as_str(), b)),
+            _ => None,
+        })
+        .collect();
+    let mut first: HashMap<&str, (&str, &Block)> = HashMap::new();
+    for (theme, b) in theme_components(doc) {
+        let Some(name) = &b.name else { continue };
+        let specs = collect_params_in_body(b, "component", source, diags);
+        let (base, what) = match (top.get(name.text.as_str()), first.get(name.text.as_str())) {
+            (Some(base), _) => (*base, "the component it replaces".to_string()),
+            (None, Some((t, base))) => (*base, format!("theme `{t}`'s `{}`", name.text)),
+            (None, None) => {
+                first.insert(name.text.as_str(), (theme, b));
+                params.components.insert(name.text.clone(), specs);
+                continue;
+            }
+        };
+        let (want, got) = (component_signature(base), component_signature(b));
+        if want != got {
+            diags.push(Diagnostic::new(
+                name.span,
+                format!(
+                    "theme `{theme}`'s component `{}` takes {}, {what} takes {}; a theme's component takes the same params (name, type, optional or not)",
+                    name.text,
+                    signature_text(&got),
+                    signature_text(&want),
+                ),
+            ));
+        }
+    }
+}
+
+/// The themes that can be active: `screen:theme` (else the first
+/// theme) and the night theme.
+fn themes_in_use(applied: &Document) -> Vec<String> {
+    fn theme_of(items: &[Item]) -> Option<String> {
+        items.iter().find_map(|i| match i {
+            Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "theme") => {
+                Some(a.value.text.trim().to_string())
+            }
+            _ => None,
+        })
+    }
+    let mut out = Vec::new();
+    let mut configured = None;
+    for it in &applied.items {
+        let Item::Block(b) = it else { continue };
+        if b.kind.text != "screen" || b.name.is_some() {
+            continue;
+        }
+        configured = configured.or_else(|| theme_of(&b.items));
+        for i in &b.items {
+            if let Item::Block(n) = i {
+                if n.kind.text == "night" {
+                    out.extend(theme_of(&n.items));
+                }
+            }
+        }
+    }
+    let first = applied.items.iter().find_map(|it| match it {
+        Item::Block(b) if b.kind.text == "theme" => b.name.as_ref().map(|n| n.text.clone()),
+        _ => None,
+    });
+    out.extend(configured.or(first));
+    out.retain(|t| !t.contains("{{"));
+    out
+}
+
+/// A component only themes define, called from a page or a config
+/// component: every theme that can be active defines or inherits it,
+/// else its pages would miss a part under that theme.
+fn check_theme_only_calls(doc: &Document, applied: &Document, diags: &mut Vec<Diagnostic>) {
+    for t in themes_in_use(applied) {
+        for (name, span) in theme_only_calls_missing(doc, applied, &t) {
+            diags.push(Diagnostic::new(
+                span,
+                format!("component `{name}` is only defined in themes, and theme `{t}` (in use) neither defines nor inherits it"),
+            ));
+        }
+    }
+}
+
+/// The calls (component name, where) from pages and config components
+/// to a component only themes define that theme `theme` neither
+/// defines nor inherits.
+fn theme_only_calls_missing(doc: &Document, applied: &Document, theme: &str) -> Vec<(String, Span)> {
+    let top: std::collections::HashSet<&str> = doc
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Block(b) if b.kind.text == "component" => b.name.as_ref().map(|n| n.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let only_themes: std::collections::HashSet<&str> = theme_components(doc)
+        .into_iter()
+        .filter_map(|(_, b)| b.name.as_ref().map(|n| n.text.as_str()))
+        .filter(|n| !top.contains(n))
+        .collect();
+    let mut out = Vec::new();
+    if only_themes.is_empty() {
+        return out;
+    }
+    let themes = theme_blocks(applied);
+    let chain = theme_chain(&themes, theme);
+    let provides = |comp: &str| {
+        chain.iter().any(|t| {
+            t.items.iter().any(|it| {
+                matches!(it, Item::Block(c) if c.kind.text == "component" && c.name.as_ref().is_some_and(|n| n.text == comp))
+            })
+        })
+    };
+    fn walk(items: &[Item], f: &mut dyn FnMut(&Block)) {
+        for it in items {
+            match it {
+                Item::Block(b) => {
+                    f(b);
+                    walk(&b.items, f);
+                }
+                Item::Repeat(r) => walk(&r.items, f),
+                _ => {}
+            }
+        }
+    }
+    for item in &doc.items {
+        let Item::Block(b) = item else { continue };
+        if !matches!(b.kind.text.as_str(), "page" | "component") {
+            continue;
+        }
+        walk(&b.items, &mut |call| {
+            let name = call.kind.text.as_str();
+            if only_themes.contains(name) && !provides(name) {
+                out.push((name.to_string(), call.kind.span));
+            }
+        });
+    }
+    out
+}
+
+/// Whether the pages of `doc` (a checked config) can be drawn under
+/// theme `theme`, for a switch at run time (`paneld ctl theme`): the
+/// theme exists, and it has every component only themes define that
+/// a page calls. The error says what is missing.
+pub fn check_theme_switch(doc: &Document, theme: &str) -> Result<(), String> {
+    let mut applied = doc.clone();
+    crate::apply_overrides(&mut applied);
+    let themes = theme_blocks(&applied);
+    if !themes.iter().any(|t| t.name.as_ref().is_some_and(|n| n.text == theme)) {
+        let mut known: Vec<&str> = themes.iter().filter_map(|t| t.name.as_ref().map(|n| n.text.as_str())).collect();
+        known.sort_unstable();
+        return Err(format!("no theme `{theme}` (themes: {})", known.join(", ")));
+    }
+    match theme_only_calls_missing(doc, &applied, theme).first() {
+        Some((name, _)) => Err(format!("theme `{theme}` neither defines nor inherits component `{name}`, which the pages use")),
+        None => Ok(()),
+    }
 }
 
 struct UiContext<'a> {
@@ -3958,6 +4186,7 @@ fn assign_ref_kind(parent_kind: &str, key: &str) -> Option<RefKind> {
         ("alert", "action") => Some(RefKind::Action),
         ("screen", "theme") => Some(RefKind::Theme),
         ("night", "theme") => Some(RefKind::Theme),
+        ("theme", "extends") => Some(RefKind::Theme),
         ("app", "start_page") => Some(RefKind::Page),
         ("security", "pin") => Some(RefKind::Secret),
         ("button", "action") => Some(RefKind::Action),
@@ -4009,9 +4238,17 @@ fn check_ref_name(
         RefKind::Secret => (&names.secrets, "secret"),
     };
     if !table.contains(t) {
+        let hint = match kind {
+            RefKind::Theme => format!(
+                " (no `theme {t} {{ }}` in the config and no `{}{}` beside it)",
+                crate::assets::theme_prefix(t),
+                crate::assets::THEME_FILE
+            ),
+            _ => String::new(),
+        };
         diags.push(Diagnostic::new(
             span,
-            format!("unknown {label} `{t}`"),
+            format!("unknown {label} `{t}`{hint}"),
         ));
     }
 }
@@ -5968,6 +6205,7 @@ theme dark {
     #[test]
     fn theme_replacement_component_is_accepted() {
         let text = r#"
+theme dark { }
 theme glass {
     extends = dark
     component stat_tile {
@@ -6211,5 +6449,205 @@ page home { text { value = \{{ sources.ghost.value }} } }
             !diags.iter().any(|d| d.contains("unknown source")),
             "unexpected ghost diagnostic: {diags:?}"
         );
+    }
+
+    // --- Theme folders and theme components (ADR 0021) ---
+
+    /// A config folder with `files` (path, text); checks `root.conf`.
+    /// Returns the diagnostics (`file:line:col: message`, file names
+    /// relative to the folder) and the loaded document.
+    fn check_folder(label: &str, files: &[(&str, &str)]) -> (Vec<String>, Document) {
+        let root = tmp_file(label, files[0].1);
+        let dir = root.parent().unwrap().to_path_buf();
+        for (path, text) in &files[1..] {
+            let p = dir.join(path);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        }
+        let (map, doc, mut diags) = load(&root).unwrap();
+        diags.extend(check(&doc, &map));
+        let canon = fs::canonicalize(&dir).unwrap();
+        let out = diags
+            .iter()
+            .map(|d| {
+                let loc = map.location(d.span);
+                let file = loc.path.strip_prefix(&canon).unwrap_or(&loc.path).display().to_string();
+                format!("{file}:{}:{}: {}", loc.line, loc.column, d.message)
+            })
+            .collect();
+        let _ = fs::remove_dir_all(&dir);
+        (out, doc)
+    }
+
+    fn theme_value(doc: &Document, theme: &str, key: &str) -> String {
+        doc.items
+            .iter()
+            .find_map(|it| match it {
+                Item::Block(b) if b.kind.text == "theme" && b.name.as_ref().is_some_and(|n| n.text == theme) => {
+                    b.items.iter().find_map(|i| match i {
+                        Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key: k } if k.text == key) => {
+                            Some(a.value.text.clone())
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {theme}.{key}"))
+    }
+
+    const GLASS: &str = "theme glass {\n    extends = base\n    font = fonts/f.ttf 18\n    icons = icons\n    \
+        background_image = images/bg.png\n    accent = #44aaff\n    style .card { font = fonts/f.ttf 12 }\n    \
+        component tile {\n        param label: string\n        param value: number = 0\n        \
+        column { text { value = {{ label }} }\n image { src = images/{{ label }}.png }\n image { src = images/bg2.png } }\n    }\n}\n";
+
+    #[test]
+    fn a_theme_folder_is_loaded_with_its_asset_paths() {
+        let (diags, doc) = check_folder(
+            "tdir",
+            &[
+                ("root.conf", "screen:theme = glass\ncomponent tile { param label: string\n param value: number = 0\n text { value = {{ label }} } }\npage home { tile { label = a } }\n"),
+                ("themes/glass/theme.conf", GLASS),
+                ("themes/glass/fonts/f.ttf", "x"),
+                ("themes/base/theme.conf", "theme base { surface = #222222 }\n"),
+            ],
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(theme_value(&doc, "glass", "font"), "themes/glass/fonts/f.ttf 18");
+        assert_eq!(theme_value(&doc, "glass", "icons"), "themes/glass/icons");
+        assert_eq!(theme_value(&doc, "glass", "background_image"), "themes/glass/images/bg.png");
+        assert_eq!(theme_value(&doc, "glass", "accent"), "#44aaff");
+        assert_eq!(theme_value(&doc, "base", "surface"), "#222222");
+        let text = format!("{doc:?}");
+        // A literal `src` is the theme folder's; one from an expression
+        // (a param from a page) the config folder's.
+        assert!(text.contains("\"themes/glass/images/bg2.png\""), "literal src rewritten");
+        assert!(text.contains("\"images/{{ label }}.png\""), "expression src left alone");
+        assert!(text.contains("themes/glass/fonts/f.ttf 12"), "style font rewritten");
+    }
+
+    #[test]
+    fn a_theme_folder_wins_only_when_the_config_does_not_define_it() {
+        let (diags, doc) = check_folder(
+            "tinl",
+            &[
+                ("root.conf", "screen:theme = glass\ntheme glass { accent = #000001 }\n"),
+                ("themes/glass/theme.conf", "theme glass { accent = #000002 }\n"),
+            ],
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(theme_value(&doc, "glass", "accent"), "#000001");
+    }
+
+    #[test]
+    fn a_broken_theme_folder_is_reported_in_its_file() {
+        // A font file missing from the theme folder, a font kept
+        // outside it, a bad token, and items a theme file cannot hold.
+        let (diags, _) = check_folder(
+            "tbad",
+            &[
+                ("root.conf", "screen:theme = glass\nscreen { night { theme = gone } }\n"),
+                ("themes/glass/theme.conf", "theme glass {\n  font = fonts/none.ttf 18\n  font_big = ../f.ttf 20\n  accent = banana\n}\npage x { }\ntheme other { }\n"),
+            ],
+        );
+        let has = |needle: &str| assert!(diags.iter().any(|d| d.contains(needle)), "no `{needle}` in {diags:?}");
+        has("themes/glass/theme.conf:2:10: font file `themes/glass/fonts/none.ttf` not found");
+        has("themes/glass/theme.conf:3:14: font file `../f.ttf` must be a relative path");
+        has("themes/glass/theme.conf:4:");
+        has("themes/glass/theme.conf:6:1: `themes/glass/theme.conf` holds only `theme glass { }`; `page` belongs in the config");
+        has("themes/glass/theme.conf:7:7: `themes/glass/theme.conf` holds one `theme glass { }`");
+        has("root.conf:2:26: unknown theme `gone` (no `theme gone { }` in the config and no `themes/gone/theme.conf` beside it)");
+
+        let (diags, _) = check_folder(
+            "tname",
+            &[("root.conf", "screen:theme = glass\n"), ("themes/glass/theme.conf", "theme glas { }\n")],
+        );
+        assert!(diags.iter().any(|d| d.contains("root.conf:1:16: `themes/glass/theme.conf` does not define `theme glass { }`")), "{diags:?}");
+    }
+
+    #[test]
+    fn a_broken_theme_folder_nothing_names_is_a_warning() {
+        let root = tmp_file("tunused", "screen:theme = good\npage home { }\n");
+        let dir = root.parent().unwrap().to_path_buf();
+        for (name, text) in [("good", "theme good { accent = #000001 }\n"), ("bad", "theme bad {\n accent = banana\n}\n"), ("fine", "theme fine { }\n")] {
+            fs::create_dir_all(dir.join("themes").join(name)).unwrap();
+            fs::write(dir.join("themes").join(name).join("theme.conf"), text).unwrap();
+        }
+        let (map, mut doc, mut diags) = load(&root).unwrap();
+        diags.extend(check(&doc, &map));
+        let (errors, warnings) = crate::split_warnings(&mut doc, &map, diags);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(map.location(warnings[0].span).path.ends_with("themes/bad/theme.conf"));
+        assert!(warnings[0].message.contains("theme `bad` is named nowhere: left out"), "{}", warnings[0].message);
+        assert!(check_theme_switch(&doc, "bad").is_err());
+        assert!(check_theme_switch(&doc, "fine").is_ok());
+        // Named, the same theme is an error.
+        fs::write(&root, "screen:theme = bad\n").unwrap();
+        let (map, mut doc, mut diags) = load(&root).unwrap();
+        diags.extend(check(&doc, &map));
+        let (errors, _) = crate::split_warnings(&mut doc, &map, diags);
+        assert!(errors.iter().any(|d| d.message.contains("banana")), "{errors:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extends_names_a_known_theme() {
+        assert_msg(&check_text("theme a { extends = gone }\n"), "unknown theme `gone`");
+        assert_msg(&check_text("theme a { }\ntheme[a]:extends = gone\n"), "unknown theme `gone`");
+    }
+
+    #[test]
+    fn a_theme_component_takes_the_same_params() {
+        // Replacing the library's `shell` (no params) with one that
+        // has one; replacing a config component with other params.
+        let text = "component tile { param label: string\n text { value = {{ label }} } }\n\
+            theme t {\n component shell { param x: int\n column { slot { } } }\n\
+            component tile { param label: number\n text { value = x } }\n}\n";
+        let d = check_text(text);
+        assert_msg(&d, "root.conf:4:12: theme `t`'s component `shell` takes `x: int`, the component it replaces takes no params");
+        assert_msg(&d, "component `tile` takes `label: number`, the component it replaces takes `label: string`");
+        // Same params, a different default: fine. Optional or not counts.
+        assert!(check_text("component tile { param a: int = 1\n text { value = x } }\ntheme t { component tile { param a: int = 2\n row { } } }\n").is_empty());
+        assert_msg(
+            &check_text("component tile { param a: int = 1\n text { value = x } }\ntheme t { component tile { param a: int\n row { } } }\n"),
+            "takes `a: int`, the component it replaces takes `a: int = ...`",
+        );
+        // Two themes adding the same component agree with each other.
+        assert_msg(
+            &check_text("theme a { component pill { param n: int\n row { } } }\ntheme b { component pill { row { } } }\n"),
+            "theme `b`'s component `pill` takes no params, theme `a`'s `pill` takes `n: int`",
+        );
+        // Calls to a theme-only component check against its params.
+        assert_msg(
+            &check_text("theme a { component pill { param n: int\n row { } } }\npage home { pill { n = abc } }\n"),
+            "expected an integer, got `abc`",
+        );
+        assert!(check_text("theme a { component pill { param n: int\n row { } } }\npage home { pill { n = 3 } }\n").is_empty());
+    }
+
+    #[test]
+    fn a_switch_at_run_time_is_checked() {
+        let p = tmp_file("switch", "theme day { component pill { row { } } }\ntheme dusk { extends = day }\nscreen:theme = day\npage home { pill { } }\n");
+        let (map, doc, mut diags) = load(&p).unwrap();
+        diags.extend(check(&doc, &map));
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(check_theme_switch(&doc, "dusk").is_ok());
+        assert_eq!(check_theme_switch(&doc, "dark").unwrap_err(), "theme `dark` neither defines nor inherits component `pill`, which the pages use");
+        assert_eq!(check_theme_switch(&doc, "gone").unwrap_err(), "no theme `gone` (themes: dark, day, dusk, light)");
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn a_theme_only_component_is_in_every_theme_in_use() {
+        let head = "theme day { component pill { row { } } }\ntheme dusk { extends = day }\ntheme dark { }\n";
+        let page = "page home { pill { } }\n";
+        assert!(check_text(&format!("{head}screen {{ theme = dusk }}\n{page}")).is_empty());
+        assert_msg(
+            &check_text(&format!("{head}screen {{ theme = day; night {{ theme = dark }} }}\n{page}")),
+            "root.conf:5:13: component `pill` is only defined in themes, and theme `dark` (in use) neither defines nor inherits it",
+        );
+        // Used only inside the theme's own components: no matter.
+        assert!(check_text("theme day { component pill { row { } }\n component shell { column { pill { }\n slot { } } } }\ntheme dark { }\nscreen { theme = day; night { theme = dark } }\n").is_empty());
     }
 }

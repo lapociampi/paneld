@@ -554,3 +554,119 @@ fn reloads_free_the_fonts_of_the_old_screen() {
     assert_eq!(d.eval("vars.a"), "40");
     assert!(!d.log().contains("fonts in use"), "{}", d.log());
 }
+
+#[test]
+fn a_broken_theme_folder_keeps_the_last_good_config() {
+    let dir = tmp("theme-dir");
+    let theme = dir.join("themes/glass/theme.conf");
+    std::fs::create_dir_all(theme.parent().unwrap()).unwrap();
+    std::fs::write(&theme, "theme glass {\n  accent = #123456\n}\n").unwrap();
+    let d = Daemon::start(&dir, "screen:theme = glass\npage home { text { value = x } }\n");
+    assert_eq!(d.eval("theme.accent"), "#123456");
+
+    std::fs::write(&theme, "theme glass {\n  accent = #654321\n}\n").unwrap();
+    assert_eq!(d.ok(&["reload"]), "reloaded");
+    assert_eq!(d.eval("theme.accent"), "#654321");
+
+    // Broken: refused with the theme file and line; the old theme stays.
+    std::fs::write(&theme, "theme glass {\n  accent = #654321\n  font = fonts/none.ttf 18\n}\n").unwrap();
+    let why = d.refused(&["reload"]);
+    assert!(why.contains("themes/glass/theme.conf:3:") && why.contains("not found"), "{why}");
+    assert_eq!(d.eval("theme.accent"), "#654321");
+}
+
+#[test]
+fn ctl_switches_the_theme_until_reset_and_over_reloads() {
+    let dir = tmp("ctl-theme");
+    let theme = dir.join("themes/glass/theme.conf");
+    std::fs::create_dir_all(theme.parent().unwrap()).unwrap();
+    // `glass` is named nowhere in the config: a folder is enough.
+    std::fs::write(&theme, "theme glass { extends = dark\n accent = #44aaff }\n").unwrap();
+    let d = Daemon::start(&dir, "page home { text { value = x } }\n");
+    // No theme set: the shipped `light`.
+    assert_eq!(d.ok(&["theme"]), "light");
+    assert_eq!(d.eval("theme.background"), "#f5f5f5");
+    // The shipped `dark`, by name.
+    assert_eq!(d.ok(&["theme", "dark"]), "dark");
+    assert_eq!(d.eval("theme.background"), "#121212");
+    // A folder theme; it extends the shipped one.
+    assert_eq!(d.ok(&["theme", "glass"]), "glass");
+    assert_eq!(d.eval("theme.accent"), "#44aaff");
+    assert_eq!(d.eval("theme.background"), "#121212");
+    assert!(d.ok(&["status"]).contains("\"theme\":\"glass\""));
+    // An unknown one is refused; the current one stays.
+    let why = d.refused(&["theme", "nope"]);
+    assert!(why.contains("no theme `nope`"), "{why}");
+    assert_eq!(d.eval("theme.accent"), "#44aaff");
+    // Kept over a reload while the theme is still there.
+    assert_eq!(d.ok(&["reload"]), "reloaded");
+    assert_eq!(d.ok(&["theme"]), "glass");
+    // Editing the theme folder's file reloads it, like the config.
+    std::thread::sleep(Duration::from_millis(1100));
+    std::fs::write(&theme, "theme glass { extends = dark\n accent = #00ff00 }\n").unwrap();
+    d.wait_for("theme.accent", "#00ff00");
+    // A new theme folder is found without a reload by hand, once its
+    // file is there.
+    let neu = dir.join("themes/neu");
+    std::fs::create_dir_all(&neu).unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    std::fs::write(neu.join("theme.conf"), "theme neu { accent = #abcdef }\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while d.ctl(&["theme", "neu"]).status.code() != Some(0) {
+        assert!(Instant::now() < deadline, "theme `neu` never loaded: {}", d.log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(d.eval("theme.accent"), "#abcdef");
+    // Back to the config's.
+    assert_eq!(d.ok(&["theme", "--reset"]), "light");
+    assert_eq!(d.eval("theme.background"), "#f5f5f5");
+}
+
+#[test]
+fn a_ctl_theme_wins_over_the_night_theme_until_reset() {
+    let dir = tmp("ctl-night");
+    let h = local_hour();
+    let d = Daemon::start(
+        &dir,
+        &format!(
+            "screen {{ theme = light; night {{ from = {:02}:00; to = {:02}:00; theme = dark }} }}\npage home {{ text {{ value = x }} }}\n",
+            (h + 23) % 24,
+            (h + 2) % 24
+        ),
+    );
+    d.wait_for("theme.background", "#121212");
+    assert_eq!(d.ok(&["theme"]), "dark");
+    assert_eq!(d.ok(&["theme", "light"]), "light");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(d.eval("theme.background"), "#f5f5f5");
+    // Reset: the night hours have it again.
+    assert_eq!(d.ok(&["theme", "--reset"]), "dark");
+    assert_eq!(d.eval("theme.background"), "#121212");
+}
+
+#[test]
+fn theme_switches_free_the_fonts_of_the_old_theme() {
+    let dir = tmp("theme-fonts");
+    for n in 0..10u32 {
+        let t = dir.join(format!("themes/t{n}"));
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(
+            t.join("theme.conf"),
+            format!("theme t{n} {{ font = inter {}; font_big = noto_sans {} bold; font_huge = montserrat {} }}\n", 12 + n, 20 + n, 30 + n),
+        )
+        .unwrap();
+    }
+    let d = Daemon::start(
+        &dir,
+        "page home { column { text { value = a }\n text { value = b; font = font_big }\n text { value = c; font = font_huge } } }\n",
+    );
+    // 3 or 4 fonts a theme, 40 switches: past the cap of 32 unless each
+    // switch frees the last theme's.
+    for i in 0..40u32 {
+        assert_eq!(d.ok(&["theme", &format!("t{}", i % 10)]), format!("t{}", i % 10));
+        // Let the redraw happen.
+        d.eval("1");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(!d.log().contains("fonts in use"), "{}", d.log());
+}

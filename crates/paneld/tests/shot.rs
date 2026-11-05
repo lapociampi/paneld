@@ -2028,3 +2028,157 @@ fn an_arrow_in_roboto_comes_from_montserrat() {
     let (boxed, boxed_filled) = red_box("arrow_x", "text { value = \"\u{2603}\"; color = #ff0000; font = roboto 20 }");
     assert_ne!((size(roboto), filled), (size(boxed), boxed_filled), "the arrow drew as a placeholder");
 }
+
+/// A config folder with theme folder `themes/side` (ADR 0021): its
+/// `shell` puts the navigation in a blue column on the left, its
+/// `tile` is a green box holding the folder's `icons/home.png` (a
+/// magenta square, drawn tinted red), its text font is `font`. The
+/// config's own `tile` is plain text; `night` adds night hours that
+/// switch to theme `plain`, which has no components.
+fn theme_folder(label: &str, font: &str, night: bool) -> PathBuf {
+    let d = tmp(label);
+    let src = d.join("src.conf");
+    std::fs::write(&src, "page home { rect { width = 100%; height = 100%; background = #ff00ff } }\n").unwrap();
+    shot(&src, &["--size", "16x16"]);
+    let side = d.join("themes/side");
+    std::fs::create_dir_all(side.join("icons")).unwrap();
+    std::fs::create_dir_all(side.join("fonts")).unwrap();
+    std::fs::rename(src.with_extension("png"), side.join("icons/home.png")).unwrap();
+    let inter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../paneld-ui/fonts/inter-regular.ttf");
+    std::fs::copy(inter, side.join("fonts/f.ttf")).unwrap();
+    std::fs::write(
+        side.join("theme.conf"),
+        format!(
+            "theme side {{\n\
+                 font  = {font}\n\
+                 icons = icons\n\
+                 component shell {{\n\
+                     row {{\n\
+                         width = 100%; height = 100%; padding = 0; gap = 0; radius = 0; border = 0; background = #000000\n\
+                         column {{\n\
+                             width = 120; height = 100%; padding = 0; gap = 0; radius = 0; border = 0; background = #0000ff\n\
+                             repeat p in {{{{ nav }}}} {{\n\
+                                 button {{ width = 120; height = 60; label = {{{{ p.title }}}}; on_tap {{ goto = {{{{ p.name }}}} }} }}\n\
+                             }}\n\
+                         }}\n\
+                         column {{ grow = 1; height = 100%; padding = 10; gap = 10; radius = 0; border = 0; slot {{ }} }}\n\
+                     }}\n\
+                 }}\n\
+                 component tile {{\n\
+                     param label: string\n\
+                     row {{ width = 200; height = 60; padding = 10; radius = 0; border = 0; background = #00ff00\n\
+                         icon {{ name = home; size = 40; color = #ff0000 }} }}\n\
+                 }}\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    let night = if night {
+        let o = Command::new("date").arg("+%H").output().unwrap();
+        let h: u32 = String::from_utf8_lossy(&o.stdout).trim().parse().unwrap();
+        format!("theme plain {{ }}\nscreen {{ night {{ from = {:02}:00; to = {:02}:00; theme = plain }} }}\n", (h + 23) % 24, (h + 2) % 24)
+    } else {
+        String::new()
+    };
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "screen:theme = side\n{night}\
+             component tile {{ param label: string\n text {{ value = {{{{ label }}}}; color = #00ff00 }} }}\n\
+             page home {{ title = One; nav = 1\n\
+                 tile {{ label = config }}\n\
+                 text {{ value = \"Quick brown fox 12:45\"; color = #ffff00 }} }}\n\
+             page two {{ title = Two; nav = 2\n rect {{ width = 100; height = 40; background = #ff8000 }} }}\n"
+        ),
+    )
+    .unwrap();
+    conf
+}
+
+#[test]
+fn a_theme_folder_replaces_the_shell_and_a_component_with_its_own_assets() {
+    let conf = theme_folder("tdir", "fonts/f.ttf 20", false);
+    let check = Command::new(env!("CARGO_BIN_EXE_paneld")).arg("check").arg("-c").arg(&conf).output().unwrap();
+    assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+    let img = shot(&conf, &["--settle", "100"]);
+    let blue = |p| close(p, [0, 0, 0xff], 16);
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    let red = |p| close(p, [0xff, 0, 0], 40);
+    // The theme's shell: navigation in a column on the left, the full
+    // height; no bottom bar.
+    let b = bbox(&img, blue).expect("no blue nav column");
+    assert!(b.0 < 2 && b.2 > 110 && b.2 < 125 && b.3 > 470, "nav column {b:?}");
+    // The theme's tile, with the theme folder's icon PNG (a full square,
+    // not the built-in glyph).
+    let g = bbox(&img, green).expect("theme tile not drawn");
+    assert!(g.0 >= 120 && g.2 - g.0 > 190, "tile {g:?}");
+    assert!(count(&img, red) > 1300, "theme icon PNG not drawn: {} px", count(&img, red));
+    // The theme's font file: drawn as Inter, the same text as the
+    // built-in `inter 20` and not as Montserrat.
+    let yellow = |p: [u8; 3]| p[0] > 150 && p[1] > 150 && p[2] < 90;
+    let width = |img: &Image| {
+        let b = bbox(img, yellow).expect("no text");
+        b.2 - b.0
+    };
+    let file = width(&img);
+    let builtin = width(&shot(&theme_folder("tdir-inter", "inter 20", false), &["--settle", "100"]));
+    let montserrat = width(&shot(&theme_folder("tdir-mont", "montserrat 20", false), &["--settle", "100"]));
+    assert_eq!(file, builtin, "theme font file not used");
+    assert!(file.abs_diff(montserrat) >= 4, "inter {file} px, montserrat {montserrat} px");
+
+    // The left nav works: page two.
+    let two = shot(&conf, &["--tap", "60,90", "--settle", "100"]);
+    assert!(two.any(|p| close(p, [0xff, 0x80, 0], 16)) && !two.any(green), "nav did not switch to page two");
+}
+
+#[test]
+fn the_night_theme_brings_its_own_components() {
+    // Night hours now: theme `plain`, which has no components, so the
+    // config's `tile` and the library's shell are back.
+    let conf = theme_folder("tnight", "fonts/f.ttf 20", true);
+    let img = shot(&conf, &["--settle", "200"]);
+    assert!(!img.any(|p| close(p, [0, 0, 0xff], 16)), "the side theme's shell under the night theme");
+    assert!(count(&img, |p| close(p, [0xff, 0, 0], 40)) < 50, "the side theme's tile under the night theme");
+    // The config's tile: green text, not a 200 px box.
+    let g = bbox(&img, |p| close(p, [0, 0xff, 0], 40)).expect("config tile not drawn");
+    assert!(g.2 - g.0 < 150, "config tile {g:?}");
+}
+
+#[test]
+fn a_broken_theme_folder_is_a_check_error_with_its_file_and_line() {
+    let conf = theme_folder("tbroken", "fonts/none.ttf 20", false);
+    let check = Command::new(env!("CARGO_BIN_EXE_paneld")).arg("check").arg("-c").arg(&conf).output().unwrap();
+    assert!(!check.status.success());
+    let err = String::from_utf8_lossy(&check.stderr);
+    assert!(err.contains("themes/side/theme.conf:2:") && err.contains("font file `themes/side/fonts/none.ttf` not found"), "{err}");
+}
+
+#[test]
+fn the_shipped_light_and_dark_themes_draw_by_name() {
+    let d = tmp("shipped");
+    let look = |theme: &str| {
+        let conf = d.join(format!("{theme}.conf"));
+        std::fs::write(
+            &conf,
+            format!(
+                "screen:theme = {theme}\n\
+                 page home {{ title = One; nav = 1\n text {{ value = \"Quick brown fox\"; font = roboto 32 }} }}\n\
+                 page two {{ title = Two; nav = 2 }}\n"
+            ),
+        )
+        .unwrap();
+        shot(&conf, &["--settle", "100"])
+    };
+    // Light: today's built-in default look; dark text on light grey.
+    let light = look("light");
+    assert!(close(light.px(400, 300), [0xf5, 0xf5, 0xf5], 8), "light page {:?}", light.px(400, 300));
+    assert!(close(light.px(400, 20), [0xff, 0xff, 0xff], 8), "light header");
+    let ink = |img: &Image, f: &dyn Fn([u8; 3]) -> bool| (60..160).flat_map(|y| (0..400).map(move |x| (x, y))).filter(|&(x, y)| f(img.px(x, y))).count();
+    assert!(ink(&light, &|p| p[0] < 0x40) > 300, "light body text not dark");
+    // Dark: light text on near black, the header a step lighter.
+    let dark = look("dark");
+    assert!(close(dark.px(400, 300), [0x12, 0x12, 0x12], 8), "dark page {:?}", dark.px(400, 300));
+    assert!(close(dark.px(400, 20), [0x1e, 0x1e, 0x1e], 8), "dark header");
+    assert!(ink(&dark, &|p| p[0] > 0xc0) > 300, "dark body text not light");
+}

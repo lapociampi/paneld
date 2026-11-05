@@ -262,11 +262,12 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         );
     }
 
-    // Also watch the config file: an editor save fires Reload the
-    // same way `paneld ctl reload` does.
+    // Also watch the config file, its includes and the theme folders
+    // (inotify): a save fires Reload the same way `paneld ctl reload`
+    // does.
     ctl::watch_config(
         &config,
-        std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(200),
         control_tx,
     );
 
@@ -654,10 +655,18 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         let typed = paneld_ui::snapshot_inputs();
         let same_page = live.rendered_page == live.current_page;
         screen.clear_children();
+        // After a theme switch: free the old theme's fonts, now that no
+        // object uses them (the toast goes too; no dialog is up here),
+        // as a reload does. Else switching themes fills the font cache.
+        if std::mem::take(&mut live.release_fonts) {
+            screen.top_layer().clear_children();
+            live.toast_until = None;
+            screen.release_fonts();
+        }
         paneld_ui::reset_action_bindings();
         paneld_ui::set_call_states(live.calls.values().cloned().collect());
         paneld_ui::render_page(
-            &live.doc,
+            &live.ui_doc,
             &live.current_page,
             &ctx,
             &live.event_tx,
@@ -674,6 +683,9 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
 /// Everything the main loop re-creates on a `reload`.
 struct LiveState {
     doc: paneld_config::parse::Document,
+    /// `doc` as the pages are drawn: the active theme's components in
+    /// place of the config's and the library's (themes.md).
+    ui_doc: paneld_config::parse::Document,
     /// Shared with the action worker so a `run =` that references
     /// `sources.X.value` sees the current sample, not whatever was
     /// in the base ctx snapshot at daemon start.
@@ -729,6 +741,13 @@ struct LiveState {
     redraw: bool,
     /// Screen power and night hours (schema 12).
     screen: screen::Screen,
+    /// The theme the night hours ask for (`None`: the config's).
+    screen_theme: Option<String>,
+    /// The theme chosen with `paneld ctl theme <name>`: wins over the
+    /// config's and the night's until `theme --reset` or a restart.
+    ctl_theme: Option<String>,
+    /// A theme switch happened: free the fonts at the next redraw.
+    release_fonts: bool,
     /// The sleep cover was touched since the last step.
     touched: bool,
     pin_gate: pin::Gate,
@@ -760,11 +779,18 @@ struct Asking {
 
 /// Load and check the config; the issues, with locations, if any.
 fn load_checked(config: &std::path::Path) -> Result<paneld_config::parse::Document, Vec<ctl::CtlError>> {
-    let (source, doc, mut diags) = match paneld_config::load(config) {
+    let (source, mut doc, mut diags) = match paneld_config::load(config) {
         Ok(parts) => parts,
         Err(e) => return Err(vec![ctl::CtlError::msg(e.to_string())]),
     };
     diags.extend(paneld_config::check(&doc, &source));
+    // A broken theme folder nothing names: said, and left out.
+    let (diags, warnings) = paneld_config::split_warnings(&mut doc, &source, diags);
+    for w in &warnings {
+        eprintln!("paneld: warning: {}: {}", source.location(w.span), w.message);
+    }
+    // Edits to any file read here reload the config, a broken one's too.
+    ctl::watch_files(source.files().map(|(_, p)| p.to_path_buf()).filter(|p| p.is_absolute()).collect());
     if diags.is_empty() {
         return Ok(doc);
     }
@@ -827,19 +853,10 @@ fn setup_live_state(
     // `<instance>.<member>` (ADR 0018), after the overrides so
     // `remote[x]:host` counts.
     paneld_config::remote::lower(&mut doc);
-    visible::install(
-        &doc,
-        &paneld_config::remote::remotes(&doc)
-            .into_iter()
-            .map(|(name, r)| {
-                let values = paneld_config::remote::members(&r.kind)
-                    .filter(|(_, b)| b.kind.text == "value")
-                    .map(|(m, _)| m.to_string())
-                    .collect();
-                (name, values)
-            })
-            .collect(),
-    );
+    // What the pages are drawn from: the active theme's components in
+    // place of the config's and the library's.
+    let ui_doc = themes::ui_doc(&doc, None);
+    install_visible(&doc, &ui_doc);
     remotes::install(remotes::Remotes::from_doc(
         &doc,
         &state_path.map(std::path::Path::to_path_buf).unwrap_or_else(|| state::config_path(&doc)),
@@ -1015,13 +1032,14 @@ fn setup_live_state(
     // reloads do not fill the cache and an edited `.ttf` is read again.
     screen.release_fonts();
     paneld_ui::reset_action_bindings();
-    paneld_ui::render_page(&doc, &current_page, &ctx, &event_tx, screen);
+    paneld_ui::render_page(&ui_doc, &current_page, &ctx, &event_tx, screen);
     visible::show(&current_page);
 
     let screen_state =
         screen::Screen::new(screen::Config::from_doc(&doc), tz::Zone::local(), config_dir.clone());
     Ok(LiveState {
         doc,
+        ui_doc,
         source_values,
         source_rx,
         source_started: Default::default(),
@@ -1049,9 +1067,30 @@ fn setup_live_state(
         toast_until: None,
         redraw: false,
         screen: screen_state,
+        screen_theme: None,
+        ctl_theme: None,
+        release_fonts: false,
         touched: false,
         pin_gate,
     })
+}
+
+/// Which sources each page reads (`active = visible`), through the
+/// components the pages are drawn with (`ui_doc`, the active theme's).
+fn install_visible(doc: &paneld_config::parse::Document, ui_doc: &paneld_config::parse::Document) {
+    visible::install(
+        ui_doc,
+        &paneld_config::remote::remotes(doc)
+            .into_iter()
+            .map(|(name, r)| {
+                let values = paneld_config::remote::members(&r.kind)
+                    .filter(|(_, b)| b.kind.text == "value")
+                    .map(|(m, _)| m.to_string())
+                    .collect();
+                (name, values)
+            })
+            .collect(),
+    );
 }
 
 /// The directory commands run in by default (ADR 0013): the config
@@ -1234,13 +1273,36 @@ fn screen_step(live: &mut LiveState) -> bool {
                 screen_command(&live.screen, live.screen.cfg.dim.clone(), Some(level));
             }
             screen::Effect::Theme(name) => {
-                live.theme = themes::resolve_with(&live.doc, name.as_deref());
-                apply_theme_ui(&live.doc, &live.theme, name.as_deref());
-                redraw = true;
+                live.screen_theme = name;
+                // A theme chosen over ctl stays until `theme --reset`.
+                if live.ctl_theme.is_none() {
+                    apply_active_theme(live);
+                    redraw = true;
+                }
             }
         }
     }
     redraw
+}
+
+/// The theme in force: one chosen over ctl, else the night theme in
+/// night hours, else the config's (`None`).
+fn active_theme(live: &LiveState) -> Option<&str> {
+    live.ctl_theme.as_deref().or(live.screen_theme.as_deref())
+}
+
+/// Apply the theme in force: tokens, styles, and components (another
+/// shell, other tiles), and which sources each page reads through them.
+fn apply_active_theme(live: &mut LiveState) {
+    let name = active_theme(live).map(str::to_string);
+    live.theme = themes::resolve_with(&live.doc, name.as_deref());
+    apply_theme_ui(&live.doc, &live.theme, name.as_deref());
+    live.ui_doc = themes::ui_doc(&live.doc, name.as_deref());
+    install_visible(&live.doc, &live.ui_doc);
+    visible::show(&live.current_page);
+    live.redraw = true;
+    // The old theme's fonts go with the old screen, at the next redraw.
+    live.release_fonts = true;
 }
 
 /// Run a screen command (`on`, `off`, `dim` with `level`) in the
@@ -1670,7 +1732,7 @@ fn find_start_page(doc: &paneld_config::parse::Document) -> String {
 fn run_check(config: PathBuf) -> ExitCode {
     use paneld_config::{check, load};
 
-    let (source, doc, mut diags) = match load(&config) {
+    let (source, mut doc, mut diags) = match load(&config) {
         Ok(parts) => parts,
         Err(e) => {
             eprintln!("paneld check: {e}");
@@ -1678,6 +1740,11 @@ fn run_check(config: PathBuf) -> ExitCode {
         }
     };
     diags.extend(check(&doc, &source));
+    // A broken theme folder nothing names: a warning (it is left out).
+    let (diags, warnings) = paneld_config::split_warnings(&mut doc, &source, diags);
+    for w in &warnings {
+        eprintln!("warning: {}: {}", source.location(w.span), w.message);
+    }
 
     if diags.is_empty() {
         println!("{} ok", config.display());
@@ -1825,7 +1892,20 @@ fn reload(
             // Stop the old poll / stream workers; the new state runs
             // its own.
             live.sources_shutdown.stop();
+            // A theme chosen over ctl stays if the new config still has
+            // it and can draw its pages with it.
+            let ctl_theme = live.ctl_theme.take().filter(|t| match paneld_config::check_theme_switch(&fresh.doc, t) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("paneld: {e}; back to the config's theme");
+                    false
+                }
+            });
             *live = fresh;
+            if ctl_theme.is_some() {
+                live.ctl_theme = ctl_theme;
+                apply_active_theme(live);
+            }
             eprintln!("paneld: reloaded config");
             Ok(())
         }
@@ -1834,6 +1914,15 @@ fn reload(
             Err(issues)
         }
     }
+}
+
+/// The name of the theme in force, as `paneld ctl theme` reports it
+/// (empty with no theme at all).
+fn active_theme_name(live: &LiveState) -> String {
+    active_theme(live)
+        .map(str::to_string)
+        .or_else(|| themes::active_theme_name(&live.doc))
+        .unwrap_or_default()
 }
 
 /// Answer one ctl request (ADR 0007's command set) from the main loop.
@@ -1970,8 +2059,23 @@ fn handle_request(
                 Err(ctl::CtlError::msg(format!("no active ctl alert `{id}`")))
             }
         }
+        "theme" => {
+            if let Some(name) = req.opt_arg("name") {
+                paneld_config::check_theme_switch(&live.doc, &name).map_err(ctl::CtlError::msg)?;
+                live.ctl_theme = Some(name);
+                apply_active_theme(live);
+            }
+            Ok(Value::String(active_theme_name(live)))
+        }
+        "theme_reset" => {
+            if live.ctl_theme.take().is_some() {
+                apply_active_theme(live);
+            }
+            Ok(Value::String(active_theme_name(live)))
+        }
         "status" => {
             let mut m = BTreeMap::new();
+            m.insert("theme".to_string(), Value::String(active_theme_name(live)));
             m.insert("config".to_string(), Value::String(config.display().to_string()));
             m.insert("page".to_string(), Value::String(live.current_page.clone()));
             m.insert("sources".to_string(), Value::Map(live.source_values.lock().unwrap().clone()));

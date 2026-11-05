@@ -528,10 +528,27 @@ thread_local! {
     static ICON_CACHE: std::cell::RefCell<IconCache> = std::cell::RefCell::new(IconCache::default());
 }
 
-/// A file `path` (relative to the asset folder) exists: a theme's
-/// `icons/<name>.png` replaces the built-in only then.
+/// A file `path` (relative to the asset folder) exists, inside the
+/// config folder or, under `themes/<name>/`, inside that theme's
+/// folder: a theme's `icons/<name>.png` replaces the built-in only then.
 pub fn asset_exists(path: &str) -> bool {
-    ASSET_DIR.with(|d| d.borrow().join(path).is_file())
+    asset_path(path, "icon").is_some_and(|p| p.is_file())
+}
+
+/// The real path of asset `path`, confined to its folder
+/// ([`paneld_config::assets::resolve`]); `None` (logged once) when it
+/// leads out of it. A missing file is `None` without a log.
+fn asset_path(path: &str, what: &str) -> Option<std::path::PathBuf> {
+    let dir = ASSET_DIR.with(|d| d.borrow().clone());
+    match paneld_config::assets::resolve(&dir, path, what) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            if !e.contains("not found") {
+                log_font_once(e);
+            }
+            None
+        }
+    }
 }
 
 /// The compiled bitmap Montserrat nearest to `size` px.
@@ -1247,6 +1264,13 @@ impl<'ui> Obj<'ui> {
         unsafe {
             sys::lv_obj_set_style_bg_opa(obj.raw, sys::_lv_opacity_level_t_LV_OPA_TRANSP as sys::lv_opa_t, 0);
             sys::lv_obj_set_style_border_width(obj.raw, 0, 0);
+            // LVGL's theme gives every container its own text color;
+            // a layout block passes on its parent's instead (a dark
+            // theme's light text).
+            let color = sys::lv_obj_get_style_text_color(self.raw, 0);
+            let opa = sys::lv_obj_get_style_text_opa(self.raw, 0);
+            sys::lv_obj_set_style_text_color(obj.raw, color, 0);
+            sys::lv_obj_set_style_text_opa(obj.raw, opa, 0);
         }
         obj
     }
@@ -1559,7 +1583,11 @@ impl<'ui> Obj<'ui> {
     /// (see [`set_asset_dir`]). Returns `None` for a path LVGL cannot
     /// take (an interior NUL).
     pub fn new_image(&self, path: &str, fit: ImageFit) -> Option<Obj<'ui>> {
-        let full = ASSET_DIR.with(|d| d.borrow().join(path));
+        // A theme's image (`themes/<name>/...`) stays in its folder.
+        let full = match paneld_config::assets::root_of(path) {
+            Some(_) => asset_path(path, "image")?,
+            None => ASSET_DIR.with(|d| d.borrow().join(path)),
+        };
         // Decoded, an image takes 4 bytes a pixel whatever its file
         // size: a small PNG of 8000x8000 would take 250 MB. Up to twice
         // the screen's pixels is allowed.
@@ -1600,7 +1628,7 @@ impl<'ui> Obj<'ui> {
     /// a large file's pixels. Past the cache's budget it is read as an
     /// ordinary image.
     pub fn new_icon_image(&self, path: &str, size: u16) -> Option<Obj<'ui>> {
-        let full = ASSET_DIR.with(|d| d.borrow().join(path));
+        let full = asset_path(path, "icon")?;
         let mtime = std::fs::metadata(&full).and_then(|m| m.modified()).ok()?;
         let key = (full.clone(), size, mtime);
         let cached = ICON_CACHE.with(|c| c.borrow().entries.iter().find(|(k, _)| *k == key).map(|(_, b)| *b));

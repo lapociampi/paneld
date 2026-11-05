@@ -209,7 +209,7 @@ component stat_tile {
 - One root node. Parameters are read by name in expressions.
 - Using it: `stat_tile { label = CPU; value = {{ sources.cpu_temp.value }} }`. Common node properties (section 8.1) set on the call apply to the root node.
 - Children written inside the call go where the component places `slot { }`. Without a `slot`, children are an error.
-- Library components ship with the program; a theme can replace them ([Themes](themes.md)).
+- Library components ship with the program; a config component of the same name replaces one, and the active theme's component replaces both, with the same params ([Themes](themes.md)).
 
 ## 8. Pages and building blocks
 
@@ -249,7 +249,7 @@ The theme's `shell` component wraps every page: header, navigation, alert banner
 | `border` | `<width> <color>` | |
 | `shadow` | `<size> <color> [<x> <y>]` | |
 | `color` | color, expr | Foreground: text, icon, line; the value part of an `arc` or `bar` |
-| `font` | font, expr | `<family> <size> [bold]`, e.g. `roboto 20`, `inter 16 bold`, or a theme font token named bare (`font = font_big`). Family: `roboto` (also `sans`), `open_sans`, `noto_sans`, `montserrat`, `inter`, or a `.ttf` path relative to the config folder (no `bold` then: name the bold file). Size 6 to 200 px. Unset: the theme's `font` ([ADR 0015](decisions/0015-fonts.md)) |
+| `font` | font, expr | `<family> <size> [bold]`, e.g. `roboto 20`, `inter 16 bold`, or a theme font token named bare (`font = font_big`). Family: `roboto` (also `sans`), `open_sans`, `noto_sans`, `montserrat`, `inter`, or a `.ttf` path relative to the config folder, or in a theme folder's `theme.conf` to the theme folder (no `bold` then: name the bold file). Size 6 to 200 px. Unset: the theme's `font` ([ADR 0015](decisions/0015-fonts.md)) |
 | `visible` | bool, expr | |
 | `enabled` | bool, expr | Disabled: no input, `:disabled` style |
 | `on_tap`, `on_hold` | action | |
@@ -272,8 +272,8 @@ Layout blocks are transparent and borderless: only a `background`, `border` or t
 | Block | Keys |
 | --- | --- |
 | `text` | `value` (string, expr), `align` (`left`, `center`, `right`), `overflow` (`wrap` default, `clip`, `dots`: cut with `...`, on one line unless a `height` is set (on the node, a style or a component call); `scroll`: scrolls to and fro). All but `wrap` need a `width`. A `scroll` text that does not fit keeps the screen redrawing while it is shown, which costs CPU; the panel is otherwise asleep when idle |
-| `icon` | `name` (built-in icon or theme icon, expr), `size` (px, expr; default the theme's `font` size), `color` (default the text color). A built-in is a glyph of the compiled Montserrat font nearest to `size` (12, 14, 16, 20, 24, 32); above 32 the 32 px glyph is scaled up, to at most 128. With the theme's `icons` set to a folder (relative to the config folder), `<folder>/<name>.png` replaces the built-in of that name or adds a new one: sized to `size` x `size`, tinted with `color`; decoded once and kept at that size (up to 1 MiB of them, past that read as a plain `image`). A literal name found in neither is a check error when no folder is set; at render an unknown name draws nothing (logged once) |
-| `image` | `src` (path to a PNG, expr; relative to the config folder), `fit` (`contain`, `cover`, `fill`, `none`), `recolor` (color) |
+| `icon` | `name` (built-in icon or theme icon, expr), `size` (px, expr; default the theme's `font` size), `color` (default the text color). A built-in is a glyph of the compiled Montserrat font nearest to `size` (12, 14, 16, 20, 24, 32); above 32 the 32 px glyph is scaled up, to at most 128. With the theme's `icons` set to a folder (relative to the config folder, or to the theme folder for a theme folder's `theme.conf`), `<folder>/<name>.png` replaces the built-in of that name or adds a new one: sized to `size` x `size`, tinted with `color`; decoded once and kept at that size (up to 1 MiB of them, past that read as a plain `image`). A literal name found in neither is a check error when no folder is set; at render an unknown name draws nothing (logged once) |
+| `image` | `src` (path to a PNG, expr; relative to the config folder, or in a theme folder's component to the theme folder and inside it), `fit` (`contain`, `cover`, `fill`, `none`), `recolor` (color) |
 | `rect` | none beyond the common ones: a shape |
 | `arc` | `value`, `min` = 0, `max` = 100 (expr), `start` = 135, `end` = 45 (degrees: 0 at 3 o'clock, clockwise, so the default leaves the gap at the bottom; a span of 360, e.g. `0` to `360`, is a full circle), `thickness` (px, at least 1), `track` (color; default the theme's `muted`, faint), `rounded` (bool, default false), `color` (the value; default the theme's `accent`). For display: no knob, and a press never changes the value |
 | `bar` | `value`, `min` = 0, `max` = 100 (expr), `direction` (`horizontal` default, `vertical`: fills from the bottom), `track` (color; default the theme's `muted`, faint), `color` (the value; default the theme's `accent`) |
@@ -365,7 +365,7 @@ The alert names `ctl`, `reminder` and `source_down` are reserved for the panel's
 
 ## 11. Themes
 
-See [Themes](themes.md) for the folder, styles, components and motion. Tokens every theme must define (directly or through `extends`):
+See [Themes](themes.md) for styles, components and motion. A theme is a `theme <name> { }` in the config, the file `themes/<name>/theme.conf` beside it (every such folder is read and checked, [ADR 0021](decisions/0021-theme-folders.md)), or a shipped one: `light` (the built-in tokens below) and `dark`; `extends` names a parent the same way. Asset paths written in a theme folder (font files, `icons`, `background_image`, literal `src` in its components) are relative to that folder; a `src` from an expression is relative to the config folder. Tokens every theme must define (directly or through `extends`):
 
 | Group | Tokens |
 | --- | --- |
@@ -375,6 +375,8 @@ See [Themes](themes.md) for the folder, styles, components and motion. Tokens ev
 | Other | `shadow`, `background_image` (optional), `icons` (`builtin`, or a folder of `<name>.png` icons, section 8.3), `motion`, `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
 
 A theme may add any other token; they are read as `theme.<name>`.
+
+A `component <name> { }` in a theme replaces the config's or the library's `<name>` while the theme (or one extending it) is active, and takes the same params (name, type, optional or not).
 
 ## 12. Screen
 
@@ -392,7 +394,7 @@ screen {
 
 | Key | Type | Notes |
 | --- | --- | --- |
-| `theme` | theme name | Active theme |
+| `theme` | theme name | Active theme; default: the config's first `theme`, else the shipped `light`. `paneld ctl theme` overrides it until reset or restart |
 | `idle` | duration | Turn off after no touch |
 | `brightness` | 0..100 | Passed to `dim` as `level` |
 | `on`, `off`, `dim` | command | Backlight control |
