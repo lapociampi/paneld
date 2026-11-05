@@ -38,4 +38,4 @@ The homelab and smart home configs read demo data from their `demo/` folders and
 | ![Overview](../docs/images/system-overview.png) | ![CPU](../docs/images/system-cpu.png) |
 | ![Network](../docs/images/system-network.png) | ![Processes](../docs/images/system-processes.png) |
 
-The screenshots are made with `paneld shot`, which renders a config headless to a PNG; the system monitor's were rendered on a Raspberry Pi 3B+ (the second `paneld` in its process list is the screenshot run).
+The screenshots are made with `paneld shot`, which renders a config headless to a PNG.

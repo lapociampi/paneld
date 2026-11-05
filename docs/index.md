@@ -5,11 +5,12 @@ date: 2026-10-29
 tags: [paneld]
 series: paneld
 order: 0
+updated: 2026-11-05
 ---
 
 paneld is a generic touch panel: "Grafana for actions". The program draws widgets, runs commands and keeps a little state. Everything specific lives in config files: the pages and how they look, where every value comes from, what every button does, what counts as an alert. It knows no service: every integration is a command, mostly `curl`.
 
-Status: design done, no code yet.
+Status: v0.1. The daemon runs on desktop (SDL) and on a Raspberry Pi (DRM/KMS), and every block, key and function in [Schema](schema.md) is implemented. The repo's `README.md` shows the examples and how to build.
 
 ## Design in short
 

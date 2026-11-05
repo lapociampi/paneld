@@ -4,7 +4,7 @@
   "description": "Syntax highlighting for paneld config files.",
   "version": "0.1.0",
   "publisher": "paneld",
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "private": true,
   "engines": {
     "vscode": "^1.70.0"
