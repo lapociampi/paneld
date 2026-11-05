@@ -55,6 +55,11 @@
 #define LV_DEF_REFR_PERIOD      33
 #define LV_DPI_DEF              130
 
+/* The default theme's own press transitions are off: the theme's
+ * `motion` decides what animates (ADR 0023), `tap_transition` for a
+ * press. */
+#define LV_THEME_DEFAULT_TRANSITION_TIME 0
+
 /* ---------------------------------------------------------------------
  * Logging and asserts (dev build; tighten for release)
  * --------------------------------------------------------------------- */

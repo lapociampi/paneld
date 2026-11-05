@@ -38,7 +38,7 @@ Details: [ADR 0021](decisions/0021-theme-folders.md).
 | Tokens | Colors, fonts, sizes, spacing, radius, shadows, background image; read as `theme.x` | `accent = #44aaff` |
 | Styles | Properties for every node (`*`), per building block and per named class (a node opts in with `class = ...`), applied in that order under what the node sets itself (in the default state: a state style wins while the node is in its state); then per state of either: `:pressed`, `:checked`, `:disabled` (a node with `enabled = false`), `:focused`, `:hover`, and on a button `:running` (its action call runs) and `:failed` (its last run failed, until the action runs again; default look: a border in the theme's `critical`). A state body cannot change `width`, `height`, `grow`, `visible` or `enabled` | `style button:pressed { scale = 0.96 }`, `style .card { radius = 16 }`, `style .card:pressed { background = #333 }` |
 | Components | Replacements for the config's or the library's components, including the page shell (header, navigation, where banners appear): this is how a theme changes the layout. Same params as the one replaced (see below) | `component shell { ... }` |
-| Motion | Page transitions, tap feedback, animated value changes, alert banner entrance | `page_transition = fade 200ms` |
+| Motion | How much moves (`motion`), page transitions, tap feedback, animated value changes, alert banner entrance (see Motion below) | `page_transition = fade 200ms` |
 | Inheritance | Start from another theme and change a few things | `extends = dark` |
 
 Pages only use components, so the same pages look and are laid out differently under each theme.
@@ -50,6 +50,7 @@ theme glass {
     accent     = #44aaff
     font       = fonts/Inter.ttf 18
     motion     = full
+    page_transition = slide 250ms
 
     shadow     = 12 #00000080 0 4
 
@@ -122,8 +123,30 @@ Details: [ADR 0015](decisions/0015-fonts.md).
 
 ## Motion
 
+Details: [ADR 0023](decisions/0023-motion.md).
+
 - `motion = full | reduced | none`, default `reduced`: fades and value animations, no full-screen slides. The Pi draws in software, so full-screen effects cost CPU.
-- Each animation in a theme says the lowest level it runs at; below it, the change happens instantly.
+- Each animation runs from a lowest level; below it, the change happens at once.
+
+| Token (default) | What moves | Lowest level |
+| --- | --- | --- |
+| `page_transition` (`fade 200ms`) | Going to another page (a `goto`, the navigation, `ctl goto`): `fade` brings the new page in over the old one; `slide` moves the old one out to the left and the new one in from the right (from the left going `back` or to an earlier `nav` page). Taps wait until it is in. A value change on the same page never moves the page | `fade`: `reduced`, `slide`: `full` |
+| `value_transition` (`300ms`) | `arc`, `bar` and `chart` values, eased from the value shown ([Schema](schema.md) 8.3) | `reduced` |
+| `tap_transition` (`80ms`) | A press: what a `:pressed` style changes (`scale`, `opacity`, colors, border) moves there and back, on buttons and nodes with `on_tap` / `on_hold` | `reduced` |
+| `banner_transition` (`fade 200ms`) | The shipped shell's alert banner coming in (its `enter`, [Schema](schema.md) 8.1); any node can have an `enter` | `fade`: `reduced`, `slide`: `full` |
+
+- A transition is `<fade|slide|none> [<duration>]`, a duration `none` or up to `2s`.
+- **Idle means asleep:** each animation runs once and ends; then nothing is redrawn and the loop sleeps its full second again. While the screen is off nothing animates: going to sleep ends every animation where it was going, and the render on waking shows the values as they are, at once.
+- A spinner (`spinner`, a running button) and a `text` with `overflow = scroll` are content, not motion: they move at every level while shown.
+- **Cost**, measured on x86 (one core, release build), 800x480, a page of 12 cards with a bar each, frames 33 ms apart. A full rebuild and redraw (a value change, no motion) is 3.5 ms:
+
+| Animation (300 ms, 10 frames) | ms per frame, avg / max |
+| --- | --- |
+| Page `fade` (both pages drawn, the new one blended) | 4.1 / 5.3 |
+| Page `slide` (both pages drawn, moved) | 2.5-3.1 / 3.8 |
+| 12 bars moving | 1.4 / 3.1 |
+
+The Pi 3B+ is about 4 to 6 times slower per frame on this kind of drawing (10 times on gradients and shadows, see above), so a fade costs about 16 to 30 ms of a 33 ms frame there: it fits, with little to spare. On x86 the daemon used 0.5% of a core idle, 10% during a value animation, 13% during a page fade, and 0.5% again from the end of each.
 
 ## Switching
 

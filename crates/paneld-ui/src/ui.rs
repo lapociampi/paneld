@@ -265,8 +265,9 @@ pub fn show_sleep_cover(absorb: bool, sink: Sender<UiEvent>) {
         }
         SLEEP_COVER.with(|c| c.set(cover));
         // Nothing animates under the cover (a running button's
-        // spinner): the wake redraws the page with fresh ones.
-        sys::lv_anim_delete_all();
+        // spinner, a value, a page coming in): each ends where it was
+        // going, and the wake redraws the page with fresh ones.
+        finish_motion();
     }
 }
 
@@ -1002,12 +1003,18 @@ impl Ui {
     /// build). WSLg surfaces this as an X11 window.
     #[cfg(feature = "sdl")]
     pub fn open_sdl_window(&self, width: i32, height: i32, title: &str) -> Window {
+        let before = timers();
         let display = unsafe { sys::lv_sdl_window_create(width, height) };
         assert!(!display.is_null(), "lv_sdl_window_create returned null");
         let c_title = CString::new(title).expect("window title contains a NUL byte");
         unsafe { sys::lv_sdl_window_set_title(display, c_title.as_ptr()) };
         let mouse = unsafe { sys::lv_sdl_mouse_create() };
         assert!(!mouse.is_null(), "lv_sdl_mouse_create returned null");
+        // The driver's own timers (SDL events, the mouse read) are left
+        // out of [`idle_hint_ms`]; the display's refresh is not.
+        let refr = unsafe { sys::lv_display_get_refr_timer(display) };
+        let new: Vec<_> = timers().into_iter().filter(|t| !before.contains(t) && *t != refr).collect();
+        DRIVER_TIMERS.with(|d| d.borrow_mut().extend(new));
         Window { display, _input: Some(mouse) }
     }
 
@@ -1235,6 +1242,33 @@ const IDLE_STEP_MS: u32 = 1000;
 /// times a long press in its input read.
 const PRESSED_STEP_MS: u32 = 50;
 
+thread_local! {
+    /// Timers of the SDL driver (see [`idle_hint_ms`]).
+    static DRIVER_TIMERS: std::cell::RefCell<Vec<*mut sys::lv_timer_t>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// LVGL's timers now.
+#[cfg_attr(not(feature = "sdl"), allow(dead_code))]
+fn timers() -> Vec<*mut sys::lv_timer_t> {
+    let mut v = Vec::new();
+    let mut t = unsafe { sys::lv_timer_get_next(std::ptr::null_mut()) };
+    while !t.is_null() {
+        v.push(t);
+        t = unsafe { sys::lv_timer_get_next(t) };
+    }
+    v
+}
+
+/// What the last pump step's timers let it sleep, in ms, up to the idle
+/// step: [`IDLE_STEP_MS`] when nothing animates or redraws. The SDL
+/// driver's own timers (it reads events every 5 ms) are left out, so
+/// a desktop shows the panel's rate.
+static IDLE_HINT_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn idle_hint_ms() -> u32 {
+    IDLE_HINT_MS.load(Ordering::Relaxed)
+}
+
 /// One iteration of the LVGL tick loop. See [`Ui::pump`].
 pub struct Pump<'ui> {
     last: Instant,
@@ -1258,6 +1292,11 @@ impl<'ui> Pump<'ui> {
             .any(|(_, indev)| unsafe { sys::lv_indev_get_state(*indev) } == sys::lv_indev_state_t_LV_INDEV_STATE_PRESSED);
         let cap = if pressed { PRESSED_STEP_MS } else { IDLE_STEP_MS };
         let sleep_ms = unsafe { sys::lv_timer_handler() }.min(cap);
+        let hint = DRIVER_TIMERS.with(|d| {
+            let d = d.borrow();
+            unsafe { sys::lv_paneld_timers_idle_ms(d.as_ptr(), d.len() as u32, IDLE_STEP_MS) }
+        });
+        IDLE_HINT_MS.store(hint, Ordering::Relaxed);
         let sleep = Duration::from_millis(sleep_ms as u64);
         // Sleep in `poll` on the touch devices and the wake pipe: a touch
         // is read at once, news for the main loop wakes it at once, and
@@ -1464,6 +1503,16 @@ impl<'ui> Obj<'ui> {
         let raw = unsafe { sys::lv_obj_create(self.raw) };
         assert!(!raw.is_null());
         Obj { raw, _ui: PhantomData }
+    }
+
+    /// The holder of a whole page on the screen: no look of its own,
+    /// takes no taps, the screen's size.
+    pub fn new_page_holder(&self) -> Obj<'ui> {
+        let obj = self.new_container();
+        unsafe { sys::lv_obj_remove_style_all(obj.raw) };
+        obj.set_enabled(false);
+        obj.set_size(Size::Percent(100), Size::Percent(100));
+        obj
     }
 
     /// A layout container (`row`, `column`, `stack`, `grid`,
@@ -2910,7 +2959,13 @@ impl<'ui> Obj<'ui> {
     /// `scale`: 1.0 is the node's own size (a pressed button at 0.96).
     pub fn set_scale(&self, scale: f64) {
         let v = (scale.clamp(0.1, 10.0) * 256.0).round() as i32;
-        unsafe { sys::lv_obj_set_style_transform_scale(self.raw, v, sel()) };
+        unsafe {
+            sys::lv_obj_set_style_transform_scale(self.raw, v, sel());
+            // About its middle, in every state (a pressed button shrinks
+            // in place).
+            sys::lv_obj_set_style_transform_pivot_x(self.raw, Size::Percent(50).to_lvgl(), 0);
+            sys::lv_obj_set_style_transform_pivot_y(self.raw, Size::Percent(50).to_lvgl(), 0);
+        }
     }
 
     /// 0.0 transparent .. 1.0 opaque.
@@ -3014,6 +3069,11 @@ impl<'ui> Obj<'ui> {
             LAYOUT_MEM.with(|m| m.borrow_mut().clear());
             LINE_MEM.with(|m| m.borrow_mut().clear());
             CHART_ALPHA.with(|m| m.borrow_mut().clear());
+            // A page transition's objects went with the rest.
+            if PAGE_TR.with(|p| p.borrow_mut().take()).is_some() {
+                unsafe { sys::lv_obj_set_scrollable(self.raw, true) };
+            }
+            OLD_PAGE.with(|o| o.borrow_mut().clear());
         }
     }
 
@@ -3813,6 +3873,340 @@ impl Ui {
         }
         Some(Window { display, _input: None })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Motion (themes.md "Motion", ADR 0023): value tweens, a node's
+// entrance, page transitions and press transitions. Every animation
+// is a one-shot `lv_anim` that LVGL removes when it ends, so its
+// timer pauses again and the pump sleeps as before.
+// ---------------------------------------------------------------------------
+
+/// The steps of a tween's progress (0 start, `TWEEN_END` done).
+const TWEEN_END: i32 = 1024;
+
+/// Ease-out cubic: fast start, gentle stop. `t` and the result in 0..=1.
+pub fn ease(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn lerp(from: i32, to: i32, e: f64) -> i32 {
+    (from as f64 + (to - from) as f64 * e).round() as i32
+}
+
+/// A chart series' points from, to (`None`: no point).
+pub type SeriesTween = (Vec<Option<i32>>, Vec<Option<i32>>);
+
+/// What one animation changes, from its start to its end.
+enum Tween {
+    Bar { from: i32, to: i32 },
+    Arc { from: i32, to: i32 },
+    /// Each series' points (`None`: no point) from, to.
+    Chart { series: Vec<SeriesTween> },
+    /// A node coming in: opacity from 0 to `opa`; with `slide`, also
+    /// moved down from one own height above.
+    Enter { opa: u8, slide: bool, from: f64 },
+    /// The page transition (see [`run_page_transition`]).
+    Page { slide: bool, dir: i32, width: i32 },
+}
+
+struct Tw {
+    obj: *mut sys::lv_obj_t,
+    tween: Tween,
+}
+
+thread_local! {
+    /// Set while [`finish_motion`] removes every animation: each one
+    /// jumps to its end value as it goes.
+    static FINISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The page transition that runs, if any.
+    static PAGE_TR: std::cell::RefCell<Option<PageTr>> = const { std::cell::RefCell::new(None) };
+    /// The screen's children of the page being left, between
+    /// [`begin_page_change`] and [`run_page_transition`].
+    static OLD_PAGE: std::cell::RefCell<Vec<*mut sys::lv_obj_t>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Press transition descriptors by duration: LVGL keeps the
+    /// pointer, so each is leaked once (a theme names a few).
+    static PRESS_TR: std::cell::RefCell<Vec<(u32, &'static sys::lv_style_transition_dsc_t)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct PageTr {
+    old: Vec<*mut sys::lv_obj_t>,
+    new: Vec<*mut sys::lv_obj_t>,
+    /// Takes the taps while the pages move; the animation's var.
+    blocker: *mut sys::lv_obj_t,
+}
+
+fn apply_tween(tw: &Tw, step: i32) {
+    let e = ease(step as f64 / TWEEN_END as f64);
+    // SAFETY: an animation's var is its object: LVGL deletes the
+    // animation with it, so `obj` is alive while the animation runs.
+    unsafe {
+        match &tw.tween {
+            Tween::Bar { from, to } => sys::lv_bar_set_value(tw.obj, lerp(*from, *to, e), false),
+            Tween::Arc { from, to } => sys::lv_arc_set_value(tw.obj, lerp(*from, *to, e)),
+            Tween::Chart { series } => {
+                let mut ser = sys::lv_chart_get_series_next(tw.obj, std::ptr::null_mut());
+                let mut pts: Vec<i32> = Vec::new();
+                for (from, to) in series {
+                    if ser.is_null() {
+                        break;
+                    }
+                    pts.clear();
+                    pts.extend(from.iter().zip(to).map(|(f, t)| match (f, t) {
+                        (Some(f), Some(t)) => lerp(*f, *t, e),
+                        (_, Some(t)) => *t,
+                        (_, None) => sys::LV_CHART_POINT_NONE as i32,
+                    }));
+                    sys::lv_chart_set_series_values(tw.obj, ser, pts.as_ptr(), pts.len());
+                    ser = sys::lv_chart_get_series_next(tw.obj, ser);
+                }
+                sys::lv_chart_refresh(tw.obj);
+            }
+            Tween::Enter { opa, slide, from } => {
+                // A rebuild mid-way carries on from where it was.
+                let e = from + (1.0 - from) * e;
+                sys::lv_obj_set_style_opa(tw.obj, (*opa as f64 * e).round() as sys::lv_opa_t, 0);
+                if *slide {
+                    let pct = -((1.0 - e) * 100.0).round() as i16;
+                    sys::lv_obj_set_style_translate_y(tw.obj, Size::Percent(pct).to_lvgl(), 0);
+                }
+            }
+            Tween::Page { slide, dir, width } => {
+                PAGE_TR.with(|p| {
+                    let p = p.borrow();
+                    let Some(p) = p.as_ref() else { return };
+                    if *slide {
+                        let x = (*dir as f64 * *width as f64 * (1.0 - e)).round() as i32;
+                        for &n in &p.new {
+                            sys::lv_obj_set_style_translate_x(n, x, 0);
+                        }
+                        let x = (-*dir as f64 * *width as f64 * e).round() as i32;
+                        for &o in &p.old {
+                            sys::lv_obj_set_style_translate_x(o, x, 0);
+                        }
+                    } else {
+                        let opa = (255.0 * e).round() as sys::lv_opa_t;
+                        for &n in &p.new {
+                            sys::lv_obj_set_style_opa(n, opa, 0);
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn tween_exec(a: *mut sys::lv_anim_t, v: i32) {
+    // SAFETY: user data is the `Tw` boxed in `start_tween`, freed only
+    // in `tween_deleted`.
+    let tw = unsafe { &*(sys::lv_anim_get_user_data(a) as *const Tw) };
+    apply_tween(tw, v);
+}
+
+unsafe extern "C" fn tween_deleted(a: *mut sys::lv_anim_t) {
+    // SAFETY: as in `tween_exec`; this is the last call for this anim.
+    let tw = unsafe { Box::from_raw(sys::lv_anim_get_user_data(a) as *mut Tw) };
+    if FINISHING.with(|f| f.get()) && !matches!(tw.tween, Tween::Page { .. }) {
+        apply_tween(&tw, TWEEN_END);
+    }
+}
+
+unsafe extern "C" fn page_tween_completed(_a: *mut sys::lv_anim_t) {
+    // LVGL has unlinked the animation already: deleting its var here
+    // does not find it again.
+    end_page_transition();
+    // The redraw a value change deferred can come now.
+    wake();
+}
+
+/// Run `tween` on `var` over `ms`, applying its start now. false: LVGL
+/// could not start it (out of memory); its end is applied instead.
+fn start_tween(var: *mut sys::lv_obj_t, tw: Tw, ms: u32, completed: sys::lv_anim_completed_cb_t) -> bool {
+    apply_tween(&tw, 0);
+    let boxed = Box::into_raw(Box::new(tw));
+    unsafe {
+        let mut a: sys::lv_anim_t = std::mem::zeroed();
+        sys::lv_anim_init(&mut a);
+        sys::lv_anim_set_var(&mut a, var.cast());
+        sys::lv_anim_set_custom_exec_cb(&mut a, Some(tween_exec));
+        sys::lv_anim_set_values(&mut a, 0, TWEEN_END);
+        sys::lv_anim_set_duration(&mut a, ms.max(1));
+        sys::lv_anim_set_path_cb(&mut a, Some(sys::lv_anim_path_linear));
+        sys::lv_anim_set_user_data(&mut a, boxed.cast());
+        sys::lv_anim_set_deleted_cb(&mut a, Some(tween_deleted));
+        sys::lv_anim_set_completed_cb(&mut a, completed);
+        // Not early: an object may run two (a value and an entrance),
+        // which LVGL would otherwise take for one replacing the other.
+        sys::lv_anim_set_early_apply(&mut a, false);
+        if sys::lv_anim_start(&a).is_null() {
+            let tw = Box::from_raw(boxed);
+            if !matches!(tw.tween, Tween::Page { .. }) {
+                apply_tween(&tw, TWEEN_END);
+            }
+            return false;
+        }
+    }
+    true
+}
+
+impl<'ui> Obj<'ui> {
+    /// Move a bar's value from `from` to `to` over `ms` (eased).
+    pub fn animate_bar(&self, from: i32, to: i32, ms: u32) {
+        start_tween(self.raw, Tw { obj: self.raw, tween: Tween::Bar { from, to } }, ms, None);
+    }
+
+    /// Move an arc's value from `from` to `to` over `ms` (eased).
+    pub fn animate_arc(&self, from: i32, to: i32, ms: u32) {
+        start_tween(self.raw, Tw { obj: self.raw, tween: Tween::Arc { from, to } }, ms, None);
+    }
+
+    /// Move a chart's series (as added, in order) from one set of
+    /// points to another over `ms`; a point with no `from` is at its
+    /// end value at once.
+    pub fn animate_chart(&self, series: Vec<SeriesTween>, ms: u32) {
+        start_tween(self.raw, Tw { obj: self.raw, tween: Tween::Chart { series } }, ms, None);
+    }
+
+    /// Bring this node in: fade from transparent to its opacity, and
+    /// with `slide` come down from one own height above; from progress
+    /// `from` (0 out, 1 in, eased).
+    pub fn animate_enter(&self, slide: bool, from: f64, ms: u32) {
+        let opa = unsafe { sys::lv_obj_get_style_opa(self.raw, 0) };
+        let from = from.clamp(0.0, 1.0);
+        start_tween(self.raw, Tw { obj: self.raw, tween: Tween::Enter { opa, slide, from } }, ms, None);
+    }
+
+    /// Animate this node's state changes (`:pressed` and back: scale,
+    /// opacity, colors) over `ms`.
+    pub fn set_press_transition(&self, ms: u32) {
+        static PROPS: [sys::lv_style_prop_t; 12] = [
+            sys::_lv_style_id_t_LV_STYLE_BG_OPA as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_BG_COLOR as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_TRANSFORM_SCALE_X as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_TRANSFORM_SCALE_Y as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_TRANSFORM_WIDTH as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_TRANSFORM_HEIGHT as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_OPA as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_BORDER_COLOR as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_TEXT_COLOR as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_RECOLOR as sys::lv_style_prop_t,
+            sys::_lv_style_id_t_LV_STYLE_RECOLOR_OPA as sys::lv_style_prop_t,
+            0,
+        ];
+        if ms == 0 {
+            return;
+        }
+        let dsc = PRESS_TR.with(|t| {
+            let mut t = t.borrow_mut();
+            if let Some((_, d)) = t.iter().find(|(m, _)| *m == ms) {
+                return *d;
+            }
+            let d: &'static mut sys::lv_style_transition_dsc_t = Box::leak(Box::new(unsafe { std::mem::zeroed() }));
+            unsafe {
+                sys::lv_style_transition_dsc_init(d, PROPS.as_ptr(), Some(sys::lv_anim_path_ease_out), ms, 0, std::ptr::null_mut());
+            }
+            t.push((ms, &*d));
+            &*d
+        });
+        unsafe {
+            sys::lv_obj_set_style_transition(self.raw, dsc, 0);
+            sys::lv_obj_set_style_transition(self.raw, dsc, sys::lv_state_t_LV_STATE_PRESSED as sys::lv_style_selector_t);
+        }
+    }
+
+    /// Hidden (`visible = false`).
+    pub fn is_hidden(&self) -> bool {
+        unsafe { sys::lv_obj_is_hidden(self.raw) }
+    }
+}
+
+/// The current tick of LVGL's clock, in ms (what animations run on).
+pub fn tick_ms() -> u32 {
+    unsafe { sys::lv_tick_get() }
+}
+
+/// Before drawing the next page over `screen`: keep what it shows now
+/// (the page being left) for [`run_page_transition`].
+pub fn begin_page_change(screen: &Obj<'_>) {
+    finish_page_transition();
+    let old = (0..screen.child_count()).filter_map(|i| screen.child(i)).map(|c| c.raw).collect();
+    OLD_PAGE.with(|o| *o.borrow_mut() = old);
+}
+
+/// Bring in what was drawn on `screen` since [`begin_page_change`],
+/// over `ms`: fading in over the page being left, or sliding in from
+/// the right (from the left with `back`) while it slides out. The old
+/// page is deleted at the end; taps wait until then.
+pub fn run_page_transition(screen: &Obj<'_>, slide: bool, back: bool, ms: u32) {
+    let old = OLD_PAGE.with(|o| std::mem::take(&mut *o.borrow_mut()));
+    let new: Vec<_> =
+        (0..screen.child_count()).filter_map(|i| screen.child(i)).map(|c| c.raw).filter(|c| !old.contains(c)).collect();
+    let width = unsafe { sys::lv_obj_get_width(screen.raw) };
+    unsafe {
+        // A page moved aside is not something to scroll to (no
+        // scrollbar while it slides).
+        sys::lv_obj_set_scrollable(screen.raw, false);
+        let blocker = sys::lv_obj_create(screen.raw);
+        sys::lv_obj_remove_style_all(blocker);
+        sys::lv_obj_set_size(blocker, Size::Percent(100).to_lvgl(), Size::Percent(100).to_lvgl());
+        PAGE_TR.with(|p| *p.borrow_mut() = Some(PageTr { old, new, blocker }));
+        let dir = if back { -1 } else { 1 };
+        let started = start_tween(
+            blocker,
+            Tw { obj: blocker, tween: Tween::Page { slide, dir, width } },
+            ms,
+            Some(page_tween_completed),
+        );
+        if !started {
+            // No animation to end it: the new page is in at once.
+            end_page_transition();
+        }
+    }
+}
+
+/// A page transition runs (redraws wait for its end).
+pub fn page_transition_running() -> bool {
+    PAGE_TR.with(|p| p.borrow().is_some())
+}
+
+/// Delete the page left behind and the tap blocker; the new page
+/// stays where the transition ends.
+fn end_page_transition() {
+    let Some(tr) = PAGE_TR.with(|p| p.borrow_mut().take()) else { return };
+    unsafe {
+        for n in tr.new {
+            sys::lv_obj_set_style_opa(n, 255, 0);
+            sys::lv_obj_set_style_translate_x(n, 0, 0);
+        }
+        for o in tr.old {
+            sys::lv_obj_delete(o);
+        }
+        let screen = sys::lv_obj_get_parent(tr.blocker);
+        sys::lv_obj_delete(tr.blocker);
+        sys::lv_obj_set_scrollable(screen, true);
+    }
+}
+
+/// End a running page transition now, at its end.
+fn finish_page_transition() {
+    let Some(blocker) = PAGE_TR.with(|p| p.borrow().as_ref().map(|t| t.blocker)) else { return };
+    unsafe { sys::lv_anim_delete(blocker.cast(), None) };
+    end_page_transition();
+}
+
+/// Stop every animation, each at its end (the screen goes to sleep:
+/// nothing animates under the cover).
+pub fn finish_motion() {
+    finish_page_transition();
+    FINISHING.with(|f| f.set(true));
+    unsafe { sys::lv_anim_delete_all() };
+    FINISHING.with(|f| f.set(false));
+}
+
+/// Animations running now (LVGL's, the style transitions included).
+pub fn running_animations() -> u32 {
+    unsafe { sys::lv_anim_count_running() as u32 }
 }
 
 #[cfg(test)]

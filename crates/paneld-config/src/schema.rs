@@ -141,6 +141,10 @@ enum ExpectedType {
     Shadow,
     /// A theme's `background_image`: a `.png` inside its folder.
     Image,
+    /// A motion transition: `<fade|slide|none> [<duration>]` (ADR 0023).
+    Transition,
+    /// A motion duration: `none` or at most 2s.
+    MotionMs,
     /// Any text accepted; no shape check.
     Any,
 }
@@ -845,6 +849,7 @@ const COMMON_UI_KEYS: &[KeyRule] = &[
     KeyRule { name: "class", ty: ExpectedType::IdentOrList, required: false, expr_ok: false },
     KeyRule { name: "background", ty: ExpectedType::Background, required: false, expr_ok: true },
     KeyRule { name: "opacity", ty: ExpectedType::Number, required: false, expr_ok: true },
+    KeyRule { name: "enter", ty: ExpectedType::Transition, required: false, expr_ok: true },
     KeyRule { name: "radius", ty: ExpectedType::Size, required: false, expr_ok: false },
     KeyRule { name: "border", ty: ExpectedType::Str, required: false, expr_ok: false },
     KeyRule { name: "shadow", ty: ExpectedType::Shadow, required: false, expr_ok: false },
@@ -1261,6 +1266,10 @@ pub const BUILTIN_THEME_TOKENS: &[(&str, &str)] = &[
     ("shadow", "none"),
     ("icons", "builtin"),
     ("motion", "reduced"),
+    ("page_transition", "fade 200ms"),
+    ("banner_transition", "fade 200ms"),
+    ("value_transition", "300ms"),
+    ("tap_transition", "80ms"),
 ];
 
 /// A theme's tokens as written (built-ins under it), by name.
@@ -2808,6 +2817,8 @@ fn check_literal(text: &str, ty: ExpectedType) -> Result<(), String> {
         ExpectedType::Background => check_background(text),
         ExpectedType::Shadow => check_shadow(text),
         ExpectedType::Image => check_image(text, "background image"),
+        ExpectedType::Transition => crate::motion::parse_transition(text).map(|_| ()),
+        ExpectedType::MotionMs => crate::motion::parse_ms(text).map(|_| ()),
         ExpectedType::HexColor => parse_color(text)
             .map(|_| ())
             .ok_or_else(|| {
@@ -2952,6 +2963,8 @@ fn type_name(ty: ExpectedType) -> &'static str {
         ExpectedType::Background => "a background",
         ExpectedType::Shadow => "a shadow",
         ExpectedType::Image => "a PNG path",
+        ExpectedType::Transition => "a transition",
+        ExpectedType::MotionMs => "an animation duration",
         ExpectedType::Any => "a value",
     }
 }
@@ -3119,6 +3132,8 @@ fn theme_token_type(key: &str) -> Option<ExpectedType> {
     match key {
         "extends" => Some(ExpectedType::Ident),
         "motion" => Some(ExpectedType::OneOf(&["full", "reduced", "none"])),
+        "page_transition" | "banner_transition" => Some(ExpectedType::Transition),
+        "value_transition" | "tap_transition" => Some(ExpectedType::MotionMs),
         "shadow" => Some(ExpectedType::Shadow),
         // schema.md calls `background_image` an optional path. The
         // themes.md example also writes `background = images/bg.jpg`
@@ -6277,6 +6292,27 @@ theme dark {
     fn theme_motion_bad_keyword_is_flagged() {
         let diags = check_text("theme dark { motion = sometimes }\n");
         assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
+    fn theme_motion_tokens_and_enter_are_checked() {
+        let ok = check_text(
+            "theme t {\n\
+                 motion = full\n\
+                 page_transition = slide 250ms\n\
+                 banner_transition = fade\n\
+                 value_transition = 0.3s\n\
+                 tap_transition = none\n\
+             }\n\
+             page home { row { enter = slide 150ms }; bar { enter = {{ theme.banner_transition }} } }\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        assert_msg(&check_text("theme t { page_transition = wipe 200ms }\n"), "expected a transition");
+        assert_msg(&check_text("theme t { page_transition = fade 5s }\n"), "too long for an animation");
+        assert_msg(&check_text("theme t { banner_transition = fade soon }\n"), "expected a duration");
+        assert_msg(&check_text("theme t { value_transition = slide }\n"), "expected a duration");
+        assert_msg(&check_text("theme t { tap_transition = 3s }\n"), "too long for an animation");
+        assert_msg(&check_text("page home { text { value = x; enter = bounce } }\n"), "expected a transition");
     }
 
     #[test]

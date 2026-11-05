@@ -235,7 +235,7 @@ fn shell_shows_the_alert_banner_and_switches_pages() {
 
     // Nav buttons sit evenly spaced in the bottom bar; the second is
     // in the right half of the screen.
-    let second = shot(&conf, &["--tap", "546,450", "--settle", "100"]);
+    let second = shot(&conf, &["--tap", "546,450", "--settle", "300"]);
     assert!(second.any(blue) && !second.any(green), "nav did not switch to page two");
 }
 
@@ -366,9 +366,9 @@ fn acknowledging_takes_an_alert_off_the_banner() {
     let critical = |p| close(p, [0xd3, 0x2f, 0x2f], 16);
     // The banner (just under the header) opens the alerts page; its
     // first card's first button is Acknowledge.
-    let before = shot(&conf, &["--tap", "400,72", "--settle", "100"]);
+    let before = shot(&conf, &["--tap", "400,72", "--settle", "300"]);
     assert!(before.any(critical), "no critical alert drawn");
-    let after = shot(&conf, &["--tap", "400,72", "--tap", "100,145", "--settle", "100"]);
+    let after = shot(&conf, &["--tap", "400,72", "--tap", "100,145", "--settle", "300"]);
     // The title text stays critical-colored; the full-width banner must
     // be gone: check a pixel in the banner row away from any text.
     assert!(close(before.px(700, 72), [0xd3, 0x2f, 0x2f], 16), "no banner before the ack");
@@ -388,11 +388,11 @@ fn a_due_reminder_is_an_alert_until_done_and_snooze_1w_works() {
     let warning = [0xef, 0x6c, 0x00];
     let banner = |img: &Image| close(img.px(700, 72), warning, 16);
     // Banner opens the alerts page: Done, Snooze 1d, Snooze 1w.
-    let before = shot(&conf, &["--tap", "400,72", "--settle", "100"]);
+    let before = shot(&conf, &["--tap", "400,72", "--settle", "300"]);
     assert!(banner(&before), "no banner for a due reminder");
-    let done = shot(&conf, &["--tap", "400,72", "--tap", "67,163", "--settle", "100"]);
+    let done = shot(&conf, &["--tap", "400,72", "--tap", "67,163", "--settle", "300"]);
     assert!(!done.any(|p| close(p, warning, 16)), "reminder still listed after Done");
-    let snoozed = shot(&conf, &["--tap", "400,72", "--tap", "307,163", "--settle", "100"]);
+    let snoozed = shot(&conf, &["--tap", "400,72", "--tap", "307,163", "--settle", "300"]);
     assert!(!banner(&snoozed), "banner still shown after Snooze 1w");
     assert!(snoozed.any(|p| close(p, warning, 16)), "snoozed reminder must stay listed");
 }
@@ -411,9 +411,9 @@ fn builtin_actions_take_the_gates_of_an_override() {
     .unwrap();
     let banner = |img: &Image| close(img.px(700, 72), [0xd3, 0x2f, 0x2f], 16);
     // Acknowledge, then Cancel: still on the banner.
-    let cancelled = shot(&conf, &["--tap", "400,72", "--tap", "100,145", "--tap", "351,282", "--settle", "150"]);
+    let cancelled = shot(&conf, &["--tap", "400,72", "--tap", "100,145", "--tap", "351,282", "--settle", "300"]);
     assert!(banner(&cancelled), "ack ran without the confirm");
-    let ok = shot(&conf, &["--tap", "400,72", "--tap", "100,145", "--tap", "463,282", "--settle", "150"]);
+    let ok = shot(&conf, &["--tap", "400,72", "--tap", "100,145", "--tap", "463,282", "--settle", "300"]);
     assert!(!banner(&ok), "ack did not run after OK");
 }
 
@@ -1908,7 +1908,7 @@ fn a_tap_on_a_buttons_row_or_big_icon_reaches_the_button() {
     let green = |p| close(p, [0, 0xff, 0], 16);
     for b in [red, blue] {
         let at = format!("{},{}", (b.0 + b.2) / 2, (b.1 + b.3) / 2);
-        let after = shot(&conf, &["--tap", &at, "--settle", "50"]);
+        let after = shot(&conf, &["--tap", &at, "--settle", "300"]);
         assert!(after.any(green), "a tap at {at} on {b:?} did not reach its button");
     }
 }
@@ -2128,7 +2128,7 @@ fn a_theme_folder_replaces_the_shell_and_a_component_with_its_own_assets() {
     assert!(file.abs_diff(montserrat) >= 4, "inter {file} px, montserrat {montserrat} px");
 
     // The left nav works: page two.
-    let two = shot(&conf, &["--tap", "60,90", "--settle", "100"]);
+    let two = shot(&conf, &["--tap", "60,90", "--settle", "300"]);
     assert!(two.any(|p| close(p, [0xff, 0x80, 0], 16)) && !two.any(green), "nav did not switch to page two");
 }
 
@@ -2401,4 +2401,161 @@ fn a_background_image_lies_over_a_gradient_or_image_background() {
     let img = shot(&conf, &["--settle", "50"]);
     assert!(close(img.px(100, 300), [200, 0, 200], 8), "image background under {:?}", img.px(100, 300));
     assert!(close(img.px(700, 300), [0, 200, 0], 8), "image half {:?}", img.px(700, 300));
+}
+
+/// A page with a bar (red, with an `enter`, which must not stop its
+/// value from moving), an arc (green) and a bar chart (magenta) on
+/// `vars.v`, and a button that sets it from 10 to 90, under a theme
+/// with `tokens`.
+fn motion_conf(label: &str, tokens: &str) -> PathBuf {
+    let d = tmp(label);
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "theme t {{ {tokens} }}\n\
+             var v: int = 10\n\
+             page home {{\n\
+                 button {{ width = 200; height = 60; label = go; on_tap {{ set {{ v = 90 }} }} }}\n\
+                 row {{ gap = 20\n\
+                     bar {{ width = 300; height = 20; value = {{{{ vars.v }}}}; color = #ff0000; enter = fade }}\n\
+                     arc {{ width = 120; height = 120; thickness = 12; value = {{{{ vars.v }}}}; color = #00ff00 }}\n\
+                     chart {{ width = 60; height = 120; type = bar; min = 0; max = 100\n\
+                              series {{ values = {{{{ [vars.v] }}}}; color = #ff00ff }} }}\n\
+                 }}\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    conf
+}
+
+/// Pixels of the bar, the arc and the chart.
+fn gauges(img: &Image) -> [usize; 3] {
+    [
+        count(img, |p| close(p, [0xff, 0, 0], 16)),
+        count(img, |p| close(p, [0, 0xff, 0], 16)),
+        count(img, |p| close(p, [0xff, 0, 0xff], 16)),
+    ]
+}
+
+#[test]
+fn value_changes_move_from_the_last_value_and_end_on_the_new_one() {
+    let conf = motion_conf("motion-value", "value_transition = 1000ms");
+    let before = gauges(&shot(&conf, &["--settle", "50"]));
+    let mid_img = shot(&conf, &["--tap", "100,95", "--settle", "20", "--wait", "200"]);
+    // A value change redraws the page in place: no page transition.
+    assert!(close(mid_img.px(30, 80), [0x21, 0x96, 0xf3], 12), "the page faded on a value change: {:?}", mid_img.px(30, 80));
+    let mid = gauges(&mid_img);
+    let end = gauges(&shot(&conf, &["--tap", "100,95", "--settle", "20", "--wait", "1300"]));
+    for i in 0..3 {
+        let (b, m, e) = (before[i], mid[i], end[i]);
+        assert!(b * 3 < e, "gauge {i}: {b} px at 10, {e} px at 90");
+        // Under way: well past the start, not yet at the end.
+        assert!(m > b + (e - b) / 5 && m + (e - b) / 10 < e, "gauge {i} mid-way: {b} < {m} < {e}");
+    }
+    // The same after the change with motion off: at the end at once.
+    let conf = motion_conf("motion-none", "value_transition = 1000ms; motion = none");
+    let mid = gauges(&shot(&conf, &["--tap", "100,95", "--settle", "20", "--wait", "200"]));
+    assert_eq!(mid, end, "motion = none still animates");
+}
+
+/// Two pages: green on the left of `home` with a button to `two`,
+/// blue on the right of `two`.
+fn pages_conf(label: &str, tokens: &str) -> PathBuf {
+    let d = tmp(label);
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "theme t {{ {tokens} }}\n\
+             page home {{ row {{ gap = 200\n\
+                 button {{ width = 160; height = 60; label = go; on_tap {{ goto = two }} }}\n\
+                 rect {{ width = 100; height = 100; background = #00ff00 }} }} }}\n\
+             page two {{ row {{ gap = 400\n\
+                 text {{ value = two }}\n\
+                 rect {{ width = 100; height = 100; background = #0000ff }} }} }}\n"
+        ),
+    )
+    .unwrap();
+    conf
+}
+
+#[test]
+fn navigation_fades_or_slides_the_page_in() {
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    let blue = |p| close(p, [0, 0, 0xff], 16);
+    let tap = ["--tap", "90,90", "--settle", "20", "--wait"];
+    // `none`: the new page at once.
+    let conf = pages_conf("tr-none", "page_transition = none");
+    let img = shot(&conf, &[&tap[..], &["200"]].concat());
+    assert!(img.any(blue) && !img.any(green), "`none` did not switch at once");
+    // `fade`: under way both pages show, blended; then only the new one.
+    let conf = pages_conf("tr-fade", "page_transition = fade 1000ms");
+    let g = bbox(&shot(&conf, &["--settle", "50"]), green).expect("no green on home");
+    let (gx, gy) = ((g.0 + g.2) / 2, (g.1 + g.3) / 2);
+    let mid = shot(&conf, &[&tap[..], &["200"]].concat());
+    let p = mid.px(gx, gy);
+    assert!(!green(p) && p[0] > 0x20 && p[0] < 0xd0, "not fading at {gx},{gy}: {p:?}");
+    let end = shot(&conf, &[&tap[..], &["1300"]].concat());
+    assert!(end.any(blue) && !end.any(green), "fade did not end on the new page");
+    // `slide` needs `motion = full`: under the default `reduced` it
+    // switches at once.
+    let conf = pages_conf("tr-slide-reduced", "page_transition = slide 1000ms");
+    let img = shot(&conf, &[&tap[..], &["200"]].concat());
+    assert!(img.any(blue) && !img.any(green), "a slide ran under `reduced`");
+    // Under `full` the old page moves out to the left, the new one in.
+    let conf = pages_conf("tr-slide", "page_transition = slide 1000ms; motion = full");
+    let mid = shot(&conf, &[&tap[..], &["200"]].concat());
+    let moved = bbox(&mid, green).expect("old page gone mid-slide");
+    assert!(moved.0 + 100 < g.0, "old page did not slide left: {moved:?} vs {g:?}");
+    let end = shot(&conf, &[&tap[..], &["1300"]].concat());
+    assert!(end.any(blue) && !end.any(green), "slide did not end on the new page");
+}
+
+#[test]
+fn the_alert_banner_comes_in_with_the_theme_transition() {
+    let d = tmp("banner-enter");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t { banner_transition = fade 1000ms }\n\
+         var on: bool = false\n\
+         alert hot { when = {{ vars.on }}; severity = critical; title = Hot }\n\
+         page home { button { width = 200; height = 60; label = go; on_tap { set { on = true } } } }\n",
+    )
+    .unwrap();
+    let critical = [0xd3, 0x2f, 0x2f];
+    // The banner sits under the header, before the body.
+    let mid = shot(&conf, &["--tap", "100,95", "--settle", "20", "--wait", "200"]);
+    let end = shot(&conf, &["--tap", "100,95", "--settle", "20", "--wait", "1300"]);
+    let y = (0..end.h).find(|&y| close(end.px(700, y), critical, 16)).expect("no banner");
+    let p = mid.px(700, y + 4);
+    assert!(!close(p, critical, 16) && p[1] < 0xe0, "banner not fading in: {p:?}");
+    // A rebuild during the entrance (another var set) carries it on
+    // from where it was, not at full opacity.
+    let d2 = tmp("banner-rebuild");
+    let conf2 = d2.join("p.conf");
+    std::fs::write(
+        &conf2,
+        "theme t { banner_transition = fade 1000ms }\n\
+         var on: bool = false\n\
+         var n: int = 0\n\
+         alert hot { when = {{ vars.on }}; severity = critical; title = Hot }\n\
+         page home { row { gap = 20\n\
+             button { width = 200; height = 60; label = go; on_tap { set { on = true } } }\n\
+             button { width = 200; height = 60; background = #00ffff; label = {{ string(vars.n) }}; on_tap { set { n = {{ vars.n + 1 }} } } } } }\n",
+    )
+    .unwrap();
+    let shown = shot(&conf2, &["--tap", "100,95", "--settle", "1300"]);
+    let c = bbox(&shown, |p| close(p, [0, 0xff, 0xff], 16)).expect("no second button");
+    let at = format!("{},{}", (c.0 + c.2) / 2, (c.1 + c.3) / 2);
+    // (`--settle` is one setting for every step: the gap goes in `--wait`.)
+    let cut = shot(&conf2, &["--settle", "20", "--tap", "100,95", "--wait", "60", "--tap", &at, "--wait", "40"]);
+    let p = cut.px(700, y + 4);
+    assert!(!close(p, critical, 16) && p[1] < 0xe0, "a rebuild ended the entrance at once: {p:?}");
+    // At once with `motion = none`.
+    std::fs::write(&conf, std::fs::read_to_string(&conf).unwrap().replace("fade 1000ms", "fade 1000ms; motion = none")).unwrap();
+    let img = shot(&conf, &["--tap", "100,95", "--settle", "20", "--wait", "200"]);
+    assert!(close(img.px(700, y + 4), critical, 16), "banner faded under `motion = none`");
 }

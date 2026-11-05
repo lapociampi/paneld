@@ -17,13 +17,14 @@
 //! few lines in [`render::render_node`].
 
 pub mod expr;
+pub mod motion;
 pub mod render;
 pub mod ui;
 
 pub use expr::{eval, Context, EvalError, Value};
 pub use render::{interpolate, render_page, render_toast, resolve_value, set_call_states, set_styles, shows_call, CallState, RunState};
 pub use ui::{
-    hide_sleep_cover, inactive_ms, reset_action_bindings, restore_inputs, set_ask_value, set_asset_dir, set_dialog_backdrop, set_wake_sink, show_sleep_cover,
+    begin_page_change, finish_motion, hide_sleep_cover, idle_hint_ms, inactive_ms, page_transition_running, run_page_transition, running_animations, reset_action_bindings, restore_inputs, set_ask_value, set_asset_dir, set_dialog_backdrop, set_wake_sink, show_sleep_cover,
     snapshot_inputs, trigger_activity, wake, ActionArg, ActionTrigger, Backdrop, EventValue, InlineSetItem, MemDisplay, Ui, UiEvent, WakingSender,
     Window,
 };

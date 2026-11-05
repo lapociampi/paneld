@@ -688,3 +688,90 @@ fn a_display_that_does_not_open_falls_back_and_says_where() {
     assert_eq!(d.eval("alerts.count"), "1");
     assert!(d.log().contains("display: rotation changed; restart paneld to apply"), "{}", d.log());
 }
+
+/// A number field of `ctl --json status`.
+fn status_num(d: &Daemon, field: &str) -> i64 {
+    let s = d.ok(&["--json", "status"]);
+    let at = s.find(&format!("\"{field}\":")).unwrap_or_else(|| panic!("no `{field}` in {s}"));
+    let rest = &s[at + field.len() + 3..];
+    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(rest.len());
+    rest[..end].parse().unwrap()
+}
+
+/// Wait until nothing animates and the loop sleeps its full idle step.
+fn wait_idle(d: &Daemon) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while (status_num(d, "animations"), status_num(d, "idle_ms")) != (0, 1000) {
+        assert!(Instant::now() < deadline, "never idle: {}", d.ok(&["--json", "status"]));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn animations_end_and_the_loop_sleeps_again_and_none_run_while_asleep() {
+    let dir = tmp("motion");
+    let log = dir.join("screen.log");
+    let d = Daemon::start(
+        &dir,
+        &format!(
+            "theme t {{ value_transition = 600ms; page_transition = fade 600ms }}\n\
+             var v: int = 10\n\
+             screen {{\n\
+                 idle = 4s\n\
+                 off = sh -c 'echo off >> \"$$0\"' {log}\n\
+                 on = sh -c 'echo on >> \"$$0\"' {log}\n\
+             }}\n\
+             page home {{ nav = 1; bar {{ width = 200; value = {{{{ vars.v }}}} }} }}\n\
+             page two {{ nav = 2; arc {{ value = {{{{ vars.v }}}} }} }}\n",
+            log = log.display()
+        ),
+    );
+    // Idle: the loop sleeps its whole idle step (IDLE_STEP_MS).
+    wait_idle(&d);
+    // A value change moves the bar: an animation, frames every 33 ms.
+    d.ok(&["set", "vars.v=90"]);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(status_num(&d, "animations") >= 1, "the bar did not animate");
+    assert!(status_num(&d, "idle_ms") <= 33, "no frames while animating");
+    // Then it ends and the loop sleeps as before.
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!((status_num(&d, "animations"), status_num(&d, "idle_ms")), (0, 1000));
+    // The same for a page transition.
+    d.ok(&["goto", "two"]);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(status_num(&d, "animations") >= 1, "the page did not fade in");
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!((status_num(&d, "animations"), status_num(&d, "idle_ms")), (0, 1000));
+    // Asleep: a change is not drawn; on waking it is drawn at its value
+    // at once, with no animation (the banner of the waking alert too).
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while read() != "off\n" {
+        assert!(Instant::now() < deadline, "the screen did not sleep: `{}`", read());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    d.ok(&["set", "vars.v=20"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!((status_num(&d, "animations"), status_num(&d, "idle_ms")), (0, 1000));
+    d.ok(&["alert", "fire", "c", "severity=critical"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while read() != "off\non\n" {
+        assert!(Instant::now() < deadline, "the screen did not wake: `{}`", read());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(status_num(&d, "animations"), 0, "something animated on waking");
+    wait_idle(&d);
+    // The banner is up; a theme switch or a reload (lines moved) does
+    // not bring it in again.
+    d.ok(&["theme", "dark"]);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(status_num(&d, "animations"), 0, "a theme switch replayed something");
+    wait_idle(&d);
+    let conf = std::fs::read_to_string(dir.join("p.conf")).unwrap();
+    std::fs::write(dir.join("p.conf"), format!("# moved\n# down\n{conf}")).unwrap();
+    d.ok(&["reload"]);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(status_num(&d, "animations"), 0, "a reload replayed something");
+    wait_idle(&d);
+}

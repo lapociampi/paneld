@@ -11,6 +11,7 @@ pub mod icons;
 pub mod lex;
 pub mod library;
 pub mod load;
+pub mod motion;
 pub mod overrides;
 pub mod paint;
 pub mod parse;

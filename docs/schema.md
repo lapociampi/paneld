@@ -251,6 +251,7 @@ The theme's `shell` component wraps every page: header, navigation, alert banner
 | `color` | color, expr | Foreground: text, icon, line; the value part of an `arc` or `bar` |
 | `font` | font, expr | `<family> <size> [bold]`, e.g. `roboto 20`, `inter 16 bold`, or a theme font token named bare (`font = font_big`). Family: `roboto` (also `sans`), `open_sans`, `noto_sans`, `montserrat`, `inter`, or a `.ttf` path relative to the config folder, or in a theme folder's `theme.conf` to the theme folder (no `bold` then: name the bold file). Size 6 to 200 px. Unset: the theme's `font` ([ADR 0015](decisions/0015-fonts.md)) |
 | `visible` | bool, expr | |
+| `enter` | transition, expr | `<fade\|slide\|none> [<duration>]` (duration default `200ms`, at most `2s`): how the node comes in when it shows on a page already on screen (it was hidden or not drawn on the last render), e.g. the shell's alert banner (`enter = {{ theme.banner_transition }}`). Not on a page's first render, after a navigation, a wake, a reload or a theme switch; a redraw during it carries it on. `fade` needs the theme's `motion` at `reduced`, `slide` (down from one own height above) at `full` ([Themes](themes.md#motion)) |
 | `enabled` | bool, expr | Disabled: no input, `:disabled` style |
 | `on_tap`, `on_hold` | action | |
 
@@ -299,7 +300,7 @@ Layout blocks are transparent and borderless: only a `background`, `border` or t
 | `qr` | `data` (string, expr), `size` |
 | `spinner` | `size` |
 
-Value changes of `arc`, `bar` and `chart` animate when the theme's motion allows it.
+Value changes of `arc`, `bar` and `chart` animate over the theme's `value_transition` (eased, from the value shown, also when the page is rebuilt mid-way) when its `motion` is `reduced` or `full`; with `none`, or on the first render after the screen woke, they show the new value at once. A chart whose points moved left (a `history` with new points) keeps its line and grows the new points out of the last one ([ADR 0023](decisions/0023-motion.md)).
 
 Built-in icons: `home`, `settings`, `power`, `refresh`, `ok`, `close`, `plus`, `minus`, `edit`, `save`, `trash`, `cut`, `copy`, `paste`, `list`, `bars`, `bell`, `warning`, `eye_open`, `eye_close`, `left`, `right`, `up`, `down`, `prev`, `next`, `play`, `pause`, `stop`, `eject`, `shuffle`, `loop`, `audio`, `video`, `volume`, `volume_max`, `mute`, `image`, `file`, `directory`, `drive`, `sd_card`, `usb`, `upload`, `download`, `wifi`, `bluetooth`, `gps`, `call`, `envelope`, `keyboard`, `backspace`, `new_line`, `charge`, `tint`, `battery_full`, `battery_3`, `battery_2`, `battery_1`, `battery_empty`, `bullet` (LVGL's symbol set).
 
@@ -389,7 +390,7 @@ See [Themes](themes.md) for styles, components and motion. A theme is a `theme <
 | Colors | `background`, `surface`, `text`, `muted`, `accent`, `ok`, `info`, `warning`, `critical` |
 | Fonts | `font_small`, `font`, `font_big`, `font_huge`: font values, e.g. `roboto 16`, `inter 24 bold`; built in `roboto` 12, 16, 24, 32. `font` is the text font of every node that sets none |
 | Sizes | `gap`, `padding`, `radius`, `tap_min` (smallest touch target) |
-| Other | `shadow` (a `shadow` value, default `none`: what `shadow = shadow` draws), `background_image` (optional: a PNG drawn behind every page, `cover`, over the `background` token, which may itself be a color, gradient or image; the shipped shell draws no background of its own), `icons` (`builtin`, or a folder of `<name>.png` icons, section 8.3), `motion`, `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
+| Other | `shadow` (a `shadow` value, default `none`: what `shadow = shadow` draws), `background_image` (optional: a PNG drawn behind every page, `cover`, over the `background` token, which may itself be a color, gradient or image; the shipped shell draws no background of its own), `icons` (`builtin`, or a folder of `<name>.png` icons, section 8.3), `motion` (`full`, `reduced` (default), `none`), `page_transition` (`fade 200ms`), `banner_transition` (`fade 200ms`), `value_transition` (`300ms`), `tap_transition` (`80ms`): see [Themes](themes.md#motion), `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
 
 A theme may add any other token; they are read as `theme.<name>`.
 

@@ -20,7 +20,7 @@ Themes must change much more than colors: background images, fonts, layout, anim
 A theme is a folder ([Themes](../themes.md)) with tokens, styles per building block, state and class, replacement components (so a theme changes layout without touching pages), motion settings, and `extends` for variants.
 
 - Fonts: the binary ships a small set of built-in fonts; TTF files are also supported, rendered at runtime with TinyTTF. Changed by [ADR 0015](0015-fonts.md): the built-in fonts are TTF too.
-- Motion: `full | reduced | none`, default `reduced`.
+- Motion: `full | reduced | none`, default `reduced` (levels and tokens: [ADR 0023](0023-motion.md)).
 - Night: a whole other theme, usually a few lines with `extends`; no separate token-override mechanism.
 
 ## Consequences

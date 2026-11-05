@@ -39,4 +39,10 @@ bool lv_paneld_set_rotation(lv_display_t * disp, int32_t degrees);
  * grows least. For the rotation's changed areas; exposed for tests. */
 void lv_paneld_areas_add(lv_area_t * list, int32_t * n, int32_t max, const lv_area_t * a);
 
+/* How long LVGL's timers, all but the `n_skip` in `skip`, let the
+ * loop sleep from now, at most `cap` ms: what lv_timer_handler would
+ * hint without them (the SDL driver's own timers, to measure the
+ * panel's idle wake rate on a desktop). */
+uint32_t lv_paneld_timers_idle_ms(lv_timer_t * const * skip, uint32_t n_skip, uint32_t cap);
+
 #endif

@@ -79,7 +79,9 @@ pub fn render_page(
             if b.kind.text == "page"
                 && b.name.as_ref().is_some_and(|n| n.text == page_name)
             {
+                crate::motion::begin(page_name, theme_of(ctx));
                 render_page_body(b, doc, ctx, sink, screen);
+                crate::motion::end();
                 return;
             }
         }
@@ -109,16 +111,18 @@ fn render_page_body(
         screen.set_text_color_hex(rgb, opa);
     }
 
+    // The whole page in one holder, which a page transition moves.
+    let holder = screen.new_page_holder();
     // Behind every page, two layers: the theme's `background` (a
     // color, gradient or image) on a backdrop of the screen's size, and
     // its `background_image` over it on the page root, so each has its
     // own background slot.
-    let backdrop = screen.new_container();
+    let backdrop = holder.new_container();
     backdrop.set_size(Size::Percent(100), Size::Percent(100));
     backdrop.set_enabled(false);
     backdrop.set_border(0, None);
     backdrop.set_radius(0);
-    let page_root = screen.new_container();
+    let page_root = holder.new_container();
     page_root.set_size(Size::Percent(100), Size::Percent(100));
     page_root.set_flex_column();
     page_root.set_border(0, None);
@@ -260,10 +264,12 @@ fn expand_repeat(
             return;
         }
     };
-    for item in items {
+    for (i, item) in items.into_iter().enumerate() {
+        crate::motion::push_scope(crate::motion::item_key(&item, i));
         let mut inner = ctx.clone();
         inner.insert(r.binding.text.clone(), item);
         render_item_list(&r.items, doc, &inner, slot, sink, parent);
+        crate::motion::pop_scope();
     }
 }
 
@@ -457,7 +463,11 @@ fn render_node(
             let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
             obj.set_bar_range(min, max);
             if let Some(v) = resolve_num(node, "value", ctx) {
-                obj.set_bar_value(v as i32);
+                let to = (v as i32).clamp(min.min(max), max.max(min));
+                match crate::motion::gauge(node, to) {
+                    Some((from, ms)) => obj.animate_bar(from.clamp(min.min(max), max.max(min)), to, ms),
+                    None => obj.set_bar_value(to),
+                }
             }
             apply_props(node, ctx, sink, &obj);
         }
@@ -476,7 +486,11 @@ fn render_node(
             let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
             obj.set_arc_range(min, max);
             if let Some(v) = resolve_num(node, "value", ctx) {
-                obj.set_arc_value(v as i32);
+                let to = (v as i32).clamp(min.min(max), max.max(min));
+                match crate::motion::gauge(node, to) {
+                    Some((from, ms)) => obj.animate_arc(from.clamp(min.min(max), max.max(min)), to, ms),
+                    None => obj.set_arc_value(to),
+                }
             }
             apply_props(node, ctx, sink, &obj);
         }
@@ -792,7 +806,9 @@ fn expand_component(
     let before = parent.child_count();
     // The call's `on_tap` wins over its root button's `action`.
     ROOT_TAP.with(|t| t.set(has_handler(call, "on_tap")));
+    crate::motion::push_scope((call.kind.span.file, call.kind.span.start));
     render_item_list(&comp.items, doc, &inner_ctx, Some(&slot), sink, parent);
+    crate::motion::pop_scope();
     ROOT_TAP.with(|t| t.set(false));
     // The call's own `on_tap` / `on_hold` act on the component's root
     // object, with args evaluated in the caller's scope (`item`, ...).
@@ -1027,7 +1043,30 @@ fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_
     let tap_call = bind_handlers(node, ctx, sink, obj);
     apply_styles(&node.kind.text, &node.items, true, ctx, obj);
     apply_plain_props(&node.kind.text, &node.items, ctx, obj);
+    apply_motion(node, ctx, obj);
     tap_call
+}
+
+/// Theme motion on a node (ADR 0023): a press shown over
+/// `tap_transition` on what takes taps, and `enter` when the node
+/// appears on the page shown.
+fn apply_motion(node: &Block, ctx: &Context, obj: &Obj<'_>) {
+    let settings = crate::motion::settings();
+    let tappable = node.kind.text == "button" || has_handler(node, "on_tap") || has_handler(node, "on_hold");
+    if tappable && settings.tap_ms() > 0 {
+        obj.set_press_transition(settings.tap_ms());
+    }
+    if let Some((raw, span)) = find_raw(node, "enter") {
+        let text = resolve_scalar(raw, span, ctx);
+        match paneld_config::motion::parse_transition(text.trim()) {
+            Ok(t) => {
+                if let Some((slide, from, ms)) = crate::motion::enter(node, t, obj.is_hidden()) {
+                    obj.animate_enter(slide, from, ms);
+                }
+            }
+            Err(e) => note_bad_value(format!("enter: {e}")),
+        }
+    }
 }
 
 thread_local! {
@@ -1723,11 +1762,25 @@ fn render_chart(node: &Block, ctx: &Context, obj: &Obj<'_>) {
     if ty == Some("area") {
         obj.chart_fill_area();
     }
-    for (values, color) in &series {
-        let tail = shown(values);
-        let mut padded: Vec<Option<i32>> = vec![None; points - tail.len()];
-        padded.extend(tail.iter().map(|v| v.map(scaled)));
-        obj.chart_add_series(color.0, color.1, &padded);
+    let padded: Vec<Vec<Option<i32>>> = series
+        .iter()
+        .map(|(values, _)| {
+            let tail = shown(values);
+            let mut padded: Vec<Option<i32>> = vec![None; points - tail.len()];
+            padded.extend(tail.iter().map(|v| v.map(scaled)));
+            padded
+        })
+        .collect();
+    // Value changes move (schema 8.3) from what the chart showed.
+    let moving = crate::motion::chart(node, &padded);
+    for (i, (_, color)) in series.iter().enumerate() {
+        match &moving {
+            Some((tween, _)) => obj.chart_add_series(color.0, color.1, &tween[i].0),
+            None => obj.chart_add_series(color.0, color.1, &padded[i]),
+        }
+    }
+    if let Some((tween, ms)) = moving {
+        obj.animate_chart(tween, ms);
     }
 }
 

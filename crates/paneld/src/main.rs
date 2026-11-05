@@ -659,6 +659,12 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         live.redraw = true;
         dirty = false;
     }
+    // A page coming in is not redrawn under way: the change shows
+    // when it is in (its end wakes the loop).
+    if dirty && paneld_ui::page_transition_running() {
+        live.redraw = true;
+        dirty = false;
+    }
 
     if dirty && live.pending.is_none() {
         let ctx = build_ctx(
@@ -671,7 +677,24 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         // is typing into a keypad on the same page.
         let typed = paneld_ui::snapshot_inputs();
         let same_page = live.rendered_page == live.current_page;
-        screen.clear_children();
+        // After a sleep everything is drawn as it is now, at once.
+        let instant = std::mem::take(&mut live.instant);
+        if instant {
+            paneld_ui::motion::next_render_instant();
+        }
+        // Only a navigation moves the page (themes.md, "Motion"); a
+        // value change redraws it in place. Not with fonts to free:
+        // the page being left uses them.
+        let transition = if same_page || instant || live.release_fonts {
+            None
+        } else {
+            paneld_ui::motion::Settings::from_theme(Some(&live.theme)).page_transition()
+        };
+        if transition.is_some() {
+            paneld_ui::begin_page_change(screen);
+        } else {
+            screen.clear_children();
+        }
         // After a theme switch: free the old theme's fonts, now that no
         // object uses them (the toast goes too; no dialog is up here),
         // as a reload does. Else switching themes fills the font cache.
@@ -692,6 +715,15 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         if same_page {
             paneld_ui::restore_inputs(&typed);
         }
+        if let Some((slide, ms)) = transition {
+            let back = live.went_back
+                || matches!(
+                    (nav_pos(&live.ui_doc, &live.current_page), nav_pos(&live.ui_doc, &live.rendered_page)),
+                    (Some(to), Some(from)) if to < from
+                );
+            paneld_ui::run_page_transition(screen, slide, back, ms);
+        }
+        live.went_back = false;
         live.rendered_page = live.current_page.clone();
         visible::show(&live.current_page);
     }
@@ -767,6 +799,11 @@ struct LiveState {
     release_fonts: bool,
     /// The sleep cover was touched since the last step.
     touched: bool,
+    /// The screen woke: the next render sets every value at once.
+    instant: bool,
+    /// The last navigation was `goto = back` (a slide comes from the
+    /// left).
+    went_back: bool,
     pin_gate: pin::Gate,
 }
 
@@ -1049,6 +1086,8 @@ fn setup_live_state(
     // reloads do not fill the cache and an edited `.ttf` is read again.
     screen.release_fonts();
     paneld_ui::reset_action_bindings();
+    // A reload: what the old config drew is no guide to the new one.
+    paneld_ui::motion::forget();
     paneld_ui::render_page(&ui_doc, &current_page, &ctx, &event_tx, screen);
     visible::show(&current_page);
 
@@ -1088,6 +1127,8 @@ fn setup_live_state(
         ctl_theme: None,
         release_fonts: false,
         touched: false,
+        instant: false,
+        went_back: false,
         pin_gate,
     })
 }
@@ -1280,6 +1321,7 @@ fn screen_step(live: &mut LiveState) -> bool {
             }
             screen::Effect::Wake => {
                 paneld_ui::hide_sleep_cover();
+                live.instant = true;
                 visible::set_asleep(false);
                 // An alert wake has no touch: restart the idle clock.
                 paneld_ui::trigger_activity();
@@ -1318,6 +1360,8 @@ fn apply_active_theme(live: &mut LiveState) {
     install_visible(&live.doc, &live.ui_doc);
     visible::show(&live.current_page);
     live.redraw = true;
+    // Other components: nothing moves on the switch.
+    paneld_ui::motion::forget();
     // The old theme's fonts go with the old screen, at the next redraw.
     live.release_fonts = true;
 }
@@ -1458,7 +1502,25 @@ fn go_to(live: &mut LiveState, page: &str) -> bool {
         return false;
     }
     live.previous_page = Some(std::mem::replace(&mut live.current_page, target));
+    live.went_back = page == "back";
     true
+}
+
+/// A page's `nav` position: a slide to a page before the one shown
+/// comes from the left.
+fn nav_pos(doc: &paneld_config::parse::Document, page: &str) -> Option<i64> {
+    use paneld_config::parse::{AssignTarget, Item};
+    doc.items.iter().find_map(|item| match item {
+        Item::Block(b) if b.kind.text == "page" && b.name.as_ref().is_some_and(|n| n.text == page) => {
+            b.items.iter().find_map(|it| match it {
+                Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "nav") => {
+                    a.value.text.trim().parse::<i64>().ok()
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    })
 }
 
 /// Finish an action call (schema 5): `goto` on success, and the
@@ -1813,6 +1875,8 @@ fn run_shot(o: ShotOpts) -> ExitCode {
 
     if let Some(page) = &o.page {
         let _ = live.event_tx.send(paneld_ui::UiEvent::Goto { page: page.clone() });
+        // The page asked for is the start: drawn as it is, no transition.
+        live.instant = true;
     }
     settle(&mut live, o.settle_ms);
     for step in &o.taps {
@@ -2123,6 +2187,10 @@ fn handle_request(
             // Event queues of replaced configs still waiting for their
             // worker to finish.
             m.insert("old_queues".to_string(), Value::Int(live.stale_events.len() as i64));
+            // Motion (ADR 0023): animations running, and how long the
+            // loop's last sleep could be (1000 ms when nothing moves).
+            m.insert("animations".to_string(), Value::Int(paneld_ui::running_animations() as i64));
+            m.insert("idle_ms".to_string(), Value::Int(paneld_ui::idle_hint_ms() as i64));
             Ok(Value::Map(m))
         }
         other => Err(ctl::CtlError::msg(format!("unknown command `{other}`"))),

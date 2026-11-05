@@ -5,6 +5,7 @@
 #include "src/display/lv_display_private.h"
 #include "src/misc/lv_area_private.h"
 #include "src/misc/lv_event_private.h"
+#include "src/misc/lv_timer_private.h"
 
 const lv_area_t * lv_paneld_layer_clip_area(const lv_layer_t * layer)
 {
@@ -345,4 +346,22 @@ bool lv_paneld_set_rotation(lv_display_t * disp, int32_t degrees)
     lv_display_add_event_cb(disp, paneld_rot_delete, LV_EVENT_DELETE, NULL);
     lv_obj_invalidate(lv_screen_active());
     return true;
+}
+
+uint32_t lv_paneld_timers_idle_ms(lv_timer_t * const * skip, uint32_t n_skip, uint32_t cap)
+{
+    uint32_t idle = cap;
+    lv_timer_t * t = lv_timer_get_next(NULL);
+    for(; t != NULL; t = lv_timer_get_next(t)) {
+        if(t->paused) continue;
+        bool skipped = false;
+        for(uint32_t i = 0; i < n_skip; i++) {
+            if(skip[i] == t) skipped = true;
+        }
+        if(skipped) continue;
+        uint32_t elapsed = lv_tick_elaps(t->last_run);
+        uint32_t left = t->period > elapsed ? t->period - elapsed : 0;
+        if(left < idle) idle = left;
+    }
+    return idle;
 }
