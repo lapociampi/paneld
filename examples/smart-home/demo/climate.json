@@ -1,0 +1,7 @@
+{"inside": 20.6, "humidity": 48, "heating": true,
+ "rooms": [
+   {"name": "Living room", "temp": 21.1},
+   {"name": "Kitchen",     "temp": 20.4},
+   {"name": "Bedroom",     "temp": 18.7},
+   {"name": "Office",      "temp": 21.8}
+ ]}

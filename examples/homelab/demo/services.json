@@ -1,0 +1,10 @@
+[
+  {"name": "Proxmox",        "icon": "drive",     "state": "ok",       "detail": "3 of 4 VMs up"},
+  {"name": "NAS",            "icon": "sd_card",   "state": "critical", "detail": "pool cold degraded"},
+  {"name": "AdGuard Home",   "icon": "eye_close", "state": "ok",       "detail": "18% blocked today"},
+  {"name": "Home Assistant", "icon": "home",      "state": "ok",       "detail": "42 entities"},
+  {"name": "Jellyfin",       "icon": "video",     "state": "ok",       "detail": "2 streams"},
+  {"name": "Nextcloud",      "icon": "upload",    "state": "ok",       "detail": "v29.0.4"},
+  {"name": "Backups",        "icon": "download",  "state": "warning",  "detail": "last run 27h ago"},
+  {"name": "UPS",            "icon": "charge",    "state": "ok",       "detail": "100%, 38 min"}
+]

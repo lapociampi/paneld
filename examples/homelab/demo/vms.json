@@ -1,0 +1,6 @@
+[
+  {"id": 100, "name": "home-assistant", "status": "running", "cpu": 7,  "mem": 2.1, "mem_max": 4,  "uptime": 1209600},
+  {"id": 101, "name": "media",          "status": "running", "cpu": 34, "mem": 5.6, "mem_max": 8,  "uptime": 1209600},
+  {"id": 102, "name": "nextcloud",      "status": "running", "cpu": 3,  "mem": 3.2, "mem_max": 6,  "uptime": 604800},
+  {"id": 103, "name": "dev-box",        "status": "stopped", "cpu": 0,  "mem": 0,   "mem_max": 16, "uptime": 0}
+]
