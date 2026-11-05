@@ -34,6 +34,13 @@ void lv_paneld_image_cache_drop(const void * src);
  * already rotated, or a display this cannot rotate. */
 bool lv_paneld_set_rotation(lv_display_t * disp, int32_t degrees);
 
+/* Draw `disp` (DRM: DIRECT mode, two write-combined dumb buffers)
+ * into a cached buffer of its size and copy the changed areas into
+ * the driver's buffer on each flush, so they are never read back; see
+ * lv_paneld_set_rotation, which then only turns it. +1 frame of RAM
+ * (1.5 MB at 800x480 XRGB8888). false: not DIRECT, or already done. */
+bool lv_paneld_drm_shadow(lv_display_t * disp);
+
 /* Add area `a` to `list` (`*n` used of `max`): dropped if inside one
  * already listed; when the list is full, joined into the entry it
  * grows least. For the rotation's changed areas; exposed for tests. */
@@ -44,5 +51,10 @@ void lv_paneld_areas_add(lv_area_t * list, int32_t * n, int32_t max, const lv_ar
  * hint without them (the SDL driver's own timers, to measure the
  * panel's idle wake rate on a desktop). */
 uint32_t lv_paneld_timers_idle_ms(lv_timer_t * const * skip, uint32_t n_skip, uint32_t cap);
+
+/* With PANELD_PERF set in the environment, print one line of timings
+ * (us) per drawn frame to stderr; nothing is attached otherwise. Call
+ * after lv_paneld_drm_shadow / lv_paneld_set_rotation. */
+void lv_paneld_perf_attach(lv_display_t * disp);
 
 #endif

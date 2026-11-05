@@ -150,15 +150,24 @@ lv_draw_buf_t * lv_paneld_load_fitted(const char * src, int32_t w, int32_t h, in
     return out;
 }
 
-/* Display rotation (schema 13) for a DIRECT-mode display whose flush
- * callback shows the buffer LVGL drew into (`buf_act`): the DRM
- * driver and paneld's memory display. LVGL's software renderer cannot
- * draw rotated into such a buffer, so LVGL draws upright into one
- * extra logical-size buffer and, on the last flush of a frame, the
- * changed areas are rotated into the panel's buffer (the next of the
- * driver's one or two buffers), which the driver's own flush then
- * shows. With two buffers each one is two frames behind, so the
- * rotated areas are this frame's and the last frame's.
+/* The shadow buffer (DRM, always) and display rotation (schema 13),
+ * for a DIRECT-mode display whose flush callback shows the buffer
+ * LVGL drew into (`buf_act`): the DRM driver and paneld's memory
+ * display. LVGL draws upright into one extra logical-size buffer in
+ * ordinary (cached) memory and, on the last flush of a frame, the
+ * changed areas are copied (rotated, if the display is) into the
+ * panel's buffer (the next of the driver's one or two buffers), which
+ * the driver's own flush then shows. With two buffers each one is two
+ * frames behind, so the copied areas are this frame's and the last
+ * frame's.
+ *
+ * Why always on DRM: the driver's dumb buffers are write-combined
+ * (uncached) on the Pi's vc4. Drawn into directly, every blend and
+ * LVGL's double-buffer sync read them back at uncached speed (a
+ * full-screen fade frame took 100+ ms on a Pi 3B+); here they are only
+ * written, row by row. The driver's wait for the last page flip runs
+ * right before the copy into the buffer it frees, not before LVGL
+ * starts drawing.
  *
  * The display's REFR_START listeners (the DRM driver's: it picks the
  * buffer to show from `buf_act`, and starts the CPU access on a GBM
@@ -175,6 +184,8 @@ typedef struct {
 typedef struct {
     lv_display_t * disp;
     lv_display_flush_cb_t flush;
+    lv_display_flush_wait_cb_t flush_wait;
+    bool rotated;
     lv_draw_buf_t scan[2];
     int scan_cnt;
     int next;
@@ -231,6 +242,16 @@ static void paneld_rot_area(paneld_rot_t * r, lv_draw_buf_t * dst, const lv_area
     uint32_t src_stride = r->logical->header.stride;
     uint32_t dst_stride = dst->header.stride;
     const uint8_t * src = r->logical->data + (size_t)a->y1 * src_stride + (size_t)a->x1 * px;
+    if(lv_display_get_rotation(disp) == LV_DISPLAY_ROTATION_0) {
+        uint8_t * out = dst->data + (size_t)a->y1 * dst_stride + (size_t)a->x1 * px;
+        size_t len = (size_t)lv_area_get_width(a) * px;
+        for(int32_t y = a->y1; y <= a->y2; y++) {
+            lv_memcpy(out, src, len);
+            out += dst_stride;
+            src += src_stride;
+        }
+        return;
+    }
     lv_area_t ra = *a;
     lv_display_rotate_area(disp, &ra);
     uint8_t * out = dst->data + (size_t)ra.y1 * dst_stride + (size_t)ra.x1 * px;
@@ -241,12 +262,19 @@ static void paneld_rot_area(paneld_rot_t * r, lv_draw_buf_t * dst, const lv_area
 static void paneld_rot_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map)
 {
     paneld_rot_t * r = paneld_rot_find(disp);
-    if(r == NULL) return;
+    if(r == NULL) {
+        lv_display_flush_ready(disp);
+        return;
+    }
     paneld_areas_push(&r->cur, area);
     if(!lv_display_flush_is_last(disp)) {
         r->flush(disp, area, px_map);
+        lv_display_flush_ready(disp);
         return;
     }
+    /* The buffer about to be written was on screen until the last page
+     * flip is done (the driver's wait returns at once if it is). */
+    if(r->flush_wait != NULL) r->flush_wait(disp);
     lv_draw_buf_t * dst = &r->scan[r->next];
     r->next = (r->next + 1) % r->scan_cnt;
 
@@ -272,6 +300,8 @@ static void paneld_rot_flush(lv_display_t * disp, const lv_area_t * area, uint8_
 
     r->flush(disp, area, dst->data);
     disp->buf_act = own;
+    /* LVGL may draw the next frame into the logical buffer at once. */
+    lv_display_flush_ready(disp);
 }
 
 static void paneld_rot_delete(lv_event_t * e)
@@ -282,42 +312,38 @@ static void paneld_rot_delete(lv_event_t * e)
     lv_memzero(r, sizeof(*r));
 }
 
-bool lv_paneld_set_rotation(lv_display_t * disp, int32_t degrees)
+/* The logical buffer is new or turned: what the lists hold is in the
+ * old layout. LVGL redraws all of it next (the screen is invalidated);
+ * the last frame's list says all too, so both panel buffers get the
+ * whole of it. */
+static void paneld_rot_restart(paneld_rot_t * r)
 {
-    lv_display_rotation_t rot;
-    switch(degrees) {
-        case 0: rot = LV_DISPLAY_ROTATION_0; break;
-        case 90: rot = LV_DISPLAY_ROTATION_90; break;
-        case 180: rot = LV_DISPLAY_ROTATION_180; break;
-        case 270: rot = LV_DISPLAY_ROTATION_270; break;
-        default: return false;
-    }
-    if(disp == NULL || paneld_rot_find(disp) != NULL) return false;
-    if(rot == LV_DISPLAY_ROTATION_0) return true;
-    /* PARTIAL mode (fbdev): the driver rotates each area itself. */
-    if(disp->render_mode == LV_DISPLAY_RENDER_MODE_PARTIAL) {
-        lv_display_set_rotation(disp, rot);
-        return true;
-    }
+    lv_area_t all = {0, 0, (int32_t)r->logical->header.w - 1, (int32_t)r->logical->header.h - 1};
+    r->cur.n = 0;
+    r->prev.n = 1;
+    r->prev.a[0] = all;
+}
+
+/* Wrap `disp` (DIRECT mode, its buffers and flush callback set) so
+ * LVGL draws into a new logical buffer of `lw` x `lh`. */
+static paneld_rot_t * paneld_rot_wrap(lv_display_t * disp, int32_t lw, int32_t lh)
+{
     if(disp->render_mode != LV_DISPLAY_RENDER_MODE_DIRECT || disp->buf_1 == NULL || disp->flush_cb == NULL) {
-        return false;
+        return NULL;
     }
     paneld_rot_t * r = paneld_rot_find(NULL);
-    if(r == NULL) return false;
+    if(r == NULL) return NULL;
     int starts = 0;
     for(uint32_t i = 0; i < lv_display_get_event_count(disp); i++) {
         if(lv_display_get_event_dsc(disp, i)->filter == LV_EVENT_REFR_START) starts++;
     }
-    if(starts > PANELD_ROT_LISTENERS) return false;
-    int32_t w = lv_display_get_horizontal_resolution(disp);
-    int32_t h = lv_display_get_vertical_resolution(disp);
-    bool swap = rot == LV_DISPLAY_ROTATION_90 || rot == LV_DISPLAY_ROTATION_270;
-    lv_draw_buf_t * logical = lv_draw_buf_create(swap ? h : w, swap ? w : h, lv_display_get_color_format(disp),
-                                                 LV_STRIDE_AUTO);
-    if(logical == NULL) return false;
+    if(starts > PANELD_ROT_LISTENERS) return NULL;
+    lv_draw_buf_t * logical = lv_draw_buf_create(lw, lh, lv_display_get_color_format(disp), LV_STRIDE_AUTO);
+    if(logical == NULL) return NULL;
     lv_memzero(r, sizeof(*r));
     r->disp = disp;
     r->flush = disp->flush_cb;
+    r->flush_wait = disp->flush_wait_cb;
     /* Copies: the display's own draw buffer structs are reused by
      * lv_display_set_buffers, so do not keep pointers to them. */
     r->scan[0] = *disp->buf_1;
@@ -327,6 +353,7 @@ bool lv_paneld_set_rotation(lv_display_t * disp, int32_t degrees)
         r->scan_cnt = 2;
     }
     r->logical = logical;
+    paneld_rot_restart(r);
     for(int32_t i = (int32_t)lv_display_get_event_count(disp) - 1; i >= 0; i--) {
         lv_event_dsc_t * d = lv_display_get_event_dsc(disp, i);
         if(d->filter != LV_EVENT_REFR_START) continue;
@@ -340,10 +367,59 @@ bool lv_paneld_set_rotation(lv_display_t * disp, int32_t degrees)
         r->start_cnt++;
         lv_display_remove_event(disp, i);
     }
-    lv_display_set_rotation(disp, rot);
     lv_display_set_draw_buffers(disp, logical, NULL);
     disp->flush_cb = paneld_rot_flush;
+    /* Waited for in paneld_rot_flush, before the copy. */
+    disp->flush_wait_cb = NULL;
     lv_display_add_event_cb(disp, paneld_rot_delete, LV_EVENT_DELETE, NULL);
+    lv_obj_invalidate(lv_screen_active());
+    return r;
+}
+
+bool lv_paneld_drm_shadow(lv_display_t * disp)
+{
+    if(disp == NULL || paneld_rot_find(disp) != NULL) return false;
+    return paneld_rot_wrap(disp, disp->hor_res, disp->ver_res) != NULL;
+}
+
+bool lv_paneld_set_rotation(lv_display_t * disp, int32_t degrees)
+{
+    lv_display_rotation_t rot;
+    switch(degrees) {
+        case 0: rot = LV_DISPLAY_ROTATION_0; break;
+        case 90: rot = LV_DISPLAY_ROTATION_90; break;
+        case 180: rot = LV_DISPLAY_ROTATION_180; break;
+        case 270: rot = LV_DISPLAY_ROTATION_270; break;
+        default: return false;
+    }
+    if(disp == NULL) return false;
+    paneld_rot_t * r = paneld_rot_find(disp);
+    if(r != NULL && r->rotated) return false;
+    if(rot == LV_DISPLAY_ROTATION_0) return true;
+    /* PARTIAL mode (fbdev): the driver rotates each area itself. */
+    if(r == NULL && disp->render_mode == LV_DISPLAY_RENDER_MODE_PARTIAL) {
+        lv_display_set_rotation(disp, rot);
+        return true;
+    }
+    int32_t w = disp->hor_res;
+    int32_t h = disp->ver_res;
+    bool swap = rot == LV_DISPLAY_ROTATION_90 || rot == LV_DISPLAY_ROTATION_270;
+    int32_t lw = swap ? h : w, lh = swap ? w : h;
+    if(r == NULL) {
+        r = paneld_rot_wrap(disp, lw, lh);
+        if(r == NULL) return false;
+    }
+    else if(swap) {
+        /* A shadowed display: its logical buffer turns. */
+        lv_draw_buf_t * logical = lv_draw_buf_create(lw, lh, lv_display_get_color_format(disp), LV_STRIDE_AUTO);
+        if(logical == NULL) return false;
+        lv_display_set_draw_buffers(disp, logical, NULL);
+        lv_draw_buf_destroy(r->logical);
+        r->logical = logical;
+    }
+    r->rotated = true;
+    lv_display_set_rotation(disp, rot);
+    paneld_rot_restart(r);
     lv_obj_invalidate(lv_screen_active());
     return true;
 }
@@ -364,4 +440,77 @@ uint32_t lv_paneld_timers_idle_ms(lv_timer_t * const * skip, uint32_t n_skip, ui
         if(left < idle) idle = left;
     }
     return idle;
+}
+
+/* PANELD_PERF (docs/deploy.md, Diagnostics): one stderr line per drawn
+ * frame, times in us: gap (ms since the last frame start), pre
+ * (layout and LVGL's buffer sync), render (drawing and the flush,
+ * including the copy and the wait for the last page flip), post, wait
+ * (LVGL's flush waits), total, px (area redrawn). */
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+static uint64_t perf_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static struct {
+    uint64_t prev_start, start, render_start, render_ready, wait_start, wait_sum;
+    uint64_t px;
+} perf;
+
+static void perf_cb(lv_event_t * e)
+{
+    lv_event_code_t c = lv_event_get_code(e);
+    uint64_t now = perf_us();
+    switch(c) {
+        case LV_EVENT_REFR_START:
+            perf.prev_start = perf.start;
+            perf.start = now;
+            perf.render_start = perf.render_ready = 0;
+            perf.wait_sum = 0;
+            perf.px = 0;
+            break;
+        case LV_EVENT_FLUSH_WAIT_START:
+            perf.wait_start = now;
+            break;
+        case LV_EVENT_FLUSH_WAIT_FINISH:
+            perf.wait_sum += now - perf.wait_start;
+            break;
+        case LV_EVENT_RENDER_START: {
+            perf.render_start = now;
+            lv_display_t * d = lv_event_get_target(e);
+            for(uint32_t i = 0; i < d->inv_p; i++)
+                if(!d->inv_area_joined[i]) perf.px += lv_area_get_size(&d->inv_areas[i]);
+            break;
+        }
+        case LV_EVENT_RENDER_READY:
+            perf.render_ready = now;
+            break;
+        case LV_EVENT_REFR_READY:
+            if(perf.render_start) {
+                fprintf(stderr, "perf t=%llu gap=%llu pre=%llu render=%llu post=%llu wait=%llu total=%llu px=%llu\n",
+                        (unsigned long long)perf.start,
+                        (unsigned long long)(perf.prev_start ? (perf.start - perf.prev_start) / 1000 : 0),
+                        (unsigned long long)(perf.render_start - perf.start),
+                        (unsigned long long)(perf.render_ready - perf.render_start),
+                        (unsigned long long)(now - perf.render_ready),
+                        (unsigned long long)perf.wait_sum,
+                        (unsigned long long)(now - perf.start),
+                        (unsigned long long)perf.px);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void lv_paneld_perf_attach(lv_display_t * disp)
+{
+    if(getenv("PANELD_PERF") == NULL) return;
+    lv_display_add_event_cb(disp, perf_cb, LV_EVENT_ALL, NULL);
 }

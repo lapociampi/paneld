@@ -350,6 +350,13 @@ fn run_daemon(config: PathBuf) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `PANELD_PERF` set at start: time page rebuilds (docs/deploy.md,
+/// Diagnostics). Read once.
+fn perf_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PANELD_PERF").is_some())
+}
+
 /// One pass of the main loop after the ctl messages: UI events,
 /// deferred chained calls, source updates, alerts, state file and
 /// (when something changed) a re-render. Shared by the daemon and
@@ -703,6 +710,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     }
 
     if dirty && live.pending.is_none() {
+        let perf_t0 = perf_on().then(std::time::Instant::now);
         let drawn_at = clock::unix_now();
         let ctx = build_ctx(
             &live.source_values,
@@ -763,6 +771,9 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             paneld_ui::run_page_transition(screen, slide, back, ms);
         }
         live.went_back = false;
+        if let Some(t0) = perf_t0 {
+            eprintln!("perf build page={} same={} us={}", live.current_page, same_page, t0.elapsed().as_micros());
+        }
         live.rendered_page = live.current_page.clone();
         RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         visible::show(&live.current_page);

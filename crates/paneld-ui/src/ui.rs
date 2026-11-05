@@ -1032,6 +1032,7 @@ impl Ui {
         if r != sys::lv_result_t_LV_RESULT_OK {
             return None;
         }
+        drm_shadow(display);
         Some(Window { display, _input: None })
     }
 
@@ -4053,6 +4054,19 @@ impl Size {
 
 // ---- Display open fallback and rotation (schema 13, `display`) ----
 
+/// After a DRM display opened: LVGL draws into a cached buffer and
+/// the changed areas are copied into the driver's write-combined
+/// buffers (`lv_paneld_drm_shadow`, docs/deploy.md); then, with
+/// `PANELD_PERF` set, per-frame timings go to stderr.
+#[cfg(feature = "drm")]
+fn drm_shadow(display: *mut sys::lv_display_t) {
+    // SAFETY: a live display of this (UI) thread, just opened.
+    if !unsafe { sys::lv_paneld_drm_shadow(display) } {
+        eprintln!("paneld: display: no shadow buffer; drawing into the DRM buffers");
+    }
+    unsafe { sys::lv_paneld_perf_attach(display) };
+}
+
 /// Rotate `display` by `degrees` (0, 90, 180, 270), right after it
 /// was opened and before the UI is built. Pages then lay out in the
 /// rotated size; pointer input is rotated by LVGL to match. `false`
@@ -4105,6 +4119,7 @@ impl Ui {
             unsafe { sys::lv_display_delete(display) };
             return None;
         }
+        drm_shadow(display);
         Some(Window { display, _input: None })
     }
 

@@ -10,7 +10,7 @@
 #            on it (the unstripped copy is kept as paneld.unstripped)
 #   -- ...   cargo args that replace the default `--features device`
 #
-# Output: target/<target>/release/paneld (stripped).
+# Output: ${CARGO_TARGET_DIR:-target}/<target>/release/paneld (stripped).
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -39,7 +39,7 @@ build() {
         -p paneld --no-default-features --release "$@"
 }
 
-out=target/$target/release/paneld
+out=${CARGO_TARGET_DIR:-target}/$target/release/paneld
 if [ $check = 1 ]; then
     CARGO_PROFILE_RELEASE_STRIP=none build "$@"
     cp "$out" "$out.unstripped"

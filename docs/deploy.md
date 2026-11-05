@@ -172,4 +172,19 @@ remote_kind linux {
 - `journalctl -u paneld -f` -- daemon logs.
 - `paneld check -c /etc/paneld/paneld.conf` -- offline config validation ([Config format](config-format.md)).
 - `paneld shot -c paneld.conf -o page.png [--page P] [--size 800x480] [--rotation 90] [--tap X,Y | --hold X,Y | --wait MS]...` -- render the UI without a display into a PNG, optionally after taps, long presses and pauses. With `--rotation`, `--size` is the panel's and the PNG and the tap points are the panel's too, as on the device. Sources and touched actions run for real; the alert state file is not opened.
+- `PANELD_PERF=1` in the daemon's environment (e.g. a test run by hand with the service stopped: `sudo -u paneld env PANELD_PERF=1 PANELD_SOCK=/tmp/x.sock paneld -c ...`) prints timings to stderr; read once at start, nothing is timed without it. On DRM, one line per drawn frame, `perf t= gap= pre= render= post= wait= total= px=`, times in microseconds unless noted:
+
+  | Field | Meaning |
+  | --- | --- |
+  | `t` | Frame start, `CLOCK_MONOTONIC` |
+  | `gap` | Milliseconds since the last frame started; about 33 while something animates (30 fps) |
+  | `pre` | Layout and LVGL's buffer sync before drawing; large on the first frame of a new page |
+  | `render` | Drawing, plus the flush: the wait for the last page flip and the copy of the changed areas into the panel buffer |
+  | `post` | After drawing, until the frame ends |
+  | `wait` | LVGL's own flush waits; about 0 on DRM, since the flip wait is inside `render` |
+  | `total` | Whole frame; well under 33000 for a smooth animation |
+  | `px` | Pixels redrawn (384000 is all of 800x480) |
+
+  And one line per page rebuild: `perf build page=<page> same=<true: a value change, false: navigation> us=<time to build it>`.
+- Memory: on DRM, LVGL draws into a shadow buffer of one frame (1.5 MB at 800x480) that is copied into the panel's buffers ([ADR 0012](decisions/0012-display-input.md)); count it in the RSS.
 - `paneld ctl status` / `check` / `reload` / `eval '<cel>'` / `set vars.x=1` / `goto <page>` / `alert fire|resolve|ack|snooze <id>` / `reminder done <name>` -- talk to a running daemon over its Unix socket at `$PANELD_SOCK` (set to `/run/paneld/paneld.sock` by the service file; mode 0660; without it `$XDG_RUNTIME_DIR/paneld.sock`, else `/tmp/paneld-<uid>/paneld.sock` in a directory only that user can open). A second daemon refuses to start on a socket that a running one answers on. `--json` prints the raw replies ([ADR 0014](decisions/0014-ctl-protocol-state-file.md)); scripts can also speak the JSON lines directly, e.g. with `socat`.

@@ -15,9 +15,11 @@ paneld is one native process: Rust and [LVGL](https://lvgl.io), drawing straight
 | | |
 | --- | --- |
 | Binary | one static file, about 3.1 MB (fonts and icons included) |
-| Memory | about 4 MB resident (RSS), with six live sources polling |
+| Memory | about 5.5 MB resident (RSS), with six live sources polling |
 | CPU | about 0.4% of one core, averaged over 10 minutes of normal running |
 | Start | the screen is open about 0.1 s after launch |
+| Drawing | a full 800x480 redraw in about 7 ms; page transitions at about 30 frames per second |
+| Touch | visible feedback within about 5 ms of a touch reaching paneld |
 
 Idle means asleep: with nothing changing, paneld waits in `poll` and wakes about once a second for its clocks. A page only redraws when a value it shows changes, sources can poll only while their page is on screen, and after a while without a touch the screen dims and turns off (through your backlight commands; see [Deploy](docs/deploy.md)).
 
