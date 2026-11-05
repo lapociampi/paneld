@@ -58,8 +58,8 @@
  * Fonts
  * --------------------------------------------------------------------- */
 
-/* A few Montserrat sizes to match the theme tokens (font_small / font /
- * font_big / font_huge). Custom fonts come in through TinyTTF. */
+/* Bitmap Montserrat sizes for the symbol glyphs: icons, and the fallback
+ * of every TTF font (ADR 0015). Text is drawn in TTF through TinyTTF. */
 #define LV_FONT_MONTSERRAT_12   1
 #define LV_FONT_MONTSERRAT_14   1
 #define LV_FONT_MONTSERRAT_16   1
@@ -68,7 +68,7 @@
 #define LV_FONT_MONTSERRAT_32   1
 #define LV_FONT_DEFAULT         LV_FONT_DEFAULT_MONTSERRAT_16
 
-/* TinyTTF for user fonts dropped into a theme folder (ADR 0015). */
+/* TinyTTF for the built-in and theme TTF fonts (ADR 0015). */
 #define LV_USE_TINY_TTF         1
 #define LV_TINY_TTF_FILE_SUPPORT 1
 

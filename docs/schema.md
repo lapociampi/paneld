@@ -249,7 +249,7 @@ The theme's `shell` component wraps every page: header, navigation, alert banner
 | `border` | `<width> <color>` | |
 | `shadow` | `<size> <color> [<x> <y>]` | |
 | `color` | color, expr | Foreground: text, icon, line; the value part of an `arc` or `bar` |
-| `font` | font, expr | `<family> <size> [bold]`, e.g. `roboto 20`, or a theme font token ([ADR 0015](decisions/0015-fonts.md)) |
+| `font` | font, expr | `<family> <size> [bold]`, e.g. `roboto 20`, `inter 16 bold`, or a theme font token named bare (`font = font_big`). Family: `roboto` (also `sans`), `open_sans`, `noto_sans`, `montserrat`, `inter`, or a `.ttf` path relative to the config folder (no `bold` then: name the bold file). Size 6 to 200 px. Unset: the theme's `font` ([ADR 0015](decisions/0015-fonts.md)) |
 | `visible` | bool, expr | |
 | `enabled` | bool, expr | Disabled: no input, `:disabled` style |
 | `on_tap`, `on_hold` | action | |
@@ -370,7 +370,7 @@ See [Themes](themes.md) for the folder, styles, components and motion. Tokens ev
 | Group | Tokens |
 | --- | --- |
 | Colors | `background`, `surface`, `text`, `muted`, `accent`, `ok`, `info`, `warning`, `critical` |
-| Fonts | `font_small`, `font`, `font_big`, `font_huge`: font values with size, e.g. `roboto 16` |
+| Fonts | `font_small`, `font`, `font_big`, `font_huge`: font values, e.g. `roboto 16`, `inter 24 bold`; built in `roboto` 12, 16, 24, 32. `font` is the text font of every node that sets none |
 | Sizes | `gap`, `padding`, `radius`, `tap_min` (smallest touch target) |
 | Other | `shadow`, `background_image` (optional), `icons` (`builtin`, or a folder of `<name>.png` icons, section 8.3), `motion`, `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
 

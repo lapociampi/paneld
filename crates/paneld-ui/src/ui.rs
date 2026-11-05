@@ -534,6 +534,182 @@ pub fn asset_exists(path: &str) -> bool {
     ASSET_DIR.with(|d| d.borrow().join(path).is_file())
 }
 
+/// The compiled bitmap Montserrat nearest to `size` px.
+fn bitmap_font(size: u16) -> *const sys::lv_font_t {
+    let sizes = paneld_config::icons::FONT_SIZES;
+    let px = *sizes.iter().min_by_key(|s| (i32::from(**s) - i32::from(size)).abs()).unwrap_or(&16);
+    // SAFETY: taking the address of LVGL's static font descriptors.
+    unsafe {
+        match px {
+            12 => &sys::lv_font_montserrat_12,
+            14 => &sys::lv_font_montserrat_14,
+            20 => &sys::lv_font_montserrat_20,
+            24 => &sys::lv_font_montserrat_24,
+            32 => &sys::lv_font_montserrat_32,
+            _ => &sys::lv_font_montserrat_16,
+        }
+    }
+}
+
+/// The built-in families as TTF, regular and bold (`fonts/README.md`).
+fn builtin_ttf(family: paneld_config::fonts::Builtin, bold: bool) -> &'static [u8] {
+    use paneld_config::fonts::Builtin as B;
+    match (family, bold) {
+        (B::Roboto, false) => include_bytes!("../fonts/roboto-regular.ttf"),
+        (B::Roboto, true) => include_bytes!("../fonts/roboto-bold.ttf"),
+        (B::OpenSans, false) => include_bytes!("../fonts/opensans-regular.ttf"),
+        (B::OpenSans, true) => include_bytes!("../fonts/opensans-bold.ttf"),
+        (B::NotoSans, false) => include_bytes!("../fonts/notosans-regular.ttf"),
+        (B::NotoSans, true) => include_bytes!("../fonts/notosans-bold.ttf"),
+        (B::Montserrat, false) => include_bytes!("../fonts/montserrat-regular.ttf"),
+        (B::Montserrat, true) => include_bytes!("../fonts/montserrat-bold.ttf"),
+        (B::Inter, false) => include_bytes!("../fonts/inter-regular.ttf"),
+        (B::Inter, true) => include_bytes!("../fonts/inter-bold.ttf"),
+    }
+}
+
+/// At most this many TTF fonts (family, weight, size) are live. A font
+/// is kept while any object may point at it, so fonts are only freed
+/// all at once, by [`Obj::release_fonts`] when a config is (re)loaded
+/// and the old screen is gone; until then, past the bound a new one
+/// draws as bitmap Montserrat. A theme uses four; 32 leaves room for
+/// pages that set their own.
+const MAX_FONTS: usize = 32;
+
+/// Glyph bitmaps a font keeps rendered: about 256 KB worth at its size,
+/// from 4 glyphs (at 200 px) to 128 (LVGL's default; Latin-1 text
+/// rarely uses more distinct glyphs on one screen).
+fn glyph_cache_size(size: u16) -> usize {
+    (256 * 1024 / (usize::from(size) * usize::from(size))).clamp(4, 128)
+}
+
+/// A font in the cache: what it was made from (a file font by its
+/// canonical path, so `a.ttf` and `./a.ttf` are one font).
+#[derive(PartialEq, Eq)]
+struct FontKey {
+    family: paneld_config::fonts::Family,
+    bold: bool,
+    size: u16,
+}
+
+struct FontEntry {
+    key: FontKey,
+    font: *mut sys::lv_font_t,
+    /// A file font's bytes: TinyTTF reads glyphs from them, so they are
+    /// freed only after the font.
+    _data: Option<Box<[u8]>>,
+}
+
+#[derive(Default)]
+struct FontCache {
+    entries: Vec<FontEntry>,
+    /// Problems already logged (each once, at most [`MAX_FONTS`]).
+    logged: Vec<String>,
+}
+
+thread_local! {
+    /// TinyTTF fonts by (family, weight, size), until the next
+    /// [`Obj::release_fonts`]; UI thread only, like every LVGL object.
+    static FONTS: std::cell::RefCell<FontCache> = std::cell::RefCell::new(FontCache::default());
+}
+
+fn log_font_once(msg: String) {
+    FONTS.with(|c| {
+        let logged = &mut c.borrow_mut().logged;
+        if logged.len() < MAX_FONTS && !logged.contains(&msg) {
+            eprintln!("paneld: {msg}");
+            logged.push(msg);
+        }
+    });
+}
+
+/// What a built-in family falls back to for glyphs it lacks: Roboto,
+/// Open Sans and Noto Sans have no arrows, Montserrat of the same size
+/// and weight has. Everything ends in the bitmap Montserrat, which
+/// holds LVGL's symbols (icons in text, the keypad's backspace and OK).
+fn font_fallback(font: &paneld_config::fonts::Font) -> *const sys::lv_font_t {
+    use paneld_config::fonts::{Builtin, Family, Font};
+    match font.family {
+        Family::Builtin(Builtin::Roboto | Builtin::OpenSans | Builtin::NotoSans) => {
+            let m = Font { family: Family::Builtin(Builtin::Montserrat), ..font.clone() };
+            ttf_font(&m).unwrap_or_else(|| bitmap_font(font.size))
+        }
+        _ => bitmap_font(font.size),
+    }
+}
+
+/// The TinyTTF font for `font`, created on first use; `None` (logged
+/// once) when it cannot be made.
+fn ttf_font(font: &paneld_config::fonts::Font) -> Option<*const sys::lv_font_t> {
+    use paneld_config::fonts::Family;
+    // A file font: read whole from inside the config folder.
+    let (family, data) = match &font.family {
+        Family::Builtin(_) => (font.family.clone(), None),
+        Family::File(p) => {
+            let dir = ASSET_DIR.with(|d| d.borrow().clone());
+            let full = match paneld_config::fonts::resolve_file(&dir, p) {
+                Ok(full) => full,
+                Err(e) => {
+                    log_font_once(format!("{e}; drawn in Montserrat"));
+                    return None;
+                }
+            };
+            (Family::File(full.to_string_lossy().into_owned()), Some(full))
+        }
+    };
+    let key = FontKey { family, bold: font.bold, size: font.size };
+    let found = FONTS.with(|c| {
+        let c = c.borrow();
+        let hit = c.entries.iter().find(|e| e.key == key).map(|e| e.font as *const sys::lv_font_t);
+        (hit, c.entries.len())
+    });
+    match found {
+        (Some(f), _) => return Some(f),
+        (None, n) if n >= MAX_FONTS => {
+            log_font_once(format!("more than {MAX_FONTS} fonts in use; more are drawn in Montserrat"));
+            return None;
+        }
+        _ => {}
+    }
+    // Made before this font, so it is in the cache already.
+    let fallback = font_fallback(font);
+    let bytes: Option<Box<[u8]>> = match &data {
+        None => None,
+        Some(full) => match paneld_config::fonts::read_file(full) {
+            Ok(b) => Some(b.into_boxed_slice()),
+            Err(e) => {
+                log_font_once(format!("{e}; drawn in Montserrat"));
+                return None;
+            }
+        },
+    };
+    let ttf: &[u8] = match (&font.family, &bytes) {
+        (Family::Builtin(b), _) => builtin_ttf(*b, font.bold),
+        (_, Some(b)) => b,
+        (Family::File(_), None) => return None,
+    };
+    // SAFETY: `ttf` is static or kept in the entry with the font, and
+    // freed after it. TinyTTF returns NULL for a file without the
+    // tables it needs; past that stb_truetype trusts the file, which is
+    // why a font file must be inside the config folder.
+    let f = unsafe {
+        sys::lv_tiny_ttf_create_data_ex(
+            ttf.as_ptr().cast(),
+            ttf.len(),
+            i32::from(font.size),
+            sys::lv_font_kerning_t_LV_FONT_KERNING_NONE,
+            glyph_cache_size(font.size),
+        )
+    };
+    if f.is_null() {
+        log_font_once(format!("font {:?} could not be read as TTF; drawn in Montserrat", key.family));
+        return None;
+    }
+    unsafe { (*f).fallback = fallback };
+    FONTS.with(|c| c.borrow_mut().entries.push(FontEntry { key, font: f, _data: bytes }));
+    Some(f as *const _)
+}
+
 /// Width and height from a PNG's header; `None` (with a log line) for
 /// a file that is missing or not a PNG.
 fn png_size(path: &std::path::Path) -> Option<(u32, u32)> {
@@ -2379,23 +2555,41 @@ impl<'ui> Obj<'ui> {
         }
     }
 
-    /// Pick one of the compiled Montserrat font sizes for this
-    /// object. Returns `false` if the requested size isn't compiled
-    /// into our LVGL build (see `lv_conf.h`).
-    pub fn set_font_size(&self, size: u16) -> bool {
-        let font: *const sys::lv_font_t = unsafe {
-            match size {
-                12 => &sys::lv_font_montserrat_12,
-                14 => &sys::lv_font_montserrat_14,
-                16 => &sys::lv_font_montserrat_16,
-                20 => &sys::lv_font_montserrat_20,
-                24 => &sys::lv_font_montserrat_24,
-                32 => &sys::lv_font_montserrat_32,
-                _ => return false,
-            }
-        };
-        unsafe { sys::lv_obj_set_style_text_font(self.raw, font, sel()) };
-        true
+    /// The bitmap Montserrat nearest to `size` for this object (the
+    /// sizes in `lv_conf.h`, [`paneld_config::icons::FONT_SIZES`]).
+    /// Icons use it: those glyphs are only in the bitmap fonts.
+    pub fn set_font_size(&self, size: u16) {
+        unsafe { sys::lv_obj_set_style_text_font(self.raw, bitmap_font(size), sel()) };
+    }
+
+    /// Text in `font` (ADR 0015): a built-in or theme TTF drawn by
+    /// TinyTTF, created on first use and kept (see [`FONTS`]). A font
+    /// that cannot be loaded draws as the bitmap Montserrat nearest its
+    /// size (logged once).
+    pub fn set_font(&self, font: &paneld_config::fonts::Font) {
+        let f = ttf_font(font).unwrap_or_else(|| bitmap_font(font.size));
+        unsafe { sys::lv_obj_set_style_text_font(self.raw, f, sel()) };
+    }
+
+    /// Free every TTF font, so a reloaded config starts with an empty
+    /// cache (and sees edited `.ttf` files). Call on the screen after
+    /// its children and the top layer's are deleted: the fonts the
+    /// screen and the top layer have themselves are reset here, and no
+    /// other object may still point at one.
+    pub fn release_fonts(&self) {
+        let default = bitmap_font(16);
+        unsafe {
+            sys::lv_obj_set_style_text_font(self.raw, default, 0);
+            sys::lv_obj_set_style_text_font(sys::lv_layer_top(), default, 0);
+        }
+        let entries = FONTS.with(|c| std::mem::take(&mut c.borrow_mut().entries));
+        // Fonts falling back to others first; the bytes go after.
+        for e in entries.into_iter().rev() {
+            // SAFETY: made by `lv_tiny_ttf_create_data_ex`, and (per the
+            // caller) used by no object; a font only falls back to one
+            // made before it, which is destroyed after it.
+            unsafe { sys::lv_tiny_ttf_destroy(e.font) };
+        }
     }
 
     pub fn set_text_align_left(&self) {

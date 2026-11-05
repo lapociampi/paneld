@@ -2,6 +2,7 @@
 title: "Requirements"
 description: "What paneld is, what it does and what it deliberately leaves out."
 date: 2026-10-29
+updated: 2026-11-05
 tags: [paneld, requirements]
 series: paneld
 order: 1
@@ -68,7 +69,7 @@ Details: [Themes](themes.md) ([ADR 0008](decisions/0008-themes.md)).
 
 - A theme is a folder: tokens (colors, fonts, sizes, spacing, radius, shadows, background image), styles per building block, state and class, replacement components (so it can change the layout), motion, and `extends` for variants.
 - Components use the theme's tokens (`theme.critical`), not raw values, so a theme restyles the whole UI.
-- Fonts: five built-in families (Roboto, Open Sans, Noto Sans, Montserrat, Lato) and any TTF from the theme, rendered at runtime ([ADR 0015](decisions/0015-fonts.md)).
+- Fonts: five built-in families (Roboto, Open Sans, Noto Sans, Montserrat, Inter) and any TTF from the theme, rendered at runtime ([ADR 0015](decisions/0015-fonts.md)).
 - Motion: `full | reduced | none`, default `reduced`.
 - One theme is active; a night theme takes over in the screen's night hours. Every switch is validated first.
 - The program ships a light and a dark theme.

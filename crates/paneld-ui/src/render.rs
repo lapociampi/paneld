@@ -99,6 +99,11 @@ fn render_page_body(
     pctx.insert("page".into(), page_info(page, ctx));
     pctx.insert("nav".into(), nav_entries(doc, page, ctx));
 
+    // The theme's `font` is the text font of everything on the page,
+    // the dialogs on the top layer included; a node's `font` wins.
+    apply_font(screen, "font", theme_of(ctx));
+    apply_font(&screen.top_layer(), "font", theme_of(ctx));
+
     let page_root = screen.new_container();
     page_root.set_size(Size::Percent(100), Size::Percent(100));
     page_root.set_flex_column();
@@ -629,6 +634,9 @@ thread_local! {
     /// every render).
     static UNKNOWN_ICONS: std::cell::RefCell<std::collections::HashSet<String>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Font values already reported as unusable (same bound).
+    static BAD_FONTS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 const UNKNOWN_ICONS_MAX: usize = 32;
@@ -647,12 +655,7 @@ fn new_icon<'ui>(parent: &Obj<'ui>, name: &str, size: Option<u16>, ctx: &Context
         Some(Value::Map(t)) => Some(t),
         _ => None,
     };
-    let size = size.unwrap_or_else(|| {
-        theme
-            .and_then(|t| t.get("font"))
-            .and_then(|f| extract_font_size(&f.to_display_string()))
-            .unwrap_or(16)
-    });
+    let size = size.unwrap_or_else(|| theme_font_size(theme).unwrap_or(16));
     let folder = theme.and_then(|t| t.get("icons")).map(|v| v.to_display_string()).unwrap_or_default();
     let folder = folder.trim().trim_end_matches('/');
     if !folder.is_empty() && folder != "builtin" && paneld_config::icons::is_file_name(name) {
@@ -1403,17 +1406,10 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
                 }
             }
             "font" => {
-                // Accept `<family> <size> [bold]` and pick the
-                // compiled Montserrat at that size, ignoring the
-                // family token for now (TinyTTF-loaded fonts come
-                // in a later phase). Falls back silently if the
-                // size isn't compiled in.
                 let resolved = resolve_expr_value(value, a.value.span, ctx)
                     .map(|v| v.to_display_string())
                     .unwrap_or_else(|| value.to_string());
-                if let Some(size) = extract_font_size(&resolved) {
-                    obj.set_font_size(size);
-                }
+                apply_font(obj, &resolved, theme_of(ctx));
             }
             // On `row` / `column` (and `scroll`) `align` places the
             // children; it is handled where those are built.
@@ -1487,15 +1483,49 @@ fn resolve_num(node: &Block, key: &str, ctx: &Context) -> Option<f64> {
     }
 }
 
-/// Pull the size integer out of a `font` value such as
-/// `roboto 20`, `montserrat 16 bold`, `fonts/Inter.ttf 24`.
-fn extract_font_size(s: &str) -> Option<u16> {
-    for tok in s.split_whitespace() {
-        if let Ok(n) = tok.parse::<u16>() {
-            return Some(n);
+type Theme = std::collections::BTreeMap<String, Value>;
+
+fn theme_of(ctx: &Context) -> Option<&Theme> {
+    match ctx.get("theme") {
+        Some(Value::Map(t)) => Some(t),
+        _ => None,
+    }
+}
+
+/// The font a `font` value means (ADR 0015): `<family> <size> [bold]`,
+/// or a theme font token named bare (`font_big`).
+fn resolve_font(text: &str, theme: Option<&Theme>) -> Result<paneld_config::fonts::Font, String> {
+    let text = text.trim();
+    if paneld_config::fonts::TOKENS.contains(&text) {
+        let token = theme.and_then(|t| t.get(text)).map(|v| v.to_display_string()).unwrap_or_default();
+        return paneld_config::fonts::parse(&token).map_err(|e| format!("theme token `{text}`: {e}"));
+    }
+    paneld_config::fonts::parse(text)
+}
+
+/// Set `obj`'s text font from a `font` value. One that does not parse
+/// (an expression's result: a literal is checked) draws in the bitmap
+/// Montserrat at the size it names, if any, and is logged once.
+fn apply_font(obj: &Obj<'_>, text: &str, theme: Option<&Theme>) {
+    match resolve_font(text, theme) {
+        Ok(font) => obj.set_font(&font),
+        Err(e) => {
+            BAD_FONTS.with(|b| {
+                let mut b = b.borrow_mut();
+                if b.len() < UNKNOWN_ICONS_MAX && b.insert(e.clone()) {
+                    eprintln!("paneld: font: {e}; drawn in Montserrat");
+                }
+            });
+            if let Some(n) = text.split_whitespace().find_map(|t| t.parse::<u16>().ok()) {
+                obj.set_font_size(n);
+            }
         }
     }
-    None
+}
+
+/// The size of the theme's `font` token, the default for an icon.
+fn theme_font_size(theme: Option<&Theme>) -> Option<u16> {
+    resolve_font("font", theme).ok().map(|f| f.size)
 }
 
 fn find_simple<'a>(node: &'a Block, key: &str) -> Option<&'a str> {

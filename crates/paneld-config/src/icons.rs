@@ -68,8 +68,9 @@ pub const BUILTIN: &[(&str, char)] = &[
     ("bullet", '\u{2022}'),
 ];
 
-/// The Montserrat sizes compiled in (`lv_conf.h`); an icon takes the
-/// nearest one, and above the largest it is scaled up to [`MAX_SIZE`].
+/// The bitmap Montserrat sizes in `lv_conf.h`, which carry the symbol
+/// glyphs: an icon takes the nearest one (above the largest it is
+/// scaled up to [`MAX_SIZE`]), and so does a TTF font as its fallback.
 pub const FONT_SIZES: &[u16] = &[12, 14, 16, 20, 24, 32];
 
 /// The largest icon `size` drawn: the 32 px glyph scaled up 4 times.
@@ -106,7 +107,7 @@ pub fn suggest(name: &str) -> Option<&'static str> {
 }
 
 /// Levenshtein distance (short ASCII names).
-fn distance(a: &str, b: &str) -> usize {
+pub(crate) fn distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.chars().enumerate() {

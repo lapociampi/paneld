@@ -72,7 +72,8 @@ pub fn styles(doc: &Document, theme: Option<&str>) -> BTreeMap<String, Vec<Item>
 
 /// The built-in token set: every token schema section 11 requires.
 /// Light, matching LVGL's default theme so widgets that are not
-/// themed yet still fit in. Fonts are the compiled Montserrat sizes.
+/// themed yet still fit in. Fonts are Roboto (ADR 0015) at 12, 16, 24
+/// and 32 px.
 fn builtin_tokens() -> BTreeMap<String, Value> {
     paneld_config::schema::BUILTIN_THEME_TOKENS
         .iter()

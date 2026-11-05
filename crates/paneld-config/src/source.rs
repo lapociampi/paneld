@@ -104,6 +104,12 @@ impl SourceMap {
         &self.files[id.0 as usize].path
     }
 
+    /// The folder of the first file added (the root config): where a
+    /// relative asset path in the config is read from.
+    pub fn root_dir(&self) -> Option<&Path> {
+        self.files.first().map(|f| f.path.parent().unwrap_or(Path::new("")))
+    }
+
     pub fn text(&self, id: FileId) -> &str {
         &self.files[id.0 as usize].text
     }

@@ -74,9 +74,11 @@ A raw value on a node ignores the theme; prefer tokens.
 
 Details: [ADR 0015](decisions/0015-fonts.md).
 
-- **Built in:** Roboto (the default, also `sans`), Open Sans, Noto Sans, Montserrat and Lato, regular and bold, Latin-1, rendered at any size by LVGL's TinyTTF.
-- **From the theme:** any `.ttf` in the theme folder.
+- **Built in:** Roboto (the default, also `sans`), Open Sans, Noto Sans, Montserrat and Inter, regular and bold, Latin-1, rendered at any size (6 to 200 px) by LVGL's TinyTTF.
+- **From the theme:** any `.ttf` file of at most 4 MiB; until theme folders are loaded, the path is relative to the config folder and must stay inside it (symlinks included). An edited file is read again when the config reloads. `bold` does not apply to a file: name the bold file.
 - A font value is `<family> <size> [bold]`: `font = roboto 20`, `font_big = montserrat 32 bold`, `font = fonts/Inter.ttf 18`.
+- The theme's `font` is the text font of everything that sets none; a node's `font` can also name a token bare: `font = font_big`.
+- LVGL's symbol glyphs (icons inside text, the keypad's keys) are not in the TTF files; they come from a bitmap Montserrat of the nearest size, each font's last fallback. Roboto, Open Sans and Noto Sans have no arrows and take them from Montserrat.
 
 ## Motion
 

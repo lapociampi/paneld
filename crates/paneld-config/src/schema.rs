@@ -130,6 +130,9 @@ enum ExpectedType {
     /// An icon name (schema 8.3): a built-in, or any name when the
     /// active theme has an `icons` folder (its file may supply it).
     Icon,
+    /// A font value (ADR 0015): `<family> <size> [bold]`, or a bare
+    /// theme font token (`font_big`).
+    Font,
     /// Any text accepted; no shape check.
     Any,
 }
@@ -838,7 +841,7 @@ const COMMON_UI_KEYS: &[KeyRule] = &[
     KeyRule { name: "border", ty: ExpectedType::Str, required: false, expr_ok: false },
     KeyRule { name: "shadow", ty: ExpectedType::Str, required: false, expr_ok: false },
     KeyRule { name: "color", ty: ExpectedType::Color, required: false, expr_ok: true },
-    KeyRule { name: "font", ty: ExpectedType::Str, required: false, expr_ok: true },
+    KeyRule { name: "font", ty: ExpectedType::Font, required: false, expr_ok: true },
     KeyRule { name: "visible", ty: ExpectedType::Bool, required: false, expr_ok: true },
     KeyRule { name: "enabled", ty: ExpectedType::Bool, required: false, expr_ok: true },
     // `on_tap = action` / `on_hold = action` as the plain-assign form.
@@ -1239,10 +1242,10 @@ pub const BUILTIN_THEME_TOKENS: &[(&str, &str)] = &[
     ("info", "#1976d2"),
     ("warning", "#ef6c00"),
     ("critical", "#d32f2f"),
-    ("font_small", "montserrat 12"),
-    ("font", "montserrat 16"),
-    ("font_big", "montserrat 24"),
-    ("font_huge", "montserrat 32"),
+    ("font_small", "roboto 12"),
+    ("font", "roboto 16"),
+    ("font_big", "roboto 24"),
+    ("font_huge", "roboto 32"),
     ("gap", "8"),
     ("padding", "12"),
     ("radius", "8"),
@@ -1402,7 +1405,26 @@ fn check_icon_name(name: &str) -> Result<(), String> {
     Err(format!("unknown icon `{name}`: not a built-in icon (schema 8.3) and the theme sets no `icons` folder{hint}"))
 }
 
+/// A literal font value: a theme font token, or `<family> <size>
+/// [bold]` whose `.ttf` file (relative to the config folder) exists.
+fn check_font(text: &str) -> Result<(), String> {
+    let text = text.trim();
+    if crate::fonts::TOKENS.contains(&text) {
+        return Ok(());
+    }
+    let font = crate::fonts::parse(text)?;
+    if let crate::fonts::Family::File(path) = &font.family {
+        let Some(dir) = CONFIG_DIR.with(|d| d.borrow().clone()) else { return Ok(()) };
+        let full = crate::fonts::resolve_file(&dir, path)?;
+        if std::fs::metadata(&full).map_or(true, |m| m.len() > crate::fonts::MAX_FILE_BYTES) {
+            return Err(format!("font file `{path}` is larger than {} MiB", crate::fonts::MAX_FILE_BYTES >> 20));
+        }
+    }
+    Ok(())
+}
+
 pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
+    CONFIG_DIR.with(|d| *d.borrow_mut() = source.root_dir().map(|p| p.to_path_buf()));
     let mut applied = doc.clone();
     crate::apply_overrides(&mut applied);
     let themes = theme_blocks(&applied);
@@ -1414,6 +1436,9 @@ pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
 }
 
 thread_local! {
+    /// The root config's folder while a document is checked: a font
+    /// file is looked up there.
+    static CONFIG_DIR: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
     /// The document's themes while it is checked: a theme's own tokens
     /// resolve in its own chain.
     static THEME_BLOCKS: std::cell::RefCell<Vec<Block>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -2421,6 +2446,7 @@ fn check_literal(text: &str, ty: ExpectedType) -> Result<(), String> {
             }
         }
         ExpectedType::Icon => check_icon_name(text),
+        ExpectedType::Font => check_font(text),
         ExpectedType::HexColor => parse_color(text)
             .map(|_| ())
             .ok_or_else(|| {
@@ -2561,6 +2587,7 @@ fn type_name(ty: ExpectedType) -> &'static str {
         ExpectedType::Offset => "an offset",
         ExpectedType::PositiveInt => "an integer of at least 1",
         ExpectedType::Icon => "an icon name",
+        ExpectedType::Font => "a font",
         ExpectedType::Any => "a value",
     }
 }
@@ -2720,7 +2747,7 @@ const THEME_COLOR_TOKENS: &[&str] = &[
     "critical",
 ];
 
-const THEME_FONT_TOKENS: &[&str] = &["font_small", "font", "font_big", "font_huge"];
+const THEME_FONT_TOKENS: &[&str] = crate::fonts::TOKENS;
 
 const THEME_SIZE_TOKENS: &[&str] = &["gap", "padding", "radius", "tap_min"];
 
@@ -2740,7 +2767,7 @@ fn theme_token_type(key: &str) -> Option<ExpectedType> {
             if THEME_COLOR_TOKENS.contains(&key) {
                 Some(ExpectedType::Color)
             } else if THEME_FONT_TOKENS.contains(&key) {
-                Some(ExpectedType::Str)
+                Some(ExpectedType::Font)
             } else if THEME_SIZE_TOKENS.contains(&key) {
                 Some(ExpectedType::Size)
             } else {
@@ -2874,7 +2901,11 @@ fn validate_theme_style_block(b: &Block, diags: &mut Vec<Diagnostic>) {
                     ));
                     continue;
                 };
-                check_value_type(&a.value.text, a.value.span, ExpectedType::Any, true, diags);
+                let ty = match &a.target {
+                    AssignTarget::Simple { key } if key.text == "font" => ExpectedType::Font,
+                    _ => ExpectedType::Any,
+                };
+                check_value_type(&a.value.text, a.value.span, ty, true, diags);
             }
             Item::Block(child) => diags.push(Diagnostic::new(
                 child.kind.span,
@@ -5818,6 +5849,39 @@ theme dark {
 "#;
         let diags = check_text(text);
         assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn font_values_are_checked_where_they_appear() {
+        let ok = check_text(
+            "theme t { font = inter 18 bold; font_big = sans 30; style .x { font = noto_sans 12 } }\n\
+             page home { text { value = a; font = open_sans 20 } text { value = b; font = font_big } \
+             text { value = c; font = {{ theme.font_huge }} } }\n",
+        );
+        assert!(ok.is_empty(), "unexpected: {ok:?}");
+        assert_msg(&check_text("theme t { font = robto 16 }\n"), "did you mean `roboto`");
+        assert_msg(&check_text("theme t { font_small = 12 }\n"), "expected a font");
+        assert_msg(&check_text("theme t { style .x { font = inter 999 } }\n"), "from 6 to 200");
+        assert_msg(&check_text("page home { text { value = a; font = montserrat 16 italic } }\n"), "`italic`");
+        // The diagnostic carries file and line.
+        let d = check_text("page home {\n  text { value = a; font = arial 16 }\n}\n");
+        assert!(d.iter().any(|m| m.contains("root.conf:2:") && m.contains("unknown font family `arial`")), "{d:?}");
+    }
+
+    #[test]
+    fn a_ttf_font_must_exist_next_to_the_config() {
+        let p = tmp_file("ttf", "page home { text { value = a; font = fonts/Inter.ttf 18 } }\n");
+        let run = |p: &std::path::Path| {
+            let (map, doc, mut diags) = load(p).unwrap();
+            diags.extend(check(&doc, &map));
+            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        };
+        assert_msg(&run(&p), "font file `fonts/Inter.ttf` not found");
+        let dir = p.parent().unwrap();
+        fs::create_dir_all(dir.join("fonts")).unwrap();
+        fs::write(dir.join("fonts/Inter.ttf"), b"x").unwrap();
+        assert!(run(&p).is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1011,6 +1011,9 @@ fn setup_live_state(
     screen.clear_children();
     // A toast from before a reload belongs to the old state.
     screen.top_layer().clear_children();
+    // No object points at a font now: free them, so fonts tried across
+    // reloads do not fill the cache and an edited `.ttf` is read again.
+    screen.release_fonts();
     paneld_ui::reset_action_bindings();
     paneld_ui::render_page(&doc, &current_page, &ctx, &event_tx, screen);
     visible::show(&current_page);

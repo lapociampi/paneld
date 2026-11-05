@@ -5,6 +5,7 @@
 //! producing tokens with spans, then a recursive-descent parser.
 
 pub mod cel;
+pub mod fonts;
 pub mod icons;
 pub mod lex;
 pub mod library;

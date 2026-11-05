@@ -530,3 +530,27 @@ fn a_remote_kind_declares_an_alert_for_each_instance() {
     assert_eq!(d.eval("alerts.active[0].rule"), "a.hot");
     assert_eq!(d.eval("alerts.worst"), "critical");
 }
+
+#[test]
+fn reloads_free_the_fonts_of_the_old_screen() {
+    let dir = tmp("fonts");
+    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/../paneld-ui/fonts/inter-regular.ttf"), dir.join("f.ttf")).unwrap();
+    let page = |n: u32| {
+        format!(
+            "var a: int = {n}\npage home {{ text {{ value = \"a \u{2192}\"; font = roboto {} }} \
+             text {{ value = b; font = f.ttf {} }} text {{ value = c; font = noto_sans {} bold }} }}\n",
+            10 + n,
+            10 + n,
+            10 + n
+        )
+    };
+    let d = Daemon::start(&dir, &page(0));
+    // 4 fonts a config (roboto falls back to montserrat), 40 configs:
+    // past the cap of 32 unless each reload frees the last one's.
+    for n in 1..=40 {
+        write_conf(&dir, &page(n));
+        assert_eq!(d.ok(&["reload"]), "reloaded");
+    }
+    assert_eq!(d.eval("vars.a"), "40");
+    assert!(!d.log().contains("fonts in use"), "{}", d.log());
+}

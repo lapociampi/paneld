@@ -467,7 +467,7 @@ fn image_reads_a_png_next_to_the_config_and_line_draws() {
     // A PNG of our own: a shot of a magenta page.
     let src = d.join("src.conf");
     std::fs::write(&src, "page home { rect { width = 100%; height = 100%; background = #ff00ff } }\n").unwrap();
-    shot(&src, &["--size", "120x80"]);
+    shot(&src, &["--size", "120x120"]);
     let conf = d.join("p.conf");
     std::fs::write(
         &conf,
@@ -1956,4 +1956,75 @@ fn nav_content(img: &Image, b: (usize, usize, usize, usize)) -> (usize, usize) {
         .filter(|&x| (mid - 8..mid + 8).any(|y| close(img.px(x, y), [0xff, 0xff, 0xff], 60)))
         .fold(None, |r: Option<(usize, usize)>, x| Some(r.map_or((x, x), |(a, _)| (a, x))))
         .expect("nav button empty")
+}
+
+/// The box of what `node` (a `text` or `icon`, colored pure red) draws,
+/// alone on a page.
+fn red_box(label: &str, node: &str) -> ((usize, usize, usize, usize), usize) {
+    let d = tmp(label);
+    let conf = d.join("p.conf");
+    std::fs::write(&conf, format!("page home {{ {node} }}\n")).unwrap();
+    let img = shot(&conf, &["--size", "800x300", "--settle", "50"]);
+    let red = |p: [u8; 3]| p[0] as i32 - p[1] as i32 > 90 && p[0] as i32 - p[2] as i32 > 90;
+    let b = bbox(&img, red).unwrap_or_else(|| panic!("{label}: nothing red drawn"));
+    let filled = (b.1..=b.3).flat_map(|y| (b.0..=b.2).map(move |x| (x, y))).filter(|&(x, y)| red(img.px(x, y))).count();
+    (b, filled)
+}
+
+/// Width, height and red pixels of a line of text in `font`.
+fn text_box(label: &str, font: &str) -> (usize, usize, usize) {
+    let (b, ink) = red_box(label, &format!("text {{ value = \"Quick brown fox 12:45\"; color = #ff0000; font = {font} }}"));
+    (b.2 - b.0 + 1, b.3 - b.1 + 1, ink)
+}
+
+#[test]
+fn ttf_families_weights_and_sizes_draw_differently() {
+    let (roboto, _, roboto_ink) = text_box("roboto", "roboto 20");
+    let (inter, _, _) = text_box("inter", "inter 20");
+    assert!(roboto.abs_diff(inter) >= 4, "roboto 20 {roboto} px, inter 20 {inter} px");
+    // Roboto Bold keeps nearly the widths of Regular, with more ink.
+    let (_, _, bold_ink) = text_box("rbold", "roboto 20 bold");
+    assert!(bold_ink * 10 > roboto_ink * 13, "bold ink {bold_ink}, regular {roboto_ink}");
+    let (open, _, _) = text_box("open", "open_sans 20");
+    let (bold, _, _) = text_box("bold", "open_sans 20 bold");
+    assert!(bold > open + 4, "bold {bold} px not wider than regular {open} px");
+    let (_, h32, _) = text_box("h32", "noto_sans 32");
+    let (_, h48, _) = text_box("h48", "noto_sans 48");
+    assert!(h48 * 10 > h32 * 13, "48 px is {h48} high, 32 px {h32}");
+    // Any size: 37 is no bitmap size.
+    let (w37, _, _) = text_box("w37", "montserrat 37");
+    let (w32, _, _) = text_box("w32", "montserrat 32");
+    assert!(w37 > w32 + 10, "37 px {w37}, 32 px {w32}");
+}
+
+#[test]
+fn a_symbol_inside_ttf_text_comes_from_the_bitmap_fallback() {
+    // `home` (U+F015) is not in the TTF: drawn from Montserrat 20, the
+    // same glyph as the icon, not a placeholder box.
+    let (glyph, filled) = red_box("sym", "text { value = \"\u{f015}\"; color = #ff0000; font = roboto 20 }");
+    let (icon, _) = red_box("icon", "icon { name = home; size = 20; color = #ff0000 }");
+    let size = |b: (usize, usize, usize, usize)| (b.2 - b.0, b.3 - b.1);
+    assert_eq!(size(glyph), size(icon));
+    let area = (glyph.2 - glyph.0 + 1) * (glyph.3 - glyph.1 + 1);
+    assert!(filled * 10 > area * 3, "an outline, not the glyph: {filled} of {area}");
+}
+
+#[test]
+fn an_unreadable_font_file_falls_back_to_montserrat() {
+    // From an expression, so the check cannot catch it.
+    let (b, _) = red_box("nofile", "text { value = Hi; color = #ff0000; font = {{ \"fonts/none.ttf 20\" }} }");
+    assert!(b.3 - b.1 > 8, "{b:?}");
+}
+
+#[test]
+fn an_arrow_in_roboto_comes_from_montserrat() {
+    // Roboto has no arrows: drawn from Montserrat 20 (TTF), not as a
+    // placeholder box.
+    let (roboto, filled) = red_box("arrow", "text { value = \"\u{2192}\"; color = #ff0000; font = roboto 20 }");
+    let (montserrat, _) = red_box("arrow_m", "text { value = \"\u{2192}\"; color = #ff0000; font = montserrat 20 }");
+    let size = |b: (usize, usize, usize, usize)| (b.2 - b.0, b.3 - b.1);
+    assert_eq!(size(roboto), size(montserrat));
+    // A glyph no font has (a snowman) draws as the placeholder box.
+    let (boxed, boxed_filled) = red_box("arrow_x", "text { value = \"\u{2603}\"; color = #ff0000; font = roboto 20 }");
+    assert_ne!((size(roboto), filled), (size(boxed), boxed_filled), "the arrow drew as a placeholder");
 }
