@@ -2182,3 +2182,223 @@ fn the_shipped_light_and_dark_themes_draw_by_name() {
     assert!(close(dark.px(400, 20), [0x1e, 0x1e, 0x1e], 8), "dark header");
     assert!(ink(&dark, &|p| p[0] > 0xc0) > 300, "dark body text not light");
 }
+
+#[test]
+fn rotation_90_draws_the_upright_page_turned_into_the_panel_and_turns_taps() {
+    // The tap test's page on an 800x480 panel mounted turned 90
+    // degrees clockwise: the page lays out at 480x800, the panel's
+    // buffer gets it turned, and a touch (in panel coordinates) on
+    // the button's place still presses it.
+    let d = tmp("rot");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var on: bool = false\n\
+         page home {\n\
+             button { width = 200; height = 100; label = go\n\
+                      on_tap { set { on = true } } }\n\
+             rect { width = 200; height = 100\n\
+                    background = {{ vars.on ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let upright = shot(&conf, &["--size", "480x800", "--settle", "50"]);
+    let panel = shot(&conf, &["--size", "800x480", "--rotation", "90", "--settle", "50"]);
+    assert_eq!((panel.w, panel.h), (800, 480));
+    // Logical (x, y) shows at panel (y, 479 - x).
+    let mut differ = 0;
+    for y in 0..800 {
+        for x in 0..480 {
+            if !close(upright.px(x, y), panel.px(y, 479 - x), 8) {
+                differ += 1;
+            }
+        }
+    }
+    assert!(differ < 480 * 800 / 100, "{differ} pixels differ from the upright page turned");
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    assert!(!panel.any(green), "green before the tap");
+    // The button's middle at logical (100, 120) is panel (120, 379).
+    let after = shot(&conf, &["--size", "800x480", "--rotation", "90", "--tap", "120,379", "--settle", "100"]);
+    assert!(after.any(green), "the turned tap missed the button");
+}
+
+/// Write an RGBA PNG of `w` x `h` with pixels from `f` (stored
+/// deflate blocks: big enough for test images).
+fn write_png(path: &Path, w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) {
+    fn crc(data: &[u8]) -> u32 {
+        let mut c = 0xffff_ffffu32;
+        for &b in data {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 == 1 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    let mut raw = Vec::new();
+    for y in 0..h {
+        raw.push(0);
+        for x in 0..w {
+            raw.extend_from_slice(&f(x, y));
+        }
+    }
+    let mut z = vec![0x78, 0x01];
+    let chunks: Vec<&[u8]> = raw.chunks(65535).collect();
+    for (i, c) in chunks.iter().enumerate() {
+        z.push(u8::from(i + 1 == chunks.len()));
+        z.extend_from_slice(&(c.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(c.len() as u16)).to_le_bytes());
+        z.extend_from_slice(c);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut chunk = |kind: &[u8], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc(&body).to_be_bytes());
+    };
+    let mut ihdr = w.to_be_bytes().to_vec();
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(b"IHDR", &ihdr);
+    chunk(b"IDAT", &z);
+    chunk(b"IEND", &[]);
+    std::fs::write(path, out).unwrap();
+}
+
+#[test]
+fn gradients_change_across_the_node_with_alpha_stops() {
+    let d = tmp("grad");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             rect { width = 100%; height = 120; border = 0; radius = 0; background = linear 90 #ff0000 #0000ff }\n\
+             rect { width = 100%; height = 120; border = 0; radius = 0; background = linear 180 #00ff00 #00ff0000 }\n\
+             rect { width = 200; height = 120; border = 0; radius = 0; background = radial #ffffff #000000 }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--size", "800x600", "--settle", "50"]);
+    // The first rect: find its rows by the reddest pixel on the left.
+    let y = (0..600).find(|&y| close(img.px(14, y), [0xff, 0, 0], 40)).expect("no red at the left edge");
+    let (l, r) = (img.px(14, y + 10), img.px(785, y + 10));
+    assert!(l[0] > 200 && l[2] < 60, "left {l:?}");
+    assert!(r[2] > 200 && r[0] < 60, "right {r:?}");
+    let mid = img.px(400, y + 10);
+    assert!(mid[0] > 80 && mid[2] > 80, "middle {mid:?}");
+    // The second: green at the top fading to the page (#f5f5f5): the
+    // last stop's alpha is 0.
+    let g = (y + 120..600).find(|&yy| close(img.px(400, yy), [0, 0xff, 0], 40)).expect("no green");
+    let bottom = img.px(400, g + 115);
+    assert!(close(bottom, [0xf5, 0xf5, 0xf5], 30), "bottom of the fade {bottom:?}");
+    // The radial: white in the middle, dark in the corners.
+    let top = (g + 120..600).find(|&yy| img.px(14, yy)[0] < 120).expect("no radial");
+    let center = img.px(14 + 100, top + 60);
+    let corner = img.px(16, top + 2);
+    assert!(center[0] > 220, "radial center {center:?}");
+    assert!(corner[0] < 100, "radial corner {corner:?}");
+}
+
+#[test]
+fn image_backgrounds_cover_contain_and_sit_behind_the_page() {
+    let d = tmp("bgimg");
+    // 200x100: red left half, blue right half.
+    write_png(&d.join("a.png"), 200, 100, |x, _| if x < 100 { [255, 0, 0, 255] } else { [0, 0, 255, 255] });
+    write_png(&d.join("bg.png"), 16, 16, |_, _| [0, 160, 80, 255]);
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t { background_image = bg.png }\n\
+         screen { theme = t }\n\
+         page home {\n\
+             row { gap = 0; padding = 0\n\
+                 rect { width = 100; height = 100; border = 0; radius = 0; background = a.png }\n\
+                 rect { width = 100; height = 100; border = 0; radius = 0; background = a.png contain }\n\
+                 rect { width = 100; height = 100; border = 0; radius = 0; background = a.png fill }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let red = |p| close(p, [0xff, 0, 0], 40);
+    let blue = |p| close(p, [0, 0, 0xff], 40);
+    let x0 = (0..800).find(|&x| (0..480).any(|y| red(img.px(x, y)))).expect("no image drawn");
+    let count = |x: usize, f: &dyn Fn([u8; 3]) -> bool| (0..480).filter(|&y| f(img.px(x, y))).count();
+    // Cover: the middle 100x100 of the image, so red then blue, full height.
+    assert!((95..=100).contains(&count(x0 + 25, &red)), "cover red {}", count(x0 + 25, &red));
+    assert!((95..=100).contains(&count(x0 + 75, &blue)), "cover blue {}", count(x0 + 75, &blue));
+    // Contain: 100x50, centered: half the height.
+    assert!((45..=55).contains(&count(x0 + 125, &red)), "contain red {}", count(x0 + 125, &red));
+    assert!((45..=55).contains(&count(x0 + 175, &blue)), "contain blue {}", count(x0 + 175, &blue));
+    // Fill: the whole image squeezed.
+    assert!((95..=100).contains(&count(x0 + 225, &red)), "fill red");
+    assert!((95..=100).contains(&count(x0 + 275, &blue)), "fill blue");
+    // The theme's background image behind the page (the shell's body).
+    assert!(close(img.px(600, 300), [0, 160, 80], 8), "page background {:?}", img.px(600, 300));
+    // Contain leaves the rect's own (transparent) background: the page shows.
+    let y_top = (0..480).find(|&y| red(img.px(x0 + 25, y))).unwrap();
+    assert!(close(img.px(x0 + 125, y_top + 5), [0, 160, 80], 8), "{:?}", img.px(x0 + 125, y_top + 5));
+}
+
+#[test]
+fn a_shadow_draws_outside_the_node() {
+    let d = tmp("shadow");
+    let conf = d.join("p.conf");
+    let page = |shadow: &str| {
+        format!(
+            "page home {{\n\
+                 rect {{ width = 120; height = 80; border = 0; radius = 8; background = #ff00ff; {shadow} }}\n\
+             }}\n"
+        )
+    };
+    std::fs::write(&conf, page("shadow = 16 #000000 0 8")).unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let magenta = |p| close(p, [0xff, 0, 0xff], 8);
+    let (x0, y0) = (0..480)
+        .find_map(|y| (0..800).find(|&x| magenta(img.px(x, y))).map(|x| (x, y)))
+        .expect("no rect");
+    // Below the rect (offset 8 down): darker than the page.
+    let below = img.px(x0 + 60, y0 + 80 + 6);
+    assert!(below[0] < 0xd0, "no shadow under the rect: {below:?}");
+    std::fs::write(&conf, page("shadow = none")).unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    assert!(close(img.px(x0 + 60, y0 + 80 + 6), [0xf5, 0xf5, 0xf5], 4), "shadow = none drew one");
+}
+
+#[test]
+fn a_background_image_lies_over_a_gradient_or_image_background() {
+    let d = tmp("bglayers");
+    // Left half transparent, right half green.
+    write_png(&d.join("over.png"), 40, 20, |x, _| if x < 20 { [0, 0, 0, 0] } else { [0, 200, 0, 255] });
+    write_png(&d.join("under.png"), 8, 8, |_, _| [200, 0, 200, 255]);
+    let conf = d.join("p.conf");
+    let write = |background: &str| {
+        std::fs::write(
+            &conf,
+            format!(
+                "theme t {{ background = {background}\n background_image = over.png }}\n\
+                 screen {{ theme = t }}\n\
+                 page home {{ text {{ value = hi }} }}\n"
+            ),
+        )
+        .unwrap();
+    };
+    write("linear 180 #ff0000 #0000ff");
+    let img = shot(&conf, &["--settle", "50"]);
+    let (top, bottom) = (img.px(100, 80), img.px(100, 470));
+    assert!(top[0] > 150 && top[2] < 120, "gradient top under the image {top:?}");
+    assert!(bottom[2] > 150 && bottom[0] < 120, "gradient bottom under the image {bottom:?}");
+    assert!(close(img.px(700, 300), [0, 200, 0], 8), "image half {:?}", img.px(700, 300));
+    write("under.png");
+    let img = shot(&conf, &["--settle", "50"]);
+    assert!(close(img.px(100, 300), [200, 0, 200], 8), "image background under {:?}", img.px(100, 300));
+    assert!(close(img.px(700, 300), [0, 200, 0], 8), "image half {:?}", img.px(700, 300));
+}

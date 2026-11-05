@@ -36,6 +36,17 @@
 /* Software renderer; no GPU acceleration on the first-target Pi. */
 #define LV_USE_DRAW_SW          1
 
+/* `background` gradients (schema 8.1): up to 4 color stops, and the
+ * angled `linear` and the `radial` ones (computed per pixel; the
+ * vertical and horizontal ones are the cheap path). */
+#define LV_GRADIENT_MAX_STOPS   4
+#define LV_USE_DRAW_SW_COMPLEX_GRADIENTS 1
+
+/* `shadow`: the blurred corner of the last shadow drawn is kept, so
+ * cards with the same shadow and radius (a page is rebuilt on every
+ * value change) blur once. Size: shadow + radius up to 64 px, 4 KiB. */
+#define LV_DRAW_SW_SHADOW_CACHE_SIZE 64
+
 /* ---------------------------------------------------------------------
  * Timing and DPI
  * --------------------------------------------------------------------- */

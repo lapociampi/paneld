@@ -12,6 +12,7 @@ pub mod lex;
 pub mod library;
 pub mod load;
 pub mod overrides;
+pub mod paint;
 pub mod parse;
 pub mod remote;
 pub mod schema;

@@ -243,16 +243,33 @@ The theme's `shell` component wraps every page: header, navigation, alert banner
 | `x`, `y`, `anchor` | px or `%`, px or `%`, `top_left`, `top_center`, `top_right`, `left`, `center`, `right`, `bottom_left`, `bottom_center`, `bottom_right` | In a `stack`: `anchor` (default `top_left`) is the point of the stack the child sits at, `x` / `y` move it from there (right and down are positive, `-8` or `-10%` goes left or up) |
 | `padding` | 1, 2 or 4 sizes in px | `8` all sides, `8 16` vertical horizontal, `1 2 3 4` top right bottom left |
 | `class` | list of names | Theme styles (`style .card`) |
-| `background` | color, image path or gradient, expr | |
+| `background` | color, gradient or image, expr | See 8.1.1. Default: none (layout blocks are transparent) |
 | `opacity` | 0..1, expr | |
 | `radius` | size | |
 | `border` | `<width> <color>` | |
-| `shadow` | `<size> <color> [<x> <y>]` | |
+| `shadow` | `none`, `<size> [<color>] [<x> <y>]`, or a theme token holding one | Blur `size` 1 to 32 px, color default `#00000060`, offset -64 to 64 px (right and down positive), e.g. `shadow = 12 #00000080 0 4`, `shadow = shadow` (the theme's). Drawn outside the node: a parent with no padding cuts it off |
 | `color` | color, expr | Foreground: text, icon, line; the value part of an `arc` or `bar` |
 | `font` | font, expr | `<family> <size> [bold]`, e.g. `roboto 20`, `inter 16 bold`, or a theme font token named bare (`font = font_big`). Family: `roboto` (also `sans`), `open_sans`, `noto_sans`, `montserrat`, `inter`, or a `.ttf` path relative to the config folder, or in a theme folder's `theme.conf` to the theme folder (no `bold` then: name the bold file). Size 6 to 200 px. Unset: the theme's `font` ([ADR 0015](decisions/0015-fonts.md)) |
 | `visible` | bool, expr | |
 | `enabled` | bool, expr | Disabled: no input, `:disabled` style |
 | `on_tap`, `on_hold` | action | |
+
+#### 8.1.1 Backgrounds
+
+[ADR 0022](decisions/0022-backgrounds-shadows.md).
+
+| Form | Example | Notes |
+| --- | --- | --- |
+| Color | `#1e1e1e`, `#ffffff20`, `surface` | A hex with optional alpha, or a theme color name |
+| None | `none`, `transparent` | |
+| Linear gradient | `linear 180 #000000 accent #00000000` | `linear <angle> <color> <color> [<color> <color>]`: 2 to 4 stops, spread evenly, each with its own alpha. CSS angles in degrees: `0` bottom to top, `90` left to right, `180` top to bottom, `270` right to left, others corner to corner. `0`, `90`, `180`, `270` are the cheap path (one color per row or column) |
+| Radial gradient | `radial #ffffff #00000000` | `radial <color> <color> [...]`: from the center to the corners |
+| Image | `images/bg.png`, `bg.png contain` | `<path>.png [fit]`, relative to the config folder (in a theme folder's `theme.conf`: to the theme folder), no `..`. Fit: `cover` (default: scaled to fill the node, the middle kept), `contain` (scaled to fit inside, centered, the node's parent shows around it), `fill` (stretched), `tile` (its own size, repeated). Clipped to `radius` |
+| Theme token | `background = sunset` | A token holding any of the above (`sunset = radial #ff8800 #220044`) |
+
+An image is decoded once per drawn size and kept (8 MiB of fitted images, the least recently used unshown ones freed first), so a page drawn again every second does not decode it again; it is box filtered down, scaled up by the nearest pixel (ship it at the size it is drawn). A file must be a PNG of at most twice the screen's pixels (800x480 at least) and 1 Mi pixels (the 4 MiB decoded-image cache); a tiled image is kept once whatever the node's size. `paneld check` checks literal values: the gradient syntax and colors, and that an image file exists, stays in its folder, is a PNG and is within that size (the screen from `display` `width` x `height`). A value from an expression that does not parse is logged once and leaves the node as it was.
+
+Cost on the Pi (software rendering): a vertical or horizontal gradient costs about what a color does; an angled or radial one is computed per pixel. A page is rebuilt and drawn whole on every value change, so this is paid on each poll that changes a value: measured on x86 ([Themes](themes.md#cost)), the Pi is about 10 times slower.
 
 ### 8.2 Layout
 
@@ -372,7 +389,7 @@ See [Themes](themes.md) for styles, components and motion. A theme is a `theme <
 | Colors | `background`, `surface`, `text`, `muted`, `accent`, `ok`, `info`, `warning`, `critical` |
 | Fonts | `font_small`, `font`, `font_big`, `font_huge`: font values, e.g. `roboto 16`, `inter 24 bold`; built in `roboto` 12, 16, 24, 32. `font` is the text font of every node that sets none |
 | Sizes | `gap`, `padding`, `radius`, `tap_min` (smallest touch target) |
-| Other | `shadow`, `background_image` (optional), `icons` (`builtin`, or a folder of `<name>.png` icons, section 8.3), `motion`, `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
+| Other | `shadow` (a `shadow` value, default `none`: what `shadow = shadow` draws), `background_image` (optional: a PNG drawn behind every page, `cover`, over the `background` token, which may itself be a color, gradient or image; the shipped shell draws no background of its own), `icons` (`builtin`, or a folder of `<name>.png` icons, section 8.3), `motion`, `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
 
 A theme may add any other token; they are read as `theme.<name>`.
 
@@ -406,11 +423,26 @@ screen {
 
 | Key | Type | Notes |
 | --- | --- | --- |
-| `backend` | `drm`, `fbdev`, `sdl` | Default: `drm` on a device, `sdl` with a desktop |
-| `device` | path | e.g. `/dev/dri/card1`, `/dev/fb0` |
-| `touch` | path | Input device, e.g. `/dev/input/event0`; default: first touchscreen found |
-| `width`, `height` | int | Default: from the display |
-| `rotation` | `0`, `90`, `180`, `270` | |
+| `backend` | `drm`, `fbdev`, `sdl` | Default: picked at start (below) |
+| `device` | path | e.g. `/dev/dri/card1`, `/dev/fb0`; default: the DRM card with a connected screen (else `/dev/dri/card0`), `/dev/fb0` |
+| `touch` | path, `none` | Input device, e.g. `/dev/input/event0`; default: first touchscreen found (below); `none`: no touch input. SDL uses the mouse |
+| `width`, `height` | int | The panel's size, unrotated, default 800x480. Only `sdl` uses it; `drm` and `fbdev` take the display's own mode |
+| `rotation` | `0`, `90`, `180`, `270` | Default `0`. How far the panel is mounted turned clockwise from its native orientation. Pages lay out in the rotated size (90 on an 800x480 panel: 480x800) and touch turns with the picture. `sdl` opens its window at the rotated size |
+
+The `display` block is read once, at start: a reload (`paneld ctl reload` or a saved file) does not apply changes to it, and logs which keys changed (`paneld: display: rotation changed; restart paneld to apply`). Restart to apply.
+
+Without `backend`, the first that fits, logged at start (`paneld: display: ...`):
+
+1. `sdl`, when the binary has it and a desktop runs. A desktop is only `WAYLAND_DISPLAY` or `DISPLAY` being set, so a desktop build started over `ssh -X` picks SDL.
+2. `drm`, when the binary has it and a card in `/sys/class/drm` has a `connected` connector.
+3. `fbdev`, when `/dev/fb0` exists.
+4. `sdl`, when the binary has it; else the binary's device backend, which then fails with an error.
+
+Each one that does not open is followed by the next in this list. A `backend` or `device` set in the config is tried first; if it does not open, paneld goes on with the list and shows the error as a warning alert, with the file and line of the key (for example `paneld.conf:12:5`, then what did not open and what is used instead), until a restart. Only when nothing opens does paneld exit with an error.
+
+The default touchscreen is the first device in `/proc/bus/input/devices` with absolute X/Y (`ABS_X`/`ABS_Y` or `ABS_MT_POSITION_X`/`_Y`) and `BTN_TOUCH`, not a touchpad (`INPUT_PROP_POINTER`); one marked as on the screen (`INPUT_PROP_DIRECT`) wins. Mice and keyboards never match. It is looked for once, at start: a touchscreen plugged in later needs a restart, and one that goes away is dropped.
+
+Rotation: `fbdev` rotates each drawn area in LVGL's driver; `drm` draws into one extra upright buffer (width x height x 4 bytes); on each frame it rotates the areas that changed in this frame and in the frame before (the panel's two buffers take turns, so each is two frames behind) into the panel's buffer, up to 8 areas per frame (more are joined into the nearest), never one box around far-apart changes. Touch coordinates are the panel's, as the controller reports them, and LVGL turns them with the picture, so a touch controller mounted the same way as the panel needs no setting. `paneld shot --rotation 90` renders what the panel gets.
 
 ## 14. Security
 

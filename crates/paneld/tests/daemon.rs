@@ -670,3 +670,21 @@ fn theme_switches_free_the_fonts_of_the_old_theme() {
     }
     assert!(!d.log().contains("fonts in use"), "{}", d.log());
 }
+
+#[test]
+fn a_display_that_does_not_open_falls_back_and_says_where() {
+    let dir = tmp("display");
+    let conf = "display:backend = fbdev\ndisplay:device = /nonexistent/fb\npage home { text { value = x } }\n";
+    let d = Daemon::start(&dir, conf);
+    // The next backend opened; the config's display is an alert, with
+    // the file and line of `backend`.
+    d.wait_for("alerts.count", "1");
+    let text = d.eval("alerts.active[0].text");
+    assert!(text.contains("p.conf:3:") && text.contains("fbdev on /nonexistent/fb"), "{text}");
+    assert!(d.log().contains("display: fbdev on /nonexistent/fb did not open"), "{}", d.log());
+    // A reload keeps the alert and says that display keys need a restart.
+    write_conf(&dir, &format!("display:rotation = 90\n{conf}"));
+    assert_eq!(d.ok(&["reload"]), "reloaded");
+    assert_eq!(d.eval("alerts.count"), "1");
+    assert!(d.log().contains("display: rotation changed; restart paneld to apply"), "{}", d.log());
+}

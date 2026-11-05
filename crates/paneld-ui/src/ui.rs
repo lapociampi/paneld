@@ -741,6 +741,216 @@ fn png_size(path: &std::path::Path) -> Option<(u32, u32)> {
     Some((be(&head[16..20]), be(&head[20..24])))
 }
 
+/// An object with an image background, for one style selector: the
+/// file, how it fits, and the cached buffer it shows (fitted to `size`).
+struct BgObj {
+    obj: *mut sys::lv_obj_t,
+    selector: sys::lv_style_selector_t,
+    path: std::path::PathBuf,
+    fit: paneld_config::paint::Fit,
+    buf: *mut sys::lv_draw_buf_t,
+    size: (i32, i32),
+}
+
+/// A fitted background image: (file, width, height, fit, mtime).
+type BgKey = (std::path::PathBuf, i32, i32, paneld_config::paint::Fit, std::time::SystemTime);
+
+struct BgEntry {
+    key: BgKey,
+    buf: *mut sys::lv_draw_buf_t,
+    bytes: usize,
+    /// Objects showing it now: never freed while above 0.
+    refs: u32,
+    used: u64,
+}
+
+/// Background images decoded and fitted to their node's size. An
+/// entry no object shows is kept for the next redraw (a page drawn
+/// again every second finds its images here) until the cache passes
+/// [`BG_CACHE_BYTES`]: then the least recently used unshown ones go.
+#[derive(Default)]
+struct BgCache {
+    entries: Vec<BgEntry>,
+    bytes: usize,
+    tick: u64,
+}
+
+/// 8 MiB: five full 800x480 screens.
+const BG_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+thread_local! {
+    static BG_CACHE: std::cell::RefCell<BgCache> = std::cell::RefCell::new(BgCache::default());
+    static BG_OBJS: std::cell::RefCell<Vec<BgObj>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The most pixels a PNG may have to be drawn: twice the screen's (at
+/// least 800x480's), and no more than the decoded-image cache holds.
+fn image_pixel_cap() -> u64 {
+    let screen = unsafe {
+        let d = sys::lv_display_get_default();
+        (sys::lv_display_get_horizontal_resolution(d) as u64) * (sys::lv_display_get_vertical_resolution(d) as u64)
+    };
+    paneld_config::paint::max_image_pixels(screen)
+}
+
+const _: () = assert!(sys::LV_CACHE_DEF_SIZE as u64 == paneld_config::paint::IMAGE_CACHE_BYTES);
+
+/// The cached buffer for `key`, decoded now if needed, with one more
+/// user; null when the file cannot be read.
+fn bg_acquire(key: BgKey) -> *mut sys::lv_draw_buf_t {
+    BG_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.tick += 1;
+        let tick = c.tick;
+        if let Some(e) = c.entries.iter_mut().find(|e| e.key == key) {
+            e.refs += 1;
+            e.used = tick;
+            return e.buf;
+        }
+        let Ok(src) = CString::new(format!("A:{}", key.0.display())) else { return std::ptr::null_mut() };
+        let fit = match key.3 {
+            paneld_config::paint::Fit::Cover => 0,
+            paneld_config::paint::Fit::Contain => 1,
+            paneld_config::paint::Fit::Fill => 2,
+            paneld_config::paint::Fit::Tile => 3,
+        };
+        let buf = unsafe { sys::lv_paneld_load_fitted(src.as_ptr(), key.1, key.2, fit) };
+        if buf.is_null() {
+            return buf;
+        }
+        let bytes = unsafe { (*buf).data_size } as usize;
+        c.bytes += bytes;
+        c.entries.push(BgEntry { key, buf, bytes, refs: 1, used: tick });
+        // Over budget: free the least recently used unshown ones.
+        while c.bytes > BG_CACHE_BYTES {
+            let Some(i) = c.entries.iter().enumerate().filter(|(_, e)| e.refs == 0).min_by_key(|(_, e)| e.used).map(|(i, _)| i)
+            else {
+                break;
+            };
+            let e = c.entries.swap_remove(i);
+            c.bytes -= e.bytes;
+            // SAFETY: no object shows it (refs 0); LVGL's caches may
+            // still know the pointer, so they drop it first.
+            unsafe {
+                sys::lv_paneld_image_cache_drop(e.buf as *const std::ffi::c_void);
+                sys::lv_draw_buf_destroy(e.buf);
+            }
+        }
+        buf
+    })
+}
+
+fn bg_release(buf: *mut sys::lv_draw_buf_t) {
+    if buf.is_null() {
+        return;
+    }
+    BG_CACHE.with(|c| {
+        if let Some(e) = c.borrow_mut().entries.iter_mut().find(|e| e.buf == buf) {
+            e.refs = e.refs.saturating_sub(1);
+        }
+    });
+}
+
+/// Forget `obj`'s image backgrounds (for `selector`, or all: the
+/// object is going), releasing their buffers. For one selector the
+/// style stops pointing at the buffer too: once released it may be
+/// freed before the object is fitted again.
+fn bg_forget(obj: *mut sys::lv_obj_t, selector: Option<sys::lv_style_selector_t>) {
+    let gone: Vec<*mut sys::lv_draw_buf_t> = BG_OBJS.with(|o| {
+        let mut o = o.borrow_mut();
+        let mut gone = Vec::new();
+        o.retain(|b| {
+            let hit = b.obj == obj && selector.map_or(true, |s| s == b.selector);
+            if hit {
+                gone.push(b.buf);
+            }
+            !hit
+        });
+        gone
+    });
+    if let Some(selector) = selector {
+        if gone.iter().any(|b| !b.is_null()) {
+            unsafe { sys::lv_obj_set_style_bg_image_src(obj, std::ptr::null(), selector) };
+        }
+    }
+    gone.into_iter().for_each(bg_release);
+}
+
+/// Fit `obj`'s image backgrounds to its size now, if that changed.
+fn bg_fit(obj: *mut sys::lv_obj_t) {
+    let (w, h) = unsafe { (sys::lv_obj_get_width(obj), sys::lv_obj_get_height(obj)) };
+    if w < 1 || h < 1 {
+        return;
+    }
+    let todo: Vec<(sys::lv_style_selector_t, BgKey, *mut sys::lv_draw_buf_t)> = BG_OBJS.with(|o| {
+        o.borrow()
+            .iter()
+            .filter(|b| b.obj == obj && (b.buf.is_null() || b.size != fit_size(b.fit, w, h)))
+            .filter_map(|b| {
+                let mtime = std::fs::metadata(&b.path).and_then(|m| m.modified()).ok()?;
+                let (kw, kh) = fit_size(b.fit, w, h);
+                Some((b.selector, (b.path.clone(), kw, kh, b.fit, mtime), b.buf))
+            })
+            .collect()
+    });
+    for (selector, key, old) in todo {
+        let (key_w, key_h) = (key.1, key.2);
+        let buf = bg_acquire(key);
+        BG_OBJS.with(|o| {
+            if let Some(b) = o.borrow_mut().iter_mut().find(|b| b.obj == obj && b.selector == selector) {
+                b.buf = buf;
+                b.size = (key_w, key_h);
+            }
+        });
+        bg_release(old);
+        // SAFETY: the buffer is laid out as an `lv_image_dsc_t` and stays
+        // in the cache while this object holds it (until it goes or
+        // its background changes).
+        unsafe { sys::lv_obj_set_style_bg_image_src(obj, buf as *const std::ffi::c_void, selector) };
+    }
+}
+
+/// The size a background image is fitted (and cached) at: the node's,
+/// but a tiled image keeps its own whatever the node, so one entry.
+fn fit_size(fit: paneld_config::paint::Fit, w: i32, h: i32) -> (i32, i32) {
+    if fit == paneld_config::paint::Fit::Tile {
+        (1, 1)
+    } else {
+        (w, h)
+    }
+}
+
+unsafe extern "C" fn bg_event(e: *mut sys::lv_event_t) {
+    // SAFETY: registered on the object in `set_background_image`.
+    let (obj, code) = unsafe { (sys::lv_event_get_target(e) as *mut sys::lv_obj_t, sys::lv_event_get_code(e)) };
+    if code == sys::lv_event_code_t_LV_EVENT_DELETE {
+        bg_forget(obj, None);
+    } else {
+        bg_fit(obj);
+    }
+}
+
+/// Lay out the screens with image backgrounds waiting for their size,
+/// and fit those images: call after drawing a page (LVGL would lay
+/// out before the next frame anyway; doing it now costs nothing more).
+pub fn settle_backgrounds() {
+    let waiting: Vec<*mut sys::lv_obj_t> =
+        BG_OBJS.with(|o| o.borrow().iter().filter(|b| b.buf.is_null()).map(|b| b.obj).collect());
+    let mut screens: Vec<*mut sys::lv_obj_t> = Vec::new();
+    for obj in &waiting {
+        let s = unsafe { sys::lv_obj_get_screen(*obj) };
+        if !screens.contains(&s) {
+            screens.push(s);
+        }
+    }
+    for s in screens {
+        unsafe { sys::lv_obj_update_layout(s) };
+    }
+    for obj in waiting {
+        bg_fit(obj);
+    }
+}
+
 /// How an image fills its box (schema 7 `fit`).
 #[derive(Clone, Copy, Debug)]
 pub enum ImageFit {
@@ -2546,6 +2756,141 @@ impl<'ui> Obj<'ui> {
         }
     }
 
+    /// Drop a gradient or image background set before (by a theme
+    /// style, say), so the color set next is what shows.
+    pub fn clear_background_paint(&self) {
+        let selector = sel();
+        unsafe {
+            sys::lv_obj_set_style_bg_grad(self.raw, std::ptr::null(), selector);
+            sys::lv_obj_set_style_bg_grad_dir(self.raw, sys::lv_grad_dir_t_LV_GRAD_DIR_NONE, selector);
+            sys::lv_obj_set_style_bg_image_src(self.raw, std::ptr::null(), selector);
+        }
+        bg_forget(self.raw, Some(selector));
+    }
+
+    /// A gradient background (schema 8.1) through `stops` (rgb,
+    /// alpha), 2 to [`paneld_config::paint::MAX_STOPS`], spread evenly.
+    pub fn set_background_gradient(&self, kind: &paneld_config::paint::GradientKind, stops: &[(u32, u8)]) {
+        use paneld_config::paint::GradientKind;
+        if stops.len() < 2 || stops.len() > paneld_config::paint::MAX_STOPS {
+            return;
+        }
+        let mut stops: Vec<(u32, u8)> = stops.to_vec();
+        // SAFETY: a plain C struct; zeroed is its "no gradient" state.
+        let mut grad: Box<sys::lv_grad_dsc_t> = Box::new(unsafe { std::mem::zeroed() });
+        let g: *mut sys::lv_grad_dsc_t = &mut *grad;
+        unsafe {
+            match *kind {
+                // The cheap paths: one color per row or per column.
+                GradientKind::Linear(180) => sys::lv_grad_vertical_init(g),
+                GradientKind::Linear(0) => {
+                    stops.reverse();
+                    sys::lv_grad_vertical_init(g)
+                }
+                GradientKind::Linear(90) => sys::lv_grad_horizontal_init(g),
+                GradientKind::Linear(270) => {
+                    stops.reverse();
+                    sys::lv_grad_horizontal_init(g)
+                }
+                // CSS angles, from one edge or corner of the box to the
+                // opposite one (in % of its width and height).
+                GradientKind::Linear(deg) => {
+                    let a = f64::from(deg).to_radians();
+                    let (dx, dy) = (a.sin(), -a.cos());
+                    let k = 50.0 / dx.abs().max(dy.abs());
+                    let pct = |v: f64| sys::lv_pct(v.round() as i32);
+                    sys::lv_grad_linear_init(
+                        g,
+                        pct(50.0 - dx * k),
+                        pct(50.0 - dy * k),
+                        pct(50.0 + dx * k),
+                        pct(50.0 + dy * k),
+                        sys::lv_grad_extend_t_LV_GRAD_EXTEND_PAD,
+                    );
+                }
+                // From the center to the corners.
+                GradientKind::Radial => sys::lv_grad_radial_init(
+                    g,
+                    sys::lv_pct(50),
+                    sys::lv_pct(50),
+                    sys::lv_pct(100),
+                    sys::lv_pct(100),
+                    sys::lv_grad_extend_t_LV_GRAD_EXTEND_PAD,
+                ),
+            }
+            let colors: Vec<sys::lv_color_t> = stops.iter().map(|(rgb, _)| sys::lv_color_hex(*rgb)).collect();
+            let opas: Vec<sys::lv_opa_t> = stops.iter().map(|(_, a)| *a).collect();
+            sys::lv_grad_init_stops(g, colors.as_ptr(), opas.as_ptr(), std::ptr::null(), stops.len() as i32);
+        }
+        self.clear_background_paint();
+        let raw = Box::into_raw(grad);
+        unsafe extern "C" fn free_grad(e: *mut sys::lv_event_t) {
+            // SAFETY: registered below with the Box's pointer, freed
+            // once, when the object (and its styles) go.
+            unsafe { drop(Box::from_raw(sys::lv_event_get_user_data(e) as *mut sys::lv_grad_dsc_t)) };
+        }
+        unsafe {
+            // The style keeps the pointer: it lives as long as the object.
+            sys::lv_obj_add_event_cb(self.raw, Some(free_grad), sys::lv_event_code_t_LV_EVENT_DELETE, raw.cast());
+            sys::lv_obj_set_style_bg_grad(self.raw, raw, sel());
+            sys::lv_obj_set_style_bg_opa(self.raw, 255, sel());
+        }
+    }
+
+    /// An image background (schema 8.1): the PNG `path` (relative to
+    /// the asset folder, confined to its folder) fitted to the
+    /// object's size, drawn over its background color and clipped to
+    /// its radius. Decoded once per size into [`BG_CACHE`]; the size
+    /// is known after layout, so it is loaded by [`settle_backgrounds`]
+    /// and again when the object's size changes. False (logged once)
+    /// for a file that is missing, not a PNG or too large.
+    pub fn set_background_image(&self, path: &str, fit: paneld_config::paint::Fit) -> bool {
+        let selector = sel();
+        let full = match asset_path(path, "background image") {
+            Some(p) if p.is_file() => p,
+            _ => {
+                log_font_once(format!("background image `{path}` not found; not drawn"));
+                return false;
+            }
+        };
+        let Some((w, h)) = png_size(&full) else { return false };
+        if u64::from(w) * u64::from(h) > image_pixel_cap() {
+            log_font_once(format!("background image {}: {w}x{h} is too large for this screen; not drawn", full.display()));
+            return false;
+        }
+        unsafe {
+            sys::lv_obj_set_style_bg_grad(self.raw, std::ptr::null(), selector);
+            sys::lv_obj_set_style_bg_grad_dir(self.raw, sys::lv_grad_dir_t_LV_GRAD_DIR_NONE, selector);
+            sys::lv_obj_set_style_bg_image_tiled(self.raw, fit == paneld_config::paint::Fit::Tile, selector);
+            sys::lv_obj_set_style_bg_image_opa(self.raw, 255, selector);
+        }
+        bg_forget(self.raw, Some(selector));
+        let first = BG_OBJS.with(|o| !o.borrow().iter().any(|b| b.obj == self.raw));
+        BG_OBJS.with(|o| {
+            o.borrow_mut().push(BgObj { obj: self.raw, selector, path: full, fit, buf: std::ptr::null_mut(), size: (0, 0) })
+        });
+        if first {
+            unsafe {
+                sys::lv_obj_add_event_cb(self.raw, Some(bg_event), sys::lv_event_code_t_LV_EVENT_SIZE_CHANGED, std::ptr::null_mut());
+                sys::lv_obj_add_event_cb(self.raw, Some(bg_event), sys::lv_event_code_t_LV_EVENT_DELETE, std::ptr::null_mut());
+            }
+        }
+        true
+    }
+
+    /// `shadow` (schema 8.1): blur `size` px (0: none) in `rgb` at
+    /// `opa`, moved by `x`, `y`.
+    pub fn set_shadow(&self, size: i32, rgb: u32, opa: u8, x: i32, y: i32) {
+        unsafe {
+            sys::lv_obj_set_style_shadow_width(self.raw, size.max(0), sel());
+            sys::lv_obj_set_style_shadow_color(self.raw, sys::lv_color_hex(rgb), sel());
+            sys::lv_obj_set_style_shadow_opa(self.raw, if size > 0 { opa } else { 0 }, sel());
+            sys::lv_obj_set_style_shadow_offset_x(self.raw, x, sel());
+            sys::lv_obj_set_style_shadow_offset_y(self.raw, y, sel());
+            sys::lv_obj_set_style_shadow_spread(self.raw, 0, sel());
+        }
+    }
+
     pub fn set_radius(&self, px: i32) {
         unsafe { sys::lv_obj_set_style_radius(self.raw, px, sel()) };
     }
@@ -3394,6 +3739,79 @@ impl Size {
             }
             Size::Content => LV_SIZE_CONTENT_LOCAL,
         }
+    }
+}
+
+// ---- Display open fallback and rotation (schema 13, `display`) ----
+
+/// Rotate `display` by `degrees` (0, 90, 180, 270), right after it
+/// was opened and before the UI is built. Pages then lay out in the
+/// rotated size; pointer input is rotated by LVGL to match. `false`
+/// for any other angle or a display that cannot be rotated.
+fn rotate_display(display: *mut sys::lv_display_t, degrees: i32) -> bool {
+    // SAFETY: `display` is a live display of this (UI) thread; the C
+    // side only swaps its buffers and flush callback.
+    unsafe { sys::lv_paneld_set_rotation(display, degrees) }
+}
+
+impl Window {
+    /// See [`rotate_display`]. For DRM/KMS and fbdev displays; an SDL
+    /// window is opened at the rotated size instead.
+    pub fn set_rotation(&self, degrees: i32) -> bool {
+        rotate_display(self.display, degrees)
+    }
+}
+
+impl MemDisplay {
+    /// See [`rotate_display`]. The frame [`MemDisplay::rgb`] returns
+    /// stays the panel's (unrotated) buffer and pointer positions are
+    /// the panel's, as a touch controller reports them.
+    pub fn set_rotation(&mut self, degrees: i32) -> bool {
+        rotate_display(self.display, degrees)
+    }
+
+    /// The panel's buffer as it is now, without the full redraw
+    /// [`MemDisplay::rgb`] does: XRGB8888, row by row.
+    pub fn pixels(&self) -> &[u32] {
+        self.buf
+    }
+}
+
+// Opening a device display for a fallback chain (schema 13): unlike
+// `open_drm_display` / `open_fbdev_display`, a device that does not
+// open leaves no half-made display behind (it would stay the default
+// display and take the screen), so the next backend can be tried.
+
+impl Ui {
+    /// [`Ui::open_drm_display`], deleting the display on failure.
+    #[cfg(feature = "drm")]
+    pub fn try_open_drm_display(&self, device: &str) -> Option<Window> {
+        let c_dev = CString::new(device).ok()?;
+        let display = unsafe { sys::lv_linux_drm_create() };
+        if display.is_null() {
+            return None;
+        }
+        if unsafe { sys::lv_linux_drm_set_file(display, c_dev.as_ptr(), -1) } != sys::lv_result_t_LV_RESULT_OK {
+            // SAFETY: created above, nothing else refers to it.
+            unsafe { sys::lv_display_delete(display) };
+            return None;
+        }
+        Some(Window { display, _input: None })
+    }
+
+    /// [`Ui::open_fbdev_display`], deleting the display on failure.
+    pub fn try_open_fbdev_display(&self, device: &str) -> Option<Window> {
+        let c_dev = CString::new(device).ok()?;
+        let display = unsafe { sys::lv_linux_fbdev_create() };
+        if display.is_null() {
+            return None;
+        }
+        if unsafe { sys::lv_linux_fbdev_set_file(display, c_dev.as_ptr()) } != sys::lv_result_t_LV_RESULT_OK {
+            // SAFETY: created above, nothing else refers to it.
+            unsafe { sys::lv_display_delete(display) };
+            return None;
+        }
+        Some(Window { display, _input: None })
     }
 }
 

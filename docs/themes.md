@@ -51,7 +51,9 @@ theme glass {
     font       = fonts/Inter.ttf 18
     motion     = full
 
-    style .card { radius = 16; shadow = 12; background = #ffffff20 }
+    shadow     = 12 #00000080 0 4
+
+    style .card { radius = 16; shadow = shadow; background = #ffffff20 }
     style button:pressed { scale = 0.96; background = {{ theme.accent }} }
 
     component stat_tile {
@@ -67,6 +69,27 @@ theme dim {
     motion  = none
 }
 ```
+
+## Backgrounds and shadows
+
+- **Behind every page:** the `background` token (a color, a gradient or an image, [Schema](schema.md) 8.1.1) on a backdrop the size of the screen, then `background_image` over it, fitted with `cover` (each its own layer, so a gradient or an image `background` shows under a transparent `background_image`). The shipped shell and its body are transparent; its header and navigation bar keep `surface`. A theme's own `shell` that paints a background hides them.
+- **Any node:** `background = linear 135 #1e3c72 #6dd5ed`, `background = images/card.png contain`, in a style too (`style .card { background = ... }`); a path in a theme folder's file is relative to that folder.
+- **Shadow:** `shadow = <size> [<color>] [<x> <y>]`; the `shadow` token is a shadow value that a style names (`shadow = shadow`); another token works the same (`lifted = 16 #00000080 0 8`, `shadow = lifted`).
+
+### Cost
+
+Measured on x86 (one core, release build), a page with 12 cards on a 4-column grid, 800x480. A page is rebuilt and drawn whole on every value change (a poll, a tap), so the second column is what a page with a changing value costs each time:
+
+| Page | ms per full redraw | ms per rebuild and redraw |
+| --- | --- | --- |
+| Color background, no shadow | 1.46 | 1.75 |
+| 12 shadows of 4 / 16 / 32 px | 2.34 / 2.36 / 2.44 | 2.50 / 2.56 / 2.69 |
+| Vertical gradient background | 1.50 | |
+| 135 degree gradient | 1.93 | |
+| Radial gradient | 2.43 | 2.71 |
+| Full-screen image background | 1.71 | 1.98 |
+
+The Pi 3B+ is about 10 times slower. Shadows are capped at 32 px, and LVGL keeps the blurred corner of the last shadow drawn (`LV_DRAW_SW_SHADOW_CACHE_SIZE` 64: shadow plus radius up to 64 px), so cards with the same shadow and radius blur once per frame (12 cards with 32 px shadows: 2.78 ms without it). A gradient is computed again on every redraw; a fitted image is not decoded again. A page with a full-screen background image, 8 shadowed cards and values changing every second held its RSS (15.97 to 15.99 MB over 60 s, +1.7 MB for the fitted image) at 1.5% of one x86 core (1.2% without the image and shadows).
 
 ## Precedence
 

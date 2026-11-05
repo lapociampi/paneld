@@ -91,17 +91,25 @@ While paneld restarts after a crash (`Restart=on-failure`, 5s) the screen is bla
 
 ## Config block for the device
 
+Nothing is needed: without a `display` block paneld picks DRM on the card that has a connected screen (fbdev if there is none) and the first touchscreen, and logs both at start ([Schema](schema.md), section 13):
+
+```
+paneld: display: drm on /dev/dri/card0 (picked)
+paneld: touch: /dev/input/event0 (found: 10-0038 generic ft5x06 (79))
+```
+
+Set what the detection gets wrong, or turn the picture:
+
 ```
 display {
-    backend = drm
-    device  = /dev/dri/card1
-    touch   = /dev/input/event0
-    width   = 800
-    height  = 480
+    backend  = drm
+    device   = /dev/dri/card1
+    touch    = /dev/input/event0
+    rotation = 180
 }
 ```
 
-Device paths vary: `card0` on the Pi 3B+ (one GPU device), `card1` on the Pi 4 and 5 (`card0` is the 3D-only V3D there). `ls /sys/class/drm/` shows which card has the connector (e.g. `card0-DSI-1`). The touch controller shows up under `/dev/input/`; `evtest` lists the available devices.
+Device paths vary: `card0` on the Pi 3B+ (one GPU device), `card1` on the Pi 4 and 5 (`card0` is the 3D-only V3D there). `ls /sys/class/drm/` shows which card has the connector (e.g. `card0-DSI-1`). The touch controller shows up under `/dev/input/`; `cat /proc/bus/input/devices` or `evtest` lists the available devices.
 
 ## PIN for guarded actions
 
@@ -163,5 +171,5 @@ remote_kind linux {
 
 - `journalctl -u paneld -f` -- daemon logs.
 - `paneld check -c /etc/paneld/paneld.conf` -- offline config validation ([Config format](config-format.md)).
-- `paneld shot -c paneld.conf -o page.png [--page P] [--size 800x480] [--tap X,Y | --hold X,Y | --wait MS]...` -- render the UI without a display into a PNG, optionally after taps, long presses and pauses. Sources and touched actions run for real; the alert state file is not opened.
+- `paneld shot -c paneld.conf -o page.png [--page P] [--size 800x480] [--rotation 90] [--tap X,Y | --hold X,Y | --wait MS]...` -- render the UI without a display into a PNG, optionally after taps, long presses and pauses. With `--rotation`, `--size` is the panel's and the PNG and the tap points are the panel's too, as on the device. Sources and touched actions run for real; the alert state file is not opened.
 - `paneld ctl status` / `check` / `reload` / `eval '<cel>'` / `set vars.x=1` / `goto <page>` / `alert fire|resolve|ack|snooze <id>` / `reminder done <name>` -- talk to a running daemon over its Unix socket at `$PANELD_SOCK` (set to `/run/paneld/paneld.sock` by the service file; mode 0660; without it `$XDG_RUNTIME_DIR/paneld.sock`, else `/tmp/paneld-<uid>/paneld.sock` in a directory only that user can open). A second daemon refuses to start on a socket that a running one answers on. `--json` prints the raw replies ([ADR 0014](decisions/0014-ctl-protocol-state-file.md)); scripts can also speak the JSON lines directly, e.g. with `socat`.

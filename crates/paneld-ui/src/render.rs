@@ -109,11 +109,30 @@ fn render_page_body(
         screen.set_text_color_hex(rgb, opa);
     }
 
+    // Behind every page, two layers: the theme's `background` (a
+    // color, gradient or image) on a backdrop of the screen's size, and
+    // its `background_image` over it on the page root, so each has its
+    // own background slot.
+    let backdrop = screen.new_container();
+    backdrop.set_size(Size::Percent(100), Size::Percent(100));
+    backdrop.set_enabled(false);
+    backdrop.set_border(0, None);
+    backdrop.set_radius(0);
     let page_root = screen.new_container();
     page_root.set_size(Size::Percent(100), Size::Percent(100));
     page_root.set_flex_column();
     page_root.set_border(0, None);
     page_root.set_radius(0);
+    page_root.set_background_hex(0, 0);
+    if let Some(theme) = theme_of(ctx) {
+        if let Some(bg) = theme.get("background") {
+            apply_background(&bg.to_display_string(), ctx, &backdrop);
+        }
+        let image = theme.get("background_image").map(|v| v.to_display_string()).unwrap_or_default();
+        if !image.trim().is_empty() {
+            page_root.set_background_image(image.trim(), paneld_config::paint::Fit::Cover);
+        }
+    }
     if let Some((rgb, opa)) = color_of("text", ctx) {
         page_root.set_text_color_hex(rgb, opa);
     }
@@ -133,6 +152,8 @@ fn render_page_body(
             render_item_list(&page.items, doc, &pctx, None, sink, &page_root);
         }
     }
+    // Image backgrounds are fitted to their node's size, known now.
+    crate::ui::settle_backgrounds();
 }
 
 /// `{ name, title, icon }` of a page; `title` defaults to the name.
@@ -1399,11 +1420,8 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
                 let flag = resolve_expr_value(value, a.value.span, ctx).is_some_and(|v| value_truthy(&v));
                 obj.set_arc_rounded(flag);
             }
-            "background" => {
-                if let Some((rgb, opa)) = resolve_color(value, a.value.span, ctx) {
-                    obj.set_background_hex(rgb, opa);
-                }
-            }
+            "background" => apply_background(&resolve_scalar(value, a.value.span, ctx), ctx, obj),
+            "shadow" => apply_shadow(&resolve_scalar(value, a.value.span, ctx), ctx, obj),
             "color" => {
                 if let Some((rgb, opa)) = resolve_color(value, a.value.span, ctx) {
                     // A gauge's foreground is its indicator.
@@ -1476,6 +1494,91 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
             }
         }
     }
+}
+
+/// Draw a `background` value (schema 8.1, resolved text) on `obj`: a
+/// color, `none`, a gradient or an image; a bare name is a theme
+/// token holding one; an image replaces the color. A value that
+/// does not parse (an expression's result: a literal is checked) is
+/// logged once and leaves the node as it was.
+fn apply_background(text: &str, ctx: &Context, obj: &Obj<'_>) {
+    use paneld_config::paint::{parse_background, Background};
+    let mut text = text.trim().to_string();
+    for _ in 0..8 {
+        let parsed = match parse_background(&text) {
+            Ok(b) => b,
+            Err(e) => {
+                note_bad_value(format!("background: {e}"));
+                return;
+            }
+        };
+        match parsed {
+            Background::None => {
+                obj.clear_background_paint();
+                obj.set_background_hex(0, 0);
+            }
+            Background::Color(c) => {
+                if let Some((rgb, opa)) = color_of(c, ctx) {
+                    obj.clear_background_paint();
+                    obj.set_background_hex(rgb, opa);
+                } else if let Some(v) = theme_of(ctx).and_then(|t| t.get(c)) {
+                    // A token holding a gradient or an image.
+                    text = v.to_display_string().trim().to_string();
+                    continue;
+                } else {
+                    note_bad_value(format!("background: `{c}` is not a color or a theme token"));
+                }
+            }
+            Background::Gradient(g) => {
+                let stops: Option<Vec<(u32, u8)>> = g.stops.iter().map(|c| color_of(c, ctx)).collect();
+                match stops {
+                    Some(stops) => obj.set_background_gradient(&g.kind, &stops),
+                    None => note_bad_value(format!("background: a stop of `{text}` is not a color")),
+                }
+            }
+            Background::Image { path, fit } => {
+                if obj.set_background_image(path, fit) {
+                    obj.set_background_hex(0, 0);
+                }
+            }
+        }
+        return;
+    }
+}
+
+/// Draw a `shadow` value (schema 8.1): `none`, `<size> [<color>] [<x>
+/// <y>]`, or a theme token's name holding one.
+fn apply_shadow(text: &str, ctx: &Context, obj: &Obj<'_>) {
+    use paneld_config::paint::{parse_shadow, ShadowValue};
+    let mut text = text.trim().to_string();
+    for _ in 0..8 {
+        match parse_shadow(&text) {
+            Ok(ShadowValue::None) => obj.set_shadow(0, 0, 0, 0, 0),
+            Ok(ShadowValue::Shadow(sh)) => match color_of(sh.color, ctx) {
+                Some((rgb, opa)) => obj.set_shadow(sh.size, rgb, opa, sh.x, sh.y),
+                None => note_bad_value(format!("shadow: `{}` is not a color", sh.color)),
+            },
+            Ok(ShadowValue::Token(name)) => match theme_of(ctx).and_then(|t| t.get(name)) {
+                Some(v) => {
+                    text = v.to_display_string().trim().to_string();
+                    continue;
+                }
+                None => note_bad_value(format!("shadow: `{name}` is not a theme token")),
+            },
+            Err(e) => note_bad_value(format!("shadow: {e}")),
+        }
+        return;
+    }
+}
+
+/// Log a value that cannot be drawn, once (bounded like icon names).
+fn note_bad_value(msg: String) {
+    BAD_FONTS.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.len() < UNKNOWN_ICONS_MAX && b.insert(msg.clone()) {
+            eprintln!("paneld: {msg}");
+        }
+    });
 }
 
 /// Resolve a `key = ...` on `node` as an f64. Handles literal

@@ -133,6 +133,14 @@ enum ExpectedType {
     /// A font value (ADR 0015): `<family> <size> [bold]`, or a bare
     /// theme font token (`font_big`).
     Font,
+    /// A `background` (schema 8.1): a color, `none`, a gradient, or a
+    /// `.png` path (inside the config folder, a PNG) with a fit.
+    Background,
+    /// A `shadow`: `none`, `<size> [<color>] [<x> <y>]`, or a theme
+    /// token holding one.
+    Shadow,
+    /// A theme's `background_image`: a `.png` inside its folder.
+    Image,
     /// Any text accepted; no shape check.
     Any,
 }
@@ -835,11 +843,11 @@ const COMMON_UI_KEYS: &[KeyRule] = &[
     },
     KeyRule { name: "padding", ty: ExpectedType::Padding, required: false, expr_ok: false },
     KeyRule { name: "class", ty: ExpectedType::IdentOrList, required: false, expr_ok: false },
-    KeyRule { name: "background", ty: ExpectedType::Any, required: false, expr_ok: true },
+    KeyRule { name: "background", ty: ExpectedType::Background, required: false, expr_ok: true },
     KeyRule { name: "opacity", ty: ExpectedType::Number, required: false, expr_ok: true },
     KeyRule { name: "radius", ty: ExpectedType::Size, required: false, expr_ok: false },
     KeyRule { name: "border", ty: ExpectedType::Str, required: false, expr_ok: false },
-    KeyRule { name: "shadow", ty: ExpectedType::Str, required: false, expr_ok: false },
+    KeyRule { name: "shadow", ty: ExpectedType::Shadow, required: false, expr_ok: false },
     KeyRule { name: "color", ty: ExpectedType::Color, required: false, expr_ok: true },
     KeyRule { name: "font", ty: ExpectedType::Font, required: false, expr_ok: true },
     KeyRule { name: "visible", ty: ExpectedType::Bool, required: false, expr_ok: true },
@@ -1411,6 +1419,124 @@ fn check_icon_name(name: &str) -> Result<(), String> {
     Err(format!("unknown icon `{name}`: not a built-in icon (schema 8.3) and the theme sets no `icons` folder{hint}"))
 }
 
+/// `display` `width` x `height` as written, default 800x480.
+fn display_pixels(doc: &Document) -> u64 {
+    let mut size = (800u64, 480u64);
+    for it in &doc.items {
+        let Item::Block(b) = it else { continue };
+        if b.kind.text != "display" {
+            continue;
+        }
+        for i in &b.items {
+            if let Item::Assign(a) = i {
+                if let AssignTarget::Simple { key } = &a.target {
+                    if let Ok(n) = a.value.text.trim().parse::<u64>() {
+                        match key.text.as_str() {
+                            "width" => size.0 = n,
+                            "height" => size.1 = n,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    size.0 * size.1
+}
+
+/// A literal `background` (schema 8.1). A bare name is a theme color,
+/// or a token holding another background (a gradient, an image).
+fn check_background(text: &str) -> Result<(), String> {
+    use crate::paint::{parse_background, Background};
+    match parse_background(text)? {
+        Background::None => Ok(()),
+        Background::Color(c) if c.starts_with('#') => Ok(()),
+        Background::Color(c) => {
+            let other = THEME_MAPS.with(|m| {
+                m.borrow().iter().any(|map| {
+                    map.get(c).is_some_and(|v| {
+                        matches!(parse_background(v), Ok(Background::Gradient(_) | Background::Image { .. } | Background::None))
+                    })
+                })
+            });
+            if other {
+                Ok(())
+            } else {
+                check_color_name(c)
+            }
+        }
+        Background::Gradient(g) => {
+            for stop in g.stops {
+                if !stop.starts_with('#') {
+                    check_color_name(stop)?;
+                }
+            }
+            Ok(())
+        }
+        Background::Image { path, .. } => check_image(path, "background image"),
+    }
+}
+
+/// A literal `shadow`: its color a hex or a theme color; a bare name a
+/// theme token holding a shadow.
+fn check_shadow(text: &str) -> Result<(), String> {
+    use crate::paint::{parse_shadow, ShadowValue};
+    match parse_shadow(text)? {
+        ShadowValue::None => Ok(()),
+        ShadowValue::Shadow(sh) if sh.color.starts_with('#') => Ok(()),
+        ShadowValue::Shadow(sh) => check_color_name(sh.color),
+        ShadowValue::Token(name) => {
+            let mut first = None;
+            let found = THEME_MAPS.with(|m| {
+                m.borrow().iter().any(|map| match map.get(name).map(|v| parse_shadow(v)) {
+                    Some(Ok(ShadowValue::Token(_))) | None => false,
+                    Some(Ok(_)) => true,
+                    Some(Err(e)) => {
+                        first.get_or_insert(format!("theme token `{name}`: {e}"));
+                        false
+                    }
+                })
+            });
+            match (found, first) {
+                (true, _) => Ok(()),
+                (false, Some(e)) => Err(e),
+                (false, None) => Err(format!("unknown theme shadow `{name}`: not a token holding a shadow")),
+            }
+        }
+    }
+}
+
+/// An image file (relative to the config folder, or a theme folder's,
+/// rewritten to `themes/<name>/...`) exists inside its folder and is a
+/// PNG.
+fn check_image(path: &str, what: &str) -> Result<(), String> {
+    use std::io::Read;
+    let path = path.trim();
+    if !path.to_ascii_lowercase().ends_with(".png") {
+        return Err(format!("{what} `{path}` must be a `.png` file"));
+    }
+    let Some(dir) = CONFIG_DIR.with(|d| d.borrow().clone()) else { return Ok(()) };
+    let full = crate::assets::resolve(&dir, path, what)?;
+    let mut head = [0u8; 24];
+    let png = std::fs::File::open(&full).and_then(|mut f| f.read_exact(&mut head)).is_ok()
+        && &head[..8] == b"\x89PNG\r\n\x1a\n"
+        && &head[12..16] == b"IHDR";
+    if !png {
+        return Err(format!("{what} `{path}` is not a PNG file"));
+    }
+    let be = |b: &[u8]| u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let (w, h) = (be(&head[16..20]), be(&head[20..24]));
+    let screen = DISPLAY_PIXELS.with(|d| d.get());
+    let max = crate::paint::max_image_pixels(screen);
+    if w * h > max {
+        return Err(format!(
+            "{what} `{path}` is {w}x{h}: more than {max} pixels (twice the screen's, at most {} MiB decoded) is not drawn",
+            crate::paint::IMAGE_CACHE_BYTES >> 20
+        ));
+    }
+    Ok(())
+}
+
 /// A literal font value: a theme font token, or `<family> <size>
 /// [bold]` whose `.ttf` file (relative to the config folder) exists.
 fn check_font(text: &str) -> Result<(), String> {
@@ -1433,6 +1559,7 @@ pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     CONFIG_DIR.with(|d| *d.borrow_mut() = source.root_dir().map(|p| p.to_path_buf()));
     let mut applied = doc.clone();
     crate::apply_overrides(&mut applied);
+    DISPLAY_PIXELS.with(|d| d.set(display_pixels(&applied)));
     let themes = theme_blocks(&applied);
     let maps = active_theme_maps(&applied, &themes);
     THEME_BLOCKS.with(|t| t.replace(themes));
@@ -1445,6 +1572,9 @@ thread_local! {
     /// The root config's folder while a document is checked: a font
     /// file is looked up there.
     static CONFIG_DIR: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// The screen's pixels while a document is checked (`display`
+    /// `width` x `height`, default 800x480): the image size limit.
+    static DISPLAY_PIXELS: std::cell::Cell<u64> = const { std::cell::Cell::new(800 * 480) };
     /// The document's themes while it is checked: a theme's own tokens
     /// resolve in its own chain.
     static THEME_BLOCKS: std::cell::RefCell<Vec<Block>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -2675,6 +2805,9 @@ fn check_literal(text: &str, ty: ExpectedType) -> Result<(), String> {
         }
         ExpectedType::Icon => check_icon_name(text),
         ExpectedType::Font => check_font(text),
+        ExpectedType::Background => check_background(text),
+        ExpectedType::Shadow => check_shadow(text),
+        ExpectedType::Image => check_image(text, "background image"),
         ExpectedType::HexColor => parse_color(text)
             .map(|_| ())
             .ok_or_else(|| {
@@ -2816,6 +2949,9 @@ fn type_name(ty: ExpectedType) -> &'static str {
         ExpectedType::PositiveInt => "an integer of at least 1",
         ExpectedType::Icon => "an icon name",
         ExpectedType::Font => "a font",
+        ExpectedType::Background => "a background",
+        ExpectedType::Shadow => "a shadow",
+        ExpectedType::Image => "a PNG path",
         ExpectedType::Any => "a value",
     }
 }
@@ -2983,13 +3119,13 @@ fn theme_token_type(key: &str) -> Option<ExpectedType> {
     match key {
         "extends" => Some(ExpectedType::Ident),
         "motion" => Some(ExpectedType::OneOf(&["full", "reduced", "none"])),
-        "shadow" => Some(ExpectedType::Str),
+        "shadow" => Some(ExpectedType::Shadow),
         // schema.md calls `background_image` an optional path. The
         // themes.md example also writes `background = images/bg.jpg`
         // which overrides the Color token with a path; we accept
         // either shape by typing both as Any.
-        "background" => Some(ExpectedType::Any),
-        "background_image" => Some(ExpectedType::Path),
+        "background" => Some(ExpectedType::Background),
+        "background_image" => Some(ExpectedType::Image),
         "icons" => Some(ExpectedType::Path),
         _ => {
             if THEME_COLOR_TOKENS.contains(&key) {
@@ -4784,6 +4920,14 @@ screen { idle = 2m }
     }
 
     #[test]
+    fn display_touch_none_and_bad_rotation() {
+        let diags = check_text("display { touch = none; rotation = 270 }\n");
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+        let diags = check_text("display { rotation = 45 }\n");
+        assert_msg(&diags, "expected one of");
+    }
+
+    #[test]
     fn display_bad_backend_flagged() {
         let diags = check_text("display { backend = qt }\n");
         assert_msg(&diags, "expected one of");
@@ -6456,13 +6600,24 @@ page home { text { value = \{{ sources.ghost.value }} } }
     /// A config folder with `files` (path, text); checks `root.conf`.
     /// Returns the diagnostics (`file:line:col: message`, file names
     /// relative to the folder) and the loaded document.
+    const PNG_HEAD: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x10\0\0\0\x10";
+
+    /// 1000x800: past the limit of an 800x480 screen, not of 1024x600.
+    const BIG_PNG_HEAD: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\x03\xe8\0\0\x03\x20";
+
     fn check_folder(label: &str, files: &[(&str, &str)]) -> (Vec<String>, Document) {
         let root = tmp_file(label, files[0].1);
         let dir = root.parent().unwrap().to_path_buf();
         for (path, text) in &files[1..] {
             let p = dir.join(path);
             fs::create_dir_all(p.parent().unwrap()).unwrap();
-            fs::write(p, text).unwrap();
+            // `<png>`: the start of a PNG file, what the check reads.
+            let bytes: &[u8] = match *text {
+                "<png>" => PNG_HEAD,
+                "<bigpng>" => BIG_PNG_HEAD,
+                _ => text.as_bytes(),
+            };
+            fs::write(p, bytes).unwrap();
         }
         let (map, doc, mut diags) = load(&root).unwrap();
         diags.extend(check(&doc, &map));
@@ -6509,6 +6664,7 @@ page home { text { value = \{{ sources.ghost.value }} } }
                 ("root.conf", "screen:theme = glass\ncomponent tile { param label: string\n param value: number = 0\n text { value = {{ label }} } }\npage home { tile { label = a } }\n"),
                 ("themes/glass/theme.conf", GLASS),
                 ("themes/glass/fonts/f.ttf", "x"),
+                ("themes/glass/images/bg.png", "<png>"),
                 ("themes/base/theme.conf", "theme base { surface = #222222 }\n"),
             ],
         );
@@ -6524,6 +6680,82 @@ page home { text { value = \{{ sources.ghost.value }} } }
         assert!(text.contains("\"themes/glass/images/bg2.png\""), "literal src rewritten");
         assert!(text.contains("\"images/{{ label }}.png\""), "expression src left alone");
         assert!(text.contains("themes/glass/fonts/f.ttf 12"), "style font rewritten");
+    }
+
+    #[test]
+    fn backgrounds_and_shadows_are_checked_with_their_files() {
+        let (diags, doc) = check_folder(
+            "tbg",
+            &[
+                (
+                    "root.conf",
+                    "screen:theme = glass\n\
+                     page home {\n\
+                     rect { background = linear 180 #000 accent #ffffff00 }\n\
+                     rect { background = radial surface #00000000; shadow = 8 #00000080 0 4 }\n\
+                     rect { background = images/a.png contain; shadow = shadow }\n\
+                     rect { background = sunset; shadow = lifted }\n\
+                     rect { background = {{ 'linear 90 #000 #fff' }} }\n\
+                     rect { background = linear #000 #fff }\n\
+                     rect { background = radial #000 nope }\n\
+                     rect { background = images/none.png }\n\
+                     rect { background = images/fake.png }\n\
+                     rect { background = ../x.png }\n\
+                     rect { background = images/a.png zoom }\n\
+                     rect { shadow = 99 }\n\
+                     rect { shadow = 8 nope }\n\
+                     rect { shadow = flat }\n\
+                     rect { background = images/big.png }\n\
+                     }\n",
+                ),
+                ("images/a.png", "<png>"),
+                ("images/fake.png", "not a png"),
+                ("images/big.png", "<bigpng>"),
+                (
+                    "themes/glass/theme.conf",
+                    "theme glass {\n    background_image = img/bg.png\n    sunset = radial #ff8800 #220044\n    \
+                     lifted = 12 accent 0 6\n    shadow = 4\n    flat = #000\n    \
+                     style .card { background = img/card.png fill }\n}\n",
+                ),
+                ("themes/glass/img/bg.png", "<png>"),
+                ("themes/glass/img/card.png", "<png>"),
+            ],
+        );
+        let text = format!("{doc:?}");
+        assert!(text.contains("themes/glass/img/card.png fill"), "style background rewritten");
+        let want = [
+            "root.conf:8:21: a linear gradient is `linear <angle> <color> <color> ...`",
+            "root.conf:9:21: unknown theme color `nope`",
+            "root.conf:10:21: background image `images/none.png` not found",
+            "root.conf:11:21: background image `images/fake.png` is not a PNG file",
+            "root.conf:12:21: background image `../x.png` must be a relative path inside the config folder",
+            "root.conf:13:21: background image fit `zoom`",
+            "root.conf:14:17: shadow size 99 is out of range",
+            "root.conf:15:17: unknown theme color `nope`",
+            "root.conf:16:17: theme token `flat`: expected a shadow",
+            "root.conf:17:21: background image `images/big.png` is 1000x800: more than 768000 pixels",
+        ];
+        for w in want {
+            assert!(diags.iter().any(|d| d.starts_with(w)), "missing `{w}` in {diags:#?}");
+        }
+        assert_eq!(diags.len(), want.len(), "{diags:#?}");
+
+        // A theme folder's `background_image` must be there.
+        let (diags, _) = check_folder(
+            "tbg2",
+            &[("root.conf", "screen:theme = glass\n"), ("themes/glass/theme.conf", "theme glass { background_image = bg.png }\n")],
+        );
+        assert!(diags.iter().any(|d| d.contains("background image `themes/glass/bg.png` not found")), "{diags:?}");
+
+        // A larger screen draws a larger image.
+        let (diags, _) = check_folder(
+            "tbg3",
+            &[
+                ("root.conf", "display { width = 1024; height = 600 }\npage home { rect { background = big.png } }\n"),
+                ("big.png", "<bigpng>"),
+            ],
+        );
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

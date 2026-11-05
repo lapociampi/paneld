@@ -81,6 +81,9 @@ struct ShotOpts {
     out: PathBuf,
     page: Option<String>,
     size: (i32, i32),
+    /// `display:rotation` for the shot: `size`, the PNG and the tap
+    /// points are then the panel's (unrotated), as on the device.
+    rotation: i32,
     /// Touches and pauses, in order.
     taps: Vec<ShotStep>,
     settle_ms: u32,
@@ -92,6 +95,7 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
         out: PathBuf::new(),
         page: None,
         size: (800, 480),
+        rotation: 0,
         taps: Vec::new(),
         settle_ms: 300,
     };
@@ -116,6 +120,15 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
                 if o.size.0 <= 0 || o.size.1 <= 0 || o.size.0 > 4096 || o.size.1 > 4096 {
                     return Err("`--size` must be within 1x1..4096x4096".into());
                 }
+            }
+            "--rotation" => {
+                o.rotation = match val(&mut i, a)?.as_str() {
+                    "0" => 0,
+                    "90" => 90,
+                    "180" => 180,
+                    "270" => 270,
+                    _ => return Err("`--rotation` is 0, 90, 180 or 270".into()),
+                };
             }
             "--tap" | "--hold" => {
                 let v = val(&mut i, a)?;
@@ -229,7 +242,7 @@ Usage:
   paneld hash-pin                     Read a PIN on stdin, print its
                                       argon2 hash for security.pin
   paneld shot -o FILE.png [--page P] [--size WxH] [--settle MS]
-              [--tap X,Y | --hold X,Y | --wait MS]...
+              [--rotation DEG] [--tap X,Y | --hold X,Y | --wait MS]...
                                       Render the config headless to a PNG,
                                       after the given steps (runs sources
                                       and touched actions for real)
@@ -274,23 +287,25 @@ fn run_daemon(config: PathBuf) -> ExitCode {
     // Peek at the config just to pick the display backend. The
     // live state will reload the full config a moment later.
     let display_cfg = match paneld_config::load(&config) {
-        Ok((_, mut doc, _)) => {
+        Ok((source, mut doc, _)) => {
             // Same last-one-wins view of `display` options as the rest.
             paneld_config::apply_overrides(&mut doc);
-            display::DisplayConfig::from_doc(&doc)
+            display::DisplayConfig::from_doc_at(&doc, Some(&source))
         }
         Err(_) => display::DisplayConfig::default(),
     };
-    let _window = match display_cfg.open(&ui) {
-        Some(w) => w,
+    // Read once: a reload only says that these changed.
+    display::set_started(display_cfg.clone());
+    // The config's display, else the next one that opens (schema 13);
+    // a config display that did not open is shown on the screen.
+    let display::Opened { window: _window, problem: display_problem } = match display_cfg.open(&ui) {
+        Some(o) => o,
         None => {
-            eprintln!(
-                "paneld: display backend {:?} failed to open; try `backend = sdl` or check the device path",
-                display_cfg.backend
-            );
+            eprintln!("paneld: no display could be opened; check `display:backend` and `display:device` (schema 13)");
             return ExitCode::from(70);
         }
     };
+    let _ = DISPLAY_PROBLEM.set(display_problem);
     let screen = ui.screen();
 
     // Initial live state. `reload` wipes and rebuilds this.
@@ -298,6 +313,8 @@ fn run_daemon(config: PathBuf) -> ExitCode {
         Ok(l) => l,
         Err(_) => return ExitCode::from(1),
     };
+
+    raise_display_problem(&mut live);
 
     let mut pump = ui.pump();
     'main: loop {
@@ -1772,6 +1789,10 @@ fn run_shot(o: ShotOpts) -> ExitCode {
         }
     };
     let mut mem = ui.open_memory_display(o.size.0, o.size.1);
+    if o.rotation != 0 && !mem.set_rotation(o.rotation) {
+        eprintln!("paneld shot: could not rotate by {}", o.rotation);
+        return ExitCode::from(70);
+    }
     let screen = ui.screen();
     // A snapshot must never touch the real alert state file.
     let scratch_state = std::env::temp_dir().join(format!("paneld-shot-{}.state", std::process::id()));
@@ -1907,11 +1928,26 @@ fn reload(
                 apply_active_theme(live);
             }
             eprintln!("paneld: reloaded config");
+            display::note_reload(&live.doc);
+            raise_display_problem(live);
             Ok(())
         }
         Err(issues) => {
             eprintln!("paneld: reload failed; keeping previous config");
             Err(issues)
+        }
+    }
+}
+
+/// The config's display that did not open at start, if another one
+/// did (schema 13): shown as an alert until a restart.
+static DISPLAY_PROBLEM: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn raise_display_problem(live: &mut LiveState) {
+    if let Some(Some(problem)) = DISPLAY_PROBLEM.get() {
+        let now = std::time::SystemTime::now();
+        if live.alerts.fire_rule("paneld", "display", "warning", "Display config not used", problem, "", now) {
+            live.redraw = true;
         }
     }
 }
@@ -2275,6 +2311,9 @@ mod tests {
         assert_eq!(o.taps, vec![ShotStep::Wait(500)]);
         assert!(parse(&["shot"]).unwrap_err().contains("-o"));
         assert!(parse(&["shot", "-o", "x.png", "--size", "0x10"]).is_err());
+        let Ok(Cmd::Shot(o)) = parse(&["shot", "-o", "x.png", "--rotation", "270"]) else { panic!() };
+        assert_eq!(o.rotation, 270);
+        assert!(parse(&["shot", "-o", "x.png", "--rotation", "45"]).is_err());
     }
 
     #[test]

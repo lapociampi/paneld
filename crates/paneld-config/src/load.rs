@@ -426,7 +426,10 @@ fn rewrite_theme_assets(theme: &mut Block, prefix: &str) {
                             "src" => !top,
                             "icons" => top && v != "builtin",
                             "background_image" => top,
-                            "background" => top && !v.starts_with('#') && (v.contains('/') || v.contains('.')),
+                            // A literal image path, in a token, a style or a component.
+                            "background" => {
+                                matches!(crate::paint::parse_background(v), Ok(crate::paint::Background::Image { .. }))
+                            }
                             _ => false,
                         };
                     // A font file: in a token (`font_title = fonts/x.ttf 20`) or a `font`.
