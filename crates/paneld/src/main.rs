@@ -392,6 +392,9 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // its action would count as running for good.
     live.stale_events = stale;
     while let Ok(ev) = live.event_rx.try_recv() {
+        if perf_on() {
+            eprintln!("perf event at={}", paneld_ui::perf::mono_us());
+        }
         match ev {
             paneld_ui::UiEvent::Action { name, args } => {
                 // A tap queued before a modal opened in this same drain
@@ -711,6 +714,17 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
 
     if dirty && live.pending.is_none() {
         let perf_t0 = perf_on().then(std::time::Instant::now);
+        if perf_t0.is_some() {
+            paneld_ui::perf::take();
+        }
+        let lap = |t: &mut Option<std::time::Instant>| -> u128 {
+            t.map_or(0, |x| {
+                let now = std::time::Instant::now();
+                *t = Some(now);
+                (now - x).as_micros()
+            })
+        };
+        let mut perf_lap = perf_t0;
         let drawn_at = clock::unix_now();
         let ctx = build_ctx(
             &live.source_values,
@@ -718,6 +732,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             &live.vars,
             Some(&live.alerts),
         );
+        let perf_ctx = lap(&mut perf_lap);
         // A poll landing mid-entry must not wipe digits the user
         // is typing into a keypad on the same page.
         let typed = paneld_ui::snapshot_inputs();
@@ -748,6 +763,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             live.toast_until = None;
             screen.release_fonts();
         }
+        let perf_clear = lap(&mut perf_lap);
         paneld_ui::reset_action_bindings();
         paneld_ui::set_call_states(live.calls.values().cloned().collect());
         paneld_ui::take_ago_next();
@@ -758,6 +774,8 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             &live.event_tx,
             screen,
         );
+        let perf_render = lap(&mut perf_lap);
+        let perf_fine = if perf_t0.is_some() { paneld_ui::perf::take() } else { String::new() };
         live.ago_due = paneld_ui::take_ago_next();
         if same_page {
             paneld_ui::restore_inputs(&typed);
@@ -772,7 +790,19 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         }
         live.went_back = false;
         if let Some(t0) = perf_t0 {
-            eprintln!("perf build page={} same={} us={}", live.current_page, same_page, t0.elapsed().as_micros());
+            let perf_tr = lap(&mut perf_lap);
+            eprintln!(
+                "perf build page={} same={} us={} ctx={} clear={} render={} [{}] tr={} at={}",
+                live.current_page,
+                same_page,
+                t0.elapsed().as_micros(),
+                perf_ctx,
+                perf_clear,
+                perf_render,
+                perf_fine,
+                perf_tr,
+                paneld_ui::perf::mono_us(),
+            );
         }
         live.rendered_page = live.current_page.clone();
         RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

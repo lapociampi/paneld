@@ -1268,10 +1268,10 @@ pub const BUILTIN_THEME_TOKENS: &[(&str, &str)] = &[
     ("shadow", "none"),
     ("icons", "builtin"),
     ("motion", "reduced"),
-    ("page_transition", "fade 200ms"),
+    ("page_transition", "fade 120ms"),
     ("banner_transition", "fade 200ms"),
     ("value_transition", "300ms"),
-    ("tap_transition", "80ms"),
+    ("tap_transition", "50ms"),
 ];
 
 /// A theme's tokens as written (built-ins under it), by name.

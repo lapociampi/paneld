@@ -17,6 +17,7 @@
 //! few lines in [`render::render_node`].
 
 pub mod expr;
+pub mod perf;
 pub mod motion;
 pub mod render;
 pub mod ui;

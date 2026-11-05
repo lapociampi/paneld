@@ -90,6 +90,23 @@ impl std::fmt::Display for EvalError {
 }
 
 pub fn eval(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
+    crate::perf::time(crate::perf::Slot::Eval, || eval_node(expr, ctx))
+}
+
+/// The value an identifier or a field path (`sources.x`) names in
+/// `ctx`, borrowed; `None` for any other expression or a missing step.
+fn lookup<'a>(expr: &Expr, ctx: &'a Context) -> Option<&'a Value> {
+    match &expr.kind {
+        ExprKind::Ident(name) => ctx.get(name),
+        ExprKind::Field(inner, name) => match lookup(inner, ctx)? {
+            Value::Map(m) => m.get(name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn eval_node(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::IntLit(n) => Ok(Value::Int(*n)),
         ExprKind::DoubleLit(d) => Ok(Value::Double(*d)),
@@ -101,6 +118,14 @@ pub fn eval(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
             .cloned()
             .ok_or_else(|| EvalError::new(format!("unknown identifier `{name}`"))),
         ExprKind::Field(inner, name) => {
+            // A path into the context (`sources.x.value`, `theme.accent`)
+            // is read in place: only the leaf is cloned, not the maps on
+            // the way.
+            if let Some(Value::Map(m)) = lookup(inner, ctx) {
+                if let Some(v) = m.get(name) {
+                    return Ok(v.clone());
+                }
+            }
             let base = eval(inner, ctx)?;
             match base {
                 Value::Map(m) => m.get(name).cloned().ok_or_else(|| {
@@ -823,6 +848,62 @@ mod tests {
 
     fn ev_ctx(s: &str, ctx: &Context) -> Value {
         eval(&parse(s), ctx).expect("eval")
+    }
+
+    /// `expr` with its root `r` read through a ternary, which
+    /// [`lookup`] does not take: the full evaluation path.
+    fn full_path(expr: &str, root: &str) -> String {
+        expr.replacen(root, &format!("(true ? {root} : null)"), 1)
+    }
+
+    #[test]
+    fn a_field_path_read_in_place_is_what_the_full_path_gives() {
+        let mut host = BTreeMap::new();
+        host.insert("value".to_string(), Value::Int(42));
+        host.insert("list".to_string(), Value::List(vec![Value::Int(1), Value::Int(2)]));
+        host.insert("n".to_string(), Value::Int(3));
+        host.insert("none".to_string(), Value::Null);
+        let mut sources = BTreeMap::new();
+        sources.insert("cpu".to_string(), Value::Map(host));
+        // A remote instance's root (`pve.sources.cpu`) next to the
+        // local `sources`.
+        let mut pve = BTreeMap::new();
+        pve.insert("sources".to_string(), Value::Map(sources.clone()));
+        let mut ctx = Context::new();
+        ctx.insert("sources".into(), Value::Map(sources));
+        ctx.insert("pve".into(), Value::Map(pve));
+        ctx.insert("x".into(), Value::Int(1));
+        let cases = [
+            ("sources.cpu.value", "sources"),
+            ("sources.cpu.missing", "sources"),
+            ("sources.nope.value", "sources"),
+            ("sources.cpu.n.deeper", "sources"),
+            ("sources.cpu.none.deeper", "sources"),
+            ("sources.cpu.list", "sources"),
+            ("sources.cpu.list[1]", "sources"),
+            ("sources.cpu.list.size()", "sources"),
+            ("sources.cpu.list.map(v, v * 2)", "sources"),
+            ("x.field", "x"),
+            ("pve.sources.cpu.value", "pve"),
+            ("pve.sources.cpu.missing", "pve"),
+            ("has(sources.cpu.value)", "sources"),
+            ("has(sources.cpu.missing)", "sources"),
+            ("has(pve.sources.nope.value)", "pve"),
+            // CEL's absorption: an error on one side of `||` / `&&`
+            // gives way to the side that decides.
+            ("sources.cpu.missing || true", "sources"),
+            ("sources.cpu.missing && false", "sources"),
+            ("sources.cpu.missing || false", "sources"),
+            ("sources.cpu.value > 40 && sources.cpu.missing == 1", "sources"),
+        ];
+        for (expr, root) in cases {
+            let fast = eval(&parse(expr), &ctx);
+            let full = eval(&parse(&full_path(expr, root)), &ctx);
+            assert_eq!(fast, full, "{expr}");
+        }
+        assert_eq!(ev_ctx("pve.sources.cpu.value", &ctx), Value::Int(42));
+        assert_eq!(ev_ctx("has(sources.cpu.missing)", &ctx), Value::Bool(false));
+        assert_eq!(ev_ctx("sources.cpu.missing || true", &ctx), Value::Bool(true));
     }
 
     #[test]

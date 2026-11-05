@@ -509,6 +509,11 @@ static void perf_cb(lv_event_t * e)
     }
 }
 
+uint64_t lv_paneld_mono_us(void)
+{
+    return perf_us();
+}
+
 void lv_paneld_perf_attach(lv_display_t * disp)
 {
     if(getenv("PANELD_PERF") == NULL) return;

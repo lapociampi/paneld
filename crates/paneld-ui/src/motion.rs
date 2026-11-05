@@ -32,9 +32,9 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             level: Level::Reduced,
-            page: Transition { effect: Effect::Fade, ms: 200 },
+            page: Transition { effect: Effect::Fade, ms: 120 },
             value_ms: 300,
-            tap_ms: 80,
+            tap_ms: 50,
         }
     }
 }
@@ -366,7 +366,7 @@ mod tests {
         t.insert("motion".to_string(), Value::String("reduced".into()));
         t.insert("page_transition".to_string(), Value::String("slide 300ms".into()));
         let s = Settings::from_theme(Some(&t));
-        assert_eq!((s.value_ms(), s.tap_ms(), s.page_transition()), (300, 80, None));
+        assert_eq!((s.value_ms(), s.tap_ms(), s.page_transition()), (300, 50, None));
         t.insert("motion".to_string(), Value::String("full".into()));
         assert_eq!(Settings::from_theme(Some(&t)).page_transition(), Some((true, 300)));
         t.insert("page_transition".to_string(), Value::String("fade 120ms".into()));

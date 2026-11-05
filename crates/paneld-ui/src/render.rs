@@ -99,7 +99,7 @@ fn render_page_body(
     screen: &Obj<'_>,
 ) {
     // `page` and `nav` are visible to the shell and to the page body.
-    let mut pctx = ctx.clone();
+    let mut pctx = crate::perf::time(crate::perf::Slot::Clone, || ctx.clone());
     pctx.insert("page".into(), page_info(page, ctx));
     pctx.insert("nav".into(), nav_entries(doc, page, ctx));
 
@@ -243,16 +243,16 @@ fn expand_repeat(
     parent: &Obj<'_>,
 ) {
     let body_offset = r.source.span.start + 2;
-    let (expr, diags) =
-        cel::parse_fragment(&r.source.body, r.source.span.file, body_offset);
+    let parsed = parse_fragment_cached(&r.source.body, r.source.span.file, body_offset);
+    let (expr, diags) = (&parsed.0, &parsed.1);
     if !diags.is_empty() {
         parent.new_label(&format!("[repeat parse: {}]", diags[0].message));
         return;
     }
-    let Some(expr) = expr else {
+    let Some(expr) = expr.as_ref() else {
         return;
     };
-    let items = match eval(&expr, ctx) {
+    let items = match eval(expr, ctx) {
         Ok(Value::List(xs)) => xs,
         Ok(other) => {
             parent.new_label(&format!(
@@ -268,7 +268,7 @@ fn expand_repeat(
     };
     for (i, item) in items.into_iter().enumerate() {
         crate::motion::push_scope(crate::motion::item_key(&item, i));
-        let mut inner = ctx.clone();
+        let mut inner = crate::perf::time(crate::perf::Slot::Clone, || ctx.clone());
         inner.insert(r.binding.text.clone(), item);
         render_item_list(&r.items, doc, &inner, slot, sink, parent);
         crate::motion::pop_scope();
@@ -777,7 +777,7 @@ fn expand_component(
     sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
 ) {
-    let mut inner_ctx = outer_ctx.clone();
+    let mut inner_ctx = crate::perf::time(crate::perf::Slot::Clone, || outer_ctx.clone());
     for item in &comp.items {
         let Item::Param(p) = item else { continue };
         let bound = if let Some((raw, span)) = find_raw(call, &p.name.text) {
@@ -929,18 +929,20 @@ fn resolve_expr_value(
         // quotes themselves are not part of the value.
         ValueShape::Literal(text) => Some(Value::String(paneld_config::value::parse_string(text))),
         ValueShape::Expression(body) => {
-            let (expr, diags) = cel::parse_fragment(body, span.file, span.start + 2);
+            let parsed = parse_fragment_cached(body, span.file, span.start + 2);
+            let (expr, diags) = (&parsed.0, &parsed.1);
             if !diags.is_empty() {
                 return None;
             }
-            expr.and_then(|e| eval(&e, ctx).ok())
+            expr.as_ref().and_then(|e| eval(e, ctx).ok())
         }
         ValueShape::Interp(_) => {
-            let (fragments, diags) = cel::parse_interp(raw, span.file, span.start);
+            let parsed = parse_interp_cached(raw, span.file, span.start);
+            let (fragments, diags) = (&parsed.0, &parsed.1);
             if !diags.is_empty() {
                 return None;
             }
-            Some(Value::String(splice(raw, &fragments, ctx, false)))
+            Some(Value::String(splice(raw, fragments, ctx, false)))
         }
     }
 }
@@ -961,21 +963,23 @@ fn resolve_text(node: &Block, key: &str, ctx: &Context) -> Option<String> {
     Some(match classify(raw) {
         ValueShape::Literal(text) => paneld_config::value::parse_string(text),
         ValueShape::Expression(body) => {
-            let (expr, diags) = cel::parse_fragment(body, span.file, span.start + 2);
+            let parsed = parse_fragment_cached(body, span.file, span.start + 2);
+            let (expr, diags) = (&parsed.0, &parsed.1);
             if !diags.is_empty() {
                 return Some(format!("[parse error: {}]", diags[0].message));
             }
-            match expr.and_then(|e| eval(&e, ctx).ok()) {
+            match expr.as_ref().and_then(|e| eval(e, ctx).ok()) {
                 Some(v) => v.to_display_string(),
                 None => "[eval error]".to_string(),
             }
         }
         ValueShape::Interp(_) => {
-            let (fragments, diags) = cel::parse_interp(raw, span.file, span.start);
+            let parsed = parse_interp_cached(raw, span.file, span.start);
+            let (fragments, diags) = (&parsed.0, &parsed.1);
             if !diags.is_empty() {
                 return Some(format!("[parse error: {}]", diags[0].message));
             }
-            interpolate_text(raw, &fragments, ctx)
+            interpolate_text(raw, fragments, ctx)
         }
     })
 }
@@ -1042,11 +1046,13 @@ fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_
     //   `on_tap vm_stop { vm = {{ item.id }} }`
     // Only one gets wired per tap: the first form found wins,
     // matching schema semantics (one action per handler).
-    let tap_call = bind_handlers(node, ctx, sink, obj);
-    apply_styles(&node.kind.text, &node.items, true, ctx, obj);
-    apply_plain_props(&node.kind.text, &node.items, ctx, obj);
-    apply_motion(node, ctx, obj);
-    tap_call
+    crate::perf::time(crate::perf::Slot::Props, || {
+        let tap_call = bind_handlers(node, ctx, sink, obj);
+        apply_styles(&node.kind.text, &node.items, true, ctx, obj);
+        apply_plain_props(&node.kind.text, &node.items, ctx, obj);
+        apply_motion(node, ctx, obj);
+        tap_call
+    })
 }
 
 /// Theme motion on a node (ADR 0023): a press shown over
@@ -1183,6 +1189,60 @@ fn show_call_state(obj: &Obj<'_>, tap_call: Option<&(String, Vec<ActionArg>)>) -
 /// Applies from the next page drawn.
 pub fn set_styles(styles: std::collections::BTreeMap<String, Vec<Item>>) {
     STYLES.with(|s| *s.borrow_mut() = styles);
+    // A (re)loaded config: its expressions are parsed afresh.
+    PARSED.with(|p| p.borrow_mut().clear());
+    PARSED_INTERP.with(|p| p.borrow_mut().clear());
+}
+
+type ParseKey = (String, paneld_config::source::FileId, u32);
+type Parsed = std::rc::Rc<(Option<cel::Expr>, Vec<paneld_config::parse::Diagnostic>)>;
+type ParsedInterp = std::rc::Rc<(Vec<cel::Expr>, Vec<paneld_config::parse::Diagnostic>)>;
+
+thread_local! {
+    /// Parsed `{{ }}` bodies by text and place: a page rebuild
+    /// evaluates the same expressions again, it need not parse them.
+    static PARSED: std::cell::RefCell<std::collections::HashMap<ParseKey, Parsed>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static PARSED_INTERP: std::cell::RefCell<std::collections::HashMap<ParseKey, ParsedInterp>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn parse_fragment_cached(
+    body: &str,
+    file: paneld_config::source::FileId,
+    base: u32,
+) -> Parsed {
+    PARSED.with(|p| {
+        let mut p = p.borrow_mut();
+        let key = (body.to_string(), file, base);
+        if let Some(hit) = p.get(&key) {
+            return hit.clone();
+        }
+        use crate::perf::{time, Slot};
+        let parsed = time(Slot::Parse, || cel::parse_fragment(body, file, base));
+        let parsed = std::rc::Rc::new(parsed);
+        p.insert(key, parsed.clone());
+        parsed
+    })
+}
+
+fn parse_interp_cached(
+    raw: &str,
+    file: paneld_config::source::FileId,
+    base: u32,
+) -> ParsedInterp {
+    PARSED_INTERP.with(|p| {
+        let mut p = p.borrow_mut();
+        let key = (raw.to_string(), file, base);
+        if let Some(hit) = p.get(&key) {
+            return hit.clone();
+        }
+        use crate::perf::{time, Slot};
+        let parsed = time(Slot::Parse, || cel::parse_interp(raw, file, base));
+        let parsed = std::rc::Rc::new(parsed);
+        p.insert(key, parsed.clone());
+        parsed
+    })
 }
 
 /// The class names in `class = ...` (`card`, `card wide`, `[card,
@@ -1679,7 +1739,7 @@ fn resolve_font(text: &str, theme: Option<&Theme>) -> Result<paneld_config::font
 /// Montserrat at the size it names, if any, and is logged once.
 fn apply_font(obj: &Obj<'_>, text: &str, theme: Option<&Theme>) {
     match resolve_font(text, theme) {
-        Ok(font) => obj.set_font(&font),
+        Ok(font) => crate::perf::time(crate::perf::Slot::Font, || obj.set_font(&font)),
         Err(e) => {
             BAD_FONTS.with(|b| {
                 let mut b = b.borrow_mut();
@@ -2100,11 +2160,12 @@ fn resolve_color(
     match classify(value) {
         ValueShape::Literal(text) => color_of(text, ctx),
         ValueShape::Expression(body) => {
-            let (expr, diags) = cel::parse_fragment(body, span.file, span.start + 2);
+            let parsed = parse_fragment_cached(body, span.file, span.start + 2);
+            let (expr, diags) = (&parsed.0, &parsed.1);
             if !diags.is_empty() {
                 return None;
             }
-            let v = expr.and_then(|e| eval(&e, ctx).ok())?;
+            let v = expr.as_ref().and_then(|e| eval(e, ctx).ok())?;
             color_of(&v.to_display_string(), ctx)
         }
         ValueShape::Interp(_) => {
@@ -2149,6 +2210,30 @@ fn parse_hex_color(s: &str) -> Option<(u32, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsed_expressions_are_kept_until_a_reload() {
+        let f = paneld_config::source::FileId::default();
+        let ctx = Context::new();
+        set_styles(Default::default());
+        let a = parse_fragment_cached("1 + 1", f, 10);
+        assert!(std::rc::Rc::ptr_eq(&a, &parse_fragment_cached("1 + 1", f, 10)), "a hit");
+        // Same place, other text (an edited config): parsed afresh.
+        let b = parse_fragment_cached("2 + 2", f, 10);
+        assert_eq!(eval(b.0.as_ref().unwrap(), &ctx), Ok(Value::Int(4)));
+        // A reload empties the cache.
+        set_styles(Default::default());
+        let again = parse_fragment_cached("1 + 1", f, 10);
+        assert!(!std::rc::Rc::ptr_eq(&a, &again), "a miss after a reload");
+        // A parse error is kept as it was found.
+        assert!(!parse_fragment_cached("1 +", f, 0).1.is_empty());
+        assert!(!parse_fragment_cached("1 +", f, 0).1.is_empty());
+        let i = parse_interp_cached("t {{ 1 + 2 }} C", f, 0);
+        assert!(std::rc::Rc::ptr_eq(&i, &parse_interp_cached("t {{ 1 + 2 }} C", f, 0)));
+        assert_eq!(interpolate_text("t {{ 1 + 2 }} C", &i.0, &ctx), "t 3 C");
+        let j = parse_interp_cached("t {{ 5 }} C", f, 0);
+        assert_eq!(interpolate_text("t {{ 5 }} C", &j.0, &ctx), "t 5 C");
+    }
 
     #[test]
     fn component_args_take_their_declared_type() {

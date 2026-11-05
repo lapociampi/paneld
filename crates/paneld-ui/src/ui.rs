@@ -4146,8 +4146,32 @@ impl Ui {
 // timer pauses again and the pump sleeps as before.
 // ---------------------------------------------------------------------------
 
+/// CLOCK_MONOTONIC in us, the clock of the `PANELD_PERF` frame lines.
+pub(crate) fn mono_us() -> u64 {
+    // SAFETY: reads the clock, no state.
+    unsafe { sys::lv_paneld_mono_us() }
+}
+
 /// The steps of a tween's progress (0 start, `TWEEN_END` done).
 const TWEEN_END: i32 = 1024;
+
+/// How far into a page transition its first frame shows it: about one
+/// refresh period (LV_DEF_REFR_PERIOD), at most a quarter of it.
+const PAGE_LEAD_MS: u32 = 33;
+
+/// Where a tween of `ms` starts, in steps: a page transition one lead
+/// in, so the first frame drawn (some 15-25 ms after the start, once
+/// the new page is laid out) already shows the new page instead of a
+/// frame of the old one alone; anything else at 0. The animation then
+/// runs from there to `TWEEN_END` over the whole `ms`, so the
+/// transition still takes `ms` on the clock.
+fn tween_start(page: bool, ms: u32) -> i32 {
+    if !page || ms == 0 {
+        return 0;
+    }
+    let lead = PAGE_LEAD_MS.min(ms / 4);
+    (TWEEN_END as i64 * lead as i64 / ms as i64) as i32
+}
 
 /// Ease-out cubic: fast start, gentle stop. `t` and the result in 0..=1.
 pub fn ease(t: f64) -> f64 {
@@ -4280,6 +4304,15 @@ unsafe extern "C" fn page_tween_completed(_a: *mut sys::lv_anim_t) {
     // LVGL has unlinked the animation already: deleting its var here
     // does not find it again.
     end_page_transition();
+    // Draw the page as it ends now, not a refresh period later (the
+    // refresh timer runs before the animation timer in a pass).
+    let disp = sys::lv_display_get_default();
+    if !disp.is_null() {
+        let t = sys::lv_display_get_refr_timer(disp);
+        if !t.is_null() {
+            sys::lv_timer_ready(t);
+        }
+    }
     // The redraw a value change deferred can come now.
     wake();
 }
@@ -4287,14 +4320,15 @@ unsafe extern "C" fn page_tween_completed(_a: *mut sys::lv_anim_t) {
 /// Run `tween` on `var` over `ms`, applying its start now. false: LVGL
 /// could not start it (out of memory); its end is applied instead.
 fn start_tween(var: *mut sys::lv_obj_t, tw: Tw, ms: u32, completed: sys::lv_anim_completed_cb_t) -> bool {
-    apply_tween(&tw, 0);
+    let start = tween_start(matches!(tw.tween, Tween::Page { .. }), ms);
+    apply_tween(&tw, start);
     let boxed = Box::into_raw(Box::new(tw));
     unsafe {
         let mut a: sys::lv_anim_t = std::mem::zeroed();
         sys::lv_anim_init(&mut a);
         sys::lv_anim_set_var(&mut a, var.cast());
         sys::lv_anim_set_custom_exec_cb(&mut a, Some(tween_exec));
-        sys::lv_anim_set_values(&mut a, 0, TWEEN_END);
+        sys::lv_anim_set_values(&mut a, start, TWEEN_END);
         sys::lv_anim_set_duration(&mut a, ms.max(1));
         sys::lv_anim_set_path_cb(&mut a, Some(sys::lv_anim_path_linear));
         sys::lv_anim_set_user_data(&mut a, boxed.cast());
@@ -4498,6 +4532,15 @@ pub fn running_animations() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_page_tween_starts_one_lead_in() {
+        assert_eq!(tween_start(false, 120), 0);
+        assert_eq!(tween_start(true, 0), 0);
+        // 30 of 120 ms (a quarter at most), 33 of 300 ms.
+        assert_eq!(tween_start(true, 120), TWEEN_END / 4);
+        assert_eq!(tween_start(true, 300), TWEEN_END * 33 / 300);
+    }
 
     #[test]
     fn text_on_a_color_is_white_or_black_by_contrast() {

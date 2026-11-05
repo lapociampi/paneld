@@ -57,4 +57,7 @@ uint32_t lv_paneld_timers_idle_ms(lv_timer_t * const * skip, uint32_t n_skip, ui
  * after lv_paneld_drm_shadow / lv_paneld_set_rotation. */
 void lv_paneld_perf_attach(lv_display_t * disp);
 
+/* CLOCK_MONOTONIC in us, the clock of the frame lines' `t`. */
+uint64_t lv_paneld_mono_us(void);
+
 #endif
