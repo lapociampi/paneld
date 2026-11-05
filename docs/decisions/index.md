@@ -2,7 +2,7 @@
 title: "Decisions"
 description: "The design decisions behind paneld, one record each."
 date: 2026-10-29
-updated: 2026-11-04
+updated: 2026-11-05
 tags: [paneld, adr]
 series: paneld
 order: 7
@@ -29,3 +29,4 @@ order: 7
 | [0017](0017-vendored-libdrm.md) | libdrm built from a vendored copy |
 | [0018](0018-remotes.md) | Remotes |
 | [0019](0019-param-patterns.md) | regex-lite for param patterns |
+| [0020](0020-musl-static-link.md) | Static musl builds link Rust's musl with rust-lld |

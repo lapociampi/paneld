@@ -1,0 +1,24 @@
+# Link the static musl builds with Rust's own musl (mallocng), not
+# Zig's libc. Use with cargo-zigbuild, which still compiles the C parts
+# (LVGL, libdrm) with `zig cc` and sets up bindgen:
+#
+#   cargo zigbuild --config .cargo/musl-static.toml \
+#       --target aarch64-unknown-linux-musl -p paneld \
+#       --no-default-features --features device --release
+#
+# Why: zig 0.17 links malloc/free from Zig's libc (heap.SmpAllocator),
+# which keeps per-CPU freelists and never returns small blocks. paneld
+# frees in other threads than it allocates (one runner thread per
+# command run), so RSS grew without bound on the Pi.
+#
+# `--config` is needed (not .cargo/config.toml): cargo-zigbuild sets
+# CARGO_TARGET_<T>_LINKER to zig, which beats config files but not a
+# `--config` argument. `scripts/check-musl-malloc.sh` checks the result.
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]

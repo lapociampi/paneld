@@ -2,7 +2,7 @@
 title: "Deploy"
 description: "Cross-compile paneld for an arm64 Linux board and run it as a systemd service."
 date: 2026-10-30
-updated: 2026-11-04
+updated: 2026-11-05
 tags: [paneld, deploy, pi, systemd]
 series: paneld
 order: 7
@@ -14,8 +14,10 @@ v1. The first target is a Raspberry Pi 3B+ (arm64) running Raspberry Pi OS Lite 
 
 paneld cross-compiles from a Linux dev box using [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild). The daemon statically links `musl` libc, so the binary runs on any Linux kernel without a runtime libc version match.
 
+`zig cc` compiles the C parts (LVGL, libdrm); the link uses `rust-lld` (ships with rustup) and Rust's own musl, whose allocator is musl's mallocng ([ADR 0020](decisions/0020-musl-static-link.md)). `.cargo/musl-static.toml` sets this up and is passed with `--config`: without it, zig links its own libc, whose malloc (`heap.SmpAllocator`) never gives memory back and lets paneld's RSS grow with every command run.
+
 ```
-rustup target add aarch64-unknown-linux-musl
+rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 pacman -S zig              # or: brew install zig; apt install zig
 cargo install cargo-zigbuild
 ```
@@ -36,17 +38,29 @@ Every build also includes the fbdev + evdev drivers; they have no external depen
 ## Cross-compile for the Pi
 
 ```
-# From the workspace root. Produces a stripped, about 2.5 MB static binary.
-cargo zigbuild --target aarch64-unknown-linux-musl \
-    -p paneld --no-default-features --release
+# From the workspace root. Produces a stripped, about 2.7 MB static binary.
+cargo zigbuild --config .cargo/musl-static.toml \
+    --target aarch64-unknown-linux-musl \
+    -p paneld --no-default-features --features device --release
 ```
 
-Add `--features device` for the DRM/KMS backend. It needs libdrm, in one of two ways:
+`scripts/build-static.sh [--check] [target] [-- cargo args]` runs the same command (target defaults to `aarch64-unknown-linux-musl`; `x86_64-unknown-linux-musl` gives the desktop static build, about 3.2 MB, static-pie; cargo args after `--` replace `--features device`). Sizes are for commit `9f129b2`; later features add to them. Never drop `--config .cargo/musl-static.toml`.
+
+`--features device` is the DRM/KMS backend; without it the binary has fbdev only. It needs libdrm, in one of two ways:
 
 - **Vendored** (the default; static, nothing to install on the Pi): `vendor/libdrm` is a submodule at `libdrm-2.4.134` ([ADR 0017](decisions/0017-vendored-libdrm.md)); `git submodule update --init --recursive` fetches it, and `lvgl-sys` compiles libdrm's core into the binary (about 80 KB more). `PANELD_LIBDRM_SRC` points at another checkout instead.
 - **From the system**: a cross-sysroot that carries `libdrm`'s headers and library (e.g. a Pi root tarball under `--sysroot`); the default zig toolchain has neither.
 
 The resulting binary lives at `target/aarch64-unknown-linux-musl/release/paneld`.
+
+### Allocator check
+
+`scripts/check-musl-malloc.sh <binary>...` fails unless `malloc`, `free`, `calloc` and `realloc` resolve to musl's mallocng (each defined once, `malloc` is musl's weak alias, `free` / `realloc` go to `__libc_free` / `__libc_realloc`); a strong override, such as Zig's libc malloc (`heap.SmpAllocator`), fails it. It needs `nm` and `llvm-objdump`. It reads symbols, so it needs an unstripped build (`CARGO_PROFILE_RELEASE_STRIP=none`). `scripts/build-static.sh --check [target]` does both: builds with symbols, copies that binary to `paneld.unstripped` next to the release one and checks it, then builds the stripped binary. Run it before every deploy.
+
+```
+scripts/build-static.sh --check aarch64-unknown-linux-musl
+scripts/build-static.sh --check x86_64-unknown-linux-musl
+```
 
 ## Install on the device
 
