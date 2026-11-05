@@ -225,11 +225,11 @@ page home {
 | Key | Type | Notes |
 | --- | --- | --- |
 | `title` | string, expr | |
-| `icon` | icon name | |
+| `icon` | icon name (section 8.3) | Shown in the shell's navigation, before the title; read as `page.icon` and as `icon` of each `nav` entry |
 | `nav` | int | Position in the navigation; absent: not in it (reached only by `goto`) |
 | body | nodes | The page's content |
 
-The theme's `shell` component wraps every page: header, navigation, alert banner, and a `slot` for the body.
+The theme's `shell` component wraps every page: header, navigation, alert banner, and a `slot` for the body. The shipped shell's navigation buttons share the width, each with the page's icon and title; with more than 5 pages, a page that has an icon shows only the icon.
 
 ### 8.1 Common properties (every building block)
 
@@ -272,7 +272,7 @@ Layout blocks are transparent and borderless: only a `background`, `border` or t
 | Block | Keys |
 | --- | --- |
 | `text` | `value` (string, expr), `align` (`left`, `center`, `right`), `overflow` (`wrap` default, `clip`, `dots`: cut with `...`, on one line unless a `height` is set (on the node, a style or a component call); `scroll`: scrolls to and fro). All but `wrap` need a `width`. A `scroll` text that does not fit keeps the screen redrawing while it is shown, which costs CPU; the panel is otherwise asleep when idle |
-| `icon` | `name` (theme icon or built-in symbol, expr), `size` |
+| `icon` | `name` (built-in icon or theme icon, expr), `size` (px, expr; default the theme's `font` size), `color` (default the text color). A built-in is a glyph of the compiled Montserrat font nearest to `size` (12, 14, 16, 20, 24, 32); above 32 the 32 px glyph is scaled up, to at most 128. With the theme's `icons` set to a folder (relative to the config folder), `<folder>/<name>.png` replaces the built-in of that name or adds a new one: sized to `size` x `size`, tinted with `color`; decoded once and kept at that size (up to 1 MiB of them, past that read as a plain `image`). A literal name found in neither is a check error when no folder is set; at render an unknown name draws nothing (logged once) |
 | `image` | `src` (path to a PNG, expr; relative to the config folder), `fit` (`contain`, `cover`, `fill`, `none`), `recolor` (color) |
 | `rect` | none beyond the common ones: a shape |
 | `arc` | `value`, `min` = 0, `max` = 100 (expr), `start` = 135, `end` = 45 (degrees: 0 at 3 o'clock, clockwise, so the default leaves the gap at the bottom; a span of 360, e.g. `0` to `360`, is a full circle), `thickness` (px, at least 1), `track` (color; default the theme's `muted`, faint), `rounded` (bool, default false), `color` (the value; default the theme's `accent`). For display: no knob, and a press never changes the value |
@@ -284,11 +284,13 @@ Layout blocks are transparent and borderless: only a `background`, `border` or t
 
 Value changes of `arc`, `bar` and `chart` animate when the theme's motion allows it.
 
+Built-in icons: `home`, `settings`, `power`, `refresh`, `ok`, `close`, `plus`, `minus`, `edit`, `save`, `trash`, `cut`, `copy`, `paste`, `list`, `bars`, `bell`, `warning`, `eye_open`, `eye_close`, `left`, `right`, `up`, `down`, `prev`, `next`, `play`, `pause`, `stop`, `eject`, `shuffle`, `loop`, `audio`, `video`, `volume`, `volume_max`, `mute`, `image`, `file`, `directory`, `drive`, `sd_card`, `usb`, `upload`, `download`, `wifi`, `bluetooth`, `gps`, `call`, `envelope`, `keyboard`, `backspace`, `new_line`, `charge`, `tint`, `battery_full`, `battery_3`, `battery_2`, `battery_1`, `battery_empty`, `bullet` (LVGL's symbol set).
+
 ### 8.4 Inputs
 
 | Block | Keys |
 | --- | --- |
-| `button` | `action` (action: a name, or an expression giving one like `on_tap`, e.g. `{{ tap }}`; run on a tap, unless the button has an `on_tap` too, which wins), plus children or `label` / `icon` shortcuts. Shows the call its tap makes (`action`, or `on_tap`): while it runs, the `:running` state and the action's `busy` text or a spinner in place of its content; after it failed, the `:failed` state until the action runs again. A call from a dialog or a row matches when it carries every arg the button passes. A component whose root is a button shows its call's `on_tap` there, and that `on_tap` wins over the root's `action` |
+| `button` | `action` (action: a name, or an expression giving one like `on_tap`, e.g. `{{ tap }}`; run on a tap, unless the button has an `on_tap` too, which wins), plus children or `label` / `icon` shortcuts (both set: the icon, then the label, side by side; centered, the label on one line cut with `...` when the button is narrower, and left out beside the icon when less than two lines' height of room is left). Layout blocks and `rect` inside a button take no taps of their own unless they have `on_tap` / `on_hold`: the tap goes to the button. Shows the call its tap makes (`action`, or `on_tap`): while it runs, the `:running` state and the action's `busy` text or a spinner in place of its content; after it failed, the `:failed` state until the action runs again. A call from a dialog or a row matches when it carries every arg the button passes. A component whose root is a button shows its call's `on_tap` there, and that `on_tap` wins over the root's `action` |
 | `toggle` | `value` (bool, expr), `on_change` (action; `value` = the new state) |
 | `slider` | `value`, `min`, `max`, `step` (expr), `direction`, `on_change` (on release) |
 | `select` | `options` (list, expr), `value` (expr; the option, or its position), `style` (`dropdown` default, `roller`, `buttons`: a row with one checked), `on_change` (`value` = the option) |
@@ -370,7 +372,7 @@ See [Themes](themes.md) for the folder, styles, components and motion. Tokens ev
 | Colors | `background`, `surface`, `text`, `muted`, `accent`, `ok`, `info`, `warning`, `critical` |
 | Fonts | `font_small`, `font`, `font_big`, `font_huge`: font values with size, e.g. `roboto 16` |
 | Sizes | `gap`, `padding`, `radius`, `tap_min` (smallest touch target) |
-| Other | `shadow`, `background_image` (optional), `icons` (icon set folder), `motion`, `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
+| Other | `shadow`, `background_image` (optional), `icons` (`builtin`, or a folder of `<name>.png` icons, section 8.3), `motion`, `dialog_backdrop` (behind a dialog, over the page: `transparent` (default), `#rrggbb[aa]`, or `blur <px>` up to 20: the Pi blurs in software) |
 
 A theme may add any other token; they are read as `theme.<name>`.
 

@@ -1769,3 +1769,191 @@ fn dots_text_takes_more_lines_with_a_height_from_a_class() {
     let r = bbox(&img, |p| p[0] > 0xc0 && p[1] < 0x60 && p[2] < 0x60).expect("no text");
     assert!(r.3 - r.1 + 1 > 24, "dots text kept to one line despite its class height: {r:?}");
 }
+
+fn count(img: &Image, f: impl Fn([u8; 3]) -> bool) -> usize {
+    (0..img.h).map(|y| (0..img.w).filter(|&x| f(img.px(x, y))).count()).sum()
+}
+
+#[test]
+fn an_icon_draws_in_its_color_at_its_size() {
+    let d = tmp("icon");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home { row { gap = 20\n\
+             icon { name = home; size = 32; color = #ff0000 }\n\
+             icon { name = {{ 'bell' }}; size = 64; color = #00ff00 }\n\
+             icon { name = {{ 'not_an_icon' }}; color = #0000ff } } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let red = bbox(&img, |p| close(p, [0xff, 0, 0], 40)).expect("built-in icon not drawn");
+    assert!((20..=40).contains(&(red.2 - red.0 + 1)), "a 32 px icon is {red:?}");
+    // Above 32 px the glyph is scaled up.
+    let green = bbox(&img, |p| close(p, [0, 0xff, 0], 40)).expect("scaled icon not drawn");
+    assert!(green.3 - green.1 + 1 > 50, "a 64 px icon is {green:?}");
+    assert!(green.0 > red.2, "icons overlap: {red:?} {green:?}");
+    // An unknown name (from an expression) draws nothing.
+    assert!(!img.any(|p| close(p, [0, 0, 0xff], 40)));
+}
+
+#[test]
+fn a_button_icon_goes_before_its_label() {
+    let d = tmp("icon-button");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home { column {\n\
+             button { label = Save; background = #ff0000 }\n\
+             button { label = Save; icon = save; background = #00ff00 }\n\
+             button { icon = play; background = #0000ff } } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let plain = bbox(&img, |p| close(p, [0xff, 0, 0], 8)).expect("no label button");
+    let both = bbox(&img, |p| close(p, [0, 0xff, 0], 8)).expect("no icon + label button");
+    let icon = bbox(&img, |p| close(p, [0, 0, 0xff], 8)).expect("no icon button");
+    assert!(both.2 - both.0 > plain.2 - plain.0 + 10, "icon + label not wider: {both:?} vs {plain:?}");
+    // The icon is drawn in the button's text color (white), at its
+    // left, before the label.
+    let white = |x: usize| (both.1..both.3).any(|y| close(img.px(x, y), [0xff, 0xff, 0xff], 40));
+    let first = (both.0..both.2).find(|&x| white(x)).expect("nothing drawn on the button");
+    assert!(first < both.0 + 24, "icon not first: content starts at {first} in {both:?}");
+    assert!((icon.1..icon.3).any(|y| (icon.0..icon.2).any(|x| close(img.px(x, y), [0xff, 0xff, 0xff], 40))), "icon-only button empty");
+}
+
+#[test]
+fn a_theme_icons_folder_png_replaces_a_built_in() {
+    let d = tmp("icon-theme");
+    // A 16x16 PNG of our own: a shot of a filled page.
+    let src = d.join("src.conf");
+    std::fs::write(&src, "page home { rect { width = 100%; height = 100%; background = #ff00ff } }\n").unwrap();
+    std::fs::create_dir_all(d.join("icons")).unwrap();
+    let made = shot(&src, &["--size", "16x16"]);
+    assert_eq!((made.w, made.h), (16, 16));
+    std::fs::rename(src.with_extension("png"), d.join("icons/home.png")).unwrap();
+    let body = "page home { row { gap = 20\n\
+                    icon { name = home; size = 40; color = #00ff00 }\n\
+                    icon { name = settings; size = 32; color = #ff0000 } } }\n";
+    let conf = d.join("p.conf");
+    std::fs::write(&conf, format!("theme t {{ icons = icons }}\n{body}")).unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    // The PNG, sized to 40 px and tinted: a full green square.
+    let g = bbox(&img, |p| close(p, [0, 0xff, 0], 40)).expect("theme icon not drawn");
+    // (Its edges are blended with the page when scaled up.)
+    let (w, h) = (g.2 - g.0 + 1, g.3 - g.1 + 1);
+    assert!((37..=40).contains(&w) && (37..=40).contains(&h), "theme icon box {g:?}");
+    assert!(count(&img, |p| close(p, [0, 0xff, 0], 40)) > 1300, "theme icon not filled");
+    assert!(!img.any(|p| close(p, [0xff, 0, 0xff], 40)), "theme icon not recolored");
+    // A name the folder lacks is still the built-in.
+    assert!(img.any(|p| close(p, [0xff, 0, 0], 40)), "built-in fallback not drawn");
+
+    // Without the folder: the built-in glyph, far from a full square.
+    let conf = d.join("q.conf");
+    std::fs::write(&conf, body).unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let n = count(&img, |p| close(p, [0, 0xff, 0], 40));
+    assert!(n > 100 && n < 1200, "built-in home icon: {n} px");
+}
+
+#[test]
+fn the_shell_nav_shows_page_icons() {
+    let d = tmp("icon-nav");
+    let width = |icons: bool| {
+        let conf = d.join(format!("p{icons}.conf"));
+        let icon = |n: &str| if icons { format!("icon = {n}; ") } else { String::new() };
+        std::fs::write(
+            &conf,
+            format!(
+                "theme t {{ accent = #ff00ff }}\n\
+                 page home {{ title = Home; {}nav = 1 }}\n\
+                 page two {{ title = Two; {}nav = 2 }}\n",
+                icon("home"),
+                icon("wifi")
+            ),
+        )
+        .unwrap();
+        let img = shot(&conf, &["--settle", "50"]);
+        let b = bbox(&img, |p| close(p, [0xff, 0, 0xff], 8)).expect("no current nav button");
+        assert!(b.1 > 400, "nav not at the bottom: {b:?}");
+        let c = nav_content(&img, b);
+        c.1 - c.0
+    };
+    // The icon goes before the title.
+    let (with, without) = (width(true), width(false));
+    assert!(with > without + 14, "nav content with an icon {with} px, without {without} px");
+}
+
+#[test]
+fn a_tap_on_a_buttons_row_or_big_icon_reaches_the_button() {
+    let d = tmp("icon-tap");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home { column { gap = 20\n\
+             button { background = #ff0000; on_tap { goto = two }; icon { name = power; size = 96 } }\n\
+             button { background = #0000ff; on_tap { goto = two }\n\
+                      row { padding = 30; text { value = XXXXXXXX } } } } }\n\
+         page two { rect { width = 100; height = 40; background = #00ff00 } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let red = bbox(&img, |p| close(p, [0xff, 0, 0], 8)).expect("no icon button");
+    let blue = bbox(&img, |p| close(p, [0, 0, 0xff], 8)).expect("no row button");
+    // The scaled icon takes the button's text color (white), not
+    // LVGL's default dark one.
+    let on_red = |f: &dyn Fn([u8; 3]) -> bool| (red.1..red.3).any(|y| (red.0..red.2).any(|x| f(img.px(x, y))));
+    assert!(on_red(&|p| close(p, [0xff, 0xff, 0xff], 40)), "big icon not white");
+    assert!(!on_red(&|p| p.iter().all(|&c| c < 0x60)), "big icon drawn dark");
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    for b in [red, blue] {
+        let at = format!("{},{}", (b.0 + b.2) / 2, (b.1 + b.3) / 2);
+        let after = shot(&conf, &["--tap", &at, "--settle", "50"]);
+        assert!(after.any(green), "a tap at {at} on {b:?} did not reach its button");
+    }
+}
+
+#[test]
+fn the_shell_nav_shares_the_width_and_shows_icons_only_when_crowded() {
+    let d = tmp("icon-nav-fit");
+    let names = ["Home Overview Dashboard", "Network and Firewall", "Media Library", "Power and UPS", "Storage Arrays", "Settings", "Mail"];
+    let icons = ["home", "wifi", "video", "power", "drive", "settings", "envelope"];
+    let nav = |n: usize, with_icons: bool| {
+        let conf = d.join(format!("p{n}{with_icons}.conf"));
+        let mut text = String::from("theme t { accent = #ff00ff; muted = #00ffff }\n");
+        for i in 0..n {
+            let icon = if with_icons { format!("icon = {}; ", icons[i]) } else { String::new() };
+            text += &format!("page p{i} {{ title = {}; {icon}nav = {} }}\n", names[i], i + 1);
+        }
+        std::fs::write(&conf, text).unwrap();
+        let img = shot(&conf, &["--settle", "50"]);
+        let cur = bbox(&img, |p| close(p, [0xff, 0, 0xff], 8)).expect("no current nav button");
+        let rest = bbox(&img, |p| close(p, [0, 0xff, 0xff], 8)).expect("no other nav buttons");
+        let content = nav_content(&img, cur);
+        (img.w, cur, rest, content)
+    };
+    for n in [3, 5, 7] {
+        let (w, cur, rest, content) = nav(n, false);
+        // Every button on screen, sharing the width; titles cut short
+        // stay inside their button.
+        assert!(rest.2 < w - 4 && cur.0 > 2, "{n} pages: nav overflows: {cur:?} {rest:?}");
+        let share = (w - 16) / n;
+        assert!((cur.2 - cur.0 + 1).abs_diff(share) < 12, "{n} pages: button {cur:?}, share {share}");
+        assert!(content.0 > cur.0 && content.1 < cur.2, "{n} pages: title spills: {content:?} in {cur:?}");
+    }
+    // 5 pages with icons: icon and title; 7: just the icon.
+    let (_, cur5, _, content5) = nav(5, true);
+    assert!(content5.1 - content5.0 > 40, "5 pages: no title beside the icon: {content5:?} in {cur5:?}");
+    let (_, cur7, _, content7) = nav(7, true);
+    assert!(content7.1 - content7.0 < 24, "7 pages: more than the icon: {content7:?} in {cur7:?}");
+}
+
+/// The x extent of the white content (icon, title) across the middle
+/// of nav button `b`, away from its rounded corners.
+fn nav_content(img: &Image, b: (usize, usize, usize, usize)) -> (usize, usize) {
+    let mid = (b.1 + b.3) / 2;
+    (b.0 + 4..b.2 - 4)
+        .filter(|&x| (mid - 8..mid + 8).any(|y| close(img.px(x, y), [0xff, 0xff, 0xff], 60)))
+        .fold(None, |r: Option<(usize, usize)>, x| Some(r.map_or((x, x), |(a, _)| (a, x))))
+        .expect("nav button empty")
+}

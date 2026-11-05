@@ -511,6 +511,29 @@ pub fn set_asset_dir(dir: &std::path::Path) {
     ASSET_DIR.with(|d| *d.borrow_mut() = dir.to_path_buf());
 }
 
+/// Theme icons decoded and scaled to their drawn size, by (file, size,
+/// mtime). Entries are never freed (an image on screen, a dialog's
+/// included, may point at one), so the cache is bounded by
+/// [`ICON_CACHE_BYTES`]: past it, icons are read as plain images.
+#[derive(Default)]
+struct IconCache {
+    entries: Vec<((std::path::PathBuf, u16, std::time::SystemTime), *mut sys::lv_draw_buf_t)>,
+    bytes: usize,
+}
+
+/// 1 MiB: 64 icons of 64 px, or 16 of the largest (128 px).
+const ICON_CACHE_BYTES: usize = 1024 * 1024;
+
+thread_local! {
+    static ICON_CACHE: std::cell::RefCell<IconCache> = std::cell::RefCell::new(IconCache::default());
+}
+
+/// A file `path` (relative to the asset folder) exists: a theme's
+/// `icons/<name>.png` replaces the built-in only then.
+pub fn asset_exists(path: &str) -> bool {
+    ASSET_DIR.with(|d| d.borrow().join(path).is_file())
+}
+
 /// Width and height from a PNG's header; `None` (with a log line) for
 /// a file that is missing or not a PNG.
 fn png_size(path: &std::path::Path) -> Option<(u32, u32)> {
@@ -1052,6 +1075,89 @@ impl<'ui> Obj<'ui> {
         obj
     }
 
+    /// A row with no style of its own (no theme look, so the text
+    /// color and font are inherited), children centered across it,
+    /// `gap` px apart; taps go through to the parent. Holds a button's
+    /// icon and label side by side.
+    pub fn new_plain_row(&self, gap: i32) -> Obj<'ui> {
+        let obj = self.new_container();
+        unsafe { sys::lv_obj_remove_style_all(obj.raw) };
+        obj.set_enabled(false);
+        obj.set_size(Size::Content, Size::Content);
+        obj.set_flex_row();
+        obj.set_flex_align(FlexAlign::Start, FlexAlign::Center);
+        obj.set_gap(gap);
+        obj
+    }
+
+    /// Fit a button's shortcut `label` (its child, or the label of a
+    /// [`Self::new_plain_row`] after an icon) to the button's width on
+    /// every resize: one line, shortened with `...` when it does not
+    /// fit; beside an icon, with less room left than two lines' height
+    /// (and less than the text), only the icon shows.
+    pub fn fit_shortcut_label(&self, label: &Obj<'ui>) {
+        unsafe extern "C" fn fit(e: *mut sys::lv_event_t) {
+            // SAFETY: registered below on a live button with its own
+            // descendant label as user data; both live while it does.
+            unsafe {
+                let btn = sys::lv_event_get_target(e) as *mut sys::lv_obj_t;
+                let label = sys::lv_event_get_user_data(e) as *mut sys::lv_obj_t;
+                let main = sys::lv_part_t_LV_PART_MAIN as sys::lv_part_t;
+                let font = sys::lv_obj_get_style_text_font(label, main);
+                if font.is_null() {
+                    return;
+                }
+                let mut size = sys::lv_point_t::default();
+                sys::lv_text_get_size(
+                    &mut size,
+                    sys::lv_label_get_text(label),
+                    font,
+                    sys::lv_obj_get_style_text_letter_space(label, main),
+                    0,
+                    sys::LV_COORD_MAX as i32,
+                    sys::lv_text_flag_t_LV_TEXT_FLAG_NONE,
+                );
+                let parent = sys::lv_obj_get_parent(label);
+                let mut room = sys::lv_obj_get_content_width(btn);
+                // Beside an icon (a theme's unknown one leaves none).
+                let icon = if parent == btn { std::ptr::null_mut() } else { sys::lv_obj_get_child(parent, 0) };
+                if !icon.is_null() && icon != label {
+                    room -= sys::lv_obj_get_width(icon) + sys::lv_obj_get_style_pad_column(parent, main);
+                    let hide = room < size.x && room < 2 * (*font).line_height;
+                    if sys::lv_obj_is_hidden(label) != hide {
+                        sys::lv_obj_set_hidden(label, hide);
+                    }
+                }
+                let width = if size.x <= room { LV_SIZE_CONTENT_LOCAL } else { room.max(0) };
+                if sys::lv_obj_get_style_width(label, main) != width {
+                    sys::lv_obj_set_width(label, width);
+                }
+            }
+        }
+        /// The label goes (a running button shows a spinner instead):
+        /// the button must not fit it any more.
+        unsafe extern "C" fn forget(e: *mut sys::lv_event_t) {
+            // SAFETY: registered below on the label with its button as
+            // user data; a parent outlives its children's DELETE.
+            unsafe {
+                let label = sys::lv_event_get_target(e) as *mut sys::lv_obj_t;
+                let btn = sys::lv_event_get_user_data(e) as *mut sys::lv_obj_t;
+                sys::lv_obj_remove_event_cb_with_user_data(btn, Some(fit), label.cast());
+            }
+        }
+        unsafe {
+            sys::lv_label_set_long_mode(label.raw, sys::lv_label_long_mode_t_LV_LABEL_LONG_MODE_DOTS);
+            sys::lv_label_set_max_lines(label.raw, 1);
+            sys::lv_obj_add_event_cb(self.raw, Some(fit), sys::lv_event_code_t_LV_EVENT_SIZE_CHANGED, label.raw.cast());
+            sys::lv_obj_add_event_cb(label.raw, Some(forget), sys::lv_event_code_t_LV_EVENT_DELETE, self.raw.cast());
+        }
+    }
+
+    /// Center this object in its parent (a button's shortcut content).
+    pub fn center(&self) {
+        unsafe { sys::lv_obj_center(self.raw) };
+    }
+
     /// A text label. The text is copied by LVGL; the Rust string
     /// does not need to outlive the call.
     pub fn new_label(&self, text: &str) -> Obj<'ui> {
@@ -1312,12 +1418,117 @@ impl<'ui> Obj<'ui> {
         Some(Obj { raw, _ui: PhantomData })
     }
 
+    /// A theme icon from the PNG `path` (relative to the asset folder),
+    /// `size` x `size` px. Decoded once and kept at the drawn size (see
+    /// [`ICON_CACHE`]), so a redraw neither decodes it again nor holds
+    /// a large file's pixels. Past the cache's budget it is read as an
+    /// ordinary image.
+    pub fn new_icon_image(&self, path: &str, size: u16) -> Option<Obj<'ui>> {
+        let full = ASSET_DIR.with(|d| d.borrow().join(path));
+        let mtime = std::fs::metadata(&full).and_then(|m| m.modified()).ok()?;
+        let key = (full.clone(), size, mtime);
+        let cached = ICON_CACHE.with(|c| c.borrow().entries.iter().find(|(k, _)| *k == key).map(|(_, b)| *b));
+        let buf = match cached {
+            Some(b) => b,
+            None => {
+                let budget_left = ICON_CACHE.with(|c| c.borrow().bytes) < ICON_CACHE_BYTES;
+                let src = CString::new(format!("A:{}", full.display())).ok()?;
+                let b = if budget_left {
+                    unsafe { sys::lv_paneld_load_scaled(src.as_ptr(), i32::from(size)) }
+                } else {
+                    std::ptr::null_mut()
+                };
+                if b.is_null() {
+                    let obj = self.new_image(path, ImageFit::Contain)?;
+                    obj.set_size(Size::Px(i32::from(size)), Size::Px(i32::from(size)));
+                    return Some(obj);
+                }
+                let bytes = unsafe { (*b).data_size } as usize;
+                ICON_CACHE.with(|c| {
+                    let mut c = c.borrow_mut();
+                    c.bytes += bytes;
+                    c.entries.push((key, b));
+                });
+                b
+            }
+        };
+        let raw = unsafe { sys::lv_image_create(self.raw) };
+        assert!(!raw.is_null());
+        unsafe {
+            // A draw buffer is laid out as an `lv_image_dsc_t`; it stays
+            // in the cache for the life of the process.
+            sys::lv_image_set_src(raw, buf as *const std::ffi::c_void);
+            sys::lv_image_set_inner_align(raw, sys::lv_image_align_t_LV_IMAGE_ALIGN_CONTAIN);
+        }
+        let obj = Obj { raw, _ui: PhantomData };
+        obj.set_size(Size::Px(i32::from(size)), Size::Px(i32::from(size)));
+        Some(obj)
+    }
+
     /// Tint an image with `rgb` (icons drawn in one color); `opa` is
     /// how much of the tint covers the image.
     pub fn set_image_recolor(&self, rgb: u32, opa: u8) {
         unsafe {
             sys::lv_obj_set_style_image_recolor(self.raw, sys::lv_color_hex(rgb), 0);
             sys::lv_obj_set_style_image_recolor_opa(self.raw, opa, 0);
+        }
+    }
+
+    /// A built-in icon (schema 8.3): `glyph` from the Montserrat font
+    /// nearest to `size` px (the sizes in `lv_conf.h`). Above the
+    /// largest (32) the glyph is scaled up, inside a box of the scaled
+    /// size so the layout makes room for it; the box is returned then.
+    /// The color is the inherited text color unless set on the result.
+    pub fn new_icon_glyph(&self, glyph: char, size: u16) -> Obj<'ui> {
+        let sizes = paneld_config::icons::FONT_SIZES;
+        let largest = *sizes.last().unwrap_or(&32);
+        let font_px = *sizes.iter().min_by_key(|s| (i32::from(**s) - i32::from(size)).abs()).unwrap_or(&16);
+        let mut buf = [0u8; 4];
+        let text = glyph.encode_utf8(&mut buf);
+        if size <= largest {
+            let label = self.new_label(text);
+            label.set_font_size(font_px);
+            return label;
+        }
+        let size = size.min(paneld_config::icons::MAX_SIZE);
+        let font: *const sys::lv_font_t = unsafe { &sys::lv_font_montserrat_32 };
+        // The glyph's own box at 32 px, then scaled by size / 32.
+        let (w, h) = unsafe {
+            (
+                i32::from(sys::lv_font_get_glyph_width(font, glyph as u32, 0)),
+                sys::lv_font_get_line_height(font),
+            )
+        };
+        let scale = i32::from(size) * 256 / i32::from(largest);
+        // No style of its own (inherits the text color) and no clicks
+        // (a tap goes to the enclosing button).
+        let boxed = self.new_container();
+        unsafe { sys::lv_obj_remove_style_all(boxed.raw) };
+        boxed.set_enabled(false);
+        boxed.set_size(Size::Px(w * scale / 256), Size::Px(h * scale / 256));
+        let label = boxed.new_label(text);
+        label.set_font_size(largest);
+        unsafe {
+            sys::lv_obj_set_style_transform_scale(label.raw, scale, 0);
+            sys::lv_obj_set_style_transform_pivot_x(label.raw, 0, 0);
+            sys::lv_obj_set_style_transform_pivot_y(label.raw, 0, 0);
+        }
+        boxed
+    }
+
+    /// An image's own opacity, 255 opaque.
+    pub fn set_image_opa(&self, opa: u8) {
+        unsafe { sys::lv_obj_set_style_image_opa(self.raw, opa, 0) };
+    }
+
+    /// This object's text color as it resolves now (its own, else
+    /// inherited): the default tint of an icon image.
+    pub fn text_color(&self) -> (u32, u8) {
+        unsafe {
+            let part = sys::lv_part_t_LV_PART_MAIN;
+            let c = sys::lv_obj_get_style_text_color(self.raw, part);
+            let rgb = (u32::from(c.red) << 16) | (u32::from(c.green) << 8) | u32::from(c.blue);
+            (rgb, sys::lv_obj_get_style_text_opa(self.raw, part))
         }
     }
 

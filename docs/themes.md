@@ -2,7 +2,7 @@
 title: "Themes"
 description: "What a theme is and what it can change, layout included."
 date: 2026-10-29
-updated: 2026-11-04
+updated: 2026-11-05
 tags: [paneld, themes, ui]
 series: paneld
 order: 5
@@ -17,10 +17,10 @@ themes/glass/
   theme.conf        # theme glass { ... }
   fonts/Inter.ttf
   images/bg.jpg
-  icons/...
+  icons/...         # <name>.png, used with icons = icons
 ```
 
-Asset paths in `theme.conf` are relative to the theme's folder.
+Asset paths in `theme.conf` are relative to the theme's folder. Until theme folders are loaded, `icons` is a folder relative to the config folder ([Schema](schema.md), section 8.3).
 
 ## What a theme sets
 

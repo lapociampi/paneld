@@ -256,6 +256,9 @@ fn render_node(
     match node.kind.text.as_str() {
         "column" | "row" => {
             let obj = parent.new_layout();
+            // Taps go to the enclosing node (a button) unless it has
+            // an `on_tap` / `on_hold` of its own.
+            obj.set_enabled(false);
             obj.set_size(Size::Content, Size::Content);
             if node.kind.text == "row" {
                 obj.set_flex_row();
@@ -284,6 +287,7 @@ fn render_node(
         }
         "stack" => {
             let obj = parent.new_layout();
+            obj.set_enabled(false);
             obj.set_size(Size::Content, Size::Content);
             // Children are placed by `x` / `y` from its corner.
             obj.set_padding(0);
@@ -295,6 +299,7 @@ fn render_node(
             // fractions of it) and grows with its rows; `width` /
             // `height` props override.
             let obj = parent.new_layout();
+            obj.set_enabled(false);
             obj.set_size(Size::Percent(100), Size::Content);
             apply_props(node, ctx, sink, &obj);
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
@@ -353,14 +358,51 @@ fn render_node(
                 // child so the simplest button only takes one line. If
                 // the button also has child nodes, those render after
                 // the shortcut label.
-                if let Some(label) = resolve_assign_value(node, "label", ctx) {
-                    obj.new_label(&label.to_display_string());
+                let label = resolve_assign_value(node, "label", ctx).map(|v| v.to_display_string());
+                let icon = resolve_assign_value(node, "icon", ctx).map(|v| v.to_display_string()).unwrap_or_default();
+                let icon = icon.trim();
+                // The shortcut's content: centered on the button (alone
+                // on it), the label fitted to the button's width.
+                let content = match label {
+                    // `icon` and `label`: side by side, icon first.
+                    Some(label) if !icon.is_empty() && !label.is_empty() => {
+                        let row = obj.new_plain_row(6);
+                        if let Some(icon) = new_icon(&row, icon, None, ctx) {
+                            tint_icon(&icon);
+                        }
+                        let text = row.new_label(&label);
+                        obj.fit_shortcut_label(&text);
+                        Some(row)
+                    }
+                    Some(label) if icon.is_empty() => {
+                        let text = obj.new_label(&label);
+                        obj.fit_shortcut_label(&text);
+                        Some(text)
+                    }
+                    _ => new_icon(&obj, icon, None, ctx).map(|icon| {
+                        tint_icon(&icon);
+                        icon.0
+                    }),
+                };
+                let has_children = node.items.iter().any(|it| matches!(it, Item::Block(b) if !is_event_handler_block(&b.kind.text)) || matches!(it, Item::Repeat(_)));
+                if let Some(content) = content.filter(|_| !has_children) {
+                    content.center();
                 }
                 render_item_list(&node.items, doc, ctx, slot, sink, &obj);
             }
         }
+        "icon" => {
+            let name = resolve_text(node, "name", ctx).unwrap_or_default();
+            let size = resolve_num(node, "size", ctx)
+                .filter(|n| n.is_finite())
+                .map(|n| n.clamp(1.0, f64::from(paneld_config::icons::MAX_SIZE)) as u16);
+            let Some(icon) = new_icon(parent, name.trim(), size, ctx) else { return };
+            apply_props(node, ctx, sink, &icon.0);
+            tint_icon(&icon);
+        }
         "rect" => {
             let obj = parent.new_container();
+            obj.set_enabled(false);
             obj.set_size(Size::Content, Size::Content);
             // A shape: no inner padding, which on a small one would
             // leave no room and show scrollbars.
@@ -578,6 +620,80 @@ fn render_node(
             // Not a built-in widget and not a known component.
             parent.new_label(&format!("[{other}: not implemented yet]"));
         }
+    }
+}
+
+thread_local! {
+    /// Icon names already reported as unknown: logged once each, up to
+    /// [`UNKNOWN_ICONS_MAX`] (a name from an expression may change on
+    /// every render).
+    static UNKNOWN_ICONS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+const UNKNOWN_ICONS_MAX: usize = 32;
+
+/// Draw icon `name` into `parent` at `size` px (default: the theme's
+/// `font` size): the theme's `icons/<name>.png` when its `icons`
+/// token is a folder (relative to the config folder) holding that
+/// file, else the built-in glyph. An unknown name draws nothing and is
+/// logged once; an empty one draws nothing.
+/// Returns the object and whether it is an image.
+fn new_icon<'ui>(parent: &Obj<'ui>, name: &str, size: Option<u16>, ctx: &Context) -> Option<(Obj<'ui>, bool)> {
+    if name.is_empty() {
+        return None;
+    }
+    let theme = match ctx.get("theme") {
+        Some(Value::Map(t)) => Some(t),
+        _ => None,
+    };
+    let size = size.unwrap_or_else(|| {
+        theme
+            .and_then(|t| t.get("font"))
+            .and_then(|f| extract_font_size(&f.to_display_string()))
+            .unwrap_or(16)
+    });
+    let folder = theme.and_then(|t| t.get("icons")).map(|v| v.to_display_string()).unwrap_or_default();
+    let folder = folder.trim().trim_end_matches('/');
+    if !folder.is_empty() && folder != "builtin" && paneld_config::icons::is_file_name(name) {
+        let path = format!("{folder}/{name}.png");
+        if crate::ui::asset_exists(&path) {
+            let obj = parent.new_icon_image(&path, size.min(paneld_config::icons::MAX_SIZE))?;
+            return Some((obj, true));
+        }
+    }
+    if let Some(glyph) = paneld_config::icons::glyph(name) {
+        return Some((parent.new_icon_glyph(glyph, size), false));
+    }
+    UNKNOWN_ICONS.with(|u| {
+        for line in note_unknown_icon(&mut u.borrow_mut(), name) {
+            eprintln!("paneld: {line}");
+        }
+    });
+    None
+}
+
+/// The log lines for an unknown icon `name`: one the first time, none
+/// after; past [`UNKNOWN_ICONS_MAX`] names none at all (said once), so
+/// the set stays small.
+fn note_unknown_icon(seen: &mut std::collections::HashSet<String>, name: &str) -> Vec<String> {
+    if seen.len() >= UNKNOWN_ICONS_MAX || !seen.insert(name.to_string()) {
+        return Vec::new();
+    }
+    let mut lines = vec![format!("icon `{name}`: not a built-in icon and not in the theme's icons folder; not shown")];
+    if seen.len() == UNKNOWN_ICONS_MAX {
+        lines.push(format!("{UNKNOWN_ICONS_MAX} unknown icon names reported; further ones are not"));
+    }
+    lines
+}
+
+/// An icon image (a theme's PNG) takes the text color, as a glyph
+/// does: its own `color`, else the inherited one. A glyph is left as is.
+fn tint_icon((obj, image): &(Obj<'_>, bool)) {
+    if *image {
+        let (rgb, opa) = obj.text_color();
+        obj.set_image_recolor(rgb, 255);
+        obj.set_image_opa(opa);
     }
 }
 
@@ -1819,6 +1935,20 @@ mod tests {
         assert_eq!(theme_color("critical", Some(&theme)), Some((0xef6c00, 0x80)));
         assert_eq!(theme_color("#fff", None), Some((0xffffff, 255)));
         assert_eq!(theme_color("a", Some(&theme)), None);
+    }
+
+    #[test]
+    fn unknown_icon_names_are_logged_once_and_bounded() {
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(note_unknown_icon(&mut seen, "a").len(), 1);
+        assert!(note_unknown_icon(&mut seen, "a").is_empty());
+        let mut lines = 1;
+        for i in 0..1000 {
+            lines += note_unknown_icon(&mut seen, &format!("x{i}")).len();
+        }
+        assert_eq!(seen.len(), UNKNOWN_ICONS_MAX);
+        // One line per name, plus the one saying no more are logged.
+        assert_eq!(lines, UNKNOWN_ICONS_MAX + 1);
     }
 
     #[test]

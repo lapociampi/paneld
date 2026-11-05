@@ -127,6 +127,9 @@ enum ExpectedType {
     Offset,
     /// An integer of at least 1 (a line's or an arc's `thickness`).
     PositiveInt,
+    /// An icon name (schema 8.3): a built-in, or any name when the
+    /// active theme has an `icons` folder (its file may supply it).
+    Icon,
     /// Any text accepted; no shape check.
     Any,
 }
@@ -795,7 +798,7 @@ fn top_schema_for(kind: &str) -> Option<&'static BlockSchema> {
 
 const PAGE_KEYS: &[KeyRule] = &[
     KeyRule { name: "title", ty: ExpectedType::Str, required: false, expr_ok: true },
-    KeyRule { name: "icon", ty: ExpectedType::Ident, required: false, expr_ok: false },
+    KeyRule { name: "icon", ty: ExpectedType::Icon, required: false, expr_ok: false },
     KeyRule { name: "nav", ty: ExpectedType::Int, required: false, expr_ok: false },
 ];
 
@@ -992,8 +995,8 @@ const UI_TEXT: &UiNode = &UiNode {
 const UI_ICON: &UiNode = &UiNode {
     kind: "icon",
     keys: &[
-        KeyRule { name: "name", ty: ExpectedType::Any, required: false, expr_ok: true },
-        KeyRule { name: "size", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "name", ty: ExpectedType::Icon, required: false, expr_ok: true },
+        KeyRule { name: "size", ty: ExpectedType::PositiveInt, required: false, expr_ok: true },
     ],
     accepts_children: false,
     nested_subblocks: &[],
@@ -1125,7 +1128,7 @@ const UI_BUTTON: &UiNode = &UiNode {
     keys: &[
         KeyRule { name: "action", ty: ExpectedType::Ident, required: false, expr_ok: true },
         KeyRule { name: "label", ty: ExpectedType::Str, required: false, expr_ok: true },
-        KeyRule { name: "icon", ty: ExpectedType::Any, required: false, expr_ok: true },
+        KeyRule { name: "icon", ty: ExpectedType::Icon, required: false, expr_ok: true },
     ],
     accepts_children: true,
     nested_subblocks: &[],
@@ -1376,6 +1379,27 @@ fn check_color_name(name: &str) -> Result<(), String> {
         }
         Err(first.unwrap_or_else(|| format!("unknown theme color `{name}`")))
     })
+}
+
+/// A literal icon name is a built-in, unless the active theme has an
+/// `icons` folder (a file there may add it; the renderer skips a name
+/// found in neither).
+fn check_icon_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if crate::icons::glyph(name).is_some() {
+        return Ok(());
+    }
+    let folder = THEME_MAPS.with(|m| {
+        m.borrow().iter().any(|map| map.get("icons").is_some_and(|v| !v.trim().is_empty() && v.trim() != "builtin"))
+    });
+    if folder {
+        return Ok(());
+    }
+    let hint = match crate::icons::suggest(name) {
+        Some(s) => format!("; did you mean `{s}`?"),
+        None => String::new(),
+    };
+    Err(format!("unknown icon `{name}`: not a built-in icon (schema 8.3) and the theme sets no `icons` folder{hint}"))
 }
 
 pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
@@ -2396,6 +2420,7 @@ fn check_literal(text: &str, ty: ExpectedType) -> Result<(), String> {
                 ))
             }
         }
+        ExpectedType::Icon => check_icon_name(text),
         ExpectedType::HexColor => parse_color(text)
             .map(|_| ())
             .ok_or_else(|| {
@@ -2535,6 +2560,7 @@ fn type_name(ty: ExpectedType) -> &'static str {
         ExpectedType::Tracks => "a count or a list of tracks",
         ExpectedType::Offset => "an offset",
         ExpectedType::PositiveInt => "an integer of at least 1",
+        ExpectedType::Icon => "an icon name",
         ExpectedType::Any => "a value",
     }
 }
@@ -5061,6 +5087,25 @@ component my_toggle {
         assert_msg(&diags, "unknown theme color `banana`");
         let diags = check_text("page home { text { color = #12 } }\n");
         assert_msg(&diags, "expected a hex color");
+    }
+
+    #[test]
+    fn icon_names_are_built_ins_unless_the_theme_has_an_icons_folder() {
+        let ok = "page home { icon = wifi\n icon { name = home; size = 48; color = accent }\n\
+                  icon { name = {{ 'any' + 'thing' }}; size = {{ 20 }} }\n\
+                  button { icon = power; label = Off } }\n";
+        let diags = check_text(ok);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_msg(&check_text("page home { icon { name = hom } }\n"), "unknown icon `hom`");
+        assert_msg(&check_text("page home { icon { name = hom } }\n"), "did you mean `home`?");
+        assert_msg(&check_text("page home { button { icon = setings } }\n"), "did you mean `settings`?");
+        assert_msg(&check_text("page home { icon = rocket\n text { value = x } }\n"), "unknown icon `rocket`");
+        assert_msg(&check_text("page home { icon { name = home; size = 0 } }\n"), "at least 1");
+        // A theme icons folder may add names: not known until render.
+        let diags = check_text("theme t { icons = icons }\npage home { icon = rocket\n icon { name = rocket } }\n");
+        assert!(diags.is_empty(), "{diags:?}");
+        // `icons = builtin` (the default) adds none.
+        assert_msg(&check_text("theme t { icons = builtin }\npage home { icon { name = rocket } }\n"), "unknown icon");
     }
 
     #[test]
