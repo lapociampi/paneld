@@ -1428,11 +1428,7 @@ fn action_done(
     };
     if let Some(text) = message.filter(|t| !t.trim().is_empty()) {
         let token = if ok { "ok" } else { "critical" };
-        let bg = match live.theme.get(token) {
-            Some(paneld_ui::Value::String(c)) => c.clone(),
-            _ => String::new(),
-        };
-        paneld_ui::render_toast(&screen.top_layer(), &text, &bg);
+        paneld_ui::render_toast(&screen.top_layer(), &text, token, &live.theme);
         live.toast_until = Some(std::time::Instant::now() + TOAST_FOR);
     }
     match (ok, def.goto.as_deref()) {

@@ -293,7 +293,9 @@ pub fn command_argv(
 ) -> Result<Vec<String>, RunError> {
     let argv: Vec<String> = tokenize(template)?
         .into_iter()
-        .map(|t| if t.contains("{{") { interp(&t) } else { t })
+        // `##` is a literal `#` (config-format, "Lines"); a token with
+        // `{{ }}` gets that from the interpolator, outside the `{{ }}`.
+        .map(|t| if t.contains("{{") { interp(&t) } else { paneld_config::value::unescape_hash(&t) })
         .collect();
     if argv[0].is_empty() {
         return Err(RunError { message: "the command name is empty".into() });
@@ -551,6 +553,11 @@ mod tests {
         .unwrap();
         assert_eq!(argv, vec!["/bin/echo", "web 1; rm -rf /", "--tag=web 1; rm -rf /"]);
         assert!(command_argv("{{ x }} a", |_| String::new()).is_err());
+        // `##` is `#`, also in quotes; not inside `{{ }}`.
+        let argv = command_argv("sh -c 'echo ## x' a##b", |t| t.to_string()).unwrap();
+        assert_eq!(argv, ["sh", "-c", "echo # x", "a#b"]);
+        let argv = command_argv("echo {{ '##' }}", |t| t.to_string()).unwrap();
+        assert_eq!(argv, ["echo", "{{ '##' }}"]);
     }
 
     fn opts(timeout_ms: u64, max_bytes: usize) -> Opts<'static> {

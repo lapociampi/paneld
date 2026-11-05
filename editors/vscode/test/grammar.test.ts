@@ -131,6 +131,20 @@ test("blocks, keys and values get their scopes", () => {
   expect(tokenize(src).open).toEqual([]);
 });
 
+test("a # in a value is a comment only between spaces", () => {
+  expect(scopeOf("border = 2 #ff0000", "#ff0000")).toContain("constant.other.color");
+  expect(scopeOf("border = 2 #ff0000", "#ff0000")).not.toContain("comment");
+  const item = tokenize("text = Item #3").lines[0];
+  expect(item.map((t) => t.text).join("")).toBe("text = Item #3");
+  expect(item.some((t) => t.scopes.some((s) => s.startsWith("comment.")))).toBe(false);
+  expect(scopeOf("shadow = 8 #00000080 0 4", "#00000080")).toContain("constant.other.color");
+  expect(scopeOf("poll = 1m  # note", "# note")).toContain("comment.line");
+  expect(scopeOf("poll = 1m #", "#")).toContain("comment.line");
+  const one = "text { border = 2 #f00 }";
+  expect(scopeOf(one, "#f00")).toContain("constant.other.color");
+  expect(tokenize(one).open).toEqual([]);
+});
+
 test("cel maps, strings and braces inside values end where they should", () => {
   const src = [
     "value = {{ {'a': {'b': 1}, 'c': '}}'} }}",

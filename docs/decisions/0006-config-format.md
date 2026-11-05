@@ -2,6 +2,7 @@
 title: "ADR 0006: Hypr-style config format"
 description: "Why an own hypr-style config format instead of YAML or Lua."
 date: 2026-10-29
+updated: 2026-11-05
 tags: [paneld, adr]
 series: paneld
 order: 13
@@ -23,6 +24,8 @@ The config holds deep UI trees full of `{{ }}` expressions, plus commands, sourc
 ## Decision
 
 An own hypr-style format, parsed in Rust ([Config format](../config-format.md)). From hyprlang: `key = value`, braces, `#` comments, `$vars`, includes with globs (`include`, since `source` is one of our items), named blocks, `kind[name]:key = value`, options where the last one wins, reload on save with an error banner, a fallback screen when nothing valid ever loaded. Not taken: Lua, `noerror` switches.
+
+Amended 2026-11-05: inside a value, `#` starts a comment only between whitespace and whitespace (or the end of the line), so a color or `#3` after a space stays text (`border = 2 #ff0000`).
 
 ## Consequences
 

@@ -97,7 +97,11 @@ enum ExpectedType {
     Date,
     Size,
     Bytes,
+    /// A hex color or the name of a theme token (`accent`).
     Color,
+    /// A hex color only: an action param's value goes to a command,
+    /// which knows no theme.
+    HexColor,
     /// A path (currently a free string; no fs checks).
     Path,
     /// A command: raw text run as argv or `sh -c '...'`. Validated as
@@ -112,6 +116,17 @@ enum ExpectedType {
     IdentOrList,
     /// Exactly one of the given keyword strings.
     OneOf(&'static [&'static str]),
+    /// `padding`: 1, 2 or 4 px sizes.
+    Padding,
+    /// A grid `cell`: `col row [colspan rowspan]`, from 0.
+    Cell,
+    /// A grid's `columns` / `rows`: a count, or a list of tracks (px,
+    /// `Nfr`, `content`).
+    Tracks,
+    /// A `stack` child's `x` / `y`: px or a `%`, either may be negative.
+    Offset,
+    /// An integer of at least 1 (a line's or an arc's `thickness`).
+    PositiveInt,
     /// Any text accepted; no shape check.
     Any,
 }
@@ -799,10 +814,9 @@ const COMMON_UI_KEYS: &[KeyRule] = &[
         required: false,
         expr_ok: false,
     },
-    // cell is "col row [colspan rowspan]" - a loose string literal.
-    KeyRule { name: "cell", ty: ExpectedType::Str, required: false, expr_ok: false },
-    KeyRule { name: "x", ty: ExpectedType::Size, required: false, expr_ok: false },
-    KeyRule { name: "y", ty: ExpectedType::Size, required: false, expr_ok: false },
+    KeyRule { name: "cell", ty: ExpectedType::Cell, required: false, expr_ok: false },
+    KeyRule { name: "x", ty: ExpectedType::Offset, required: false, expr_ok: false },
+    KeyRule { name: "y", ty: ExpectedType::Offset, required: false, expr_ok: false },
     KeyRule {
         name: "anchor",
         ty: ExpectedType::OneOf(&[
@@ -813,8 +827,7 @@ const COMMON_UI_KEYS: &[KeyRule] = &[
         required: false,
         expr_ok: false,
     },
-    // padding is 1, 2 or 4 sizes - keep lenient.
-    KeyRule { name: "padding", ty: ExpectedType::Str, required: false, expr_ok: false },
+    KeyRule { name: "padding", ty: ExpectedType::Padding, required: false, expr_ok: false },
     KeyRule { name: "class", ty: ExpectedType::IdentOrList, required: false, expr_ok: false },
     KeyRule { name: "background", ty: ExpectedType::Any, required: false, expr_ok: true },
     KeyRule { name: "opacity", ty: ExpectedType::Number, required: false, expr_ok: true },
@@ -874,7 +887,7 @@ struct UiNode {
 const UI_ROW: &UiNode = &UiNode {
     kind: "row",
     keys: &[
-        KeyRule { name: "gap", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "gap", ty: ExpectedType::Int, required: false, expr_ok: true },
         KeyRule {
             name: "justify",
             ty: ExpectedType::OneOf(&["start", "center", "end", "between", "around", "evenly"]),
@@ -905,11 +918,11 @@ const UI_COLUMN: &UiNode = &UiNode {
 const UI_GRID: &UiNode = &UiNode {
     kind: "grid",
     keys: &[
-        KeyRule { name: "columns", ty: ExpectedType::Any, required: false, expr_ok: false },
-        KeyRule { name: "rows", ty: ExpectedType::Any, required: false, expr_ok: false },
-        KeyRule { name: "gap", ty: ExpectedType::Size, required: false, expr_ok: false },
-        KeyRule { name: "row_gap", ty: ExpectedType::Size, required: false, expr_ok: false },
-        KeyRule { name: "column_gap", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "columns", ty: ExpectedType::Tracks, required: false, expr_ok: false },
+        KeyRule { name: "rows", ty: ExpectedType::Tracks, required: false, expr_ok: false },
+        KeyRule { name: "gap", ty: ExpectedType::Int, required: false, expr_ok: true },
+        KeyRule { name: "row_gap", ty: ExpectedType::Int, required: false, expr_ok: true },
+        KeyRule { name: "column_gap", ty: ExpectedType::Int, required: false, expr_ok: true },
     ],
     accepts_children: true,
     nested_subblocks: &[],
@@ -939,7 +952,7 @@ const UI_SCROLL: &UiNode = &UiNode {
             required: false,
             expr_ok: false,
         },
-        KeyRule { name: "gap", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "gap", ty: ExpectedType::Int, required: false, expr_ok: true },
     ],
     accepts_children: true,
     nested_subblocks: &[],
@@ -1020,7 +1033,7 @@ const UI_ARC: &UiNode = &UiNode {
         KeyRule { name: "max", ty: ExpectedType::Number, required: false, expr_ok: true },
         KeyRule { name: "start", ty: ExpectedType::Number, required: false, expr_ok: false },
         KeyRule { name: "end", ty: ExpectedType::Number, required: false, expr_ok: false },
-        KeyRule { name: "thickness", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "thickness", ty: ExpectedType::PositiveInt, required: false, expr_ok: false },
         KeyRule { name: "track", ty: ExpectedType::Color, required: false, expr_ok: true },
         KeyRule { name: "rounded", ty: ExpectedType::Bool, required: false, expr_ok: false },
     ],
@@ -1052,7 +1065,7 @@ const UI_LINE: &UiNode = &UiNode {
     kind: "line",
     keys: &[
         KeyRule { name: "points", ty: ExpectedType::Any, required: false, expr_ok: true },
-        KeyRule { name: "thickness", ty: ExpectedType::Size, required: false, expr_ok: false },
+        KeyRule { name: "thickness", ty: ExpectedType::PositiveInt, required: false, expr_ok: false },
         KeyRule { name: "rounded", ty: ExpectedType::Bool, required: false, expr_ok: false },
     ],
     accepts_children: false,
@@ -1211,7 +1224,178 @@ fn ui_node_schema(kind: &str) -> Option<&'static UiNode> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// The built-in theme tokens and their defaults (schema section 11),
+/// under every theme. The daemon starts its theme map from these.
+pub const BUILTIN_THEME_TOKENS: &[(&str, &str)] = &[
+    ("background", "#f5f5f5"),
+    ("surface", "#ffffff"),
+    ("text", "#212121"),
+    ("muted", "#757575"),
+    ("accent", "#2196f3"),
+    ("ok", "#2e7d32"),
+    ("info", "#1976d2"),
+    ("warning", "#ef6c00"),
+    ("critical", "#d32f2f"),
+    ("font_small", "montserrat 12"),
+    ("font", "montserrat 16"),
+    ("font_big", "montserrat 24"),
+    ("font_huge", "montserrat 32"),
+    ("gap", "8"),
+    ("padding", "12"),
+    ("radius", "8"),
+    ("tap_min", "48"),
+    ("shadow", "none"),
+    ("icons", "builtin"),
+    ("motion", "reduced"),
+];
+
+/// A theme's tokens as written (built-ins under it), by name.
+type TokenMap = HashMap<String, String>;
+
+thread_local! {
+    /// Where a bare color name is looked up while checking: the token
+    /// maps of the active theme's chain (one map), or of every theme
+    /// when the active one is not known. A name is a color when it
+    /// resolves to a hex in any of them.
+    static THEME_MAPS: std::cell::RefCell<Vec<TokenMap>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with `maps` as the color-name lookup.
+fn with_theme_maps<T>(maps: Vec<TokenMap>, f: impl FnOnce() -> T) -> T {
+    let before = THEME_MAPS.with(|t| t.replace(maps));
+    let out = f();
+    THEME_MAPS.with(|t| t.replace(before));
+    out
+}
+
+/// The named `theme` blocks of `applied` (overrides folded in).
+fn theme_blocks(applied: &Document) -> Vec<Block> {
+    applied
+        .items
+        .iter()
+        .cloned()
+        .filter_map(|it| match it {
+            Item::Block(b) if b.kind.text == "theme" && b.name.is_some() => Some(b),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Built-ins, then `name`'s `extends` chain from its base down, the
+/// child winning (cycle-safe).
+fn chain_tokens(themes: &[Block], name: &str) -> TokenMap {
+    let mut chain: Vec<&Block> = Vec::new();
+    let mut next = Some(name.to_string());
+    while let Some(n) = next.take() {
+        let Some(t) = themes.iter().find(|t| t.name.as_ref().is_some_and(|x| x.text == n)) else { break };
+        if chain.iter().any(|c| std::ptr::eq(*c, t)) {
+            break;
+        }
+        chain.push(t);
+        next = t.items.iter().find_map(|it| match it {
+            Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "extends") => {
+                Some(a.value.text.trim().to_string())
+            }
+            _ => None,
+        });
+    }
+    let mut out: TokenMap = BUILTIN_THEME_TOKENS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    for t in chain.iter().rev() {
+        for it in &t.items {
+            if let Item::Assign(a) = it {
+                if let AssignTarget::Simple { key } = &a.target {
+                    if key.text != "extends" {
+                        out.insert(key.text.clone(), a.value.text.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The maps a page's color names resolve in: the active theme's chain
+/// (`screen:theme`, else the first theme), or every theme's when the
+/// active one is not defined.
+fn active_theme_maps(applied: &Document, themes: &[Block]) -> Vec<TokenMap> {
+    let configured = applied.items.iter().find_map(|it| match it {
+        Item::Block(b) if b.kind.text == "screen" && b.name.is_none() => b.items.iter().find_map(|i| match i {
+            Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key } if key.text == "theme") => {
+                Some(a.value.text.trim().to_string())
+            }
+            _ => None,
+        }),
+        _ => None,
+    });
+    let active = configured.or_else(|| themes.first().and_then(|t| t.name.as_ref()).map(|n| n.text.clone()));
+    match active {
+        Some(a) if themes.iter().any(|t| t.name.as_ref().is_some_and(|n| n.text == a)) => vec![chain_tokens(themes, &a)],
+        _ if themes.is_empty() => vec![chain_tokens(themes, "")],
+        _ => themes.iter().filter_map(|t| t.name.as_ref()).map(|n| chain_tokens(themes, &n.text)).collect(),
+    }
+}
+
+/// Follow a bare color name through `map` to a hex (cycle-safe).
+fn resolve_color_name(name: &str, map: &TokenMap) -> Result<(), String> {
+    let mut path: Vec<&str> = Vec::new();
+    let mut cur = name;
+    loop {
+        if path.contains(&cur) {
+            path.push(cur);
+            return Err(format!("theme color `{name}` refers to itself: {}", path.join(" -> ")));
+        }
+        path.push(cur);
+        let Some(v) = map.get(cur) else {
+            return Err(format!("unknown theme color `{cur}`: not a built-in token or one the active theme defines"));
+        };
+        let v = v.trim();
+        if parse_color(v).is_some() || v.contains("{{") {
+            return Ok(());
+        }
+        // Another token's name: follow it.
+        if map.contains_key(v) {
+            cur = v;
+            continue;
+        }
+        return Err(format!("theme token `{cur}` is `{v}`, not a color"));
+    }
+}
+
+/// A bare name is a color when it resolves in one of the current maps.
+fn check_color_name(name: &str) -> Result<(), String> {
+    THEME_MAPS.with(|m| {
+        let maps = m.borrow();
+        let mut first = None;
+        for map in maps.iter() {
+            match resolve_color_name(name, map) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        Err(first.unwrap_or_else(|| format!("unknown theme color `{name}`")))
+    })
+}
+
 pub fn check(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
+    let mut applied = doc.clone();
+    crate::apply_overrides(&mut applied);
+    let themes = theme_blocks(&applied);
+    let maps = active_theme_maps(&applied, &themes);
+    THEME_BLOCKS.with(|t| t.replace(themes));
+    let diags = with_theme_maps(maps, || check_inner(doc, source));
+    THEME_BLOCKS.with(|t| t.borrow_mut().clear());
+    diags
+}
+
+thread_local! {
+    /// The document's themes while it is checked: a theme's own tokens
+    /// resolve in its own chain.
+    static THEME_BLOCKS: std::cell::RefCell<Vec<Block>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn check_inner(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let mut seen: HashMap<(String, String), Span> = HashMap::new();
 
@@ -2035,6 +2219,10 @@ fn validate_param_in_body(p: &Param, parent_kind: &str, diags: &mut Vec<Diagnost
             _ => None,
         })
     };
+    let ty = match ty {
+        Some(ExpectedType::Color) if parent_kind != "component" => Some(ExpectedType::HexColor),
+        t => t,
+    };
     if let (Some(d), Some(ty)) = (&p.default, ty) {
         check_value_type(&d.text, d.span, ty, true, diags);
     }
@@ -2197,7 +2385,18 @@ fn check_literal(text: &str, ty: ExpectedType) -> Result<(), String> {
         ExpectedType::Bytes => parse_bytes(text)
             .map(|_| ())
             .ok_or_else(|| format!("expected a byte count (`64KiB`, `1MiB`, ...), got `{text}`")),
-        ExpectedType::Color => parse_color(text)
+        ExpectedType::Color => {
+            if parse_color(text).is_some() {
+                Ok(())
+            } else if is_bare_ident(text) && !text.contains('.') {
+                check_color_name(text)
+            } else {
+                Err(format!(
+                    "expected a hex color (`#rgb`, `#rrggbb`, `#rrggbbaa`) or a theme color name, got `{text}`"
+                ))
+            }
+        }
+        ExpectedType::HexColor => parse_color(text)
             .map(|_| ())
             .ok_or_else(|| {
                 format!("expected a hex color (`#rgb`, `#rrggbb`, `#rrggbbaa`), got `{text}`")
@@ -2225,6 +2424,63 @@ fn check_literal(text: &str, ty: ExpectedType) -> Result<(), String> {
                 ))
             }
         }
+        ExpectedType::Padding => {
+            let n = text.split_whitespace().count();
+            if matches!(n, 1 | 2 | 4) && text.split_whitespace().all(|p| p.parse::<u32>().is_ok()) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected 1, 2 (vertical horizontal) or 4 (top right bottom left) sizes in px, got `{text}`"
+                ))
+            }
+        }
+        ExpectedType::Cell => {
+            let n: Option<Vec<u8>> = text.split_whitespace().map(|p| p.parse::<u8>().ok()).collect();
+            match n.as_deref() {
+                Some([_, _]) => Ok(()),
+                Some([_, _, cs, rs]) if *cs > 0 && *rs > 0 => Ok(()),
+                _ => Err(format!(
+                    "expected `col row` or `col row colspan rowspan` (from 0, spans from 1, at most 255), got `{text}`"
+                )),
+            }
+        }
+        ExpectedType::Tracks => {
+            // A lone number is a count.
+            let count = text.parse::<u32>().ok();
+            if count.is_some_and(|n| (1..=1024).contains(&n)) {
+                return Ok(());
+            }
+            let inner = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')).unwrap_or(text);
+            let tracks: Vec<&str> =
+                inner.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()).collect();
+            let track_ok = |t: &str| {
+                t == "content"
+                    || t.strip_suffix("fr").is_some_and(|n| n.parse::<u8>().is_ok_and(|n| (1..=100).contains(&n)))
+                    || t.parse::<u32>().is_ok_and(|n| n <= 10_000)
+            };
+            if count.is_none() && !tracks.is_empty() && tracks.iter().all(|t| track_ok(t)) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected a count (`3`) or a list of tracks (`[120, 1fr, content]`), got `{text}`"
+                ))
+            }
+        }
+        ExpectedType::Offset => {
+            let ok = match text.strip_suffix('%') {
+                Some(p) => p.trim().parse::<i16>().is_ok_and(|p| p.abs() <= 1000),
+                None => text.parse::<i32>().is_ok(),
+            };
+            if ok {
+                Ok(())
+            } else {
+                Err(format!("expected an offset in px (`8`, `-8`) or a percentage (`50%`, `-10%`), got `{text}`"))
+            }
+        }
+        ExpectedType::PositiveInt => match parse_int(text) {
+            Some(n) if n >= 1 => Ok(()),
+            _ => Err(format!("expected an integer of at least 1, got `{text}`")),
+        },
         ExpectedType::OneOf(allowed) => {
             if allowed.contains(&text) {
                 Ok(())
@@ -2269,11 +2525,16 @@ fn type_name(ty: ExpectedType) -> &'static str {
         ExpectedType::Date => "a date",
         ExpectedType::Size => "a size",
         ExpectedType::Bytes => "a byte count",
-        ExpectedType::Color => "a color",
+        ExpectedType::Color | ExpectedType::HexColor => "a color",
         ExpectedType::Ident => "an identifier",
         ExpectedType::List => "a list",
         ExpectedType::IdentOrList => "an identifier or list of identifiers",
         ExpectedType::OneOf(_) => "a keyword",
+        ExpectedType::Padding => "1, 2 or 4 sizes in px",
+        ExpectedType::Cell => "a grid cell",
+        ExpectedType::Tracks => "a count or a list of tracks",
+        ExpectedType::Offset => "an offset",
+        ExpectedType::PositiveInt => "an integer of at least 1",
         ExpectedType::Any => "a value",
     }
 }
@@ -2467,6 +2728,15 @@ fn theme_token_type(key: &str) -> Option<ExpectedType> {
 /// tokens (assigns), `style <selector> { }` sub-blocks, and theme-
 /// local replacement `component <name> { }` sub-blocks.
 fn validate_theme_body(b: &Block, ctx: &UiContext, diags: &mut Vec<Diagnostic>) {
+    // Names in a theme resolve in that theme's own chain.
+    if let Some(name) = &b.name {
+        let map = THEME_BLOCKS.with(|t| chain_tokens(&t.borrow(), &name.text));
+        return with_theme_maps(vec![map], || validate_theme_items(b, ctx, diags));
+    }
+    validate_theme_items(b, ctx, diags);
+}
+
+fn validate_theme_items(b: &Block, ctx: &UiContext, diags: &mut Vec<Diagnostic>) {
     for item in &b.items {
         match item {
             Item::Assign(a) => validate_theme_assign(a, diags),
@@ -2719,6 +2989,73 @@ fn validate_ui_block(
 
     for item in &b.items {
         validate_ui_item_in_body(item, node, ctx, inside_component, diags);
+    }
+    if node.kind == "grid" {
+        check_grid_cells(b, diags);
+    }
+}
+
+/// The number of tracks a literal grid `columns` / `rows` makes (a
+/// count, or a list's length); `None` for an expression or a bad value.
+fn literal_track_count(b: &Block, key: &str) -> Option<usize> {
+    let a = b.items.iter().find_map(|it| match it {
+        Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key: k } if k.text == key) => Some(a),
+        _ => None,
+    })?;
+    let ValueShape::Literal(text) = classify(&a.value.text) else { return None };
+    let text = text.trim();
+    if let Ok(n) = text.parse::<usize>() {
+        return Some(n);
+    }
+    let inner = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')).unwrap_or(text);
+    Some(inner.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()).count())
+}
+
+/// A child's literal `cell` must lie inside the grid's literal columns
+/// (2 by default) and, when set, rows: the renderer would otherwise
+/// move it.
+fn check_grid_cells(grid: &Block, diags: &mut Vec<Diagnostic>) {
+    let has = |key: &str| {
+        grid.items.iter().any(|it| matches!(it, Item::Assign(a) if matches!(&a.target, AssignTarget::Simple { key: k } if k.text == key)))
+    };
+    let cols = if has("columns") { literal_track_count(grid, "columns") } else { Some(2) };
+    let rows = literal_track_count(grid, "rows");
+    fn children<'a>(items: &'a [Item], out: &mut Vec<&'a Block>) {
+        for it in items {
+            match it {
+                Item::Block(b) => out.push(b),
+                Item::Repeat(r) => children(&r.items, out),
+                _ => {}
+            }
+        }
+    }
+    let mut kids = Vec::new();
+    children(&grid.items, &mut kids);
+    for child in kids {
+        for it in &child.items {
+            let Item::Assign(a) = it else { continue };
+            if !matches!(&a.target, AssignTarget::Simple { key } if key.text == "cell") {
+                continue;
+            }
+            let ValueShape::Literal(text) = classify(&a.value.text) else { continue };
+            let n: Option<Vec<usize>> = text.split_whitespace().map(|p| p.parse().ok()).collect();
+            let (c, r, cs, rs) = match n.as_deref() {
+                Some(&[c, r]) => (c, r, 1, 1),
+                Some(&[c, r, cs, rs]) => (c, r, cs, rs),
+                _ => continue,
+            };
+            if let Some(cols) = cols.filter(|&n| c + cs > n) {
+                diags.push(Diagnostic::new(
+                    a.value.span,
+                    format!("cell `{}` is outside the grid's {cols} columns (counted from 0)", text.trim()),
+                ));
+            } else if let Some(rows) = rows.filter(|&n| r + rs > n) {
+                diags.push(Diagnostic::new(
+                    a.value.span,
+                    format!("cell `{}` is outside the grid's {rows} rows (counted from 0)", text.trim()),
+                ));
+            }
+        }
     }
 }
 
@@ -3305,6 +3642,13 @@ fn collect_params_in_body(
                 // Fall back to `any` so later checks don't double-fire.
                 ParamType::Expected(ExpectedType::Any)
             }
+        };
+        // A theme color name means something in a component's UI only.
+        let ty = match ty {
+            ParamType::Expected(ExpectedType::Color) if parent != "component" => {
+                ParamType::Expected(ExpectedType::HexColor)
+            }
+            t => t,
         };
         let asked = p
             .options
@@ -4636,6 +4980,40 @@ page home {
     }
 
     #[test]
+    fn layout_values_are_checked_as_render_reads_them() {
+        let ok = "page home {\n\
+                  grid { columns = [120, 1fr, 2fr, content]; rows = 2; row_gap = 4; column_gap = 8\n\
+                         rect { cell = 1 0 2 2; padding = 4 8 } rect { cell = 0 1; padding = 1 2 3 4 } }\n\
+                  stack { rect { anchor = bottom_right; x = -8; y = 50% } }\n\
+                  arc { value = 1; start = 180; end = 0; thickness = 12 }\n\
+                  text { overflow = dots; align_self = end } }\n";
+        let diags = check_text(ok);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+        let bad = |prop: &str| check_text(&format!("page home {{ grid {{ rect {{ {prop} }} }} }}\n"));
+        assert_msg(&bad("padding = 1 2 3"), "expected 1, 2 (vertical horizontal) or 4");
+        assert_msg(&bad("padding = 50%"), "expected 1, 2 (vertical horizontal) or 4");
+        assert_msg(&bad("cell = 1"), "expected `col row` or `col row colspan rowspan`");
+        assert_msg(&bad("cell = 0 0 0 1"), "expected `col row` or `col row colspan rowspan`");
+        assert_msg(&bad("x = grow"), "expected an offset");
+        assert_msg(&bad("anchor = middle"), "expected one of `top_left`");
+        let grid = |cols: &str| check_text(&format!("page home {{ grid {{ columns = {cols} }} }}\n"));
+        assert_msg(&grid("[100, 1x]"), "expected a count (`3`) or a list of tracks");
+        assert_msg(&grid("0"), "expected a count (`3`) or a list of tracks");
+        assert!(grid("1fr 1fr").is_empty());
+        assert_msg(&check_text("page home { arc { thickness = 50% } }\n"), "expected an integer of at least 1");
+        assert_msg(&check_text("page home { line { thickness = 0 } }\n"), "expected an integer of at least 1");
+        assert!(check_text("page home { stack { rect { x = -10%; y = -8 } } }\n").is_empty());
+        let cells = |grid: &str| check_text(&format!("page home {{ grid {{ {grid} }} }}\n"));
+        assert_msg(&cells("rect { cell = 2 0 }"), "outside the grid's 2 columns");
+        assert_msg(&cells("columns = [1fr, 1fr, 1fr]; rect { cell = 1 0 3 1 }"), "outside the grid's 3 columns");
+        assert_msg(&cells("columns = 3; rows = 2; repeat i in {{ [1] }} { rect { cell = 0 1 1 2 } }"), "outside the grid's 2 rows");
+        assert!(cells("columns = 4; rect { cell = 1 5 3 1 }").is_empty(), "rows grow when not set");
+        assert_msg(&check_text("page home { row { gap = 50% } }\n"), "expected an integer");
+        assert_msg(&check_text("page home { grid { row_gap = grow } }\n"), "expected an integer");
+        assert!(check_text("page home { row { gap = {{ theme.gap }} } }\n").is_empty());
+    }
+
+    #[test]
     fn on_tap_inline_action_unknown_key_flagged() {
         let diags = check_text("page home { text { on_tap { wobble = 1 } } }\n");
         assert_msg(&diags, "unknown inline action key `wobble`");
@@ -4680,7 +5058,51 @@ component my_toggle {
     #[test]
     fn invalid_hex_color_literal_is_flagged() {
         let diags = check_text("page home { text { color = banana } }\n");
+        assert_msg(&diags, "unknown theme color `banana`");
+        let diags = check_text("page home { text { color = #12 } }\n");
         assert_msg(&diags, "expected a hex color");
+    }
+
+    #[test]
+    fn theme_color_names_are_colors() {
+        // Built-in tokens, and any token a theme defines (here `track`,
+        // also through `theme[x]:key`).
+        let text = "theme t { track = #333333 }\ntheme[t]:glow = #ff000080\n\
+                    page home { text { value = Hi; color = accent }\n\
+                    image { src = a.png; recolor = muted }\n\
+                    bar { value = 1; track = track }\n arc { value = 1; track = glow } }\n";
+        let diags = check_text(text);
+        assert!(diags.is_empty(), "{diags:?}");
+        // A theme token may name another token.
+        assert!(check_text("theme t { accent = critical }\n").is_empty());
+        // A token of another document is not known here.
+        assert_msg(&check_text("page home { text { color = track } }\n"), "unknown theme color `track`");
+        // An action param's value goes to a command: hex only.
+        let diags = check_text("action a { param tint: color = accent\n run = echo {{ tint }} }\n");
+        assert_msg(&diags, "expected a hex color");
+        let diags = check_text("component c { param tint: color = accent\n text { value = x; color = {{ tint }} } }\n");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn theme_color_names_resolve_in_the_active_chain_to_a_hex() {
+        let head = "screen:theme = b\ntheme a { track = #ff0000 }\ntheme b { extends = c; accent = gap }\ntheme c { glow = #00ff00 }\n";
+        let page = |c: &str| check_text(&format!("{head}page home {{ text {{ value = x; color = {c} }} }}\n"));
+        // Non-color built-ins and tokens of an inactive theme are not colors.
+        assert_msg(&page("gap"), "theme token `gap` is `8`, not a color");
+        assert_msg(&page("icons"), "theme token `icons` is `builtin`, not a color");
+        assert_msg(&page("track"), "unknown theme color `track`");
+        // `accent = gap` in the active theme: reported on that line too.
+        let diags = page("glow");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_msg(&diags, "theme token `gap` is `8`, not a color");
+        // A cycle, also through two names.
+        assert_msg(&check_text("theme t { accent = accent }\n"), "refers to itself: accent -> accent");
+        assert_msg(&check_text("theme t { ok = info; info = ok }\npage p { text { value = x; color = ok } }\n"), "refers to itself");
+        // An undefined active theme: any theme that resolves the name.
+        assert!(check_text("theme a { track = #ff0000 }\nscreen:theme = gone\npage p { text { value = x; color = track } }\n")
+            .iter()
+            .all(|d| !d.contains("color")));
     }
 
     #[test]
@@ -5356,6 +5778,8 @@ theme dark {
     #[test]
     fn theme_color_token_bad_value_is_flagged() {
         let diags = check_text("theme dark { accent = banana }\n");
+        assert_msg(&diags, "unknown theme color `banana`");
+        let diags = check_text("theme dark { accent = 12 }\n");
         assert_msg(&diags, "expected a hex color");
     }
 

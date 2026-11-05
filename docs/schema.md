@@ -2,7 +2,7 @@
 title: "Schema"
 description: "Every item, category, building block and property the config can hold."
 date: 2026-10-29
-updated: 2026-11-04
+updated: 2026-11-05
 tags: [paneld, config, reference]
 series: paneld
 order: 4
@@ -238,17 +238,17 @@ The theme's `shell` component wraps every page: header, navigation, alert banner
 | `width`, `height` | size, expr | px, `%` of the parent, `grow`, `content` (default) |
 | `min_width`, `max_width`, `min_height`, `max_height` | size | |
 | `grow` | number | Share of free space in a row or column |
-| `align_self` | `start`, `center`, `end`, `stretch` | In the parent's cross axis |
-| `cell` | `col row [colspan rowspan]` | In a `grid`; default: next free cell |
-| `x`, `y`, `anchor` | size, size, `top_left`...`center`...`bottom_right` | In a `stack` |
-| `padding` | 1, 2 or 4 sizes | |
+| `align_self` | `start`, `center`, `end`, `stretch` | Across a `row` / `column` (a row's height, a column's width); `stretch` takes all of it. In a `grid`: vertically in its cell |
+| `cell` | `col row [colspan rowspan]` | In a `grid`, counted from 0, e.g. `cell = 1 0 2 1`; it must fit in the grid's `columns` and, if set, `rows`. Default: the next free cell, row by row |
+| `x`, `y`, `anchor` | px or `%`, px or `%`, `top_left`, `top_center`, `top_right`, `left`, `center`, `right`, `bottom_left`, `bottom_center`, `bottom_right` | In a `stack`: `anchor` (default `top_left`) is the point of the stack the child sits at, `x` / `y` move it from there (right and down are positive, `-8` or `-10%` goes left or up) |
+| `padding` | 1, 2 or 4 sizes in px | `8` all sides, `8 16` vertical horizontal, `1 2 3 4` top right bottom left |
 | `class` | list of names | Theme styles (`style .card`) |
 | `background` | color, image path or gradient, expr | |
 | `opacity` | 0..1, expr | |
 | `radius` | size | |
 | `border` | `<width> <color>` | |
 | `shadow` | `<size> <color> [<x> <y>]` | |
-| `color` | color, expr | Foreground: text, icon, line |
+| `color` | color, expr | Foreground: text, icon, line; the value part of an `arc` or `bar` |
 | `font` | font, expr | `<family> <size> [bold]`, e.g. `roboto 20`, or a theme font token ([ADR 0015](decisions/0015-fonts.md)) |
 | `visible` | bool, expr | |
 | `enabled` | bool, expr | Disabled: no input, `:disabled` style |
@@ -260,8 +260,8 @@ Layout blocks are transparent and borderless: only a `background`, `border` or t
 
 | Block | Keys | Notes |
 | --- | --- | --- |
-| `row`, `column` | `gap`, `justify` (`start`, `center`, `end`, `between`, `around`, `evenly`), `align` (`start`, `center`, `end`, `stretch`), `wrap` (bool) | Flex |
-| `grid` | `columns`, `rows` (count, or list of tracks: px, `1fr`, `content`), `gap`, `row_gap`, `column_gap` | |
+| `row`, `column` | `gap`, `justify` (`start`, `center`, `end`, `between`, `around`, `evenly`), `align` (`start`, `center`, `end`, `stretch`: children fill the cross axis unless they set their own `width` (column) or `height` (row) in px or `%`), `wrap` (bool) | Flex. `gap`, `row_gap` and `column_gap` here and below are px (an integer, or `{{ }}` giving one). `wrap` starts a new line when the next child does not fit; it needs a set `width` (row) or `height` (column) |
+| `grid` | `columns` (default 2), `rows` (count, or list of tracks: px, `1fr` / `2fr` (a share of the space left), `content`, e.g. `[120, 1fr, content]`), `gap`, `row_gap`, `column_gap` | A count makes equal columns (`1fr` each) and rows sized to their content. Rows are added as the children need them |
 | `stack` | | Children on top of each other, placed with `x`, `y`, `anchor` |
 | `scroll` | `direction` (`vertical`, `horizontal`), `snap` (`none`, `start`, `center`), `gap`, `align` | Children laid out as a column or row, scrollable along it. Fills the parent's width and, in a column, the space left, unless `height` or `grow` is set |
 | `slot` | | Inside components only |
@@ -271,14 +271,14 @@ Layout blocks are transparent and borderless: only a `background`, `border` or t
 
 | Block | Keys |
 | --- | --- |
-| `text` | `value` (string, expr), `align` (`left`, `center`, `right`), `overflow` (`wrap`, `clip`, `dots`, `scroll`) |
+| `text` | `value` (string, expr), `align` (`left`, `center`, `right`), `overflow` (`wrap` default, `clip`, `dots`: cut with `...`, on one line unless a `height` is set (on the node, a style or a component call); `scroll`: scrolls to and fro). All but `wrap` need a `width`. A `scroll` text that does not fit keeps the screen redrawing while it is shown, which costs CPU; the panel is otherwise asleep when idle |
 | `icon` | `name` (theme icon or built-in symbol, expr), `size` |
 | `image` | `src` (path to a PNG, expr; relative to the config folder), `fit` (`contain`, `cover`, `fill`, `none`), `recolor` (color) |
 | `rect` | none beyond the common ones: a shape |
-| `arc` | `value`, `min` = 0, `max` = 100 (expr), `start` = 135, `end` = 45 (degrees), `thickness`, `track` (color), `rounded` (bool) |
-| `bar` | `value`, `min`, `max` (expr), `direction` (`horizontal`, `vertical`), `track` (color) |
-| `line` | `points` (list of `[x, y]` in px, expr), `thickness` (default 2), `rounded`, `color` (default the theme's `text`) |
-| `chart` | `type` (`line`, `bar`, `area`: a line with the space under it filled, translucent), `min`, `max` (default: the data's range), `points` (count, default: the longest series), `divisions` (`<h> <v>`, default `3 0`), `series { values = {{ }}; color = ... }` repeatable. `values` is a list of numbers or of `{value}` maps, such as a source's `history`; the newest `points` are shown, against the right edge |
+| `arc` | `value`, `min` = 0, `max` = 100 (expr), `start` = 135, `end` = 45 (degrees: 0 at 3 o'clock, clockwise, so the default leaves the gap at the bottom; a span of 360, e.g. `0` to `360`, is a full circle), `thickness` (px, at least 1), `track` (color; default the theme's `muted`, faint), `rounded` (bool, default false), `color` (the value; default the theme's `accent`). For display: no knob, and a press never changes the value |
+| `bar` | `value`, `min` = 0, `max` = 100 (expr), `direction` (`horizontal` default, `vertical`: fills from the bottom), `track` (color; default the theme's `muted`, faint), `color` (the value; default the theme's `accent`) |
+| `line` | `points` (list of `[x, y]` in px, expr), `thickness` (px, at least 1, default 2), `rounded`, `color` (default the theme's `text`) |
+| `chart` | `type` (`line`, `bar`, `area`: a line with the space under it filled, translucent), `min`, `max` (default: the data's range), `points` (count, default: the longest series), `divisions` (`<h> <v>`, default `3 0`), `series { values = {{ }}; color = ... }` repeatable (`color` default the theme's `accent`). `values` is a list of numbers or of `{value}` maps, such as a source's `history`; the newest `points` are shown, against the right edge. A `line` or `area` chart draws no dot on each point. No box of its own: transparent and borderless unless `background` / `border` are set; the division lines in the theme's `muted`, faint |
 | `qr` | `data` (string, expr), `size` |
 | `spinner` | `size` |
 

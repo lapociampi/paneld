@@ -1387,3 +1387,385 @@ fn button_rows_fire_once_per_change_and_values_match_options_first() {
     let img = shot(&conf, &["--tap", "160,90", "--settle", "200", "--tap", "160,90", "--settle", "200"]);
     assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "not exactly one change");
 }
+
+#[test]
+fn colors_take_alpha_and_theme_names() {
+    let d = tmp("alpha");
+    let conf = d.join("p.conf");
+    // `#ffffff80` over black is mid gray; `accent` and `track` are the
+    // theme's; `border = 4 #ff0000` keeps its color on a one-line block.
+    std::fs::write(
+        &conf,
+        "theme t { accent = #00ff00; track = #0000ff }\n\
+         page home {\n\
+             column { padding = 0; background = #000000; width = 300; height = 200\n\
+                 rect { width = 100; height = 40; background = #ffffff80 }\n\
+                 rect { width = 100; height = 40; background = accent }\n\
+                 rect { width = 100; height = 40; background = track }\n\
+                 rect { width = 100; height = 40; background = #000000; border = 4 #ff0000 }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &[]);
+    assert!(img.any(|p| close(p, [0x80, 0x80, 0x80], 6)), "no half white over black");
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 10)), "theme accent not drawn");
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 10)), "theme extra token not drawn");
+    assert!(img.any(|p| close(p, [0xff, 0, 0], 10)), "border color lost to a comment");
+
+    // A translucent chart series is drawn faded; an opaque one of the
+    // same color beside it stays full red.
+    let conf = d.join("c.conf");
+    std::fs::write(
+        &conf,
+        "page home { chart { width = 100%; height = 200; type = bar\n\
+             series { values = {{ [5, 5, 5] }}; color = #0000ff60 }\n\
+             series { values = {{ [5, 5, 5] }}; color = #0000ff } } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &[]);
+    assert!(img.any(|p| close(p, [0, 0, 0xff], 10)), "opaque series drawn translucent");
+    assert!(img.any(|p| p[2] > 0xe0 && p[0] > 0x80 && p[0] < 0xd0 && p[0] == p[1]), "translucent series not drawn");
+    let conf = d.join("e.conf");
+    std::fs::write(
+        &conf,
+        "page home { chart { width = 100%; height = 200; type = bar\n\
+             series { values = {{ [5, 5, 5] }}; color = #ff000060 } } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &[]);
+    assert!(!img.any(|p| close(p, [0xff, 0, 0], 40)), "series alpha dropped");
+    assert!(img.any(|p| p[0] > 0xe0 && p[1] > 0x80 && p[1] < 0xd0 && p[1] == p[2]), "translucent series not drawn");
+}
+
+/// The smallest box (x0, y0, x1, y1, inclusive) holding every pixel
+/// that matches `f`.
+fn bbox(img: &Image, f: impl Fn([u8; 3]) -> bool) -> Option<(usize, usize, usize, usize)> {
+    let mut b: Option<(usize, usize, usize, usize)> = None;
+    for y in 0..img.h {
+        for x in 0..img.w {
+            if f(img.px(x, y)) {
+                b = Some(match b {
+                    None => (x, y, x, y),
+                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                });
+            }
+        }
+    }
+    b
+}
+
+fn near(a: usize, b: usize, tol: usize) -> bool {
+    a.abs_diff(b) <= tol
+}
+
+#[test]
+fn an_arc_draws_its_track_and_indicator_with_no_knob_and_a_press_keeps_its_value() {
+    let d = tmp("arc");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var tapped: bool = false\n\
+         page home {\n\
+             arc { width = 200; height = 200; value = 25; thickness = 20\n\
+                   track = #00ff00; color = #ff0000\n\
+                   on_hold { set { tapped = true } } }\n\
+             rect { width = 20; height = 20; background = {{ vars.tapped ? '#ffff00' : '#000000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let red = |p| close(p, [0xff, 0, 0], 16);
+    let green = |p| close(p, [0, 0xff, 0], 16);
+    let img = shot(&conf, &["--settle", "50"]);
+    let (r, g) = (bbox(&img, red).expect("no indicator"), bbox(&img, green).expect("no track"));
+    // 25% of 135..45 (270 degrees) ends at 202.5 degrees: the
+    // indicator stays left of the middle, the track goes around.
+    let (gx0, gy0, gx1, _) = g;
+    let cx = (gx0 + gx1) / 2;
+    assert!(r.2 < cx, "indicator reaches the right half: {r:?}");
+    assert!(gx1 > cx + 80, "track does not reach the right: {g:?}");
+    // No knob: LVGL draws one in its primary blue.
+    assert!(!img.any(|p| close(p, [0x21, 0x96, 0xf3], 40)), "a knob is drawn");
+    // A press on the track at 3 o'clock drags nothing, though the
+    // `on_hold` makes the arc clickable (a short tap: no re-render).
+    let at = format!("{},{}", gx1 - 10, gy0 + 100);
+    let after = shot(&conf, &["--tap", &at, "--settle", "100"]);
+    assert_eq!(bbox(&after, red), Some(r), "the press moved the value");
+    let held = shot(&conf, &["--hold", &at, "--settle", "100"]);
+    assert!(held.any(|p| close(p, [0xff, 0xff, 0], 16)), "the hold did not run on_hold");
+}
+
+#[test]
+fn stack_children_sit_at_their_anchor_and_offset() {
+    let d = tmp("stack");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             stack { width = 200; height = 200; background = #000000\n\
+                 rect { anchor = center; width = 40; height = 40; background = #ff0000; border = 0; radius = 0 }\n\
+                 rect { anchor = bottom_right; width = 30; height = 30; background = #0000ff; border = 0; radius = 0 }\n\
+                 rect { x = 20; y = 10; width = 30; height = 30; background = #00ff00; border = 0; radius = 0 }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let s = bbox(&img, |p| p == [0, 0, 0]).expect("no stack");
+    let r = bbox(&img, |p| close(p, [0xff, 0, 0], 8)).expect("no centered child");
+    let b = bbox(&img, |p| close(p, [0, 0, 0xff], 8)).expect("no bottom_right child");
+    let g = bbox(&img, |p| close(p, [0, 0xff, 0], 8)).expect("no offset child");
+    assert!(near((r.0 + r.2) / 2, (s.0 + s.2) / 2, 2) && near((r.1 + r.3) / 2, (s.1 + s.3) / 2, 2), "center: {r:?} in {s:?}");
+    assert!(near(b.2, s.2, 1) && near(b.3, s.3, 1), "bottom_right: {b:?} in {s:?}");
+    assert!(near(g.0, s.0 + 20, 1) && near(g.1, s.1 + 10, 1), "top_left + (20, 10): {g:?} in {s:?}");
+}
+
+#[test]
+fn padding_takes_two_or_four_sizes() {
+    let d = tmp("padding");
+    let conf = d.join("p.conf");
+    let child = |c: &str| format!("rect {{ width = 20; height = 20; background = {c}; border = 0; radius = 0 }}");
+    std::fs::write(
+        &conf,
+        format!(
+            "page home {{\n\
+                 row {{ gap = 20\n\
+                     column {{ background = #ff0000; radius = 0; padding = 10 30; {} }}\n\
+                     column {{ background = #0000ff; radius = 0; padding = 1 2 3 4; {} }}\n\
+                 }}\n\
+             }}\n",
+            child("#00ff00"),
+            child("#ffff00")
+        ),
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let r = bbox(&img, |p| close(p, [0xff, 0, 0], 8)).expect("no first column");
+    let g = bbox(&img, |p| close(p, [0, 0xff, 0], 8)).expect("no first child");
+    assert_eq!((r.2 - r.0 + 1, r.3 - r.1 + 1), (80, 40), "padding = 10 30: {r:?}");
+    assert_eq!((g.0 - r.0, g.1 - r.1), (30, 10), "first child at {g:?} in {r:?}");
+    let b = bbox(&img, |p| close(p, [0, 0, 0xff], 8)).expect("no second column");
+    let y = bbox(&img, |p| close(p, [0xff, 0xff, 0], 8)).expect("no second child");
+    assert_eq!((b.2 - b.0 + 1, b.3 - b.1 + 1), (26, 24), "padding = 1 2 3 4: {b:?}");
+    assert_eq!((y.0 - b.0, y.1 - b.1), (4, 1), "second child at {y:?} in {b:?}");
+}
+
+#[test]
+fn grid_takes_a_track_list_gaps_and_spanning_cells() {
+    let d = tmp("grid-tracks");
+    let conf = d.join("p.conf");
+    let rect = |c: &str, extra: &str| format!("rect {{ {extra} background = {c}; border = 0; radius = 0 }}");
+    std::fs::write(
+        &conf,
+        format!(
+            "page home {{\n\
+                 grid {{ width = 400; padding = 0; columns = [100, 1fr, content]; rows = [50, 50]\n\
+                        row_gap = 10; column_gap = 0\n\
+                     {}\n{}\n{}\n\
+                 }}\n\
+             }}\n",
+            rect("#ff0000", "cell = 1 0 2 2;"),
+            rect("#00ff00", ""),
+            rect("#0000ff", ""),
+        ),
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let r = bbox(&img, |p| close(p, [0xff, 0, 0], 8)).expect("no spanning cell");
+    let g = bbox(&img, |p| close(p, [0, 0xff, 0], 8)).expect("no first free cell");
+    let b = bbox(&img, |p| close(p, [0, 0, 0xff], 8)).expect("no second free cell");
+    let size = |(x0, y0, x1, y1): (usize, usize, usize, usize)| (x1 - x0 + 1, y1 - y0 + 1);
+    // The free children fill column 0 (100 px), row by row.
+    assert_eq!(size(g), (100, 50), "first free cell {g:?}");
+    assert_eq!(size(b), (100, 50), "second free cell {b:?}");
+    assert_eq!((b.0, b.1), (g.0, g.3 + 1 + 10), "second free cell below the first, 10 px apart");
+    // The spanning cell takes the other 300 px and both rows.
+    assert_eq!((r.0, r.1), (g.2 + 1, g.1), "spanning cell at {r:?}");
+    assert_eq!(size(r), (300, 110), "spanning cell {r:?}");
+}
+
+#[test]
+fn a_vertical_bar_fills_from_the_bottom_over_its_track() {
+    let d = tmp("bar");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             bar { direction = vertical; width = 20; height = 200; value = 25; radius = 0\n\
+                   track = #0000ff; color = #ff0000 }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let t = bbox(&img, |p| close(p, [0, 0, 0xff], 8)).expect("no track");
+    let i = bbox(&img, |p| close(p, [0xff, 0, 0], 8)).expect("no indicator");
+    assert!(i.3 - i.1 > i.2 - i.0, "indicator not upright: {i:?}");
+    assert!(t.1 < i.1 && near(i.3, t.3, 2), "indicator not at the bottom of the track: {i:?} in {t:?}");
+    assert!(near(i.3 - i.1 + 1, 50, 6), "indicator not a quarter high: {i:?}");
+}
+
+#[test]
+fn text_overflow_dots_keeps_one_line_where_wrap_breaks() {
+    let d = tmp("overflow");
+    let conf = d.join("p.conf");
+    let value = "\"aaaa bbbb cccc dddd eeee ffff gggg\"";
+    std::fs::write(
+        &conf,
+        format!(
+            "page home {{\n\
+                 text {{ width = 120; overflow = dots; color = #ff0000; value = {value} }}\n\
+                 text {{ width = 120; color = #0000ff; value = {value} }}\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let dots = bbox(&img, |p| p[0] > 0xc0 && p[1] < 0x60 && p[2] < 0x60).expect("no dots text");
+    let wrap = bbox(&img, |p| p[2] > 0xc0 && p[0] < 0x60 && p[1] < 0x60).expect("no wrapped text");
+    let h = |b: (usize, usize, usize, usize)| b.3 - b.1 + 1;
+    assert!(h(dots) < 24, "dots text is more than a line: {dots:?}");
+    assert!(h(wrap) > 2 * h(dots), "wrapped text did not wrap: {wrap:?}");
+    assert!(dots.2 - dots.0 < 120 && wrap.2 - wrap.0 < 120, "text wider than its width");
+}
+
+#[test]
+fn a_chart_has_no_white_box_unless_given_a_background() {
+    let d = tmp("chart-look");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             column { background = #000000; padding = 20; radius = 0\n\
+                 chart { width = 200; height = 100; series { values = {{ [1, 3, 2, 5] }}; color = #ff0000 } }\n\
+                 chart { width = 200; height = 100; background = #00ff00; series { values = {{ [1, 2] }} } }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let col = bbox(&img, |p| p == [0, 0, 0]).expect("no column");
+    let white = (col.1..=col.3).any(|y| (col.0..=col.2).any(|x| img.px(x, y).iter().all(|&c| c > 0xf0)));
+    assert!(!white, "a chart drew a white box");
+    assert!(img.any(|p| close(p, [0xff, 0, 0], 16)), "no series");
+    // Division lines in a faint `muted` over the black.
+    let faint = (col.1..=col.3).any(|y| (col.0..=col.2).any(|x| close(img.px(x, y), [0x1d, 0x1d, 0x1d], 8)));
+    assert!(faint, "no faint division lines");
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 8)), "a chart's own background lost");
+}
+
+#[test]
+fn align_self_places_a_child_across_its_column_and_a_row_wraps() {
+    let d = tmp("align-self");
+    let conf = d.join("p.conf");
+    let rect = |c: &str, extra: &str| format!("rect {{ {extra} height = 20; background = {c}; border = 0; radius = 0 }}");
+    std::fs::write(
+        &conf,
+        format!(
+            "page home {{\n\
+                 column {{ width = 200; padding = 0; background = #000000; radius = 0\n\
+                     {}\n{}\n{}\n\
+                 }}\n\
+                 row {{ width = 200; padding = 0; gap = 0; wrap = true\n\
+                     repeat i in {{{{ [1, 2, 3] }}}} {{ {} }}\n\
+                 }}\n\
+             }}\n",
+            rect("#ff0000", "width = 40; align_self = end;"),
+            rect("#00ff00", "width = 40; align_self = center;"),
+            rect("#0000ff", "align_self = stretch;"),
+            rect("#ffff00", "width = 80;"),
+        ),
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let col = bbox(&img, |p| p == [0, 0, 0]).expect("no column");
+    let r = bbox(&img, |p| close(p, [0xff, 0, 0], 8)).expect("no end child");
+    let g = bbox(&img, |p| close(p, [0, 0xff, 0], 8)).expect("no center child");
+    let b = bbox(&img, |p| close(p, [0, 0, 0xff], 8)).expect("no stretch child");
+    assert!(near(r.2, col.2, 1), "end: {r:?} in {col:?}");
+    assert!(near((g.0 + g.2) / 2, (col.0 + col.2) / 2, 2), "center: {g:?} in {col:?}");
+    assert!(near(b.0, col.0, 1) && near(b.2, col.2, 1), "stretch: {b:?} in {col:?}");
+    // Two 80 px children fit in 200; the third wraps to a second line.
+    let y = bbox(&img, |p| close(p, [0xff, 0xff, 0], 8)).expect("no row");
+    assert!(y.3 - y.1 + 1 >= 40, "the row did not wrap: {y:?}");
+}
+
+#[test]
+fn align_stretch_fills_the_cross_axis_unless_a_child_sets_its_size() {
+    let d = tmp("align-stretch");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home {\n\
+             column { width = 200; padding = 0; align = stretch; background = #000000; radius = 0\n\
+                 rect { height = 20; background = #ff0000; border = 0; radius = 0 }\n\
+                 rect { width = 40; height = 20; background = #00ff00; border = 0; radius = 0 }\n\
+                 text { value = abc; align_self = end; color = #0000ff }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let col = bbox(&img, |p| p == [0, 0, 0]).expect("no column");
+    // Its own `align_self` wins: its own width, at the end (stretched,
+    // the text would sit on the left).
+    let b = bbox(&img, |p| p[2] > 0xc0 && p[0] < 0x60 && p[1] < 0x60).expect("no align_self child");
+    assert!(b.0 > col.0 + 100 && near(b.2, col.2, 3), "align_self lost to align = stretch: {b:?} in {col:?}");
+    let r = bbox(&img, |p| close(p, [0xff, 0, 0], 8)).expect("no stretched child");
+    let g = bbox(&img, |p| close(p, [0, 0xff, 0], 8)).expect("no sized child");
+    assert!(near(r.0, col.0, 1) && near(r.2, col.2, 1), "not stretched: {r:?} in {col:?}");
+    assert_eq!(g.2 - g.0 + 1, 40, "a set width was stretched: {g:?}");
+}
+
+#[test]
+fn a_full_circle_arc_draws_all_round_from_any_start() {
+    let d = tmp("arc-full");
+    for (start, end) in [(0, 360), (90, 450)] {
+        let conf = d.join(format!("p{start}.conf"));
+        std::fs::write(
+            &conf,
+            format!(
+                "page home {{ arc {{ width = 200; height = 200; value = 0; thickness = 10\n\
+                     start = {start}; end = {end}; track = #00ff00 }} }}\n"
+            ),
+        )
+        .unwrap();
+        let img = shot(&conf, &["--settle", "50"]);
+        let g = bbox(&img, |p| close(p, [0, 0xff, 0], 16)).expect("no track");
+        let (cx, cy) = ((g.0 + g.2) / 2, (g.1 + g.3) / 2);
+        let on = |x: usize, y: usize| (0..6).any(|i| close(img.px(x, y + i), [0, 0xff, 0], 40) || close(img.px(x + i, y), [0, 0xff, 0], 40));
+        // Top, bottom, left and right of the ring all drawn.
+        assert!(on(cx, g.1) && on(cx, g.3 - 5) && on(g.0, cy) && on(g.2 - 5, cy), "{start}..{end} is not a full circle: {g:?}");
+    }
+}
+
+#[test]
+fn a_line_chart_draws_no_dot_on_each_point() {
+    let d = tmp("chart-dots");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home { chart { width = 300; height = 200; min = 0; max = 10\n\
+             series { values = {{ [5, 5, 5, 5] }}; color = #ff0000 } } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let r = bbox(&img, |p| close(p, [0xff, 0, 0], 60)).expect("no line");
+    let high = r.3 - r.1 + 1;
+    assert!(high <= 4, "a flat line is {high} px high: dots drawn");
+}
+
+#[test]
+fn dots_text_takes_more_lines_with_a_height_from_a_class() {
+    let d = tmp("dots-class");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t { style .two { height = 40 } }\n\
+         page home { text { class = two; width = 120; overflow = dots; color = #ff0000\n\
+             value = \"aaaa bbbb cccc dddd eeee ffff gggg hhhh\" } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--settle", "50"]);
+    let r = bbox(&img, |p| p[0] > 0xc0 && p[1] < 0x60 && p[2] < 0x60).expect("no text");
+    assert!(r.3 - r.1 + 1 > 24, "dots text kept to one line despite its class height: {r:?}");
+}

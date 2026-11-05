@@ -492,6 +492,11 @@ thread_local! {
     /// [`Obj::clear_children`] on the screen.
     static LAYOUT_MEM: std::cell::RefCell<Vec<Box<[i32]>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Chart series alphas: (chart, alpha of each series in the order
+    /// added, which is LVGL's series index). Cleared with the screen,
+    /// and per chart when one is created.
+    static CHART_ALPHA: std::cell::RefCell<Vec<(*mut sys::lv_obj_t, Vec<u8>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Point arrays of the current render's `line`s; same lifetime.
     static LINE_MEM: std::cell::RefCell<Vec<Box<[sys::lv_point_precise_t]>>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -1077,11 +1082,14 @@ impl<'ui> Obj<'ui> {
     pub fn new_chart(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_chart_create(self.raw) };
         assert!(!raw.is_null());
+        // A chart freed earlier may have had this address.
+        CHART_ALPHA.with(|m| m.borrow_mut().retain(|(c, _)| *c != raw));
         Obj { raw, _ui: PhantomData }
     }
 
     /// Kind, point count, value range of the primary y axis, and the
-    /// number of horizontal / vertical division lines.
+    /// number of horizontal / vertical division lines. A line chart
+    /// draws no dot on each point.
     pub fn chart_setup(&self, bars: bool, points: u32, min: i32, max: i32, hdiv: u32, vdiv: u32) {
         let ty = if bars {
             sys::lv_chart_type_t_LV_CHART_TYPE_BAR
@@ -1093,6 +1101,12 @@ impl<'ui> Obj<'ui> {
             sys::lv_chart_set_point_count(self.raw, points.max(1));
             sys::lv_chart_set_axis_range(self.raw, sys::lv_chart_axis_t_LV_CHART_AXIS_PRIMARY_Y, min, max);
             sys::lv_chart_set_div_line_count(self.raw, hdiv, vdiv);
+            if !bars {
+                // LVGL draws a point only when both are non-zero.
+                let indicator = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
+                sys::lv_obj_set_style_width(self.raw, 0, indicator);
+                sys::lv_obj_set_style_height(self.raw, 0, indicator);
+            }
         }
     }
 
@@ -1117,9 +1131,13 @@ impl<'ui> Obj<'ui> {
                 let width = (content.x2 - content.x1).max(1) as u32;
                 let step = (count / (width / 2).max(1)).max(1);
                 let mut ser = sys::lv_chart_get_series_next(chart, std::ptr::null_mut());
+                // Series come in the order added: their index.
+                let mut idx = 0;
                 while !ser.is_null() {
                     let ys = sys::lv_chart_get_series_y_array(chart, ser);
                     let color = sys::lv_chart_get_series_color(chart, ser);
+                    let opa = scale_opa(80, series_alpha(chart, idx));
+                    idx += 1;
                     let at = |i: u32| {
                         let mut p: sys::lv_point_t = std::mem::zeroed();
                         sys::lv_chart_get_point_pos_by_id(chart, ser, i, &mut p);
@@ -1145,7 +1163,7 @@ impl<'ui> Obj<'ui> {
                             let mut dsc: sys::lv_draw_rect_dsc_t = std::mem::zeroed();
                             sys::lv_draw_rect_dsc_init(&mut dsc);
                             dsc.bg_color = color;
-                            dsc.bg_opa = 80;
+                            dsc.bg_opa = opa;
                             let area = sys::lv_area_t { x1: x0, y1: (y0 + y1) / 2, x2: (x1 - 1).max(x0), y2: bottom };
                             sys::lv_draw_rect(layer, &dsc, &area);
                             continue;
@@ -1154,7 +1172,7 @@ impl<'ui> Obj<'ui> {
                             let mut dsc: sys::lv_draw_triangle_dsc_t = std::mem::zeroed();
                             sys::lv_draw_triangle_dsc_init(&mut dsc);
                             dsc.color = color;
-                            dsc.opa = 80;
+                            dsc.opa = opa;
                             for (k, (x, y)) in tri.into_iter().enumerate() {
                                 dsc.p[k] = sys::lv_point_precise_t { x, y };
                             }
@@ -1168,18 +1186,60 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_add_event_cb(self.raw, Some(fill), sys::lv_event_code_t_LV_EVENT_DRAW_MAIN_END, std::ptr::null_mut()) };
     }
 
-    /// Add a series in `rgb`. `None` values are gaps. The chart owns
-    /// the series and copies the values.
-    pub fn chart_add_series(&self, rgb: u32, values: &[Option<i32>]) {
+    /// Add a series in `rgb` at `opa` (255 opaque). `None` values are
+    /// gaps. The chart owns the series and copies the values.
+    pub fn chart_add_series(&self, rgb: u32, opa: u8, values: &[Option<i32>]) {
+        /// LVGL has no per-series opacity: a translucent series gets its
+        /// alpha on each of its draw tasks, found by the series index
+        /// LVGL puts in `id1` for a line and a bar (we never hide one).
+        unsafe extern "C" fn series_opa(e: *mut sys::lv_event_t) {
+            // SAFETY: registered on a chart below for DRAW_TASK_ADDED, so
+            // LVGL hands a live draw task; its descriptor matches its type.
+            unsafe {
+                let chart = sys::lv_event_get_target(e) as *mut sys::lv_obj_t;
+                let task = sys::lv_event_get_draw_task(e);
+                let base = sys::lv_draw_task_get_draw_dsc(task) as *const sys::lv_draw_dsc_base_t;
+                if base.is_null() || (*base).part != sys::lv_part_t_LV_PART_ITEMS {
+                    return;
+                }
+                let ty = sys::lv_draw_task_get_type(task);
+                let alpha = series_alpha(chart, (*base).id1);
+                if ty == sys::lv_draw_task_type_t_LV_DRAW_TASK_TYPE_LINE {
+                    let d = sys::lv_draw_task_get_line_dsc(task);
+                    (*d).opa = scale_opa((*d).opa, alpha);
+                } else if ty == sys::lv_draw_task_type_t_LV_DRAW_TASK_TYPE_FILL {
+                    let d = sys::lv_draw_task_get_fill_dsc(task);
+                    (*d).opa = scale_opa((*d).opa, alpha);
+                }
+            }
+        }
         let points: Vec<i32> = values.iter().map(|v| v.unwrap_or(sys::LV_CHART_POINT_NONE as i32)).collect();
         unsafe {
-            let ser = sys::lv_chart_add_series(
-                self.raw,
-                sys::lv_color_hex(rgb),
-                sys::lv_chart_axis_t_LV_CHART_AXIS_PRIMARY_Y,
-            );
+            let color = sys::lv_color_hex(rgb);
+            let ser = sys::lv_chart_add_series(self.raw, color, sys::lv_chart_axis_t_LV_CHART_AXIS_PRIMARY_Y);
             if ser.is_null() {
                 return;
+            }
+            // Every series is recorded, opaque ones too, so the index
+            // lines up; the hook goes on with the first translucent one.
+            let raw = self.raw;
+            let hook = CHART_ALPHA.with(|m| {
+                let mut m = m.borrow_mut();
+                let at = match m.iter().position(|(c, _)| *c == raw) {
+                    Some(i) => i,
+                    None => {
+                        m.push((raw, Vec::new()));
+                        m.len() - 1
+                    }
+                };
+                let alphas = &mut m[at].1;
+                let had = alphas.iter().any(|&a| a < 255);
+                alphas.push(opa);
+                opa < 255 && !had
+            });
+            if hook {
+                sys::lv_obj_add_flag(raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);
+                sys::lv_obj_add_event_cb(raw, Some(series_opa), sys::lv_event_code_t_LV_EVENT_DRAW_TASK_ADDED, std::ptr::null_mut());
             }
             sys::lv_chart_set_all_values(self.raw, ser, sys::LV_CHART_POINT_NONE as i32);
             sys::lv_chart_set_series_values(self.raw, ser, points.as_ptr(), points.len());
@@ -1201,13 +1261,14 @@ impl<'ui> Obj<'ui> {
         Obj { raw, _ui: PhantomData }
     }
 
-    /// Line width and rounded ends of a `line`, in `rgb`.
-    pub fn set_line_style(&self, width: i32, rounded: bool, rgb: Option<u32>) {
+    /// Line width and rounded ends of a `line`, in `color` (rgb, alpha).
+    pub fn set_line_style(&self, width: i32, rounded: bool, color: Option<(u32, u8)>) {
         unsafe {
             sys::lv_obj_set_style_line_width(self.raw, width, 0);
             sys::lv_obj_set_style_line_rounded(self.raw, rounded, 0);
-            if let Some(rgb) = rgb {
+            if let Some((rgb, opa)) = color {
                 sys::lv_obj_set_style_line_color(self.raw, sys::lv_color_hex(rgb), 0);
+                sys::lv_obj_set_style_line_opa(self.raw, opa, 0);
             }
         }
     }
@@ -1251,18 +1312,31 @@ impl<'ui> Obj<'ui> {
         Some(Obj { raw, _ui: PhantomData })
     }
 
-    /// Tint an image with `rgb` (icons drawn in one color).
-    pub fn set_image_recolor(&self, rgb: u32) {
+    /// Tint an image with `rgb` (icons drawn in one color); `opa` is
+    /// how much of the tint covers the image.
+    pub fn set_image_recolor(&self, rgb: u32, opa: u8) {
         unsafe {
             sys::lv_obj_set_style_image_recolor(self.raw, sys::lv_color_hex(rgb), 0);
-            sys::lv_obj_set_style_image_recolor_opa(self.raw, 255, 0);
+            sys::lv_obj_set_style_image_recolor_opa(self.raw, opa, 0);
         }
     }
 
-    /// A circular arc gauge (dial).
+    /// A circular arc gauge (dial) for display: no knob, and a press
+    /// (an `on_tap` makes it clickable) never drags its value.
     pub fn new_arc(&self) -> Obj<'ui> {
+        unsafe extern "C" fn no_drag(e: *mut sys::lv_event_t) {
+            // SAFETY: registered below as a preprocess handler; stopping
+            // here keeps the arc's own PRESSING handler from running.
+            unsafe { sys::lv_event_stop_processing(e) };
+        }
         let raw = unsafe { sys::lv_arc_create(self.raw) };
         assert!(!raw.is_null());
+        unsafe {
+            sys::lv_obj_remove_style(raw, std::ptr::null_mut(), sys::lv_part_t_LV_PART_KNOB as sys::lv_style_selector_t);
+            sys::lv_obj_set_clickable(raw, false);
+            let code = sys::lv_event_code_t_LV_EVENT_PRESSING | sys::lv_event_code_t_LV_EVENT_PREPROCESS;
+            sys::lv_obj_add_event_cb(raw, Some(no_drag), code, std::ptr::null_mut());
+        }
         Obj { raw, _ui: PhantomData }
     }
 
@@ -1690,6 +1764,281 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_arc_set_range(self.raw, min, max) };
     }
 
+    /// Where an arc's track starts and ends, in degrees: 0 is 3
+    /// o'clock, clockwise. A span that is a non-zero multiple of 360
+    /// is a full circle.
+    pub fn set_arc_angles(&self, start: i32, end: i32) {
+        let span = arc_span(start, end);
+        unsafe {
+            // Turned to `start`, the track runs from 0 to the span, so
+            // a full circle from any start stays one.
+            sys::lv_arc_set_rotation(self.raw, start.rem_euclid(360));
+            sys::lv_arc_set_bg_angles(self.raw, 0, span);
+        }
+    }
+
+    /// Width of an arc's track and indicator, in px.
+    pub fn set_arc_thickness(&self, px: i32) {
+        let indicator = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
+        unsafe {
+            sys::lv_obj_set_style_arc_width(self.raw, px, sel());
+            sys::lv_obj_set_style_arc_width(self.raw, px, sel() | indicator);
+        }
+    }
+
+    /// Round (or square) ends of an arc's track and indicator.
+    pub fn set_arc_rounded(&self, rounded: bool) {
+        let indicator = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
+        unsafe {
+            sys::lv_obj_set_style_arc_rounded(self.raw, rounded, sel());
+            sys::lv_obj_set_style_arc_rounded(self.raw, rounded, sel() | indicator);
+        }
+    }
+
+    /// An arc's track (the background arc) in `rgb` at `opa`.
+    pub fn set_arc_track(&self, rgb: u32, opa: u8) {
+        unsafe {
+            sys::lv_obj_set_style_arc_color(self.raw, sys::lv_color_hex(rgb), sel());
+            sys::lv_obj_set_style_arc_opa(self.raw, opa, sel());
+        }
+    }
+
+    /// An arc's indicator (the value) in `rgb` at `opa`.
+    pub fn set_arc_indicator(&self, rgb: u32, opa: u8) {
+        let indicator = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
+        unsafe {
+            sys::lv_obj_set_style_arc_color(self.raw, sys::lv_color_hex(rgb), sel() | indicator);
+            sys::lv_obj_set_style_arc_opa(self.raw, opa, sel() | indicator);
+        }
+    }
+
+    /// A bar's track (the unfilled part) in `rgb` at `opa`.
+    pub fn set_bar_track(&self, rgb: u32, opa: u8) {
+        self.set_background_hex(rgb, opa);
+    }
+
+    /// A bar's indicator (the filled part) in `rgb` at `opa`.
+    pub fn set_bar_indicator(&self, rgb: u32, opa: u8) {
+        let indicator = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
+        unsafe {
+            sys::lv_obj_set_style_bg_color(self.raw, sys::lv_color_hex(rgb), sel() | indicator);
+            sys::lv_obj_set_style_bg_opa(self.raw, opa, sel() | indicator);
+        }
+    }
+
+    /// Fill a bar bottom to top. Its theme size (wide and low) is
+    /// turned upright; a `width` / `height` set after wins.
+    pub fn set_bar_vertical(&self) {
+        unsafe {
+            sys::lv_bar_set_orientation(self.raw, sys::lv_bar_orientation_t_LV_BAR_ORIENTATION_VERTICAL);
+            let (w, h) = (sys::lv_obj_get_style_width(self.raw, 0), sys::lv_obj_get_style_height(self.raw, 0));
+            sys::lv_obj_set_size(self.raw, h, w);
+        }
+    }
+
+    /// A chart without LVGL's white box: transparent, borderless, its
+    /// division lines in `lines` (rgb, alpha). The node's own
+    /// `background` / `border` (applied after) still win.
+    pub fn set_chart_look(&self, lines: (u32, u8)) {
+        unsafe {
+            sys::lv_obj_set_style_bg_opa(self.raw, sys::_lv_opacity_level_t_LV_OPA_TRANSP as sys::lv_opa_t, 0);
+            sys::lv_obj_set_style_border_width(self.raw, 0, 0);
+            sys::lv_obj_set_style_line_color(self.raw, sys::lv_color_hex(lines.0), 0);
+            sys::lv_obj_set_style_line_opa(self.raw, lines.1, 0);
+        }
+    }
+
+    /// Place this object in its parent (a `stack`) at `anchor`, moved
+    /// by the `x` / `y` offset set with [`Self::set_x`] / [`Self::set_y`].
+    pub fn set_anchor(&self, anchor: Anchor) {
+        unsafe { sys::lv_obj_set_align(self.raw, anchor.lvgl()) };
+    }
+
+    /// Offset from the anchor point, px (right is positive) or a
+    /// percentage of the parent's width.
+    pub fn set_x(&self, x: Size) {
+        unsafe { sys::lv_obj_set_x(self.raw, x.to_lvgl()) };
+    }
+
+    /// Offset from the anchor point, px (down is positive) or a
+    /// percentage of the parent's height.
+    pub fn set_y(&self, y: Size) {
+        unsafe { sys::lv_obj_set_y(self.raw, y.to_lvgl()) };
+    }
+
+    /// Padding per side, px.
+    pub fn set_padding_sides(&self, top: i32, right: i32, bottom: i32, left: i32) {
+        unsafe {
+            sys::lv_obj_set_style_pad_top(self.raw, top, sel());
+            sys::lv_obj_set_style_pad_right(self.raw, right, sel());
+            sys::lv_obj_set_style_pad_bottom(self.raw, bottom, sel());
+            sys::lv_obj_set_style_pad_left(self.raw, left, sel());
+        }
+    }
+
+    /// Space between rows (of a grid, or of wrapped flex tracks).
+    pub fn set_row_gap(&self, px: i32) {
+        unsafe { sys::lv_obj_set_style_pad_row(self.raw, px, sel()) };
+    }
+
+    /// Space between columns.
+    pub fn set_column_gap(&self, px: i32) {
+        unsafe { sys::lv_obj_set_style_pad_column(self.raw, px, sel()) };
+    }
+
+    /// `align = stretch` on a row / column (`column`: its children's
+    /// width, else their height): each child whose size across the
+    /// flow is not set in px or % fills it. Call it after the children
+    /// exist.
+    pub fn stretch_children(&self, column: bool) {
+        let prop = if column { sys::_lv_style_id_t_LV_STYLE_WIDTH } else { sys::_lv_style_id_t_LV_STYLE_HEIGHT };
+        let full = Size::Percent(100).to_lvgl();
+        unsafe {
+            for i in 0..sys::lv_obj_get_child_count(self.raw) {
+                let child = sys::lv_obj_get_child(self.raw, i as i32);
+                // Its own `align_self` wins.
+                if local_self_align(child).is_some() {
+                    continue;
+                }
+                let mut v = sys::lv_style_value_t::default();
+                let found = sys::lv_obj_get_local_style_prop(child, prop as sys::lv_style_prop_t, &mut v, 0);
+                // SAFETY: a size is stored as `num`.
+                if found == sys::lv_style_res_t_LV_STYLE_RES_FOUND && v.num != LV_SIZE_CONTENT_LOCAL {
+                    continue;
+                }
+                if column {
+                    sys::lv_obj_set_width(child, full);
+                } else {
+                    sys::lv_obj_set_height(child, full);
+                }
+            }
+        }
+    }
+
+    /// Let a row / column wrap its children onto more lines (only
+    /// with a fixed main size: LVGL does not wrap a content-sized one).
+    pub fn set_flex_wrap(&self, column: bool) {
+        let flow = if column {
+            sys::lv_flex_flow_t_LV_FLEX_FLOW_COLUMN_WRAP
+        } else {
+            sys::lv_flex_flow_t_LV_FLEX_FLOW_ROW_WRAP
+        };
+        unsafe { sys::lv_obj_set_flex_flow(self.raw, flow) };
+    }
+
+    /// What a label does with text longer than its width. See
+    /// [`Self::fit_dots`] for `dots`.
+    pub fn set_text_overflow(&self, mode: TextOverflow) {
+        let m = match mode {
+            TextOverflow::Wrap => sys::lv_label_long_mode_t_LV_LABEL_LONG_MODE_WRAP,
+            TextOverflow::Clip => sys::lv_label_long_mode_t_LV_LABEL_LONG_MODE_CLIP,
+            TextOverflow::Dots => sys::lv_label_long_mode_t_LV_LABEL_LONG_MODE_DOTS,
+            TextOverflow::Scroll => sys::lv_label_long_mode_t_LV_LABEL_LONG_MODE_SCROLL,
+        };
+        unsafe { sys::lv_label_set_long_mode(self.raw, m) };
+    }
+
+    /// A `dots` label keeps to one line unless its height is set (by
+    /// the node, a theme style or a component call): call it once all
+    /// of those are applied.
+    pub fn fit_dots(&self) {
+        unsafe {
+            if sys::lv_label_get_long_mode(self.raw) != sys::lv_label_long_mode_t_LV_LABEL_LONG_MODE_DOTS {
+                return;
+            }
+            let content = sys::lv_obj_get_style_height(self.raw, 0) == LV_SIZE_CONTENT_LOCAL;
+            sys::lv_label_set_max_lines(self.raw, if content { 1 } else { -1 });
+        }
+    }
+
+    /// Put this object in grid cell `col`, `row` (from 0), spanning
+    /// `colspan` x `rowspan` cells, once its parent is laid out as a
+    /// grid ([`Self::layout_grid`]).
+    pub fn set_grid_cell(&self, col: u8, row: u8, colspan: u8, rowspan: u8) {
+        unsafe {
+            sys::lv_obj_set_style_grid_cell_column_pos(self.raw, col as i32, 0);
+            sys::lv_obj_set_style_grid_cell_row_pos(self.raw, row as i32, 0);
+            sys::lv_obj_set_style_grid_cell_column_span(self.raw, colspan.max(1) as i32, 0);
+            sys::lv_obj_set_style_grid_cell_row_span(self.raw, rowspan.max(1) as i32, 0);
+        }
+    }
+
+    /// `align_self`: this object's place across its parent's flow (a
+    /// row's height, a column's width), or in its grid cell vertically.
+    /// Kept as the object's grid cell y align, which a flex parent
+    /// reads after each layout; `stretch` in a flex parent is the full
+    /// cross size.
+    pub fn set_align_self(&self, align: SelfAlign) {
+        /// After a flex layout, move each child with an `align_self`
+        /// across the flow by a translate: LVGL flex has no per-child
+        /// cross alignment. Setting it lays out again, and the second
+        /// pass finds nothing to change.
+        unsafe extern "C" fn place(e: *mut sys::lv_event_t) {
+            // SAFETY: registered below on a live flex container; its
+            // children are live objects for the length of the event.
+            unsafe {
+                let cont = sys::lv_event_get_target(e) as *mut sys::lv_obj_t;
+                if sys::lv_obj_get_style_layout(cont, 0) as u32 != sys::lv_layout_t_LV_LAYOUT_FLEX {
+                    return;
+                }
+                let column = sys::lv_obj_get_style_flex_flow(cont, 0) as u32 & sys::_LV_FLEX_COLUMN != 0;
+                let mut area: sys::lv_area_t = std::mem::zeroed();
+                sys::lv_obj_get_content_coords(cont, &mut area);
+                let (lo, hi) = if column { (area.x1, area.x2) } else { (area.y1, area.y2) };
+                for i in 0..sys::lv_obj_get_child_count(cont) {
+                    let child = sys::lv_obj_get_child(cont, i as i32);
+                    let Some(align) = local_self_align(child).filter(|a| *a != SelfAlign::Stretch) else { continue };
+                    let mut c: sys::lv_area_t = std::mem::zeroed();
+                    sys::lv_obj_get_coords(child, &mut c);
+                    let (start, end) = if column { (c.x1, c.x2) } else { (c.y1, c.y2) };
+                    let size = end - start + 1;
+                    let shift = if column {
+                        sys::lv_obj_get_style_translate_x(child, 0)
+                    } else {
+                        sys::lv_obj_get_style_translate_y(child, 0)
+                    };
+                    let target = match align {
+                        SelfAlign::Center => lo + (hi - lo + 1 - size) / 2,
+                        SelfAlign::End => hi + 1 - size,
+                        _ => lo,
+                    };
+                    let want = target - (start - shift);
+                    if want != shift {
+                        if column {
+                            sys::lv_obj_set_style_translate_x(child, want, 0);
+                        } else {
+                            sys::lv_obj_set_style_translate_y(child, want, 0);
+                        }
+                    }
+                }
+            }
+        }
+        unsafe {
+            sys::lv_obj_set_style_grid_cell_y_align(self.raw, align.grid(), 0);
+            let parent = sys::lv_obj_get_parent(self.raw);
+            if parent.is_null() || sys::lv_obj_get_style_layout(parent, 0) as u32 != sys::lv_layout_t_LV_LAYOUT_FLEX {
+                return;
+            }
+            let column = sys::lv_obj_get_style_flex_flow(parent, 0) as u32 & sys::_LV_FLEX_COLUMN != 0;
+            if align == SelfAlign::Stretch {
+                let full = Size::Percent(100).to_lvgl();
+                if column {
+                    sys::lv_obj_set_width(self.raw, full);
+                } else {
+                    sys::lv_obj_set_height(self.raw, full);
+                }
+                return;
+            }
+            // Once per container, found by its user data.
+            let mark = &PLACE_MARK as *const u8 as *mut std::ffi::c_void;
+            let has = (0..sys::lv_obj_get_event_count(parent))
+                .any(|i| sys::lv_event_dsc_get_user_data(sys::lv_obj_get_event_dsc(parent, i)) == mark);
+            if !has {
+                sys::lv_obj_add_event_cb(parent, Some(place), sys::lv_event_code_t_LV_EVENT_LAYOUT_CHANGED, mark);
+            }
+        }
+    }
+
     pub fn set_size(&self, w: Size, h: Size) {
         unsafe { sys::lv_obj_set_size(self.raw, w.to_lvgl(), h.to_lvgl()) };
     }
@@ -1772,12 +2121,13 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_style_pad_gap(self.raw, px, sel()) };
     }
 
-    pub fn set_background_hex(&self, rgb: u32) {
+    /// Background in `rgb` at `opa` (255 opaque, from `#rrggbbaa`).
+    pub fn set_background_hex(&self, rgb: u32, opa: u8) {
         let color = unsafe { sys::lv_color_hex(rgb) };
         unsafe {
             sys::lv_obj_set_style_bg_color(self.raw, color, sel());
             // Layout containers start transparent.
-            sys::lv_obj_set_style_bg_opa(self.raw, sys::_lv_opacity_level_t_LV_OPA_COVER as sys::lv_opa_t, sel());
+            sys::lv_obj_set_style_bg_opa(self.raw, opa, sel());
         }
     }
 
@@ -1785,12 +2135,14 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_style_radius(self.raw, px, sel()) };
     }
 
-    /// `border = <width> [<color>]`; width 0 removes the border.
-    pub fn set_border(&self, width: i32, rgb: Option<u32>) {
+    /// `border = <width> [<color>]`; width 0 removes the border. The
+    /// color is (rgb, alpha).
+    pub fn set_border(&self, width: i32, color: Option<(u32, u8)>) {
         unsafe {
             sys::lv_obj_set_style_border_width(self.raw, width, sel());
-            if let Some(rgb) = rgb {
+            if let Some((rgb, opa)) = color {
                 sys::lv_obj_set_style_border_color(self.raw, sys::lv_color_hex(rgb), sel());
+                sys::lv_obj_set_style_border_opa(self.raw, opa, sel());
             }
         }
     }
@@ -1807,9 +2159,13 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_style_opa(self.raw, opa, sel()) };
     }
 
-    pub fn set_text_color_hex(&self, rgb: u32) {
+    /// Text in `rgb` at `opa` (255 opaque).
+    pub fn set_text_color_hex(&self, rgb: u32, opa: u8) {
         let color = unsafe { sys::lv_color_hex(rgb) };
-        unsafe { sys::lv_obj_set_style_text_color(self.raw, color, sel()) };
+        unsafe {
+            sys::lv_obj_set_style_text_color(self.raw, color, sel());
+            sys::lv_obj_set_style_text_opa(self.raw, opa, sel());
+        }
     }
 
     /// Pick one of the compiled Montserrat font sizes for this
@@ -1879,28 +2235,82 @@ impl<'ui> Obj<'ui> {
         if self.raw == unsafe { sys::lv_screen_active() } {
             LAYOUT_MEM.with(|m| m.borrow_mut().clear());
             LINE_MEM.with(|m| m.borrow_mut().clear());
+            CHART_ALPHA.with(|m| m.borrow_mut().clear());
         }
     }
 
-    /// Lay this object's current children out as a grid: `cols` equal
-    /// columns, rows sized to their content, children placed row by
-    /// row. Call it after the children exist (so `repeat` output is
-    /// counted). `rows` can ask for more rows than the children need.
-    pub fn layout_grid(&self, cols: i32, rows: Option<i32>) {
+    /// Lay this object's current children out as a grid: `cols` (a
+    /// count of equal columns, or a list of tracks), `rows` (the same;
+    /// by default rows sized to their content). A child with a cell
+    /// ([`Self::set_grid_cell`]) goes there; the others fill the free
+    /// cells row by row. Rows are added as the children need them.
+    /// Call it after the children exist (so `repeat` output is counted).
+    pub fn layout_grid(&self, cols: &Tracks, rows: Option<&Tracks>) {
         // Bounded: `columns` / `rows` can come from a source.
-        let cols = cols.clamp(1, 64);
+        const MAX_COLS: usize = 64;
+        const MAX_ROWS: usize = 1024;
+        let col_tracks: Vec<Track> = match cols {
+            Tracks::Count(n) => vec![Track::Fr(1); (*n).clamp(1, MAX_COLS as i32) as usize],
+            Tracks::List(l) if l.is_empty() => vec![Track::Fr(1)],
+            Tracks::List(l) => l.iter().copied().take(MAX_COLS).collect(),
+        };
+        let ncols = col_tracks.len();
         // LVGL skips hidden children in a grid; place only the shown
         // ones so `visible = false` leaves no hole.
         let shown: Vec<*mut sys::lv_obj_t> = (0..unsafe { sys::lv_obj_get_child_count(self.raw) })
             .map(|i| unsafe { sys::lv_obj_get_child(self.raw, i as i32) })
             .filter(|&c| !c.is_null() && !unsafe { sys::lv_obj_is_hidden(c) })
             .collect();
-        let n = shown.len() as i32;
-        let needed = (n + cols - 1) / cols;
-        let rows = rows.unwrap_or(needed).clamp(1, 1024).max(needed);
-        let mut col_dsc: Vec<i32> = (0..cols).map(|_| grid_fr(1)).collect();
+        // Cells taken, row by row; explicit cells first, then the rest
+        // in the free ones.
+        let mut taken: Vec<Vec<bool>> = Vec::new();
+        let take = |taken: &mut Vec<Vec<bool>>, c: usize, r: usize, cs: usize, rs: usize| {
+            while taken.len() < r + rs {
+                taken.push(vec![false; ncols]);
+            }
+            for row in taken.iter_mut().skip(r).take(rs) {
+                for cell in row.iter_mut().skip(c).take(cs) {
+                    *cell = true;
+                }
+            }
+        };
+        let mut placed: Vec<(usize, usize, usize, usize)> = vec![(0, 0, 1, 1); shown.len()];
+        let explicit: Vec<Option<(i32, i32, i32, i32)>> = shown.iter().map(|&c| local_grid_cell(c)).collect();
+        for (i, cell) in explicit.iter().enumerate() {
+            if let Some((c, r, cs, rs)) = *cell {
+                let c = (c.max(0) as usize).min(ncols - 1);
+                let r = (r.max(0) as usize).min(MAX_ROWS - 1);
+                let cs = (cs as usize).clamp(1, ncols - c);
+                let rs = (rs as usize).clamp(1, MAX_ROWS - r);
+                take(&mut taken, c, r, cs, rs);
+                placed[i] = (c, r, cs, rs);
+            }
+        }
+        let mut next = 0usize;
+        for (i, cell) in explicit.iter().enumerate() {
+            if cell.is_some() {
+                continue;
+            }
+            while next / ncols < taken.len() && taken[next / ncols][next % ncols] {
+                next += 1;
+            }
+            let (c, r) = (next % ncols, (next / ncols).min(MAX_ROWS - 1));
+            take(&mut taken, c, r, 1, 1);
+            placed[i] = (c, r, 1, 1);
+            next += 1;
+        }
+        let needed = taken.len().clamp(1, MAX_ROWS);
+        let mut row_tracks: Vec<Track> = match rows {
+            Some(Tracks::Count(n)) => vec![Track::Content; (*n).clamp(1, MAX_ROWS as i32) as usize],
+            Some(Tracks::List(l)) => l.iter().copied().take(MAX_ROWS).collect(),
+            None => Vec::new(),
+        };
+        while row_tracks.len() < needed {
+            row_tracks.push(Track::Content);
+        }
+        let mut col_dsc: Vec<i32> = col_tracks.iter().map(|t| t.lvgl()).collect();
         col_dsc.push(GRID_TEMPLATE_LAST);
-        let mut row_dsc: Vec<i32> = (0..rows).map(|_| GRID_CONTENT).collect();
+        let mut row_dsc: Vec<i32> = row_tracks.iter().map(|t| t.lvgl()).collect();
         row_dsc.push(GRID_TEMPLATE_LAST);
         // LVGL keeps these pointers, so they live in LAYOUT_MEM until
         // the screen is cleared.
@@ -1915,16 +2325,16 @@ impl<'ui> Obj<'ui> {
         unsafe {
             sys::lv_obj_set_layout(self.raw, sys::lv_layout_t_LV_LAYOUT_GRID);
             sys::lv_obj_set_grid_dsc_array(self.raw, col_ptr, row_ptr);
-            for (i, &child) in shown.iter().enumerate() {
-                let i = i as i32;
+            for (&child, &(c, r, cs, rs)) in shown.iter().zip(&placed) {
+                let y_align = local_self_align(child).unwrap_or(SelfAlign::Stretch).grid();
                 sys::lv_obj_set_grid_cell(
                     child,
                     sys::lv_grid_align_t_LV_GRID_ALIGN_STRETCH,
-                    i % cols,
-                    1,
-                    sys::lv_grid_align_t_LV_GRID_ALIGN_STRETCH,
-                    i / cols,
-                    1,
+                    c as i32,
+                    cs as i32,
+                    y_align,
+                    r as i32,
+                    rs as i32,
                 );
             }
         }
@@ -2182,6 +2592,195 @@ impl FlexAlign {
     }
 }
 
+/// The track of an arc from `start` to `end` degrees: 0 to 359, or
+/// 360 for a span that is a non-zero multiple of it.
+pub fn arc_span(start: i32, end: i32) -> i32 {
+    let span = end.wrapping_sub(start);
+    match span.rem_euclid(360) {
+        0 if span != 0 => 360,
+        s => s,
+    }
+}
+
+/// The marker user data of the `align_self` layout hook.
+static PLACE_MARK: u8 = 0;
+
+/// The `align_self` kept on `obj` ([`Obj::set_align_self`]), if any.
+fn local_self_align(obj: *mut sys::lv_obj_t) -> Option<SelfAlign> {
+    let mut v = sys::lv_style_value_t::default();
+    // SAFETY: `obj` is a live object (a child being laid out).
+    let found = unsafe {
+        sys::lv_obj_get_local_style_prop(obj, sys::_lv_style_id_t_LV_STYLE_GRID_CELL_Y_ALIGN as sys::lv_style_prop_t, &mut v, 0)
+    };
+    if found != sys::lv_style_res_t_LV_STYLE_RES_FOUND {
+        return None;
+    }
+    // SAFETY: an align is stored as `num`.
+    let n = unsafe { v.num } as u32;
+    Some(match n {
+        x if x == sys::lv_grid_align_t_LV_GRID_ALIGN_CENTER => SelfAlign::Center,
+        x if x == sys::lv_grid_align_t_LV_GRID_ALIGN_END => SelfAlign::End,
+        x if x == sys::lv_grid_align_t_LV_GRID_ALIGN_STRETCH => SelfAlign::Stretch,
+        _ => SelfAlign::Start,
+    })
+}
+
+/// The explicit grid cell set on `obj` ([`Obj::set_grid_cell`]):
+/// column, row, column span, row span.
+fn local_grid_cell(obj: *mut sys::lv_obj_t) -> Option<(i32, i32, i32, i32)> {
+    let get = |prop: sys::_lv_style_id_t| {
+        let mut v = sys::lv_style_value_t::default();
+        // SAFETY: `obj` is a live child of the grid being laid out.
+        let found = unsafe { sys::lv_obj_get_local_style_prop(obj, prop as sys::lv_style_prop_t, &mut v, 0) };
+        // SAFETY: grid positions and spans are stored as `num` (the
+        // default value is zeroed when not found).
+        (found == sys::lv_style_res_t_LV_STYLE_RES_FOUND).then_some(unsafe { v.num })
+    };
+    Some((
+        get(sys::_lv_style_id_t_LV_STYLE_GRID_CELL_COLUMN_POS)?,
+        get(sys::_lv_style_id_t_LV_STYLE_GRID_CELL_ROW_POS)?,
+        get(sys::_lv_style_id_t_LV_STYLE_GRID_CELL_COLUMN_SPAN).unwrap_or(1).max(1),
+        get(sys::_lv_style_id_t_LV_STYLE_GRID_CELL_ROW_SPAN).unwrap_or(1).max(1),
+    ))
+}
+
+/// A grid track (schema 8.2 `columns` / `rows` list items).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Track {
+    Px(i32),
+    /// A share of the free space (`1fr`, `2fr`).
+    Fr(u8),
+    /// Sized to its content.
+    Content,
+}
+
+impl Track {
+    /// `120`, `1fr`, `2fr`, `content`.
+    pub fn parse(s: &str) -> Option<Track> {
+        let s = s.trim();
+        if s == "content" {
+            return Some(Track::Content);
+        }
+        if let Some(n) = s.strip_suffix("fr") {
+            let n: u8 = n.trim().parse().ok()?;
+            return (1..=100).contains(&n).then_some(Track::Fr(n));
+        }
+        let px: i32 = s.trim_end_matches("px").parse().ok()?;
+        (0..=10_000).contains(&px).then_some(Track::Px(px))
+    }
+
+    fn lvgl(self) -> i32 {
+        match self {
+            Track::Px(px) => px,
+            Track::Fr(n) => grid_fr(n as i32),
+            Track::Content => GRID_CONTENT,
+        }
+    }
+}
+
+/// Grid columns or rows: a count of equal tracks, or a list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Tracks {
+    Count(i32),
+    List(Vec<Track>),
+}
+
+/// `stack` child placement, schema 8.1 `anchor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl Anchor {
+    pub fn parse(s: &str) -> Option<Anchor> {
+        Some(match s.trim() {
+            "top_left" => Anchor::TopLeft,
+            "top_center" => Anchor::TopCenter,
+            "top_right" => Anchor::TopRight,
+            "left" => Anchor::Left,
+            "center" => Anchor::Center,
+            "right" => Anchor::Right,
+            "bottom_left" => Anchor::BottomLeft,
+            "bottom_center" => Anchor::BottomCenter,
+            "bottom_right" => Anchor::BottomRight,
+            _ => return None,
+        })
+    }
+
+    fn lvgl(self) -> sys::lv_align_t {
+        match self {
+            Anchor::TopLeft => sys::lv_align_t_LV_ALIGN_TOP_LEFT,
+            Anchor::TopCenter => sys::lv_align_t_LV_ALIGN_TOP_MID,
+            Anchor::TopRight => sys::lv_align_t_LV_ALIGN_TOP_RIGHT,
+            Anchor::Left => sys::lv_align_t_LV_ALIGN_LEFT_MID,
+            Anchor::Center => sys::lv_align_t_LV_ALIGN_CENTER,
+            Anchor::Right => sys::lv_align_t_LV_ALIGN_RIGHT_MID,
+            Anchor::BottomLeft => sys::lv_align_t_LV_ALIGN_BOTTOM_LEFT,
+            Anchor::BottomCenter => sys::lv_align_t_LV_ALIGN_BOTTOM_MID,
+            Anchor::BottomRight => sys::lv_align_t_LV_ALIGN_BOTTOM_RIGHT,
+        }
+    }
+}
+
+/// Schema 8.1 `align_self`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelfAlign {
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
+impl SelfAlign {
+    pub fn parse(s: &str) -> Option<SelfAlign> {
+        Some(match s.trim() {
+            "start" => SelfAlign::Start,
+            "center" => SelfAlign::Center,
+            "end" => SelfAlign::End,
+            "stretch" => SelfAlign::Stretch,
+            _ => return None,
+        })
+    }
+
+    fn grid(self) -> sys::lv_grid_align_t {
+        match self {
+            SelfAlign::Start => sys::lv_grid_align_t_LV_GRID_ALIGN_START,
+            SelfAlign::Center => sys::lv_grid_align_t_LV_GRID_ALIGN_CENTER,
+            SelfAlign::End => sys::lv_grid_align_t_LV_GRID_ALIGN_END,
+            SelfAlign::Stretch => sys::lv_grid_align_t_LV_GRID_ALIGN_STRETCH,
+        }
+    }
+}
+
+/// Schema 8.3 `text { overflow }`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextOverflow {
+    Wrap,
+    Clip,
+    Dots,
+    Scroll,
+}
+
+impl TextOverflow {
+    pub fn parse(s: &str) -> Option<TextOverflow> {
+        Some(match s.trim() {
+            "wrap" => TextOverflow::Wrap,
+            "clip" => TextOverflow::Clip,
+            "dots" => TextOverflow::Dots,
+            "scroll" => TextOverflow::Scroll,
+            _ => return None,
+        })
+    }
+}
+
 /// Which pointer gesture fires a handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trigger {
@@ -2210,7 +2809,8 @@ impl Trigger {
 #[derive(Clone, Copy, Debug)]
 pub enum Size {
     Px(i32),
-    Percent(u16),
+    /// Of the parent's size; negative only for an offset (`x`, `y`).
+    Percent(i16),
     Content,
 }
 
@@ -2233,6 +2833,22 @@ thread_local! {
     /// state, or a state (`pressed`, ...) while a theme's `style
     /// button:pressed { }` is applied ([`with_state`]).
     static SELECTOR: std::cell::Cell<sys::lv_style_selector_t> = const { std::cell::Cell::new(0) };
+}
+
+/// The alpha of `chart`'s series number `idx` (255 when unknown).
+fn series_alpha(chart: *mut sys::lv_obj_t, idx: u32) -> u8 {
+    CHART_ALPHA.with(|m| {
+        m.borrow()
+            .iter()
+            .find(|(c, _)| *c == chart)
+            .and_then(|(_, a)| a.get(idx as usize).copied())
+            .unwrap_or(255)
+    })
+}
+
+/// `opa` scaled by `alpha` (both 0..=255).
+fn scale_opa(opa: u8, alpha: u8) -> u8 {
+    ((opa as u16 * alpha as u16 + 127) / 255) as u8
 }
 
 fn sel() -> sys::lv_style_selector_t {
@@ -2336,10 +2952,12 @@ impl Size {
         match self {
             Size::Px(px) => px,
             Size::Percent(p) => {
-                // LV_PCT(x) encodes a non-negative percentage as
-                // `x | LV_COORD_TYPE_SPEC` for x in [0, LV_PCT_POS_MAX].
-                let clamped = (p as i32).min(1000);
-                clamped | LV_COORD_TYPE_SPEC
+                // LV_PCT(x): `x | LV_COORD_TYPE_SPEC` for x >= 0, and
+                // `(LV_PCT_POS_MAX - x) | LV_COORD_TYPE_SPEC` below 0.
+                const PCT_POS_MAX: i32 = (LV_COORD_MAX_LOCAL - 1) / 2;
+                let p = (p as i32).clamp(-1000, 1000);
+                let stored = if p < 0 { PCT_POS_MAX - p } else { p };
+                stored | LV_COORD_TYPE_SPEC
             }
             Size::Content => LV_SIZE_CONTENT_LOCAL,
         }
@@ -2349,6 +2967,16 @@ impl Size {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arc_spans_keep_a_full_circle() {
+        assert_eq!(arc_span(135, 45), 270);
+        assert_eq!(arc_span(0, 360), 360);
+        assert_eq!(arc_span(90, 450), 360);
+        assert_eq!(arc_span(-90, 270), 360);
+        assert_eq!(arc_span(10, 10), 0);
+        assert_eq!(arc_span(180, 0), 180);
+    }
     use std::io::Write;
     use std::os::unix::io::IntoRawFd;
 

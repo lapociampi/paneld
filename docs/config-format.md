@@ -2,7 +2,7 @@
 title: "Config format"
 description: "The hypr-style syntax of paneld config files."
 date: 2026-10-29
-updated: 2026-11-04
+updated: 2026-11-05
 tags: [paneld, config]
 series: paneld
 order: 3
@@ -84,7 +84,8 @@ page home {
 - `key = value`. Spaces around `=` and at both ends of the value are ignored.
 - `;` separates several assignments on one line: `text { value = Hi; color = {{ theme.accent }} }`.
 - A `\` at the end of a line continues the value on the next one.
-- `#` starts a comment to the end of the line; `##` is a literal `#`.
+- `#` starts a comment to the end of the line. Inside a value it starts a comment only when it has whitespace before it and whitespace or the end of the line after it: `poll = 1m  # note`. Otherwise it is text, so `border = 2 #ff0000`, `shadow = 8 #00000080 0 4` and `text = Item #3` keep their `#`.
+- `##` is a literal `#` everywhere in a value, quotes and `run` commands included (`text = Item ##3` shows `Item #3`; `###` is `##`), so a shell `${x##*/}` in `run` is written `${x####*/}`. Inside `{{ }}` it is CEL text as written: `{{ '##' }}` is `##`.
 - A value is plain text to the end of the line (or `;` or `}`); double quotes keep leading and trailing spaces and allow `;`, `}` and `#` inside.
 
 ## Blocks
@@ -126,7 +127,7 @@ page home {
 | duration | `500ms`, `30s`, `2m`, `1h`, `1d`, `1w`, `1 month`, `1y` (a month is 30 days, a year 365) |
 | size | `120` (px), `50%`, `grow` |
 | bytes | `512`, `64KiB`, `1MiB` |
-| color | `#rgb`, `#rrggbb`, `#rrggbbaa`, or a theme color by name |
+| color | `#rgb`, `#rrggbb`, `#rrggbbaa` (`aa` is the alpha: `#ffffff80` is half see-through white), or the name of a token of the active theme or a built-in one (`accent`, `track`) that is, or names, a hex color. An action param of type `color` takes a hex only |
 | list | `[5, 30]` |
 | command | see below |
 | action | an action name, or `none` |

@@ -275,7 +275,8 @@
       ]
     },
     "value-comment": {
-      "match": "(?<=[ \\t])#(?!#).*$",
+      "comment": "Inside a value, `#` starts a comment only between whitespace and whitespace or the line end; `2 #ff0000` and `Item #3` are text.",
+      "match": "(?<=[ \\t])#(?=[ \\t]|$).*$",
       "name": "comment.line.number-sign.paneld"
     },
     "variable": {

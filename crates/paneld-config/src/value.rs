@@ -337,12 +337,13 @@ pub fn parse_color(text: &str) -> Option<Color> {
 
 /// Return the content of a quoted string with escapes resolved, or the
 /// original text if it is not quoted. Only `\"`, `\\`, `\n`, `\t`, `\r`
-/// are honored; unknown escapes keep the backslash.
+/// are honored; unknown escapes keep the backslash. In both, `##` is a
+/// literal `#` (see [`unescape_hash`]).
 pub fn parse_string(text: &str) -> String {
     let t = text.trim();
     let inner = match t.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         Some(inner) => inner,
-        None => return t.to_string(),
+        None => return unescape_hash(t),
     };
     let mut out = String::with_capacity(inner.len());
     let mut it = inner.chars();
@@ -360,11 +361,21 @@ pub fn parse_string(text: &str) -> String {
                 }
                 None => out.push('\\'),
             }
+        } else if c == '#' && it.as_str().starts_with('#') {
+            it.next();
+            out.push('#');
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// The `##` escape of the config format: each `##` in literal value
+/// text is one `#` (left to right, so `###` is `##`). Text inside
+/// `{{ }}` is CEL and is never passed through this.
+pub fn unescape_hash(text: &str) -> String {
+    text.replace("##", "#")
 }
 
 // --- list literal: `[a, b, c]` ---
@@ -487,6 +498,14 @@ pub fn pattern_matches(pattern: &str, text: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_hash_is_one_hash() {
+        assert_eq!(parse_string("Item ##3"), "Item #3");
+        assert_eq!(parse_string("\"a ## b\""), "a # b");
+        assert_eq!(parse_string("a###b"), "a##b");
+        assert_eq!(parse_string("#fff"), "#fff");
+    }
 
     #[test]
     fn classify_shapes() {

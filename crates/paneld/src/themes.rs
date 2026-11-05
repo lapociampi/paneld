@@ -12,7 +12,7 @@
 //! 2. Walk `extends = parent` chain to the base, with cycle guard.
 //! 3. Merge tokens from parent to child, child wins on conflict.
 //! 4. Each token's raw value is kept as a `Value::String` -- the
-//!    renderer's `parse_hex_color` / `parse_size` handle shape
+//!    renderer's `parse_color` / `parse_size` handle shape
 //!    checks when the token is consumed.
 
 use std::collections::BTreeMap;
@@ -74,31 +74,10 @@ pub fn styles(doc: &Document, theme: Option<&str>) -> BTreeMap<String, Vec<Item>
 /// Light, matching LVGL's default theme so widgets that are not
 /// themed yet still fit in. Fonts are the compiled Montserrat sizes.
 fn builtin_tokens() -> BTreeMap<String, Value> {
-    [
-        ("background", "#f5f5f5"),
-        ("surface", "#ffffff"),
-        ("text", "#212121"),
-        ("muted", "#757575"),
-        ("accent", "#2196f3"),
-        ("ok", "#2e7d32"),
-        ("info", "#1976d2"),
-        ("warning", "#ef6c00"),
-        ("critical", "#d32f2f"),
-        ("font_small", "montserrat 12"),
-        ("font", "montserrat 16"),
-        ("font_big", "montserrat 24"),
-        ("font_huge", "montserrat 32"),
-        ("gap", "8"),
-        ("padding", "12"),
-        ("radius", "8"),
-        ("tap_min", "48"),
-        ("shadow", "none"),
-        ("icons", "builtin"),
-        ("motion", "reduced"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
-    .collect()
+    paneld_config::schema::BUILTIN_THEME_TOKENS
+        .iter()
+        .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+        .collect()
 }
 
 fn active_theme_name(doc: &Document) -> Option<String> {

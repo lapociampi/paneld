@@ -16,11 +16,12 @@
 //! variable substitution happens in a later pass that preserves the
 //! mapping from substituted bytes back to the original span (ADR 0009).
 //!
-//! `#` starts a comment to end of line. Inside a value it is treated
-//! as literal when it is the first non-whitespace character of the
-//! value (so `color = #44aaff` works) or when it is not preceded by
-//! whitespace (so `foo#bar` is literal). `##` is always a literal `#`
-//! and is unescaped at value interpretation time.
+//! `#` starts a comment to end of line. Inside a value it starts a
+//! comment only when it is preceded by whitespace and followed by
+//! whitespace or the end of the line or file (`poll = 1m  # note`).
+//! Anywhere else it is literal: `color = #44aaff`, `foo#bar`,
+//! `border = 2 #ff0000`, `text = Item #3`. `##` is always a literal
+//! `#` and is unescaped at value interpretation time.
 
 use crate::{FileId, Span};
 
@@ -459,13 +460,20 @@ impl<'src> Lexer<'src> {
                         continue;
                     }
                     // `#` starts an in-value comment only when preceded by
-                    // in-value whitespace (not at value start).
+                    // in-value whitespace (not at value start) and followed
+                    // by whitespace or the end of the line or file. So
+                    // `2 #ff0000` and `Item #3` keep their `#`, while
+                    // `1m  # note` ends at the comment.
                     let preceded_by_ws = self.pos > start
                         && matches!(
                             self.src.get(self.pos - 1),
                             Some(b' ') | Some(b'\t')
                         );
-                    if preceded_by_ws {
+                    let followed_by_ws = matches!(
+                        self.peek_at(1),
+                        None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+                    );
+                    if preceded_by_ws && followed_by_ws {
                         break;
                     }
                     self.pos += 1;
@@ -1249,6 +1257,34 @@ mod tests {
                 (RawValue, "foo\\".into()),
             ]
         );
+    }
+
+    #[test]
+    fn hash_word_after_space_in_value_is_literal() {
+        // `#` followed by a non-space is text, even after a space.
+        assert_eq!(
+            lex("border = 2 #ff0000"),
+            vec![
+                (Ident, "border".into()),
+                (Equals, "=".into()),
+                (RawValue, "2 #ff0000".into()),
+            ]
+        );
+        assert_eq!(lex("shadow = 8 #00000080 0 4")[2], (RawValue, "8 #00000080 0 4".into()));
+        assert_eq!(lex("text = Item #3")[2], (RawValue, "Item #3".into()));
+        // A comment needs whitespace on both sides (or end of line).
+        assert_eq!(lex("poll = 1m  # note")[2], (RawValue, "1m".into()));
+        assert_eq!(lex("k = foo\t#\tnote")[2], (RawValue, "foo".into()));
+        assert_eq!(lex("k = foo #")[2], (RawValue, "foo".into()));
+        assert_eq!(lex("k = foo #\nj = 1")[2], (RawValue, "foo".into()));
+        assert_eq!(lex("k = foo ##3")[2], (RawValue, "foo ##3".into()));
+    }
+
+    #[test]
+    fn hash_color_on_one_line_block_keeps_closing_brace() {
+        let out = lex("text { border = 2 #f00 }");
+        assert!(out.contains(&(RawValue, "2 #f00".into())), "{out:?}");
+        assert_eq!(out.last(), Some(&(RBrace, "}".into())), "{out:?}");
     }
 
     #[test]

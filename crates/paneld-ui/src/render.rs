@@ -27,7 +27,10 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
 use crate::expr::{eval, Context, Value};
-use crate::ui::{ActionArg, FlexAlign, ImageFit, InlineSetItem, Obj, ScrollSnap, Size, Trigger, UiEvent, ValueWidget};
+use crate::ui::{
+    ActionArg, Anchor, FlexAlign, ImageFit, InlineSetItem, Obj, ScrollSnap, SelfAlign, Size, TextOverflow, Track, Tracks,
+    Trigger, UiEvent, ValueWidget,
+};
 
 /// Children of a component call plus the outer context they should
 /// resolve against. Threaded through [`render_node`] so a `slot { }`
@@ -38,10 +41,10 @@ struct SlotCtx<'a> {
 }
 
 /// Show `text` as a toast on `layer` (the top layer), replacing any
-/// earlier one: a pill near the bottom in `background` (a hex color,
-/// e.g. a theme token) with white text. The caller removes it with
-/// `layer.clear_children()` when it expires.
-pub fn render_toast(layer: &Obj<'_>, text: &str, background: &str) {
+/// earlier one: a pill near the bottom in `background` (a color: a hex
+/// or a token of `theme`, e.g. `ok`) with white text. The caller
+/// removes it with `layer.clear_children()` when it expires.
+pub fn render_toast(layer: &Obj<'_>, text: &str, background: &str, theme: &std::collections::BTreeMap<String, Value>) {
     layer.clear_children();
     let pill = layer.new_container();
     // Taps go through to the page (or a modal) under it.
@@ -50,11 +53,11 @@ pub fn render_toast(layer: &Obj<'_>, text: &str, background: &str) {
     pill.set_padding(12);
     pill.set_radius(8);
     pill.set_border(0, None);
-    if let Some(rgb) = parse_hex_color(background) {
-        pill.set_background_hex(rgb);
+    if let Some((rgb, opa)) = theme_color(background, Some(theme)) {
+        pill.set_background_hex(rgb, opa);
     }
     let label = pill.new_label(text);
-    label.set_text_color_hex(0xffffff);
+    label.set_text_color_hex(0xffffff, 255);
     // Above the shell's nav bar.
     pill.align_bottom_mid(-72);
 }
@@ -69,11 +72,8 @@ pub fn render_page(
     sink: &Sender<UiEvent>,
     screen: &Obj<'_>,
 ) {
-    let critical = match ctx.get("theme") {
-        Some(Value::Map(t)) => t.get("critical").and_then(|c| parse_hex_color(&c.to_display_string())),
-        _ => None,
-    };
-    FAILED_BORDER.with(|c| c.set(critical.unwrap_or(0xf85149)));
+    let critical = color_of("critical", ctx);
+    FAILED_BORDER.with(|c| c.set(critical.unwrap_or((0xf85149, 255))));
     for item in &doc.items {
         if let Item::Block(b) = item {
             if b.kind.text == "page"
@@ -262,6 +262,11 @@ fn render_node(
             } else {
                 obj.set_flex_column();
             }
+            // Schema 8.2: `wrap` onto more lines (needs a fixed size
+            // along the flow).
+            if resolve_assign_value(node, "wrap", ctx).is_some_and(|v| value_truthy(&v)) {
+                obj.set_flex_wrap(node.kind.text == "column");
+            }
             apply_props(node, ctx, sink, &obj);
             // Schema 8.2: `justify` on the main axis, `align` across.
             let justify = find_simple(node, "justify").and_then(FlexAlign::parse);
@@ -273,6 +278,9 @@ fn render_node(
                 );
             }
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
+            if find_simple(node, "align").map(str::trim) == Some("stretch") {
+                obj.stretch_children(node.kind.text == "column");
+            }
         }
         "stack" => {
             let obj = parent.new_layout();
@@ -291,9 +299,9 @@ fn render_node(
             apply_props(node, ctx, sink, &obj);
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
             // Lay out after rendering so `repeat` output counts.
-            let cols = resolve_num(node, "columns", ctx).unwrap_or(2.0) as i32;
-            let rows = resolve_num(node, "rows", ctx).map(|r| r as i32);
-            obj.layout_grid(cols, rows);
+            let cols = resolve_assign_value(node, "columns", ctx).and_then(|v| parse_tracks(&v)).unwrap_or(Tracks::Count(2));
+            let rows = resolve_assign_value(node, "rows", ctx).and_then(|v| parse_tracks(&v));
+            obj.layout_grid(&cols, rows.as_ref());
         }
         "scroll" => {
             // Schema 8.2: children as a column (or a row with
@@ -323,11 +331,15 @@ fn render_node(
                 obj.set_flex_align(FlexAlign::Start, align);
             }
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
+            if find_simple(node, "align").map(str::trim) == Some("stretch") {
+                obj.stretch_children(!horizontal);
+            }
         }
         "text" => {
             let text = resolve_text(node, "value", ctx).unwrap_or_default();
             let obj = parent.new_label(&text);
             apply_props(node, ctx, sink, &obj);
+            obj.fit_dots();
         }
         "button" => {
             let obj = parent.new_button();
@@ -357,6 +369,14 @@ fn render_node(
         }
         "bar" => {
             let obj = parent.new_bar();
+            // Schema 8.3: in the theme's `accent` on a faint `muted`
+            // track; `color` / `track` (applied below) override.
+            let (indicator, track) = gauge_colors(ctx);
+            obj.set_bar_indicator(indicator.0, indicator.1);
+            obj.set_bar_track(track.0, track.1);
+            if find_simple(node, "direction").map(str::trim) == Some("vertical") {
+                obj.set_bar_vertical();
+            }
             let min = resolve_num(node, "min", ctx).unwrap_or(0.0) as i32;
             let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
             obj.set_bar_range(min, max);
@@ -367,6 +387,15 @@ fn render_node(
         }
         "arc" => {
             let obj = parent.new_arc();
+            let (indicator, track) = gauge_colors(ctx);
+            obj.set_arc_indicator(indicator.0, indicator.1);
+            obj.set_arc_track(track.0, track.1);
+            obj.set_arc_rounded(false);
+            // Degrees, 0 at 3 o'clock, clockwise: 135 to 45 leaves the
+            // gap at the bottom.
+            let start = resolve_num(node, "start", ctx).unwrap_or(135.0);
+            let end = resolve_num(node, "end", ctx).unwrap_or(45.0);
+            obj.set_arc_angles(start as i32, end as i32);
             let min = resolve_num(node, "min", ctx).unwrap_or(0.0) as i32;
             let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
             obj.set_arc_range(min, max);
@@ -396,10 +425,9 @@ fn render_node(
             let obj = parent.new_line(&points);
             let width = resolve_num(node, "thickness", ctx).unwrap_or(2.0) as i32;
             let rounded = resolve_assign_value(node, "rounded", ctx).is_some_and(|v| value_truthy(&v));
-            let color = resolve_text(node, "color", ctx).and_then(|c| parse_hex_color(&c)).or_else(|| match ctx.get("theme") {
-                Some(Value::Map(t)) => t.get("text").and_then(|c| parse_hex_color(&c.to_display_string())),
-                _ => None,
-            });
+            let color = resolve_text(node, "color", ctx)
+                .and_then(|c| color_of(&c, ctx))
+                .or_else(|| color_of("text", ctx));
             obj.set_line_style(width.clamp(1, 64), rounded, color);
             apply_props(node, ctx, sink, &obj);
         }
@@ -416,13 +444,17 @@ fn render_node(
                 return;
             }
             let Some(obj) = parent.new_image(src, fit) else { return };
-            if let Some(rgb) = resolve_text(node, "recolor", ctx).and_then(|c| parse_hex_color(&c)) {
-                obj.set_image_recolor(rgb);
+            if let Some((rgb, opa)) = resolve_text(node, "recolor", ctx).and_then(|c| color_of(&c, ctx)) {
+                obj.set_image_recolor(rgb, opa);
             }
             apply_props(node, ctx, sink, &obj);
         }
         "chart" => {
             let obj = parent.new_chart();
+            // Schema 8.3: no white box; division lines in a faint
+            // `muted`. `background` / `border` (applied below) win.
+            let muted = color_of("muted", ctx).unwrap_or((0x757575, 255)).0;
+            obj.set_chart_look((muted, FAINT));
             render_chart(node, ctx, &obj);
             apply_props(node, ctx, sink, &obj);
         }
@@ -655,6 +687,9 @@ fn expand_component(
         // its classes only, so they do not undo the root's own props.
         apply_styles(root_kind, &props, false, outer_ctx, &root);
         apply_plain_props(root_kind, &props, outer_ctx, &root);
+        if root_kind == "text" {
+            root.fit_dots();
+        }
     }
 }
 
@@ -809,8 +844,8 @@ fn splice(raw: &str, fragments: &[cel::Expr], ctx: &Context, show_errors: bool) 
             continue;
         }
         // Text before here is literal; the special bytes are ASCII,
-        // so the slice ends on a char boundary.
-        out.push_str(&raw[literal_from..i]);
+        // so the slice ends on a char boundary. `##` in it is `#`.
+        out.push_str(&paneld_config::value::unescape_hash(&raw[literal_from..i]));
         if escaped_open {
             out.push_str("{{");
             i += 3;
@@ -828,7 +863,7 @@ fn splice(raw: &str, fragments: &[cel::Expr], ctx: &Context, show_errors: bool) 
         }
         literal_from = i;
     }
-    out.push_str(&raw[literal_from..]);
+    out.push_str(&paneld_config::value::unescape_hash(&raw[literal_from..]));
     out
 }
 
@@ -879,7 +914,7 @@ thread_local! {
     static DRAWN_CALLS: std::cell::RefCell<Vec<(String, Vec<ActionArg>)>> = Default::default();
     /// A `:failed` button's default border color: the theme's
     /// `critical`, resolved once per page.
-    static FAILED_BORDER: std::cell::Cell<u32> = const { std::cell::Cell::new(0xf85149) };
+    static FAILED_BORDER: std::cell::Cell<(u32, u8)> = const { std::cell::Cell::new((0xf85149, 255)) };
     /// The component call being expanded has its own `on_tap`, which
     /// wins over its root button's `action`: taken by the root.
     static ROOT_TAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -999,6 +1034,8 @@ fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Context, obj: &
         let selectors: Vec<String> = selectors.collect();
         for sel in &selectors {
             if let Some(body) = styles.get(sel) {
+                // `*`'s `color` is the text color, not a gauge's.
+                let kind = if sel == "*" && matches!(kind, "arc" | "bar") { "" } else { kind };
                 apply_plain_props(kind, body, ctx, obj);
             }
         }
@@ -1165,23 +1202,88 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
                 }
             }
             "padding" => {
-                if let Ok(px) = resolve_scalar(value, a.value.span, ctx).trim().parse::<i32>() {
-                    obj.set_padding(px);
+                // 1, 2 (vertical horizontal) or 4 (top right bottom
+                // left) sizes in px.
+                let text = resolve_scalar(value, a.value.span, ctx);
+                let px: Option<Vec<i32>> = text.split_whitespace().map(|p| p.parse::<i32>().ok()).collect();
+                match px.as_deref() {
+                    Some(&[all]) => obj.set_padding(all),
+                    Some(&[v, h]) => obj.set_padding_sides(v, h, v, h),
+                    Some(&[t, r, b, l]) => obj.set_padding_sides(t, r, b, l),
+                    _ => {}
                 }
             }
-            "gap" => {
+            "gap" | "row_gap" | "column_gap" => {
                 if let Ok(px) = resolve_scalar(value, a.value.span, ctx).trim().parse::<i32>() {
-                    obj.set_gap(px);
+                    match key.text.as_str() {
+                        "row_gap" => obj.set_row_gap(px),
+                        "column_gap" => obj.set_column_gap(px),
+                        _ => obj.set_gap(px),
+                    }
                 }
+            }
+            // In a `stack`: an offset from the `anchor` point.
+            "x" | "y" => {
+                if let Some(s) = parse_offset(&resolve_scalar(value, a.value.span, ctx)) {
+                    if key.text == "x" {
+                        obj.set_x(s);
+                    } else {
+                        obj.set_y(s);
+                    }
+                }
+            }
+            "anchor" => {
+                if let Some(anchor) = Anchor::parse(&resolve_scalar(value, a.value.span, ctx)) {
+                    obj.set_anchor(anchor);
+                }
+            }
+            "align_self" => {
+                if let Some(align) = SelfAlign::parse(&resolve_scalar(value, a.value.span, ctx)) {
+                    obj.set_align_self(align);
+                }
+            }
+            // In a `grid`: `col row [colspan rowspan]`, from 0.
+            "cell" => {
+                if let Some((c, r, cs, rs)) = parse_cell(&resolve_scalar(value, a.value.span, ctx)) {
+                    obj.set_grid_cell(c, r, cs, rs);
+                }
+            }
+            "overflow" if kind == "text" => {
+                if let Some(mode) = TextOverflow::parse(&resolve_scalar(value, a.value.span, ctx)) {
+                    obj.set_text_overflow(mode);
+                }
+            }
+            "track" if matches!(kind, "arc" | "bar") => {
+                if let Some((rgb, opa)) = resolve_color(value, a.value.span, ctx) {
+                    if kind == "arc" {
+                        obj.set_arc_track(rgb, opa);
+                    } else {
+                        obj.set_bar_track(rgb, opa);
+                    }
+                }
+            }
+            "thickness" if kind == "arc" => {
+                if let Some(Size::Px(px)) = parse_size(&resolve_scalar(value, a.value.span, ctx)) {
+                    obj.set_arc_thickness(px.clamp(1, 256));
+                }
+            }
+            "rounded" if kind == "arc" => {
+                let flag = resolve_expr_value(value, a.value.span, ctx).is_some_and(|v| value_truthy(&v));
+                obj.set_arc_rounded(flag);
             }
             "background" => {
-                if let Some(rgb) = resolve_color(value, a.value.span, ctx) {
-                    obj.set_background_hex(rgb);
+                if let Some((rgb, opa)) = resolve_color(value, a.value.span, ctx) {
+                    obj.set_background_hex(rgb, opa);
                 }
             }
             "color" => {
-                if let Some(rgb) = resolve_color(value, a.value.span, ctx) {
-                    obj.set_text_color_hex(rgb);
+                if let Some((rgb, opa)) = resolve_color(value, a.value.span, ctx) {
+                    // A gauge's foreground is its indicator.
+                    match kind {
+                        "arc" => obj.set_arc_indicator(rgb, opa),
+                        "bar" => obj.set_bar_indicator(rgb, opa),
+                        _ => obj.set_text_color_hex(rgb, opa),
+                    }
                 }
             }
             "font" => {
@@ -1217,7 +1319,7 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
                 let text = resolve_scalar(value, a.value.span, ctx);
                 let mut parts = text.split_whitespace();
                 if let Some(Ok(w)) = parts.next().map(|w| w.trim_end_matches("px").parse::<i32>()) {
-                    obj.set_border(w, parts.next().and_then(parse_hex_color));
+                    obj.set_border(w, parts.next().and_then(|c| color_of(c, ctx)));
                 }
             }
             "scale" => {
@@ -1315,12 +1417,9 @@ fn render_chart(node: &Block, ctx: &Context, obj: &Obj<'_>) {
         },
         _ => None,
     };
-    let accent = match ctx.get("theme") {
-        Some(Value::Map(t)) => t.get("accent").and_then(|c| parse_hex_color(&c.to_display_string())),
-        _ => None,
-    }
-    .unwrap_or(0x2196f3);
-    let series: Vec<(Vec<Option<f64>>, u32)> = node
+    let accent = color_of("accent", ctx).unwrap_or((0x2196f3, 255));
+    type Series = (Vec<Option<f64>>, (u32, u8));
+    let series: Vec<Series> = node
         .items
         .iter()
         .filter_map(|it| match it {
@@ -1332,7 +1431,7 @@ fn render_chart(node: &Block, ctx: &Context, obj: &Obj<'_>) {
                 Some(Value::List(l)) => l.iter().map(number).collect(),
                 _ => Vec::new(),
             };
-            let color = resolve_text(b, "color", ctx).and_then(|c| parse_hex_color(&c)).unwrap_or(accent);
+            let color = resolve_text(b, "color", ctx).and_then(|c| color_of(&c, ctx)).unwrap_or(accent);
             (values, color)
         })
         .collect();
@@ -1370,7 +1469,7 @@ fn render_chart(node: &Block, ctx: &Context, obj: &Obj<'_>) {
         let tail = shown(values);
         let mut padded: Vec<Option<i32>> = vec![None; points - tail.len()];
         padded.extend(tail.iter().map(|v| v.map(scaled)));
-        obj.chart_add_series(*color, &padded);
+        obj.chart_add_series(color.0, color.1, &padded);
     }
 }
 
@@ -1562,64 +1661,130 @@ fn resolve_scalar(value: &str, span: paneld_config::source::Span, ctx: &Context)
     }
 }
 
+/// The alpha of a faint line or track: a gauge's default track, a
+/// chart's division lines.
+const FAINT: u8 = 0x40;
+
+/// A gauge's default indicator (the theme's `accent`) and track (its
+/// `muted`, faint).
+fn gauge_colors(ctx: &Context) -> ((u32, u8), (u32, u8)) {
+    let accent = color_of("accent", ctx).unwrap_or((0x2196f3, 255));
+    let muted = color_of("muted", ctx).unwrap_or((0x757575, 255)).0;
+    (accent, (muted, FAINT))
+}
+
+/// A grid's `columns` / `rows`: a count, or a list of tracks (`[120,
+/// 1fr, content]`, also without the brackets or commas).
+fn parse_tracks(v: &Value) -> Option<Tracks> {
+    let items: Vec<String> = match v {
+        Value::Int(n) => return Some(Tracks::Count((*n).clamp(1, 1024) as i32)),
+        Value::Double(d) if d.is_finite() => return Some(Tracks::Count(d.clamp(1.0, 1024.0) as i32)),
+        Value::List(l) => l.iter().map(|x| x.to_display_string()).collect(),
+        Value::String(s) => {
+            let t = s.trim();
+            if let Ok(n) = t.parse::<i32>() {
+                return Some(Tracks::Count(n.clamp(1, 1024)));
+            }
+            t.trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+        _ => return None,
+    };
+    let tracks: Option<Vec<Track>> = items.iter().map(|t| Track::parse(t)).collect();
+    tracks.filter(|t| !t.is_empty()).map(Tracks::List)
+}
+
+/// `col row [colspan rowspan]`, from 0.
+fn parse_cell(s: &str) -> Option<(u8, u8, u8, u8)> {
+    let n: Option<Vec<u8>> = s.split_whitespace().map(|p| p.parse::<u8>().ok()).collect();
+    match *n?.as_slice() {
+        [c, r] => Some((c, r, 1, 1)),
+        [c, r, cs, rs] if cs > 0 && rs > 0 => Some((c, r, cs, rs)),
+        _ => None,
+    }
+}
+
+/// A `stack` child's `x` / `y`: px or a percentage, either may be
+/// negative.
+fn parse_offset(s: &str) -> Option<Size> {
+    let s = s.trim();
+    match s.strip_suffix('%') {
+        Some(p) => p.trim().parse::<i16>().ok().filter(|p| p.abs() <= 1000).map(Size::Percent),
+        None => s.parse::<i32>().ok().map(Size::Px),
+    }
+}
+
 fn parse_size(s: &str) -> Option<Size> {
     let s = s.trim();
     if s == "content" {
         return Some(Size::Content);
     }
     if let Some(p) = s.strip_suffix('%') {
-        return p.trim().parse::<u16>().ok().map(Size::Percent);
+        return p.trim().parse::<u16>().ok().map(|p| Size::Percent(p.min(1000) as i16));
     }
     s.parse::<i32>().ok().map(Size::Px)
 }
 
-/// Resolve a color value's raw text. Accepts a literal hex (`#rgb`,
-/// `#rrggbb`, `#rrggbbaa`), a `{{ expr }}` whose evaluated string
-/// is a hex, or an interpolated value whose rendered string is a
-/// hex. Returns the 24-bit RGB (alpha dropped for now).
+/// Resolve a color value's raw text. Accepts a literal color (a hex
+/// `#rgb`, `#rrggbb`, `#rrggbbaa`, or a theme token's name), a
+/// `{{ expr }}` whose evaluated string is one, or an interpolated
+/// value whose rendered string is one. Returns (rgb, alpha).
 fn resolve_color(
     value: &str,
     span: paneld_config::source::Span,
     ctx: &Context,
-) -> Option<u32> {
+) -> Option<(u32, u8)> {
     match classify(value) {
-        ValueShape::Literal(text) => parse_hex_color(text),
+        ValueShape::Literal(text) => color_of(text, ctx),
         ValueShape::Expression(body) => {
             let (expr, diags) = cel::parse_fragment(body, span.file, span.start + 2);
             if !diags.is_empty() {
                 return None;
             }
             let v = expr.and_then(|e| eval(&e, ctx).ok())?;
-            parse_hex_color(&v.to_display_string())
+            color_of(&v.to_display_string(), ctx)
         }
         ValueShape::Interp(_) => {
             // Rarely useful for colors; evaluate the whole thing
-            // and hope the result is a hex.
+            // and hope the result is a color.
             resolve_expr_value(value, span, ctx)
-                .and_then(|v| parse_hex_color(&v.to_display_string()))
+                .and_then(|v| color_of(&v.to_display_string(), ctx))
         }
     }
 }
 
-/// Accept `#rgb`, `#rrggbb`, `#rrggbbaa` (alpha ignored for now).
-fn parse_hex_color(s: &str) -> Option<u32> {
-    let hex = s.trim().strip_prefix('#')?;
-    let (r, g, b) = match hex.len() {
-        3 => {
-            let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
-            let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
-            let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
-            (r * 17, g * 17, b * 17)
-        }
-        6 | 8 => {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            (r, g, b)
-        }
-        _ => return None,
+/// A hex color, or the name of a token in the context's `theme` map
+/// whose value is one (a token may name another, a few levels deep).
+fn color_of(s: &str, ctx: &Context) -> Option<(u32, u8)> {
+    let theme = match ctx.get("theme") {
+        Some(Value::Map(t)) => Some(t),
+        _ => None,
     };
-    Some(((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+    theme_color(s, theme)
+}
+
+/// A hex color, or a token of `theme` naming one (through other
+/// names, a few levels deep, so a cycle ends).
+fn theme_color(s: &str, theme: Option<&std::collections::BTreeMap<String, Value>>) -> Option<(u32, u8)> {
+    let mut text = s.trim().to_string();
+    for _ in 0..8 {
+        if let Some(c) = parse_hex_color(&text) {
+            return Some(c);
+        }
+        text = theme?.get(text.as_str())?.to_display_string().trim().to_string();
+    }
+    None
+}
+
+/// `#rgb`, `#rrggbb`, `#rrggbbaa` as (rgb, alpha); alpha is 255
+/// without the `aa`.
+fn parse_hex_color(s: &str) -> Option<(u32, u8)> {
+    let c = paneld_config::value::parse_color(s)?;
+    Some((((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32, c.a))
 }
 
 #[cfg(test)]
@@ -1641,6 +1806,22 @@ mod tests {
     }
 
     #[test]
+    fn theme_colors_follow_names_and_end_on_a_cycle() {
+        let s = |t: &str| Value::String(t.into());
+        let theme: std::collections::BTreeMap<String, Value> = [
+            ("warning".to_string(), s("#ef6c0080")),
+            ("critical".to_string(), s("warning")),
+            ("a".to_string(), s("b")),
+            ("b".to_string(), s("a")),
+        ]
+        .into();
+        // The toast's `critical` names another token (review round 1).
+        assert_eq!(theme_color("critical", Some(&theme)), Some((0xef6c00, 0x80)));
+        assert_eq!(theme_color("#fff", None), Some((0xffffff, 255)));
+        assert_eq!(theme_color("a", Some(&theme)), None);
+    }
+
+    #[test]
     fn a_quoted_literal_loses_its_quotes() {
         let span = paneld_config::source::Span::new(paneld_config::source::FileId::default(), 0, 0);
         let v = resolve_value("\" a; b \"", span, &Context::new());
@@ -1659,5 +1840,9 @@ mod tests {
         assert_eq!(i("a {{ x == \"}}\" ? 1 : 2 }} b"), "a 2 b");
         assert_eq!(i("{{ {'a': {'b': x}}['a']['b'] }}!"), "42!");
         assert_eq!(i("\\{{ x }} {{ x }}"), "{{ x }} 42");
+        // `##` is `#` in the text, not inside `{{ }}`.
+        assert_eq!(i("Item ##{{ x }}"), "Item #42");
+        assert_eq!(i("{{ '##' + x }}"), "##42");
+        assert_eq!(i("a ## {{ x }} ##"), "a # 42 #");
     }
 }
