@@ -2,7 +2,7 @@
 title: "Deploy"
 description: "Cross-compile paneld for an arm64 Linux board and run it as a systemd service."
 date: 2026-10-30
-updated: 2026-11-05
+updated: 2026-11-06
 tags: [paneld, deploy, pi, systemd]
 series: paneld
 order: 7
@@ -185,6 +185,6 @@ remote_kind linux {
   | `total` | Whole frame; well under 33000 for a smooth animation |
   | `px` | Pixels redrawn (384000 is all of 800x480) |
 
-  And one line per page rebuild, `perf build page=<page> same=<true: a value change, false: navigation> us=<time to build it> ctx= clear= render= [parse= eval= clone= props= font=] tr= at=`: building the context, clearing the old page, rendering the new one (inside it, as `us/count`: parsing `{{ }}` bodies, evaluating them, copying the context for components and `repeat` items, applying node and style properties (includes their evaluation), setting fonts), starting the transition; `at` is the end, on the frame lines' clock. One `perf event at=` line per UI event (a tap) taken from the queue.
+  And one line per page rebuild, `perf build page=<page> same=<true: a value change, false: navigation> us=<time to build it> ctx= clear= render= [parse= eval= clone= props= font=] tr= at=`: building the context, clearing the old page, rendering the new one (inside it, as `us/count`: parsing `{{ }}` bodies, evaluating them, copying a component call's own properties onto its root (component params and `repeat` items open a scope over the context, nothing is copied: [ADR 0024](decisions/0024-in-place-updates.md)), applying node and style properties (includes their evaluation), setting fonts), starting the transition; `at` is the end, on the frame lines' clock. One `perf event at=` line per UI event (a tap) taken from the queue.
 - Memory: on DRM, LVGL draws into a shadow buffer of one frame (1.5 MB at 800x480) that is copied into the panel's buffers ([ADR 0012](decisions/0012-display-input.md)); count it in the RSS.
-- `paneld ctl status` / `check` / `reload` / `eval '<cel>'` / `set vars.x=1` / `goto <page>` / `alert fire|resolve|ack|snooze <id>` / `reminder done <name>` -- talk to a running daemon over its Unix socket at `$PANELD_SOCK` (set to `/run/paneld/paneld.sock` by the service file; mode 0660; without it `$XDG_RUNTIME_DIR/paneld.sock`, else `/tmp/paneld-<uid>/paneld.sock` in a directory only that user can open). A second daemon refuses to start on a socket that a running one answers on. `--json` prints the raw replies ([ADR 0014](decisions/0014-ctl-protocol-state-file.md)); scripts can also speak the JSON lines directly, e.g. with `socat`.
+- `paneld ctl status` / `check` / `reload` / `eval '<cel>'` / `set vars.x=1` / `goto <page>` / `alert fire|resolve|ack|snooze <id>` / `reminder done <name>` -- talk to a running daemon over its Unix socket at `$PANELD_SOCK` (set to `/run/paneld/paneld.sock` by the service file; mode 0660; without it `$XDG_RUNTIME_DIR/paneld.sock`, else `/tmp/paneld-<uid>/paneld.sock` in a directory only that user can open). `status` also has `renders` (full page builds since start), `nodes` (LVGL objects on the screen and its top layer) and `rss_kb` (resident memory). A second daemon refuses to start on a socket that a running one answers on. `--json` prints the raw replies ([ADR 0014](decisions/0014-ctl-protocol-state-file.md)); scripts can also speak the JSON lines directly, e.g. with `socat`.

@@ -2690,3 +2690,97 @@ fn text_on_the_accent_reads_and_on_accent_sets_it() {
     let img = shot(&conf, &["--settle", "50"]);
     assert!(img.any(|p| close(p, [0xff, 0, 0], 40)), "on_accent not used");
 }
+
+/// One 30x30 square per check in a row, green when its expression
+/// holds and red when not (ADR 0024 phase 0: scopes are layered, not
+/// copied). Returns how many green and red squares the picture shows.
+fn scope_checks(taps: &[&str]) -> (usize, usize) {
+    let d = tmp("scopes");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var k: int = 3\n\
+         component ok {\n\
+             param c: bool\n\
+             rect { width = 30; height = 30; background = {{ c ? '#00ff00' : '#ff0000' }} }\n\
+         }\n\
+         # A param spelled like a global hides it inside only.\n\
+         component shadow {\n\
+             param vars: string\n\
+             param sources: int = 7\n\
+             ok { c = {{ vars == 'mine' && sources == 7 }} }\n\
+         }\n\
+         component inner {\n\
+             param a: int\n\
+             param b: int\n\
+             # The caller's names are seen (as before); its own `a` wins.\n\
+             ok { c = {{ a == 5 && b == 2 && outer_only == 9 }} }\n\
+         }\n\
+         component outer {\n\
+             param a: int\n\
+             param outer_only: int = 9\n\
+             row {\n\
+                 gap = 4\n\
+                 inner { a = 5; b = {{ a + 1 }} }\n\
+                 ok { c = {{ a == 1 }} }\n\
+             }\n\
+         }\n\
+         component wrap {\n\
+             param v: int = 9\n\
+             row {\n\
+                 gap = 4\n\
+                 ok { c = {{ v == 9 }} }\n\
+                 slot { }\n\
+             }\n\
+         }\n\
+         component live {\n\
+             param p: int\n\
+             ok { c = {{ p == vars.k && vars.k == (page.name == 'home' ? vars.k : -1) }} }\n\
+         }\n\
+         page home {\n\
+             row {\n\
+                 gap = 4\n\
+                 shadow { vars = mine }\n\
+                 ok { c = {{ vars.k >= 3 }} }\n\
+                 repeat vars in {{ [1] }} {\n\
+                     ok { c = {{ vars == 1 }} }\n\
+                 }\n\
+                 ok { c = {{ vars.k >= 3 }} }\n\
+                 outer { a = 1 }\n\
+                 repeat v in {{ [7] }} {\n\
+                     wrap { ok { c = {{ v == 7 }} } }\n\
+                 }\n\
+                 ok { c = {{ [1, 2].all(vars, vars > 0) && vars.k >= 3 }} }\n\
+                 live { p = {{ vars.k }} }\n\
+                 ok { c = {{ vars.k == 3 }} }\n\
+                 button { width = 60; height = 30; label = up; on_tap { set { k = 4 } } }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut args = vec!["--size", "800x120", "--settle", "100"];
+    for t in taps {
+        args.extend(["--tap", t]);
+    }
+    let img = shot(&conf, &args);
+    // Squares do not share columns: count runs of columns with a
+    // green (red) pixel anywhere.
+    let col = |x: usize, c: [u8; 3]| (0..img.h).any(|y| close(img.px(x, y), c, 16));
+    let runs = |c: [u8; 3]| (0..img.w).filter(|&x| col(x, c) && (x == 0 || !col(x - 1, c))).count();
+    let (green, red) = (runs([0, 0xff, 0]), runs([0xff, 0, 0]));
+    (green, red)
+}
+
+#[test]
+fn params_and_repeat_bindings_hide_outer_names_only_inside() {
+    // shadow, after shadow, repeat `vars`, after it, inner, outer, wrap
+    // body, slot, macro, live, the last check: 11 squares.
+    assert_eq!(scope_checks(&[]), (11, 0));
+}
+
+#[test]
+fn a_var_set_after_a_component_call_reaches_its_params_and_body() {
+    // After `k = 4` the last check (`vars.k == 3`) turns red; `live`
+    // sees the new value through its param and directly.
+    assert_eq!(scope_checks(&["515,99"]), (10, 1));
+}

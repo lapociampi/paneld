@@ -3176,6 +3176,11 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_get_child_count(self.raw) }
     }
 
+    /// Objects under this one, at any depth (for `ctl status` `nodes`).
+    pub fn descendant_count(&self) -> u64 {
+        (0..self.child_count()).filter_map(|i| self.child(i)).map(|c| 1 + c.descendant_count()).sum()
+    }
+
     /// The `i`th child, if there is one.
     pub fn child(&self, i: u32) -> Option<Obj<'ui>> {
         let raw = unsafe { sys::lv_obj_get_child(self.raw, i as i32) };

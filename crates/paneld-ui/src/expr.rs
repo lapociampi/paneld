@@ -21,6 +21,7 @@
 //! resolution, UTF-8 aware string functions, duration / timestamp
 //! arithmetic.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use paneld_config::cel::{BinaryOp, Expr, ExprKind, UnaryOp};
@@ -72,6 +73,76 @@ impl Value {
 /// `item`, ...). Field access climbs through [`Value::Map`].
 pub type Context = BTreeMap<String, Value>;
 
+/// Where an expression is evaluated: the names bound here (a component
+/// call's params, a `repeat` binding, a macro's variable) over the
+/// scope around it, down to the pass's [`Context`]. A name is looked up
+/// innermost first, so a local hides an outer name of the same spelling
+/// (`sources` as a param) as a copied-and-overwritten map did, and
+/// nothing is copied to open a scope.
+#[derive(Clone, Copy)]
+pub struct Scope<'a> {
+    local: Local<'a>,
+    parent: Option<&'a Scope<'a>>,
+}
+
+#[derive(Clone, Copy)]
+enum Local<'a> {
+    One(&'a str, &'a Value),
+    Map(&'a Context),
+}
+
+impl<'a> Scope<'a> {
+    /// The pass's context, with nothing over it.
+    pub fn root(ctx: &'a Context) -> Self {
+        Scope { local: Local::Map(ctx), parent: None }
+    }
+
+    /// `locals` over this scope.
+    pub fn with<'b>(&'b self, locals: &'b Context) -> Scope<'b> {
+        Scope { local: Local::Map(locals), parent: Some(self) }
+    }
+
+    /// One name over this scope.
+    pub fn with_one<'b>(&'b self, name: &'b str, value: &'b Value) -> Scope<'b> {
+        Scope { local: Local::One(name, value), parent: Some(self) }
+    }
+
+    /// The value `name` has here, innermost binding first.
+    pub fn get(&self, name: &str) -> Option<&'a Value> {
+        let mut s = self;
+        loop {
+            let hit = match s.local {
+                Local::One(k, v) => (k == name).then_some(v),
+                Local::Map(m) => m.get(name),
+            };
+            if hit.is_some() {
+                return hit;
+            }
+            s = s.parent?;
+        }
+    }
+
+    /// Every name visible here with the value it has here, in name
+    /// order, as one flat context would list them.
+    pub fn visible(&self) -> BTreeMap<&'a str, &'a Value> {
+        let mut out = BTreeMap::new();
+        self.overlay(&mut out);
+        out
+    }
+
+    fn overlay(&self, out: &mut BTreeMap<&'a str, &'a Value>) {
+        if let Some(p) = self.parent {
+            p.overlay(out);
+        }
+        match self.local {
+            Local::One(k, v) => {
+                out.insert(k, v);
+            }
+            Local::Map(m) => out.extend(m.iter().map(|(k, v)| (k.as_str(), v))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalError {
     pub message: String,
@@ -90,12 +161,18 @@ impl std::fmt::Display for EvalError {
 }
 
 pub fn eval(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
+    eval_in(expr, &Scope::root(ctx))
+}
+
+/// [`eval`] in a [`Scope`]: the names local to a component call or a
+/// `repeat` item over the pass's context, without copying it.
+pub fn eval_in(expr: &Expr, ctx: &Scope<'_>) -> Result<Value, EvalError> {
     crate::perf::time(crate::perf::Slot::Eval, || eval_node(expr, ctx))
 }
 
 /// The value an identifier or a field path (`sources.x`) names in
 /// `ctx`, borrowed; `None` for any other expression or a missing step.
-fn lookup<'a>(expr: &Expr, ctx: &'a Context) -> Option<&'a Value> {
+fn lookup<'a>(expr: &Expr, ctx: &Scope<'a>) -> Option<&'a Value> {
     match &expr.kind {
         ExprKind::Ident(name) => ctx.get(name),
         ExprKind::Field(inner, name) => match lookup(inner, ctx)? {
@@ -106,7 +183,17 @@ fn lookup<'a>(expr: &Expr, ctx: &'a Context) -> Option<&'a Value> {
     }
 }
 
-fn eval_node(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
+/// `expr`'s value, borrowed when it is a path into the scope
+/// (`sources.x.history`), so a big list is not copied to be indexed,
+/// measured or walked by a macro.
+fn read<'a>(expr: &Expr, ctx: &Scope<'a>) -> Result<Cow<'a, Value>, EvalError> {
+    match lookup(expr, ctx) {
+        Some(v) => Ok(Cow::Borrowed(v)),
+        None => eval_in(expr, ctx).map(Cow::Owned),
+    }
+}
+
+fn eval_node(expr: &Expr, ctx: &Scope<'_>) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::IntLit(n) => Ok(Value::Int(*n)),
         ExprKind::DoubleLit(d) => Ok(Value::Double(*d)),
@@ -126,7 +213,7 @@ fn eval_node(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
                     return Ok(v.clone());
                 }
             }
-            let base = eval(inner, ctx)?;
+            let base = eval_in(inner, ctx)?;
             match base {
                 Value::Map(m) => m.get(name).cloned().ok_or_else(|| {
                     EvalError::new(format!("field `{name}` not set on map"))
@@ -138,9 +225,9 @@ fn eval_node(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
             }
         }
         ExprKind::Index(inner, idx) => {
-            let base = eval(inner, ctx)?;
-            let i = eval(idx, ctx)?;
-            match (&base, &i) {
+            let base = read(inner, ctx)?;
+            let i = eval_in(idx, ctx)?;
+            match (&*base, &i) {
                 (Value::List(items), Value::Int(n)) => {
                     let n = *n;
                     if n < 0 || (n as usize) >= items.len() {
@@ -164,26 +251,26 @@ fn eval_node(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
             }
         }
         ExprKind::Call(name, args) => call_builtin(name, args, ctx),
-        ExprKind::Method(inner, name, args) => call_method(eval(inner, ctx)?, name, args, ctx),
+        ExprKind::Method(inner, name, args) => call_method(read(inner, ctx)?, name, args, ctx),
         ExprKind::List(items) => {
             let mut vals = Vec::with_capacity(items.len());
             for i in items {
-                vals.push(eval(i, ctx)?);
+                vals.push(eval_in(i, ctx)?);
             }
             Ok(Value::List(vals))
         }
         ExprKind::Map(pairs) => {
             let mut m = BTreeMap::new();
             for (k, v) in pairs {
-                let Value::String(key) = eval(k, ctx)? else {
+                let Value::String(key) = eval_in(k, ctx)? else {
                     return Err(EvalError::new("map keys must be strings"));
                 };
-                m.insert(key, eval(v, ctx)?);
+                m.insert(key, eval_in(v, ctx)?);
             }
             Ok(Value::Map(m))
         }
         ExprKind::Unary(op, inner) => {
-            let v = eval(inner, ctx)?;
+            let v = eval_in(inner, ctx)?;
             match (op, v) {
                 (UnaryOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
                 (UnaryOp::Neg, Value::Double(d)) => Ok(Value::Double(-d)),
@@ -201,27 +288,27 @@ fn eval_node(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
             // the other side, in either order.
             if matches!(op, BinaryOp::And | BinaryOp::Or) {
                 let decides = matches!(op, BinaryOp::Or);
-                let lb = eval(l, ctx).and_then(|v| to_bool(&v));
+                let lb = eval_in(l, ctx).and_then(|v| to_bool(&v));
                 if lb.as_ref().is_ok_and(|b| *b == decides) {
                     return Ok(Value::Bool(decides));
                 }
-                let rb = eval(r, ctx).and_then(|v| to_bool(&v));
+                let rb = eval_in(r, ctx).and_then(|v| to_bool(&v));
                 return match (lb, rb) {
                     (_, Ok(b)) if b == decides => Ok(Value::Bool(decides)),
                     (Err(e), _) | (_, Err(e)) => Err(e),
                     (Ok(_), Ok(b)) => Ok(Value::Bool(b)),
                 };
             }
-            let lv = eval(l, ctx)?;
-            let rv = eval(r, ctx)?;
+            let lv = eval_in(l, ctx)?;
+            let rv = eval_in(r, ctx)?;
             apply_binary(*op, lv, rv)
         }
         ExprKind::Conditional(cond, then, els) => {
-            let c = eval(cond, ctx)?;
+            let c = eval_in(cond, ctx)?;
             if to_bool(&c)? {
-                eval(then, ctx)
+                eval_in(then, ctx)
             } else {
-                eval(els, ctx)
+                eval_in(els, ctx)
             }
         }
     }
@@ -330,11 +417,11 @@ fn to_bool(v: &Value) -> Result<bool, EvalError> {
     }
 }
 
-fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalError> {
+fn call_builtin(name: &str, args: &[Expr], ctx: &Scope<'_>) -> Result<Value, EvalError> {
     let argc = args.len();
     match name {
-        "string" if argc == 1 => Ok(Value::String(eval(&args[0], ctx)?.to_display_string())),
-        "int" if argc == 1 => match eval(&args[0], ctx)? {
+        "string" if argc == 1 => Ok(Value::String(eval_in(&args[0], ctx)?.to_display_string())),
+        "int" if argc == 1 => match eval_in(&args[0], ctx)? {
             Value::Int(n) => Ok(Value::Int(n)),
             Value::Double(d) => Ok(Value::Int(d as i64)),
             Value::String(s) => s
@@ -348,7 +435,7 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
                 type_name(&other)
             ))),
         },
-        "number" if argc == 1 => match eval(&args[0], ctx)? {
+        "number" if argc == 1 => match eval_in(&args[0], ctx)? {
             Value::Int(n) => Ok(Value::Double(n as f64)),
             Value::Double(d) => Ok(Value::Double(d)),
             Value::String(s) => s
@@ -361,7 +448,7 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
                 type_name(&other)
             ))),
         },
-        "round" if argc == 1 => match eval(&args[0], ctx)? {
+        "round" if argc == 1 => match eval_in(&args[0], ctx)? {
             Value::Double(d) => Ok(Value::Double(d.round())),
             Value::Int(n) => Ok(Value::Int(n)),
             other => Err(EvalError::new(format!(
@@ -369,7 +456,7 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
                 type_name(&other)
             ))),
         },
-        "round" if argc == 2 => match (eval(&args[0], ctx)?, eval(&args[1], ctx)?) {
+        "round" if argc == 2 => match (eval_in(&args[0], ctx)?, eval_in(&args[1], ctx)?) {
             (Value::Double(d), Value::Int(p)) => {
                 let scale = 10f64.powi(p as i32);
                 Ok(Value::Double((d * scale).round() / scale))
@@ -381,18 +468,18 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
                 type_name(&b)
             ))),
         },
-        "len" if argc == 1 => match eval(&args[0], ctx)? {
+        "len" if argc == 1 => match &*read(&args[0], ctx)? {
             Value::String(s) => Ok(Value::Int(s.chars().count() as i64)),
             Value::List(items) => Ok(Value::Int(items.len() as i64)),
             Value::Map(m) => Ok(Value::Int(m.len() as i64)),
             other => Err(EvalError::new(format!(
                 "len({}) is not supported",
-                type_name(&other)
+                type_name(other)
             ))),
         },
         // Schema 16: `ago(t)`, Unix seconds as "5m ago" for display.
         "ago" if argc == 1 => {
-            let t = match eval(&args[0], ctx)? {
+            let t = match eval_in(&args[0], ctx)? {
                 Value::Int(n) => n,
                 Value::Double(d) => d as i64,
                 other => return Err(EvalError::new(format!("ago({}) is not supported", type_name(&other)))),
@@ -419,19 +506,19 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
         }
         // Schema 16: display helpers.
         "format" if argc == 2 => {
-            let x = number_arg(&eval(&args[0], ctx)?, "format")?;
-            let Value::String(unit) = eval(&args[1], ctx)? else {
+            let x = number_arg(&eval_in(&args[0], ctx)?, "format")?;
+            let Value::String(unit) = eval_in(&args[1], ctx)? else {
                 return Err(EvalError::new("format(x, unit) needs a text unit"));
             };
             Ok(Value::String(format_unit(x, &unit)))
         }
         "duration" if argc == 1 => {
-            let secs = number_arg(&eval(&args[0], ctx)?, "duration")?;
+            let secs = number_arg(&eval_in(&args[0], ctx)?, "duration")?;
             Ok(Value::String(duration_text(secs)))
         }
         "clamp" if argc == 3 => {
-            let x = eval(&args[0], ctx)?;
-            let (lo, hi) = (eval(&args[1], ctx)?, eval(&args[2], ctx)?);
+            let x = eval_in(&args[0], ctx)?;
+            let (lo, hi) = (eval_in(&args[1], ctx)?, eval_in(&args[2], ctx)?);
             match (&x, &lo, &hi) {
                 (Value::Int(x), Value::Int(lo), Value::Int(hi)) if lo <= hi => Ok(Value::Int(*x.max(lo).min(hi))),
                 _ => {
@@ -444,13 +531,13 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
             }
         }
         "color" if argc == 1 => {
-            let (rgb, alpha) = color_arg(&eval(&args[0], ctx)?, ctx)?;
+            let (rgb, alpha) = color_arg(&eval_in(&args[0], ctx)?, ctx)?;
             Ok(Value::String(hex_text(rgb, alpha)))
         }
         "mix" if argc == 3 => {
-            let (a, aa) = color_arg(&eval(&args[0], ctx)?, ctx)?;
-            let (b, ba) = color_arg(&eval(&args[1], ctx)?, ctx)?;
-            let t = number_arg(&eval(&args[2], ctx)?, "mix")?.clamp(0.0, 1.0);
+            let (a, aa) = color_arg(&eval_in(&args[0], ctx)?, ctx)?;
+            let (b, ba) = color_arg(&eval_in(&args[1], ctx)?, ctx)?;
+            let t = number_arg(&eval_in(&args[2], ctx)?, "mix")?.clamp(0.0, 1.0);
             let lerp = |x: u32, y: u32| (x as f64 + (y as f64 - x as f64) * t).round() as u32;
             let blend = |shift: u32| lerp((a >> shift) & 0xff, (b >> shift) & 0xff) << shift;
             // Alpha blends too when either color has one.
@@ -461,7 +548,7 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
         "size" if argc == 1 => call_builtin("len", args, ctx),
         // There is no timestamp type: Unix seconds as the RFC 3339
         // text CEL prints for one, in UTC.
-        "timestamp" if argc == 1 => match eval(&args[0], ctx)? {
+        "timestamp" if argc == 1 => match eval_in(&args[0], ctx)? {
             Value::Int(n) => Ok(Value::String(rfc3339(n))),
             Value::Double(d) if d.is_finite() && d.abs() < 1e15 => Ok(Value::String(rfc3339(d.floor() as i64))),
             Value::String(s) if is_rfc3339(&s) => Ok(Value::String(s)),
@@ -472,7 +559,7 @@ fn call_builtin(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalE
             // `has(a.b)` in CEL tests field presence without erroring
             // on absence. Our Field eval returns Err on missing, so
             // we trap that here.
-            match eval(&args[0], ctx) {
+            match eval_in(&args[0], ctx) {
                 Ok(_) => Ok(Value::Bool(true)),
                 Err(_) => Ok(Value::Bool(false)),
             }
@@ -488,35 +575,22 @@ pub use paneld_config::cel::FUNCTIONS;
 /// `receiver.name(args)`: the CEL macros (`all`, `exists`,
 /// `exists_one`, `map`, `filter`) over a list or a map's keys, and the
 /// string and list methods.
-fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalError> {
+fn call_method(receiver: Cow<'_, Value>, name: &str, args: &[Expr], ctx: &Scope<'_>) -> Result<Value, EvalError> {
     if matches!(name, "all" | "exists" | "exists_one" | "map" | "filter") {
-        let items = match receiver {
-            Value::List(l) => l,
-            Value::Map(m) => m.into_keys().map(Value::String).collect(),
+        let items: Cow<'_, [Value]> = match receiver {
+            Cow::Borrowed(Value::List(l)) => Cow::Borrowed(l.as_slice()),
+            Cow::Owned(Value::List(l)) => Cow::Owned(l),
+            Cow::Borrowed(Value::Map(m)) => Cow::Owned(m.keys().cloned().map(Value::String).collect()),
+            Cow::Owned(Value::Map(m)) => Cow::Owned(m.into_keys().map(Value::String).collect()),
             other => return Err(EvalError::new(format!(".{name}() on a {} is not supported", type_name(&other)))),
         };
         let (var, rest) = match args.split_first() {
             Some((Expr { kind: ExprKind::Ident(v), .. }, rest)) if !rest.is_empty() && rest.len() <= 2 => (v, rest),
             _ => return Err(EvalError::new(format!(".{name}() takes a name and an expression"))),
         };
-        // Only what the body reads (not every source with its history),
-        // so a macro inside a macro stays cheap.
-        let mut scope = Context::new();
-        // `theme` is read without being named (`color('accent')`).
-        if let Some(t) = ctx.get("theme") {
-            scope.insert("theme".into(), t.clone());
-        }
-        for e in rest {
-            for (name, _) in paneld_config::cel::idents(e) {
-                if let Some(v) = ctx.get(&name) {
-                    scope.entry(name).or_insert_with(|| v.clone());
-                }
-            }
-        }
-        let mut with = |item: &Value, e: &Expr| {
-            scope.insert(var.clone(), item.clone());
-            eval(e, &scope)
-        };
+        // The variable over the scope around: nothing is copied, so a
+        // macro inside a macro stays cheap beside big sources.
+        let with = |item: &Value, e: &Expr| eval_in(e, &ctx.with_one(var, item));
         let pred = |v: Value| to_bool(&v);
         return match (name, rest) {
             // As in CEL: an item that decides the result (`false` for
@@ -524,7 +598,7 @@ fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Res
             ("all" | "exists", [p]) => {
                 let decides = name == "exists";
                 let mut error = None;
-                for i in &items {
+                for i in items.iter() {
                     match with(i, p).and_then(pred) {
                         Ok(b) if b == decides => return Ok(Value::Bool(decides)),
                         Ok(_) => {}
@@ -537,7 +611,7 @@ fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Res
             }
             ("exists_one", [p]) => {
                 let mut n = 0;
-                for i in &items {
+                for i in items.iter() {
                     if pred(with(i, p)?)? {
                         n += 1;
                     }
@@ -546,9 +620,9 @@ fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Res
             }
             ("filter", [p]) => {
                 let mut out = Vec::new();
-                for i in items {
-                    if pred(with(&i, p)?)? {
-                        out.push(i);
+                for i in items.iter() {
+                    if pred(with(i, p)?)? {
+                        out.push(i.clone());
                     }
                 }
                 Ok(Value::List(out))
@@ -556,7 +630,7 @@ fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Res
             ("map", [e]) => items.iter().map(|i| with(i, e)).collect::<Result<_, _>>().map(Value::List),
             ("map", [p, e]) => {
                 let mut out = Vec::new();
-                for i in &items {
+                for i in items.iter() {
                     if pred(with(i, p)?)? {
                         out.push(with(i, e)?);
                     }
@@ -566,12 +640,12 @@ fn call_method(receiver: Value, name: &str, args: &[Expr], ctx: &Context) -> Res
             _ => Err(EvalError::new(format!(".{name}() takes a name and one expression"))),
         };
     }
-    let args = args.iter().map(|a| eval(a, ctx)).collect::<Result<Vec<_>, _>>()?;
+    let args = args.iter().map(|a| eval_in(a, ctx)).collect::<Result<Vec<_>, _>>()?;
     let text = |v: &Value| match v {
         Value::String(s) => Ok(s.clone()),
         other => Err(EvalError::new(format!(".{name}() needs text, got {}", type_name(other)))),
     };
-    match (name, &receiver, args.as_slice()) {
+    match (name, &*receiver, args.as_slice()) {
         ("size", Value::String(s), []) => Ok(Value::Int(s.chars().count() as i64)),
         ("size", Value::List(l), []) => Ok(Value::Int(l.len() as i64)),
         ("size", Value::Map(m), []) => Ok(Value::Int(m.len() as i64)),
@@ -726,7 +800,7 @@ fn duration_text(secs: f64) -> String {
 
 /// A color value: `#rgb`, `#rrggbb`, `#rrggbbaa`, or the name of a
 /// theme color token. Its RGB and alpha.
-fn color_arg(v: &Value, ctx: &Context) -> Result<(u32, Option<u8>), EvalError> {
+fn color_arg(v: &Value, ctx: &Scope<'_>) -> Result<(u32, Option<u8>), EvalError> {
     let Value::String(s) = v else {
         return Err(EvalError::new(format!("a color is text, got {}", type_name(v))));
     };
@@ -1440,6 +1514,34 @@ mod more_tests {
         assert!(t.elapsed() < std::time::Duration::from_millis(500), "nested macros took {:?}", t.elapsed());
         // An inner macro's name does not hide the outer one's.
         assert_eq!(try_ev("rows.exists(x, [x].exists(y, y == x && x == 49))", &ctx).unwrap(), B(true));
+    }
+
+    #[test]
+    fn scopes_hide_outer_names_only_while_open() {
+        let mut g = Context::new();
+        g.insert("sources".into(), Value::Map(BTreeMap::from([("x".to_string(), I(1))])));
+        g.insert("k".into(), I(3));
+        let root = Scope::root(&g);
+        let params = Context::from([("sources".to_string(), S("mine".into())), ("a".to_string(), I(1))]);
+        let call = root.with(&params);
+        let item = I(7);
+        let rep = call.with_one("a", &item);
+        let e = |s: &str, sc: &Scope<'_>| {
+            let (e, d) = cel::parse_fragment(s, FileId::default(), 0);
+            assert!(d.is_empty());
+            eval_in(&e.unwrap(), sc).unwrap()
+        };
+        assert_eq!(e("sources == 'mine' && a == 1 && k == 3", &call), B(true));
+        assert_eq!(e("a == 7 && sources == 'mine'", &rep), B(true));
+        assert_eq!(e("sources.x == 1 && k == 3", &root), B(true));
+        // A macro's variable over a scope, and the list it walks read in
+        // place.
+        assert_eq!(e("[1, 2].map(a, a + k)", &rep), Value::List(vec![I(4), I(5)]));
+        assert_eq!(e("[1].all(a, a == 1) && a == 7", &rep), B(true));
+        // The flat view a copied context had: inner names win, in name
+        // order.
+        let v: Vec<(&str, &Value)> = rep.visible().into_iter().collect();
+        assert_eq!(v, vec![("a", &I(7)), ("k", &I(3)), ("sources", &S("mine".into()))]);
     }
 
     #[test]

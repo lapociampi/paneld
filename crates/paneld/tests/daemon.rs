@@ -161,6 +161,9 @@ fn ctl_reads_and_changes_the_running_state() {
     assert!(status.contains("\"page\":\"home\""), "{status}");
     assert!(status.contains("\"vars\":{\"n\":0,\"on\":false}"), "{status}");
     assert!(status.contains("\"value\":5.0"), "{status}");
+    // The objects on screen (the shell, the page, its text) and memory.
+    assert!(status_num(&d, "nodes") > 3, "{status}");
+    assert!(status_num(&d, "rss_kb") > 1000, "{status}");
     // eval against the live context.
     assert_eq!(d.eval("sources.c.value + 1"), "6");
     assert_eq!(d.eval("vars.on ? 'yes' : 'no'"), "no");

@@ -26,7 +26,7 @@ use paneld_config::cel;
 use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
-use crate::expr::{eval, Context, Value};
+use crate::expr::{eval_in, Context, Scope, Value};
 use crate::ui::{
     ActionArg, Anchor, FlexAlign, ImageFit, InlineSetItem, Obj, ScrollSnap, SelfAlign, Size, TextOverflow, Track, Tracks,
     Trigger, UiEvent, ValueWidget,
@@ -37,7 +37,7 @@ use crate::ui::{
 /// inside the component's body expands to the caller's children.
 struct SlotCtx<'a> {
     children: &'a [Item],
-    outer_ctx: &'a Context,
+    outer_ctx: &'a Scope<'a>,
 }
 
 /// Show `text` as a toast on `layer` (the top layer), replacing any
@@ -72,6 +72,7 @@ pub fn render_page(
     sink: &Sender<UiEvent>,
     screen: &Obj<'_>,
 ) {
+    let ctx = &Scope::root(ctx);
     let critical = color_of("critical", ctx);
     FAILED_BORDER.with(|c| c.set(critical.unwrap_or((0xf85149, 255))));
     // The inputs and the dialogs over this page in the theme's colors.
@@ -94,14 +95,13 @@ pub fn render_page(
 fn render_page_body(
     page: &Block,
     doc: &Document,
-    ctx: &Context,
+    ctx: &Scope<'_>,
     sink: &Sender<UiEvent>,
     screen: &Obj<'_>,
 ) {
     // `page` and `nav` are visible to the shell and to the page body.
-    let mut pctx = crate::perf::time(crate::perf::Slot::Clone, || ctx.clone());
-    pctx.insert("page".into(), page_info(page, ctx));
-    pctx.insert("nav".into(), nav_entries(doc, page, ctx));
+    let locals = Context::from([("page".into(), page_info(page, ctx)), ("nav".into(), nav_entries(doc, page, ctx))]);
+    let pctx = ctx.with(&locals);
 
     // The theme's `font` is the text font of everything on the page,
     // the dialogs on the top layer included; a node's `font` wins.
@@ -163,7 +163,7 @@ fn render_page_body(
 }
 
 /// `{ name, title, icon }` of a page; `title` defaults to the name.
-fn page_info(page: &Block, ctx: &Context) -> Value {
+fn page_info(page: &Block, ctx: &Scope<'_>) -> Value {
     let name = page.name.as_ref().map(|n| n.text.clone()).unwrap_or_default();
     let title = find_raw(page, "title")
         .map(|(raw, span)| resolve_scalar(raw, span, ctx))
@@ -179,7 +179,7 @@ fn page_info(page: &Block, ctx: &Context) -> Value {
 
 /// Pages that have `nav = <n>`, ordered by `n` (schema 8), each as
 /// `page_info` plus `current` (the page being shown).
-fn nav_entries(doc: &Document, current: &Block, ctx: &Context) -> Value {
+fn nav_entries(doc: &Document, current: &Block, ctx: &Scope<'_>) -> Value {
     let mut entries: Vec<(i64, Value)> = Vec::new();
     for item in &doc.items {
         let Item::Block(b) = item else { continue };
@@ -206,7 +206,7 @@ fn nav_entries(doc: &Document, current: &Block, ctx: &Context) -> Value {
 fn render_item_list(
     items: &[Item],
     doc: &Document,
-    ctx: &Context,
+    ctx: &Scope<'_>,
     slot: Option<&SlotCtx<'_>>,
     sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
@@ -237,7 +237,7 @@ fn is_event_handler_block(kind: &str) -> bool {
 fn expand_repeat(
     r: &paneld_config::parse::Repeat,
     doc: &Document,
-    ctx: &Context,
+    ctx: &Scope<'_>,
     slot: Option<&SlotCtx<'_>>,
     sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
@@ -252,7 +252,7 @@ fn expand_repeat(
     let Some(expr) = expr.as_ref() else {
         return;
     };
-    let items = match eval(expr, ctx) {
+    let items = match eval_in(expr, ctx) {
         Ok(Value::List(xs)) => xs,
         Ok(other) => {
             parent.new_label(&format!(
@@ -268,8 +268,7 @@ fn expand_repeat(
     };
     for (i, item) in items.into_iter().enumerate() {
         crate::motion::push_scope(crate::motion::item_key(&item, i));
-        let mut inner = crate::perf::time(crate::perf::Slot::Clone, || ctx.clone());
-        inner.insert(r.binding.text.clone(), item);
+        let inner = ctx.with_one(&r.binding.text, &item);
         render_item_list(&r.items, doc, &inner, slot, sink, parent);
         crate::motion::pop_scope();
     }
@@ -290,7 +289,7 @@ fn display_type(v: &Value) -> &'static str {
 fn render_node(
     node: &Block,
     doc: &Document,
-    ctx: &Context,
+    ctx: &Scope<'_>,
     slot: Option<&SlotCtx<'_>>,
     sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
@@ -693,7 +692,7 @@ const UNKNOWN_ICONS_MAX: usize = 32;
 /// built-in glyph. An unknown name draws nothing and is
 /// logged once; an empty one draws nothing.
 /// Returns the object and whether it is an image.
-fn new_icon<'ui>(parent: &Obj<'ui>, name: &str, size: Option<u16>, ctx: &Context) -> Option<(Obj<'ui>, bool)> {
+fn new_icon<'ui>(parent: &Obj<'ui>, name: &str, size: Option<u16>, ctx: &Scope<'_>) -> Option<(Obj<'ui>, bool)> {
     if name.is_empty() {
         return None;
     }
@@ -773,11 +772,11 @@ fn expand_component(
     call: &Block,
     comp: &Block,
     doc: &Document,
-    outer_ctx: &Context,
+    outer_ctx: &Scope<'_>,
     sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
 ) {
-    let mut inner_ctx = crate::perf::time(crate::perf::Slot::Clone, || outer_ctx.clone());
+    let mut locals = Context::new();
     for item in &comp.items {
         let Item::Param(p) = item else { continue };
         let bound = if let Some((raw, span)) = find_raw(call, &p.name.text) {
@@ -787,24 +786,16 @@ fn expand_component(
         } else {
             Value::Null
         };
-        inner_ctx.insert(p.name.text.clone(), typed_param(&p.ty.text, bound));
+        locals.insert(p.name.text.clone(), typed_param(&p.ty.text, bound));
     }
+    let inner_ctx = outer_ctx.with(&locals);
     // Children of the call that aren't args become the slot's
     // content. The schema check already enforced "exactly one slot"
-    // and "no children unless a slot exists".
-    // Handler blocks (`on_hold vm_stop { ... }`) belong to the call,
-    // not to the slot.
-    let child_items: Vec<Item> = call
-        .items
-        .iter()
-        .filter(|it| match it {
-            Item::Block(b) => !is_event_handler_block(&b.kind.text),
-            Item::Repeat(_) => true,
-            _ => false,
-        })
-        .cloned()
-        .collect();
-    let slot = SlotCtx { children: &child_items, outer_ctx };
+    // and "no children unless a slot exists". `render_item_list` takes
+    // only the UI nodes and `repeat`s of them: the args and handler
+    // blocks (`on_hold vm_stop { ... }`, which belong to the call) are
+    // skipped there.
+    let slot = SlotCtx { children: &call.items, outer_ctx };
     let before = parent.child_count();
     // The call's `on_tap` wins over its root button's `action`.
     ROOT_TAP.with(|t| t.set(has_handler(call, "on_tap")));
@@ -833,18 +824,19 @@ fn expand_component(
                 _ => None,
             })
             .collect();
-        let props: Vec<Item> = call
-            .items
-            .iter()
-            .filter(|it| match it {
-                Item::Assign(a) => match &a.target {
-                    AssignTarget::Simple { key } => !params.contains(&key.text.as_str()),
+        let props: Vec<Item> = crate::perf::time(crate::perf::Slot::Clone, || {
+            call.items
+                .iter()
+                .filter(|it| match it {
+                    Item::Assign(a) => match &a.target {
+                        AssignTarget::Simple { key } => !params.contains(&key.text.as_str()),
+                        _ => false,
+                    },
                     _ => false,
-                },
-                _ => false,
-            })
-            .cloned()
-            .collect();
+                })
+                .cloned()
+                .collect()
+        });
         let root_kind = comp.items.iter().find_map(|it| match it {
             Item::Block(b) => Some(b.kind.text.as_str()),
             _ => None,
@@ -895,6 +887,7 @@ pub fn interpolate(
     base: u32,
     ctx: &Context,
 ) -> String {
+    let ctx = &Scope::root(ctx);
     let span = paneld_config::source::Span { file, start: base, end: base };
     match resolve_expr_value(raw, span, ctx) {
         Some(Value::String(s)) => s,
@@ -912,7 +905,7 @@ pub fn resolve_value(
     span: paneld_config::source::Span,
     ctx: &Context,
 ) -> Option<Value> {
-    resolve_expr_value(raw, span, ctx)
+    resolve_expr_value(raw, span, &Scope::root(ctx))
 }
 
 /// Evaluate a `key = <raw>` as either a literal string (for a
@@ -922,7 +915,7 @@ pub fn resolve_value(
 fn resolve_expr_value(
     raw: &str,
     span: paneld_config::source::Span,
-    ctx: &Context,
+    ctx: &Scope<'_>,
 ) -> Option<Value> {
     match classify(raw) {
         // `"..."` keeps spaces and `;` (config-format, "Lines"); the
@@ -934,7 +927,7 @@ fn resolve_expr_value(
             if !diags.is_empty() {
                 return None;
             }
-            expr.as_ref().and_then(|e| eval(e, ctx).ok())
+            expr.as_ref().and_then(|e| eval_in(e, ctx).ok())
         }
         ValueShape::Interp(_) => {
             let parsed = parse_interp_cached(raw, span.file, span.start);
@@ -958,7 +951,7 @@ fn resolve_expr_value(
 ///
 /// On eval error the node renders the error message so the user sees
 /// the problem instead of a blank panel.
-fn resolve_text(node: &Block, key: &str, ctx: &Context) -> Option<String> {
+fn resolve_text(node: &Block, key: &str, ctx: &Scope<'_>) -> Option<String> {
     let (raw, span) = find_raw(node, key)?;
     Some(match classify(raw) {
         ValueShape::Literal(text) => paneld_config::value::parse_string(text),
@@ -968,7 +961,7 @@ fn resolve_text(node: &Block, key: &str, ctx: &Context) -> Option<String> {
             if !diags.is_empty() {
                 return Some(format!("[parse error: {}]", diags[0].message));
             }
-            match expr.as_ref().and_then(|e| eval(e, ctx).ok()) {
+            match expr.as_ref().and_then(|e| eval_in(e, ctx).ok()) {
                 Some(v) => v.to_display_string(),
                 None => "[eval error]".to_string(),
             }
@@ -990,7 +983,7 @@ fn resolve_text(node: &Block, key: &str, ctx: &Context) -> Option<String> {
 ///
 /// `fragments` is the ordered list of parsed CEL ASTs; we match them
 /// up to the openers encountered in `raw`.
-fn interpolate_text(raw: &str, fragments: &[cel::Expr], ctx: &Context) -> String {
+fn interpolate_text(raw: &str, fragments: &[cel::Expr], ctx: &Scope<'_>) -> String {
     splice(raw, fragments, ctx, true)
 }
 
@@ -998,7 +991,7 @@ fn interpolate_text(raw: &str, fragments: &[cel::Expr], ctx: &Context) -> String
 /// [`cel::parse_interp`]) in place of their `{{ ... }}` in `raw`.
 /// Mirrors the lexer's `\\` and `\{{` escapes. A failed fragment
 /// shows as `[message]` with `show_errors`, else as nothing.
-fn splice(raw: &str, fragments: &[cel::Expr], ctx: &Context, show_errors: bool) -> String {
+fn splice(raw: &str, fragments: &[cel::Expr], ctx: &Scope<'_>, show_errors: bool) -> String {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
     let (mut i, mut literal_from, mut frag_idx) = (0, 0, 0);
@@ -1023,7 +1016,7 @@ fn splice(raw: &str, fragments: &[cel::Expr], ctx: &Context, show_errors: bool) 
         } else {
             let end = cel::expr_end(raw, i).unwrap_or(bytes.len());
             if let Some(expr) = fragments.get(frag_idx) {
-                match eval(expr, ctx) {
+                match eval_in(expr, ctx) {
                     Ok(v) => out.push_str(&v.to_display_string()),
                     Err(e) if show_errors => out.push_str(&format!("[{}]", e.message)),
                     Err(_) => {}
@@ -1039,7 +1032,7 @@ fn splice(raw: &str, fragments: &[cel::Expr], ctx: &Context, show_errors: bool) 
 }
 
 /// Returns the action call a tap on the node makes, if any.
-fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_>) -> Option<(String, Vec<ActionArg>)> {
+fn apply_props(node: &Block, ctx: &Scope<'_>, sink: &Sender<UiEvent>, obj: &Obj<'_>) -> Option<(String, Vec<ActionArg>)> {
     // Inline-action block form, with or without a name:
     //   `on_tap { goto = settings }`
     //   `on_tap { set { k = v; ... } }`
@@ -1058,7 +1051,7 @@ fn apply_props(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_
 /// Theme motion on a node (ADR 0023): a press shown over
 /// `tap_transition` on what takes taps, and `enter` when the node
 /// appears on the page shown.
-fn apply_motion(node: &Block, ctx: &Context, obj: &Obj<'_>) {
+fn apply_motion(node: &Block, ctx: &Scope<'_>, obj: &Obj<'_>) {
     let settings = crate::motion::settings();
     let tappable = node.kind.text == "button" || has_handler(node, "on_tap") || has_handler(node, "on_hold");
     if tappable && settings.tap_ms() > 0 {
@@ -1270,7 +1263,7 @@ fn class_names(items: &[Item]) -> Vec<String> {
 /// kind, then each `class` in order, later winning. State selectors
 /// (`button:pressed`, `.card:checked`) follow, for that state.
 /// Without `by_kind`, only the classes.
-fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Context, obj: &Obj<'_>) {
+fn apply_styles(kind: &str, items: &[Item], by_kind: bool, ctx: &Scope<'_>, obj: &Obj<'_>) {
     let classes = class_names(items);
     STYLES.with(|styles| {
         let styles = styles.borrow();
@@ -1316,7 +1309,7 @@ fn has_handler(node: &Block, handler: &str) -> bool {
 /// Wire `node`'s `on_tap` / `on_hold` handlers (block and `= name`
 /// forms) to `obj`. Action-call args are evaluated against `ctx` now.
 /// Returns the action call a tap makes, if any (name and args).
-fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<'_>) -> Option<(String, Vec<ActionArg>)> {
+fn bind_handlers(node: &Block, ctx: &Scope<'_>, sink: &Sender<UiEvent>, obj: &Obj<'_>) -> Option<(String, Vec<ActionArg>)> {
     let mut tap_call = None;
     // A node with an `on_hold` gets short taps only for `on_tap`, so a
     // long press does not fire both.
@@ -1404,7 +1397,7 @@ fn bind_handlers(node: &Block, ctx: &Context, sink: &Sender<UiEvent>, obj: &Obj<
 /// The action an `on_tap = ...` names: a bare name, or an expression
 /// that gives one (`on_tap = {{ tap }}` with a component's `action`
 /// param). `none`, or anything that is not a name, binds nothing.
-fn action_name(raw: &str, span: paneld_config::source::Span, ctx: &Context) -> Option<String> {
+fn action_name(raw: &str, span: paneld_config::source::Span, ctx: &Scope<'_>) -> Option<String> {
     let name = match classify(raw) {
         ValueShape::Literal(t) => t.trim().to_string(),
         _ => match resolve_expr_value(raw, span, ctx) {
@@ -1421,7 +1414,7 @@ fn action_name(raw: &str, span: paneld_config::source::Span, ctx: &Context) -> O
 /// `:pressed` (etc.) body they would apply in every state.
 pub const STATELESS_KEYS: &[&str] = &["width", "height", "grow", "visible", "enabled"];
 
-fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
+fn apply_plain_props(kind: &str, items: &[Item], ctx: &Scope<'_>, obj: &Obj<'_>) {
     for item in items {
         let Item::Assign(a) = item else { continue };
         let AssignTarget::Simple { key } = &a.target else {
@@ -1620,7 +1613,7 @@ fn apply_plain_props(kind: &str, items: &[Item], ctx: &Context, obj: &Obj<'_>) {
 /// token holding one; an image replaces the color. A value that
 /// does not parse (an expression's result: a literal is checked) is
 /// logged once and leaves the node as it was.
-fn apply_background(text: &str, ctx: &Context, obj: &Obj<'_>) {
+fn apply_background(text: &str, ctx: &Scope<'_>, obj: &Obj<'_>) {
     use paneld_config::paint::{parse_background, Background};
     let mut text = text.trim().to_string();
     for _ in 0..8 {
@@ -1667,7 +1660,7 @@ fn apply_background(text: &str, ctx: &Context, obj: &Obj<'_>) {
 
 /// Draw a `shadow` value (schema 8.1): `none`, `<size> [<color>] [<x>
 /// <y>]`, or a theme token's name holding one.
-fn apply_shadow(text: &str, ctx: &Context, obj: &Obj<'_>) {
+fn apply_shadow(text: &str, ctx: &Scope<'_>, obj: &Obj<'_>) {
     use paneld_config::paint::{parse_shadow, ShadowValue};
     let mut text = text.trim().to_string();
     for _ in 0..8 {
@@ -1703,7 +1696,7 @@ fn note_bad_value(msg: String) {
 /// Resolve a `key = ...` on `node` as an f64. Handles literal
 /// numbers and `{{ expr }}` evaluating to Int/Double. Returns None
 /// if the key is absent or doesn't produce a number.
-fn resolve_num(node: &Block, key: &str, ctx: &Context) -> Option<f64> {
+fn resolve_num(node: &Block, key: &str, ctx: &Scope<'_>) -> Option<f64> {
     let (raw, span) = find_raw(node, key)?;
     let v = resolve_expr_value(raw, span, ctx)?;
     match v {
@@ -1716,7 +1709,7 @@ fn resolve_num(node: &Block, key: &str, ctx: &Context) -> Option<f64> {
 
 type Theme = std::collections::BTreeMap<String, Value>;
 
-fn theme_of(ctx: &Context) -> Option<&Theme> {
+fn theme_of<'a>(ctx: &Scope<'a>) -> Option<&'a Theme> {
     match ctx.get("theme") {
         Some(Value::Map(t)) => Some(t),
         _ => None,
@@ -1783,7 +1776,7 @@ const CHART_SCALE: f64 = 100.0;
 /// `history`. With fewer values than `points` the series is drawn
 /// against the right edge, newest last; with more, the newest
 /// `points` are shown. `min` / `max` default to the data's range.
-fn render_chart(node: &Block, ctx: &Context, obj: &Obj<'_>) {
+fn render_chart(node: &Block, ctx: &Scope<'_>, obj: &Obj<'_>) {
     let number = |v: &Value| match v {
         Value::Int(n) => Some(*n as f64),
         Value::Double(d) if d.is_finite() => Some(*d),
@@ -1864,7 +1857,7 @@ fn render_chart(node: &Block, ctx: &Context, obj: &Obj<'_>) {
     }
 }
 
-fn resolve_assign_value(node: &Block, key: &str, ctx: &Context) -> Option<Value> {
+fn resolve_assign_value(node: &Block, key: &str, ctx: &Scope<'_>) -> Option<Value> {
     for item in &node.items {
         let Item::Assign(a) = item else { continue };
         let AssignTarget::Simple { key: k } = &a.target else {
@@ -1897,7 +1890,7 @@ fn bind_change_action(
     node: &Block,
     handler: &str,
     widget: ValueWidget,
-    ctx: &Context,
+    ctx: &Scope<'_>,
     sink: &Sender<UiEvent>,
     obj: &Obj<'_>,
 ) -> Option<Vec<InlineSetItem>> {
@@ -1932,11 +1925,12 @@ fn bind_change_action(
 
 /// The bindings in `ctx` that are local to where a node is rendered
 /// (`repeat` items, component params), as action args.
-fn local_args(ctx: &Context) -> Vec<ActionArg> {
+fn local_args(ctx: &Scope<'_>) -> Vec<ActionArg> {
     const GLOBAL: &[&str] = &["sources", "vars", "alerts", "theme", "now", "page", "nav"];
-    ctx.iter()
-        .filter(|(k, _)| !GLOBAL.contains(&k.as_str()))
-        .map(|(k, v)| ActionArg { name: k.clone(), value: v.clone() })
+    ctx.visible()
+        .into_iter()
+        .filter(|(k, _)| !GLOBAL.contains(k))
+        .map(|(k, v)| ActionArg { name: k.to_string(), value: v.clone() })
         .collect()
 }
 
@@ -1944,7 +1938,7 @@ fn local_args(ctx: &Context) -> Vec<ActionArg> {
 /// against `ctx`, returning the already-resolved [`ActionArg`]s. An
 /// arg whose expression fails to evaluate is dropped so a bad arg
 /// does not make the whole tap no-op.
-fn collect_action_args(call: &Block, ctx: &Context) -> Vec<ActionArg> {
+fn collect_action_args(call: &Block, ctx: &Scope<'_>) -> Vec<ActionArg> {
     let mut out = Vec::new();
     for item in &call.items {
         let Item::Assign(a) = item else { continue };
@@ -1958,7 +1952,7 @@ fn collect_action_args(call: &Block, ctx: &Context) -> Vec<ActionArg> {
     out
 }
 
-fn collect_inline_set(set_block: &Block, ctx: &Context) -> Vec<InlineSetItem> {
+fn collect_inline_set(set_block: &Block, ctx: &Scope<'_>) -> Vec<InlineSetItem> {
     // `page` and `nav` too: only a drawn page has them (they are not
     // action args, which would change what counts as the same call).
     let mut locals = local_args(ctx);
@@ -2043,7 +2037,7 @@ fn find_raw<'a>(
 
 /// A property value as text: a literal as written, or the result of a
 /// `{{ ... }}` expression (so `padding = {{ theme.padding }}` works).
-fn resolve_scalar(value: &str, span: paneld_config::source::Span, ctx: &Context) -> String {
+fn resolve_scalar(value: &str, span: paneld_config::source::Span, ctx: &Scope<'_>) -> String {
     match classify(value) {
         ValueShape::Literal(t) => t.to_string(),
         _ => resolve_expr_value(value, span, ctx)
@@ -2058,13 +2052,13 @@ const FAINT: u8 = 0x40;
 
 /// A gauge's default indicator (the theme's `accent`) and track (its
 /// `track` when it has one, else its `muted`, faint).
-fn gauge_colors(ctx: &Context) -> ((u32, u8), (u32, u8)) {
+fn gauge_colors(ctx: &Scope<'_>) -> ((u32, u8), (u32, u8)) {
     let accent = color_of("accent", ctx).unwrap_or((0x2196f3, 255));
     (accent, track_color(ctx))
 }
 
 /// The theme's `track` color, else its `muted`, faint.
-fn track_color(ctx: &Context) -> (u32, u8) {
+fn track_color(ctx: &Scope<'_>) -> (u32, u8) {
     let theme = theme_of(ctx);
     theme
         .and_then(|t| t.get("track"))
@@ -2074,7 +2068,7 @@ fn track_color(ctx: &Context) -> (u32, u8) {
 
 /// The inputs' and dialogs' colors (themes.md): `accent`, the track,
 /// `text`, `surface`, and the text on the accent.
-fn input_colors(ctx: &Context) -> crate::ui::InputColors {
+fn input_colors(ctx: &Scope<'_>) -> crate::ui::InputColors {
     let d = crate::ui::InputColors::default();
     let accent = color_of("accent", ctx).unwrap_or(d.accent);
     // `on_accent` when the theme sets it, else what reads best.
@@ -2155,7 +2149,7 @@ fn parse_size(s: &str) -> Option<Size> {
 fn resolve_color(
     value: &str,
     span: paneld_config::source::Span,
-    ctx: &Context,
+    ctx: &Scope<'_>,
 ) -> Option<(u32, u8)> {
     match classify(value) {
         ValueShape::Literal(text) => color_of(text, ctx),
@@ -2165,7 +2159,7 @@ fn resolve_color(
             if !diags.is_empty() {
                 return None;
             }
-            let v = expr.as_ref().and_then(|e| eval(e, ctx).ok())?;
+            let v = expr.as_ref().and_then(|e| eval_in(e, ctx).ok())?;
             color_of(&v.to_display_string(), ctx)
         }
         ValueShape::Interp(_) => {
@@ -2179,7 +2173,7 @@ fn resolve_color(
 
 /// A hex color, or the name of a token in the context's `theme` map
 /// whose value is one (a token may name another, a few levels deep).
-fn color_of(s: &str, ctx: &Context) -> Option<(u32, u8)> {
+fn color_of(s: &str, ctx: &Scope<'_>) -> Option<(u32, u8)> {
     let theme = match ctx.get("theme") {
         Some(Value::Map(t)) => Some(t),
         _ => None,
@@ -2214,13 +2208,14 @@ mod tests {
     #[test]
     fn parsed_expressions_are_kept_until_a_reload() {
         let f = paneld_config::source::FileId::default();
-        let ctx = Context::new();
+        let globals = Context::new();
+        let ctx = Scope::root(&globals);
         set_styles(Default::default());
         let a = parse_fragment_cached("1 + 1", f, 10);
         assert!(std::rc::Rc::ptr_eq(&a, &parse_fragment_cached("1 + 1", f, 10)), "a hit");
         // Same place, other text (an edited config): parsed afresh.
         let b = parse_fragment_cached("2 + 2", f, 10);
-        assert_eq!(eval(b.0.as_ref().unwrap(), &ctx), Ok(Value::Int(4)));
+        assert_eq!(eval_in(b.0.as_ref().unwrap(), &ctx), Ok(Value::Int(4)));
         // A reload empties the cache.
         set_styles(Default::default());
         let again = parse_fragment_cached("1 + 1", f, 10);

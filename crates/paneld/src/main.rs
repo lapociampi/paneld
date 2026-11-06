@@ -2290,6 +2290,13 @@ fn handle_request(
             m.insert("idle_ms".to_string(), Value::Int(paneld_ui::idle_hint_ms() as i64));
             // Full page renders since start: what the panel redrew.
             m.insert("renders".to_string(), Value::Int(RENDERS.load(std::sync::atomic::Ordering::Relaxed) as i64));
+            // ADR 0024: LVGL objects on the screen and its top layer
+            // (dialogs, toast), and the process's resident memory.
+            let nodes = screen.descendant_count() + screen.top_layer().descendant_count();
+            m.insert("nodes".to_string(), Value::Int(nodes as i64));
+            if let Some(kb) = rss_kb() {
+                m.insert("rss_kb".to_string(), Value::Int(kb));
+            }
             Ok(Value::Map(m))
         }
         other => Err(ctl::CtlError::msg(format!("unknown command `{other}`"))),
@@ -2328,6 +2335,13 @@ fn build_ctx(
     }
     clock::insert(&mut ctx);
     ctx
+}
+
+/// `VmRSS` of this process in KiB, for `ctl status` (`rss_kb`).
+fn rss_kb() -> Option<i64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = s.lines().find(|l| l.starts_with("VmRSS:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Full page renders since start, for `ctl status` (`renders`).
