@@ -803,3 +803,170 @@ lv_obj_t * lv_paneld_indev_pressed_obj(const lv_indev_t * indev)
     if(indev == NULL || indev->state != LV_INDEV_STATE_PRESSED) return NULL;
     return indev->pointer.act_obj;
 }
+
+/* A stash of animations taken off the list (see lv_paneld_anims_stash). */
+typedef struct {
+    uint32_t n;
+    lv_anim_t anims[1];
+} paneld_stash_t;
+
+static void collect_tree(lv_obj_t * obj, lv_obj_t *** arr, uint32_t * n, uint32_t * cap)
+{
+    if(*n == *cap) {
+        uint32_t more = *cap ? *cap * 2 : 64;
+        lv_obj_t ** grown = lv_realloc(*arr, more * sizeof(lv_obj_t *));
+        if(grown == NULL) return;
+        *arr = grown;
+        *cap = more;
+    }
+    (*arr)[(*n)++] = obj;
+    uint32_t cnt = lv_obj_get_child_count(obj);
+    for(uint32_t i = 0; i < cnt; i++) collect_tree(lv_obj_get_child(obj, (int32_t)i), arr, n, cap);
+}
+
+static bool in_tree(const void * var, lv_obj_t * const * arr, uint32_t n)
+{
+    for(uint32_t i = 0; i < n; i++) {
+        if((const void *)arr[i] == var) return true;
+    }
+    return false;
+}
+
+static bool stashable(const lv_anim_t * x, lv_anim_custom_exec_cb_t not_cb, lv_obj_t * const * arr, uint32_t n)
+{
+    /* An animation's var need not be an object: only a pointer equal
+     * to one of the tree's objects counts. */
+    return x->repeat_cnt == LV_ANIM_REPEAT_INFINITE && x->custom_exec_cb != not_cb && x->exec_cb != paneld_doomed &&
+           in_tree(x->var, arr, n);
+}
+
+void * lv_paneld_anims_stash(lv_obj_t * root, lv_anim_custom_exec_cb_t not_cb)
+{
+    lv_ll_t * ll = &LV_GLOBAL_DEFAULT()->anim_state.anim_ll;
+    lv_obj_t ** objs = NULL;
+    uint32_t n_objs = 0, cap = 0;
+    collect_tree(root, &objs, &n_objs, &cap);
+    uint32_t n = 0;
+    for(lv_anim_t * x = lv_ll_get_head(ll); x != NULL; x = lv_ll_get_next(ll, x)) {
+        if(stashable(x, not_cb, objs, n_objs)) n++;
+    }
+    paneld_stash_t * stash = NULL;
+    if(n > 0) stash = lv_malloc(sizeof(paneld_stash_t) + (n - 1) * sizeof(lv_anim_t));
+    if(stash != NULL) {
+        stash->n = 0;
+        for(lv_anim_t * x = lv_ll_get_head(ll); x != NULL; x = lv_ll_get_next(ll, x)) {
+            if(stash->n < n && stashable(x, not_cb, objs, n_objs)) {
+                stash->anims[stash->n++] = *x;
+                /* Taken off below by this mark, as it is: not ended. */
+                x->deleted_cb = NULL;
+                x->exec_cb = paneld_doomed;
+            }
+        }
+        for(uint32_t i = 0; i < stash->n; i++) lv_anim_delete(stash->anims[i].var, paneld_doomed);
+    }
+    lv_free(objs);
+    return stash;
+}
+
+void lv_paneld_anims_unstash(void * stash)
+{
+    paneld_stash_t * s = stash;
+    if(s == NULL) return;
+    for(uint32_t i = 0; i < s->n; i++) lv_anim_start(&s->anims[i]);
+    lv_free(s);
+}
+
+void lv_paneld_anims_free(void * stash)
+{
+    lv_free(stash);
+}
+
+void * lv_paneld_anims_stash_more(lv_obj_t * root, lv_anim_custom_exec_cb_t not_cb, void * old)
+{
+    paneld_stash_t * more = lv_paneld_anims_stash(root, not_cb);
+    paneld_stash_t * was = old;
+    if(more == NULL) return was;
+    if(was == NULL) return more;
+    paneld_stash_t * all = lv_malloc(sizeof(paneld_stash_t) + (more->n + was->n - 1) * sizeof(lv_anim_t));
+    if(all == NULL) {
+        lv_free(was);
+        return more;
+    }
+    all->n = 0;
+    for(uint32_t i = 0; i < more->n; i++) all->anims[all->n++] = more->anims[i];
+    /* An animation started again (its object restyled) replaces the
+     * one kept for it. */
+    for(uint32_t i = 0; i < was->n; i++) {
+        const lv_anim_t * a = &was->anims[i];
+        bool again = false;
+        for(uint32_t j = 0; j < more->n; j++) {
+            const lv_anim_t * b = &more->anims[j];
+            if(a->var == b->var && a->exec_cb == b->exec_cb && a->custom_exec_cb == b->custom_exec_cb) again = true;
+        }
+        if(!again) all->anims[all->n++] = *a;
+    }
+    lv_free(more);
+    lv_free(was);
+    return all;
+}
+
+static bool obj_under(lv_obj_t * obj, const lv_obj_t * root)
+{
+    for(; obj != NULL; obj = lv_obj_get_parent(obj)) {
+        if(obj == root) return true;
+    }
+    return false;
+}
+
+bool lv_paneld_indev_release_under(lv_obj_t * root)
+{
+    bool any = false;
+    for(lv_indev_t * i = lv_indev_get_next(NULL); i != NULL; i = lv_indev_get_next(i)) {
+        /* Only a press under way: `last_pressed` stays set after a tap
+         * ends, and resetting then would drop the next press. */
+        if(i->type != LV_INDEV_TYPE_POINTER || i->state != LV_INDEV_STATE_PRESSED) continue;
+        if(obj_under(i->pointer.act_obj, root) || obj_under(i->pointer.scroll_obj, root)) {
+            /* Sends the pressed object LV_EVENT_INDEV_RESET (it leaves
+             * its pressed state), and the rest of the touch goes
+             * nowhere. */
+            lv_indev_reset(i, NULL);
+            lv_indev_wait_release(i);
+            any = true;
+        }
+    }
+    return any;
+}
+
+uint32_t lv_paneld_tree_bytes(const lv_obj_t * obj)
+{
+    /* Each allocation: its size plus some malloc bookkeeping. */
+    const uint32_t over = 16;
+    const lv_obj_class_t * c = obj->class_p;
+    while(c != NULL && c->instance_size == 0) c = c->base_class;
+    uint32_t n = (c ? c->instance_size : sizeof(lv_obj_t)) + over;
+    lv_obj_t * o = (lv_obj_t *)obj;
+    if(obj->spec_attr != NULL) {
+        n += sizeof(lv_obj_spec_attr_t) + over;
+        n += obj->spec_attr->child_cnt * sizeof(lv_obj_t *) + over;
+        n += lv_obj_get_event_count(o) * (sizeof(void *) + 16 + over);
+    }
+    if(obj->style_cnt > 0) n += obj->style_cnt * sizeof(lv_obj_style_t) + over;
+    for(uint32_t i = 0; i < obj->style_cnt; i++) {
+        const lv_obj_style_t * st = &obj->styles[i];
+        if(st->is_local && st->style != NULL) {
+            n += sizeof(lv_style_t) + st->style->prop_cnt * (sizeof(lv_style_prop_t) + sizeof(lv_style_value_t)) + 2 * over;
+        }
+    }
+    if(lv_obj_check_type(obj, &lv_label_class)) {
+        const char * t = lv_label_get_text(o);
+        if(t != NULL) n += lv_strlen(t) + 1 + over;
+    }
+    if(lv_obj_check_type(obj, &lv_chart_class)) {
+        uint32_t series = 0;
+        for(lv_chart_series_t * s = lv_chart_get_series_next(o, NULL); s != NULL; s = lv_chart_get_series_next(o, s)) series++;
+        n += series * (lv_chart_get_point_count(o) * sizeof(int32_t) + 64 + over);
+    }
+    uint32_t cnt = lv_obj_get_child_count(obj);
+    for(uint32_t i = 0; i < cnt; i++) n += lv_paneld_tree_bytes(lv_obj_get_child(obj, (int32_t)i));
+    return n;
+}

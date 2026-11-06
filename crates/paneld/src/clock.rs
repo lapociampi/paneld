@@ -25,9 +25,21 @@ pub fn set_zone(zone: Zone) {
     *ZONE.write().unwrap_or_else(|e| e.into_inner()) = Some(zone);
 }
 
-/// Unix seconds now.
+/// Set by [`freeze`]: the time `now` reads (`i64::MIN`: the clock's).
+static FROZEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// Unix seconds now (as [`freeze`] holds it, if it does).
 pub fn unix_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+    match FROZEN.load(std::sync::atomic::Ordering::Relaxed) {
+        i64::MIN => SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64),
+        t => t,
+    }
+}
+
+/// `paneld shot --verify`: `now` reads `t` until `freeze(None)`, so a
+/// page and the fresh render it is compared with see the same second.
+pub fn freeze(t: Option<i64>) {
+    FROZEN.store(t.unwrap_or(i64::MIN), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `now` at Unix time `t` in `zone`.

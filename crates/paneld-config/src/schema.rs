@@ -130,6 +130,9 @@ enum ExpectedType {
     Offset,
     /// An integer of at least 1 (a line's or an arc's `thickness`).
     PositiveInt,
+    /// An integer from the first to the second, both included
+    /// (`app:page_cache`).
+    IntIn(i64, i64),
     /// An icon name (schema 8.3): a built-in, or any name when the
     /// active theme has an `icons` folder (its file may supply it).
     Icon,
@@ -611,6 +614,18 @@ const APP_SCHEMA: &BlockSchema = &BlockSchema {
         KeyRule {
             name: "max_running",
             ty: ExpectedType::Int,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "page_cache",
+            ty: ExpectedType::IntIn(0, 8),
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "page_cache_bytes",
+            ty: ExpectedType::Bytes,
             required: false,
             expr_ok: false,
         },
@@ -2943,6 +2958,10 @@ fn check_literal(text: &str, ty: ExpectedType) -> Result<(), String> {
             Some(n) if n >= 1 => Ok(()),
             _ => Err(format!("expected an integer of at least 1, got `{text}`")),
         },
+        ExpectedType::IntIn(lo, hi) => match parse_int(text) {
+            Some(n) if (lo..=hi).contains(&n) => Ok(()),
+            _ => Err(format!("expected an integer from {lo} to {hi}, got `{text}`")),
+        },
         ExpectedType::OneOf(allowed) => {
             if allowed.contains(&text) {
                 Ok(())
@@ -2997,6 +3016,7 @@ fn type_name(ty: ExpectedType) -> &'static str {
         ExpectedType::Tracks => "a count or a list of tracks",
         ExpectedType::Offset => "an offset",
         ExpectedType::PositiveInt => "an integer of at least 1",
+        ExpectedType::IntIn(..) => "an integer in its range",
         ExpectedType::Icon => "an icon name",
         ExpectedType::Font => "a font",
         ExpectedType::Background => "a background",
@@ -4678,6 +4698,9 @@ mod tests {
             ("app { timeout = soon }\n", "expected a duration"),
             ("app { max_running = x }\n", "an integer"),
             ("app { max_output = lots }\n", "a byte count"),
+            ("app { page_cache = 9 }\n", "expected an integer from 0 to 8, got `9`"),
+            ("app:page_cache = -1\n", "expected an integer from 0 to 8"),
+            ("app { page_cache_bytes = big }\n", "a byte count"),
             ("action a { goto = 1x }\n", "expected an identifier, got `1x`"),
             ("action a { refresh = 1x }\n", "expected an identifier or a list of identifiers, got `1x`"),
             ("page p { param x: int }\n", "`param` is not allowed in a `page` body (use a `component`)"),

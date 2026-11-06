@@ -123,4 +123,33 @@ void lv_paneld_size_again(lv_obj_t * obj);
  * NULL when it is up. */
 lv_obj_t * lv_paneld_indev_pressed_obj(const lv_indev_t * indev);
 
+/* Page cache (ADR 0024): the animations that run for good (a
+ * spinner's turn, a scrolling label) of the objects under `root`,
+ * those run by `not_cb` left out, taken off the animation list and
+ * kept as they are (NULL: none), so a page kept off screen costs no
+ * frames. */
+void * lv_paneld_anims_stash(lv_obj_t * root, lv_anim_custom_exec_cb_t not_cb);
+
+/* Start the animations of a stash again, each where it was, and free
+ * the stash. */
+void lv_paneld_anims_unstash(void * stash);
+
+/* Free a stash without starting its animations (their objects go). */
+void lv_paneld_anims_free(void * stash);
+
+/* `old` (a stash, or NULL) with the animations that run for good under
+ * `root` now taken off too (started again since: they replace those
+ * kept for the same object and step). */
+void * lv_paneld_anims_stash_more(lv_obj_t * root, lv_anim_custom_exec_cb_t not_cb, void * old);
+
+/* A finger (or the mouse) on an object under `root` is let go of: the
+ * object leaves its pressed state and gets nothing more of this touch
+ * (a page leaving the screen). Whether one was. */
+bool lv_paneld_indev_release_under(lv_obj_t * root);
+
+/* About how many bytes the objects under `root` (itself included)
+ * hold: the objects, their local styles, event lists, label text and
+ * chart points. */
+uint32_t lv_paneld_tree_bytes(const lv_obj_t * root);
+
 #endif

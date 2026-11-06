@@ -3086,6 +3086,83 @@ fn random_changes_update_the_examples_as_a_fresh_render_would_draw_them() {
 }
 
 #[test]
+fn random_changes_and_page_visits_show_kept_pages_as_a_fresh_render_would() {
+    // ADR 0024 page cache: the random changes also go to other pages and
+    // back, so they land on pages kept off screen; now and then the
+    // theme switches or the config reloads (which drop them). Every
+    // page shown from the cache is compared with a fresh render, and
+    // the picture now and then; with one seed taps and a finger held
+    // down too.
+    let d = tmp("fuzz-pages");
+    let lib = d.join("p.conf");
+    std::fs::write(&lib, "var x: int = 0\npage home { nav = 1; text { value = {{ vars.x }} } }\npage two { nav = 2; spinner { } }\n").unwrap();
+    // Pages that slide in (a page shown from the cache is compared
+    // before it moves).
+    let slide = d.join("slide.conf");
+    let cache_conf = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cache.conf")).unwrap();
+    std::fs::write(&slide, format!("theme t {{ page_transition = slide 200ms; motion = full }}\n{cache_conf}")).unwrap();
+    let mut configs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cache.conf"), lib, slide];
+    configs.extend(fuzz_configs());
+    let runs: Vec<_> = configs
+        .iter()
+        .flat_map(|conf| ["5", "17", "40"].map(|seed| (conf.clone(), seed)))
+        .enumerate()
+        .map(|(i, (conf, seed))| {
+            let out = d.join(format!("fuzz-pages-{i}.png"));
+            std::thread::spawn(move || {
+                let run = Command::new(env!("CARGO_BIN_EXE_paneld"))
+                    .arg("shot")
+                    .arg("-c")
+                    .arg(&conf)
+                    .arg("-o")
+                    .arg(&out)
+                    .args(["--no-sources", "--no-actions", "--settle", "50", "--verify", "--fuzz", "120", "--fuzz-pages", "--seed", seed])
+                    // A finger down and taps too (phase 2's touch rule).
+                    .args(if seed == "17" { &["--fuzz-taps"][..] } else { &[] })
+                    .env("PANELD_VERIFY_UPDATES", "1")
+                    .output()
+                    .expect("run paneld shot");
+                (conf, seed, run)
+            })
+        })
+        .collect();
+    for r in runs {
+        let (conf, seed, run) = r.join().unwrap();
+        assert!(run.status.success(), "{} seed {seed}: {}\n{}", conf.display(), run.status, String::from_utf8_lossy(&run.stderr));
+    }
+}
+
+#[test]
+fn pages_kept_with_large_images_go_when_the_image_cache_is_full() {
+    // ADR 0024 page cache: a page kept off screen holds its background
+    // images in the image cache (8 MiB). Three pages of 2.9 MB each are
+    // past it: the least recently shown one that holds images goes.
+    let d = tmp("cache-images");
+    for (name, rgb) in [("a", [255, 0, 0, 255]), ("b", [0, 255, 0, 255]), ("c", [0, 0, 255, 255])] {
+        write_png(&d.join(format!("{name}.png")), 4, 4, |_, _| rgb);
+    }
+    let conf = d.join("p.conf");
+    let pages = |size: &str| {
+        ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("page {n} {{ nav = {}; rect {{ {size}; background = {n}.png }} }}\n", i + 1))
+            .collect::<String>()
+    };
+    // Bottom bar: a, b, c; back to a (`a` went on `c`, `b` goes now),
+    // and to `c`, kept.
+    let taps = ["--tap", "400,450", "--tap", "664,450", "--tap", "136,450", "--tap", "664,450"];
+    std::fs::write(&conf, pages("width = 1000; height = 720")).unwrap();
+    let err = shot_perf(&conf, &taps);
+    assert!(err.contains("perf build page=a same=false"), "`a` was kept with its image:\n{err}");
+    assert!(err.contains("perf cached page=c"), "`c` was not kept:\n{err}");
+    // Small ones: both kept.
+    std::fs::write(&conf, pages("width = 100; height = 100")).unwrap();
+    let err = shot_perf(&conf, &taps);
+    assert!(err.contains("perf cached page=a") && err.contains("perf cached page=c"), "pages were not kept:\n{err}");
+}
+
+#[test]
 fn a_spinner_shown_again_by_an_update_keeps_turning() {
     // Review: setting a node up again deleted LVGL's own animations; the
     // verify dump counts those that run for good (a spinner's turn).
@@ -3610,4 +3687,186 @@ fn keypads_in_a_column_as_tall_as_its_content_keep_their_size() {
     )
     .unwrap();
     shot(&conf, &["--set", "n=1", "--set", "n=2"]);
+}
+
+#[test]
+fn a_page_kept_in_the_cache_shows_a_call_that_ended_while_it_was_away() {
+    // ADR 0024 page cache: `home` is left while its button's call runs
+    // (spinner and all), the call ends while it is kept off screen, and
+    // going back shows it ended, as a fresh render would (verify), with
+    // nothing built.
+    let d = tmp("cache-call");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "action slow { busy = wait; run = sleep 0.6 }\n\
+         action spin { run = sleep 0.6 }\n\
+         page home {\n\
+             button { width = 200; height = 60; label = go; on_tap = slow }\n\
+             button { width = 200; height = 60; label = away; on_tap { goto = two } }\n\
+             button { width = 200; height = 60; label = spin; on_tap = spin }\n\
+         }\n\
+         page two { button { width = 200; height = 60; label = back; on_tap { goto = home } } }\n",
+    )
+    .unwrap();
+    let err = shot_perf(
+        &conf,
+        &["--verify", "--tap", "100,95", "--tap", "100,225", "--tap", "100,160", "--wait", "1200", "--tap", "100,95"],
+    );
+    assert!(err.contains("perf cached page=home"), "`home` was not shown from the cache:\n{err}");
+    assert_eq!(err.matches("perf build page=home").count(), 0, "`home` was built again:\n{err}");
+    // And back while they still run: shown running, then their end.
+    shot_perf(&conf, &["--verify", "--tap", "100,95", "--tap", "100,225", "--tap", "100,160", "--tap", "100,95", "--wait", "1200"]);
+}
+
+#[test]
+fn a_finger_on_a_page_that_leaves_does_not_change_it_when_lifted() {
+    // A hold that goes to another page leaves `home` under the finger;
+    // kept in the cache (hidden), its slider must not get the release
+    // (its `on_change`: `n` stays 0 on `two`).
+    let d = tmp("cache-hold");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var n: int = 0\n\
+         page home { slider { width = 300; on_hold { goto = two }; on_change { set { n = {{ value }} } } } }\n\
+         page two { text { value = {{ vars.n }}; font = montserrat 48 } }\n",
+    )
+    .unwrap();
+    let held = shot(&conf, &["--hold", "200,77"]);
+    let fresh = shot(&conf, &["--page", "two"]);
+    assert!(held.rgb == fresh.rgb, "the page left took the release");
+}
+
+#[test]
+fn a_change_held_under_a_finger_lands_on_the_page_kept_when_it_leaves() {
+    // ADR 0024 phase 2 + 3: with a finger on the slider, the `repeat`'s
+    // new items wait for the release (held); the page is left before
+    // that, finger still down. Kept in the cache, it has them pending:
+    // back on it, they show (verify), and nothing is built.
+    let d = tmp("cache-held");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var n: int = 1\n\
+         page home {\n\
+             slider { width = 300 }\n\
+             repeat i in {{ vars.n == 1 ? [1] : [1, 2, 3] }} { text { value = {{ i }} } }\n\
+         }\n\
+         page two { text { value = two } }\n",
+    )
+    .unwrap();
+    let err = shot_perf(&conf, &["--verify", "--down", "200,77", "--set", "n=3", "--goto", "two", "--up", "--goto", "home"]);
+    assert!(err.contains("held=true"), "the change was not held:\n{err}");
+    assert!(err.contains("perf cached page=home"), "`home` was not shown from the cache:\n{err}");
+}
+
+#[test]
+fn a_page_of_another_shape_while_kept_is_built_again_in_place_and_dropped_once() {
+    // A QR code with and without data are other shapes (phase 2): a
+    // change landing while `home` is kept builds that node again when
+    // it shows, off-page objects and all; then `home` is dropped (two
+    // pages kept at most) and built again. Verify after each step, and
+    // LVGL logs no error (an object freed twice would).
+    let d = tmp("cache-shape");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "app:page_cache = 2\n\
+         var q: string = \"\"\n\
+         page home { qr { size = 80; data = {{ vars.q }} } }\n\
+         page two { text { value = two } }\n\
+         page three { text { value = three } }\n",
+    )
+    .unwrap();
+    let err = shot_perf(
+        &conf,
+        &["--verify", "--goto", "two", "--set", "q=\"x\"", "--goto", "home", "--goto", "two", "--set", "q=\"\"", "--goto", "three", "--goto", "home"],
+    );
+    assert!(err.contains("perf cached page=home"), "`home` was not shown from the cache:\n{err}");
+    assert!(err.contains("perf build page=home same=false"), "`home` was not dropped:\n{err}");
+}
+
+#[test]
+fn a_chart_that_reads_a_change_but_shows_the_same_is_left_as_it_is() {
+    // Found by `--fuzz-pages`: an update walked into a chart whose
+    // inputs hashed as before and drew its `series` blocks as nodes of
+    // their own, so the page was built again (a page shown from the
+    // cache too).
+    let d = tmp("chart-same");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var x: int = 0\n\
+         page home { column { chart { width = 200; height = 60; series { values = {{ [vars.x > 100 ? 9 : 1, 2] }} } } } }\n",
+    )
+    .unwrap();
+    let err = shot_perf(&conf, &["--verify", "--set", "x=1", "--set", "x=2"]);
+    assert!(!err.contains("perf rebuild") && !err.contains("perf build"), "the page was built again:\n{err}");
+}
+
+#[test]
+fn the_image_budget_drops_only_as_many_kept_pages_as_it_needs() {
+    // Review: past the image cache's budget every kept page with an
+    // image went, not only enough of them. Seven pages of one 1.5 MB
+    // image each (800x480), up to eight kept: 8 MiB holds five, the one
+    // shown and four kept. With a theme `background_image` all show too,
+    // dropping a page does not free that one: three kept.
+    let d = tmp("cache-image-budget");
+    for i in 1..=7u8 {
+        write_png(&d.join(format!("b{i}.png")), 4, 4, |_, _| [i * 30, 0, 0, 255]);
+    }
+    write_png(&d.join("shared.png"), 4, 4, |_, _| [0, 0, 200, 255]);
+    let pages: String = (1..=7)
+        .map(|i| format!("page p{i} {{ nav = {i}; column {{ width = 800; height = 480; background = b{i}.png; text {{ value = p{i} }} }} }}\n"))
+        .collect();
+    let steps: Vec<String> = (2..=7).flat_map(|i| ["--goto".to_string(), format!("p{i}")]).collect();
+    let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+    for (theme, kept) in [("", 4), ("theme t { background_image = shared.png }\n", 3)] {
+        let conf = d.join("p.conf");
+        std::fs::write(&conf, format!("app:page_cache = 8\n{theme}{pages}")).unwrap();
+        let err = shot_perf(&conf, &[&["--no-sources"][..], &steps].concat());
+        assert!(err.contains(&format!("cached_pages={kept} ")), "{theme}: not {kept} kept:\n{}", err.lines().filter(|l| l.starts_with("perf end")).collect::<String>());
+    }
+}
+
+#[test]
+fn a_kept_page_keeps_where_it_was_scrolled() {
+    // ADR 0024 page cache: a page comes back as it was left, scrolled
+    // too; `--verify` scrolls the fresh render the same way.
+    let d = tmp("cache-scroll");
+    let conf = d.join("p.conf");
+    let rows: String = (0..30).map(|i| format!("text {{ value = row {i} }}\n")).collect();
+    std::fs::write(
+        &conf,
+        format!("page home {{ nav = 1; scroll {{ width = 300; height = 250; column {{ {rows} }} }} }}\npage two {{ nav = 2; text {{ value = two }} }}\n"),
+    )
+    .unwrap();
+    let drag = ["--down", "100,250", "--down", "100,200", "--down", "100,150", "--down", "100,100", "--up"];
+    let scrolled = shot(&conf, &drag);
+    let unscrolled = shot(&conf, &[]);
+    assert!(scrolled.rgb != unscrolled.rgb, "the drag did not scroll");
+    let back = shot(&conf, &[&["--verify"][..], &drag, &["--goto", "two", "--goto", "home"]].concat());
+    assert!(back.rgb == scrolled.rgb, "the page came back scrolled otherwise");
+}
+
+#[test]
+fn a_keypad_that_lost_its_focus_to_a_tap_compares_as_a_fresh_one() {
+    // Review (a rare `--fuzz-taps` flake): a tap on a keypad's field and
+    // then elsewhere takes its focus (LVGL), and with it the cursor's
+    // blink. The focus is the user's, so is that blink: verify left the
+    // focus out but counted the blink.
+    let d = tmp("keypad-focus");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var n: int = 1\n\
+         page home {\n\
+             keypad { length = 4 }\n\
+             text { value = {{ vars.n }} }\n\
+             button { width = 120; height = 40; label = other }\n\
+         }\n",
+    )
+    .unwrap();
+    shot(&conf, &["--tap", "140,85", "--tap", "70,370", "--set", "n=2"]);
 }

@@ -466,11 +466,15 @@ Rotation: `fbdev` rotates each drawn area in LVGL's driver; `drm` always draws i
 | `timeout` | duration | 10s, for commands |
 | `max_output` | bytes | `1MiB` of stdout per command |
 | `max_running` | int | 8 commands at once |
+| `page_cache` | int, 0 to 8 | 3: pages kept built for going back, the one on screen included; 0 (or 1) keeps none |
+| `page_cache_bytes` | bytes | `1MiB` for the pages kept off screen (estimated) |
 | `state` | path | `/var/lib/paneld/state` |
 | `log` | `error`, `warn`, `info`, `debug` | `info` |
 | `action_log` | path | `/var/log/paneld/actions.log` |
 | `socket` | path | `/run/paneld/ctl.sock` |
 | `shell` | path | none: `run` never uses one unless written |
+
+A page left is kept, hidden, with its objects ([ADR 0024](decisions/0024-in-place-updates.md)); going back to it updates it with what changed meanwhile instead of building it again, and it comes back as it was left (scroll position, digits typed into a keypad). Least recently shown pages go first, and those holding background images when the image cache (8 MiB) is full. A reload and a theme switch drop them all.
 
 ## 16. Expression environment
 

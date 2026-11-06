@@ -83,6 +83,8 @@ enum ShotStep {
     /// `value` (a number, `true` / `false`, `@FILE` of JSON, else text),
     /// as a poll gives.
     Source { name: String, value: String },
+    /// `--goto page`: show a page, as `paneld ctl goto` does.
+    Goto(String),
 }
 
 /// `paneld shot`: render the config headless to a PNG.
@@ -111,6 +113,9 @@ struct ShotOpts {
     /// as done (taps on a config whose actions reach real devices).
     no_actions: bool,
     seed: u64,
+    /// The random changes also go to other pages (and back), switch the
+    /// theme and reload the config (the page cache, ADR 0024).
+    fuzz_pages: bool,
     /// Run no source commands (values come from `--source` / `--fuzz`).
     no_sources: bool,
 }
@@ -129,6 +134,7 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
         fuzz_taps: false,
         no_actions: false,
         seed: 1,
+        fuzz_pages: false,
         no_sources: false,
     };
     let mut i = 0;
@@ -208,12 +214,14 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
                     ShotStep::Source { name: k, value: value.to_string() }
                 });
             }
+            "--goto" => o.taps.push(ShotStep::Goto(val(&mut i, a)?)),
             "--verify" => o.verify = true,
             "--no-sources" => o.no_sources = true,
             "--fuzz" => o.fuzz = val(&mut i, a)?.parse().map_err(|_| "bad `--fuzz` count")?,
             "--fuzz-taps" => o.fuzz_taps = true,
             "--no-actions" => o.no_actions = true,
             "--seed" => o.seed = val(&mut i, a)?.parse().map_err(|_| "bad `--seed`")?,
+            "--fuzz-pages" => o.fuzz_pages = true,
             s => return Err(format!("unexpected argument `{s}` to `shot`")),
         }
         i += 1;
@@ -313,9 +321,10 @@ Usage:
   paneld shot -o FILE.png [--page P] [--size WxH] [--settle MS]
               [--rotation DEG] [--tap X,Y | --hold X,Y | --wait MS
                | --down X,Y | --up
-               | --set VAR=VALUE | --source NAME=VALUE]... [--verify]
-              [--fuzz N [--seed S] [--fuzz-taps]] [--no-sources]
-              [--no-actions]
+               | --set VAR=VALUE | --source NAME=VALUE | --goto PAGE]...
+              [--verify]
+              [--fuzz N [--seed S] [--fuzz-taps] [--fuzz-pages]]
+              [--no-sources] [--no-actions]
                                       Render the config headless to a PNG,
                                       after the given steps (runs sources
                                       and touched actions for real);
@@ -734,8 +743,13 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     }
     let dirty = live.rebuild || !live.changes.is_empty();
     // Asleep: no redraws (ADR 0001, idle means asleep); what changed
-    // is kept for the wake, which builds the page afresh.
+    // is kept for the wake, which updates the page with every value at
+    // once (ADR 0024). Awake with nothing to draw, the next change
+    // moves as any other.
     if !dirty || live.screen.asleep() {
+        if !live.screen.asleep() {
+            live.instant = false;
+        }
         return;
     }
     // A page coming in is not redrawn under way: the change shows
@@ -748,7 +762,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // release wakes the loop). An update goes ahead, leaving what is
     // held and any change of structure for then (ADR 0024, "Touch").
     // A navigation goes ahead.
-    if touch && (live.rebuild || live.instant || live.release_fonts || !updates_on()) {
+    if touch && (live.rebuild || live.release_fonts || !updates_on()) {
         return;
     }
     let perf_t0 = perf_on().then(std::time::Instant::now);
@@ -793,13 +807,26 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     let perf_ctx = lap(&mut perf_lap);
     paneld_ui::set_call_states(live.calls.values().cloned().collect());
     let same_page = live.rendered_page == live.current_page;
+    // The pages kept off screen (ADR 0024, page cache) have what they
+    // read of this pass's changes pending, for when they show again.
+    paneld_ui::cache::note(&live.changes);
     // ADR 0024: a value change updates the page in place; a navigation,
-    // a wake, a theme switch, or what an update cannot do builds it.
-    let mut full = live.rebuild || !same_page || live.instant || live.release_fonts || !updates_on();
+    // a wake, a theme switch, or what an update cannot do builds it (a
+    // navigation to a page kept in the cache updates that one).
+    let mut full = live.rebuild || !same_page || live.release_fonts || !updates_on();
     if !full {
         let changes = std::mem::take(&mut live.changes);
         let made_before = paneld_ui::nodes::made_count();
-        match paneld_ui::update_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, &changes) {
+        // After a sleep: every value at once.
+        if live.instant {
+            paneld_ui::motion::next_render_instant();
+        }
+        let updated = paneld_ui::update_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, &changes);
+        paneld_ui::motion::cancel_instant();
+        if !matches!(updated, paneld_ui::Updated::Rebuild(_)) {
+            live.instant = false;
+        }
+        match updated {
             paneld_ui::Updated::Nothing => {
                 // Nothing on the page reads it: so says a fresh render too
                 // (once nothing waits for a release).
@@ -864,7 +891,10 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     }
     if full {
         live.rebuild = false;
-        live.changes = paneld_ui::Changes::default();
+        // What changed: the page left keeps it pending if the cache
+        // keeps it (what waited for a finger's release is in it: a
+        // navigation is not a touch on the page drawn).
+        let changes = std::mem::take(&mut live.changes);
         live.held = paneld_ui::Changes::default();
         // A poll landing mid-entry must not wipe digits the user
         // is typing into a keypad on the same page.
@@ -882,31 +912,74 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         } else {
             paneld_ui::motion::Settings::from_theme(Some(&live.theme)).page_transition()
         };
-        if transition.is_some() {
-            paneld_ui::begin_page_change(screen);
-        } else {
-            screen.clear_children();
-        }
         // After a theme switch: free the old theme's fonts, now that no
         // object uses them (the toast goes too; no dialog is up here),
         // as a reload does. Else switching themes fills the font cache.
-        if std::mem::take(&mut live.release_fonts) {
+        let old = if std::mem::take(&mut live.release_fonts) {
+            screen.clear_children();
             screen.top_layer().clear_children();
             live.toast_until = None;
             screen.release_fonts();
+            Vec::new()
+        } else {
+            // The page left is kept in the cache (ADR 0024) on a
+            // navigation, unless every change builds pages.
+            let keep = !same_page && updates_on();
+            paneld_ui::cache::leave(screen, keep, &changes, drawn_at, transition.is_some())
+        };
+        if transition.is_some() {
+            paneld_ui::begin_page_change(&old);
         }
         let perf_clear = lap(&mut perf_lap);
-        paneld_ui::render_page(
-            &live.ui_doc,
-            &live.current_page,
-            &ctx,
-            &live.event_tx,
-            screen,
-        );
+        // A page kept in the cache: updated for what changed meanwhile.
+        let shown = if same_page { None } else { paneld_ui::cache::show(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, drawn_at) };
+        let cached = match shown {
+            Some((paneld_ui::Updated::Rebuild(why), _)) => {
+                if perf_on() {
+                    eprintln!("perf rebuild page={} why=\"{why}\" cached=true", live.current_page);
+                }
+                None
+            }
+            Some((updated, pending)) => {
+                // A finger still down (it went to the page left): what
+                // its changes would restructure waits for the release,
+                // as on any page (ADR 0024, "Touch").
+                if matches!(updated, paneld_ui::Updated::Done { held: true, .. }) {
+                    live.held.merge(pending);
+                }
+                Some(updated)
+            }
+            None => None,
+        };
+        if cached.is_none() {
+            paneld_ui::render_page(
+                &live.ui_doc,
+                &live.current_page,
+                &ctx,
+                &live.event_tx,
+                screen,
+            );
+        }
+        paneld_ui::cache::enforce();
+        // The pages kept off screen stay still, whatever was built.
+        paneld_ui::cache::restash();
         let perf_render = lap(&mut perf_lap);
         let perf_fine = if perf_t0.is_some() { paneld_ui::perf::take() } else { String::new() };
         if same_page {
             paneld_ui::restore_inputs(&typed);
+        }
+        // Compared before the transition moves it.
+        if cached.is_some() && verify_on() {
+            if let Err(e) = paneld_ui::verify_held() {
+                eprintln!("paneld: verify: page `{}` shown from the cache: {e}", live.current_page);
+                std::process::exit(3);
+            }
+        }
+        if cached.is_some() && verify_on() && live.held.is_empty() {
+            if let Err(e) = paneld_ui::verify_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, screen) {
+                eprintln!("paneld: verify: page `{}` shown from the cache differs from a fresh render: {e}", live.current_page);
+                std::process::exit(3);
+            }
         }
         if let Some((slide, ms)) = transition {
             let back = live.went_back
@@ -914,26 +987,43 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                     (nav_pos(&live.ui_doc, &live.current_page), nav_pos(&live.ui_doc, &live.rendered_page)),
                     (Some(to), Some(from)) if to < from
                 );
-            paneld_ui::run_page_transition(screen, slide, back, ms);
+            let new = paneld_ui::cache::shown_holder();
+            paneld_ui::run_page_transition(screen, new.as_ref(), slide, back, ms);
         }
         live.went_back = false;
         if let Some(t0) = perf_t0 {
             let perf_tr = lap(&mut perf_lap);
-            eprintln!(
-                "perf build page={} same={} us={} ctx={} clear={} render={} [{}] tr={} at={}",
-                live.current_page,
-                same_page,
-                t0.elapsed().as_micros(),
-                perf_ctx,
-                perf_clear,
-                perf_render,
-                perf_fine,
-                perf_tr,
-                paneld_ui::perf::mono_us(),
-            );
+            if let Some(updated) = cached {
+                eprintln!(
+                    "perf cached page={} us={} ctx={} clear={} update={} [{}] {updated:?} tr={} at={}",
+                    live.current_page,
+                    t0.elapsed().as_micros(),
+                    perf_ctx,
+                    perf_clear,
+                    perf_render,
+                    perf_fine,
+                    perf_tr,
+                    paneld_ui::perf::mono_us(),
+                );
+            } else {
+                eprintln!(
+                    "perf build page={} same={} us={} ctx={} clear={} render={} [{}] tr={} at={}",
+                    live.current_page,
+                    same_page,
+                    t0.elapsed().as_micros(),
+                    perf_ctx,
+                    perf_clear,
+                    perf_render,
+                    perf_fine,
+                    perf_tr,
+                    paneld_ui::perf::mono_us(),
+                );
+            }
+        }
+        if cached.is_none() {
+            RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         live.rendered_page = live.current_page.clone();
-        RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         visible::show(&live.current_page);
     }
     live.ago_due = min_due(paneld_ui::page_ago_due(), age_due(live));
@@ -1465,7 +1555,10 @@ fn setup_live_state(
         &vars_shared,
         Some(&alerts_engine),
     );
+    // The pages kept off screen go with the rest (ADR 0024).
     screen.clear_children();
+    let (cache_pages, cache_bytes) = page_cache_limits(&doc);
+    paneld_ui::cache::set_limits(cache_pages, cache_bytes);
     // A toast from before a reload belongs to the old state.
     screen.top_layer().clear_children();
     // No object points at a font now: free them, so fonts tried across
@@ -1717,12 +1810,14 @@ fn screen_step(live: &mut LiveState) -> bool {
             }
             screen::Effect::Wake => {
                 paneld_ui::hide_sleep_cover();
+                // What changed while asleep is updated in place, every
+                // value at once (ADR 0024); the clock and `ago()` texts
+                // see their time has passed in this same pass.
                 live.instant = true;
                 visible::set_asleep(false);
                 // An alert wake has no touch: restart the idle clock.
                 paneld_ui::trigger_activity();
                 screen_command(&live.screen, live.screen.cfg.on.clone(), None);
-                redraw = true;
             }
             screen::Effect::Dim(level) => {
                 screen_command(&live.screen, live.screen.cfg.dim.clone(), Some(level));
@@ -2158,6 +2253,39 @@ fn show_confirm_modal(
     box_.msgbox_add_confirm_button("OK", true, sink.clone());
 }
 
+/// Schema 15: `app:page_cache` and `app:page_cache_bytes` (ADR 0024),
+/// the defaults where unset (the check refuses bad values; one that
+/// gets here anyway keeps the default). The last one written wins.
+fn page_cache_limits(doc: &paneld_config::parse::Document) -> (usize, usize) {
+    use paneld_config::parse::{AssignTarget, Item};
+    let (mut pages, mut bytes) = (paneld_ui::cache::DEFAULT_PAGES, paneld_ui::cache::DEFAULT_BYTES);
+    // After `apply_overrides` all `app` options sit in one `app` block.
+    for item in &doc.items {
+        let Item::Block(b) = item else { continue };
+        if b.kind.text != "app" || b.name.is_some() {
+            continue;
+        }
+        for inner in &b.items {
+            let Item::Assign(a) = inner else { continue };
+            let AssignTarget::Simple { key } = &a.target else { continue };
+            match key.text.as_str() {
+                "page_cache" => {
+                    if let Ok(n) = a.value.text.trim().parse::<usize>() {
+                        pages = n.min(paneld_ui::cache::MAX_PAGES);
+                    }
+                }
+                "page_cache_bytes" => {
+                    if let Some(n) = paneld_config::value::parse_bytes(&a.value.text) {
+                        bytes = n as usize;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (pages, bytes)
+}
+
 /// Schema 15: `app:start_page`, else the first page in `nav` order,
 /// else the first page defined (else `home`, which then shows "not
 /// found").
@@ -2286,16 +2414,13 @@ fn run_shot(o: ShotOpts) -> ExitCode {
     let mut verified = Ok(());
     let mut check = |live: &mut LiveState, mem: &mut paneld_ui::MemDisplay| {
         if o.verify && verified.is_ok() {
-            // A clock tick since the last pass is drawn first.
+            // The clock stands still from here to the fresh render: a
+            // tick since the last pass is drawn first, and the fresh page
+            // shows the same second (not one that turned meanwhile).
+            clock::freeze(Some(clock::unix_now()));
             process(live, &screen);
-            let t = clock::unix_now();
             verified = verify_picture(&ui, mem, live, &screen);
-            // The clock moved on meanwhile: the fresh page shows a time
-            // the page is drawn with only once the loop sees the tick.
-            if verified.is_err() && clock::unix_now() != t {
-                process(live, &screen);
-                verified = verify_picture(&ui, mem, live, &screen);
-            }
+            clock::freeze(None);
         }
     };
     check(&mut live, &mut mem);
@@ -2321,6 +2446,12 @@ fn run_shot(o: ShotOpts) -> ExitCode {
                 settle(&mut live, o.settle_ms);
             }
             ShotStep::Wait(ms) => settle(&mut live, *ms),
+            ShotStep::Goto(page) => {
+                if go_to(&mut live, page) {
+                    live.rebuild = true;
+                }
+                settle(&mut live, o.settle_ms);
+            }
             ShotStep::Set { var, value } => {
                 if let Err(e) = shot_set(&mut live, var, value) {
                     eprintln!("paneld shot: --set {var}: {e}");
@@ -2350,7 +2481,7 @@ fn run_shot(o: ShotOpts) -> ExitCode {
         let mut runs = Vec::new();
         let (w, h) = mem.size();
         let mut held_for = 0;
-        for _ in 0..o.fuzz {
+        for n in 0..o.fuzz {
             let at = |rng: &mut u64| ((next_rand(rng) % w as u64) as i32, (next_rand(rng) % h as u64) as i32);
             // A finger put down for one to four passes' changes (ADR
             // 0024, "Touch"), dragged now and then; or a tap (which may
@@ -2371,6 +2502,9 @@ fn run_shot(o: ShotOpts) -> ExitCode {
             for _ in 0..1 + next_rand(&mut rng) % 3 {
                 fuzz_step(&mut live, &mut rng, &mut runs);
             }
+            if o.fuzz_pages {
+                fuzz_page(&mut live, &mut rng, &o.config, &screen);
+            }
             settle(&mut live, 40);
             if let Some((x, y)) = finger {
                 held_for = held_for.saturating_sub(1);
@@ -2386,10 +2520,16 @@ fn run_shot(o: ShotOpts) -> ExitCode {
                 mem.set_pointer(x, y, false);
                 settle(&mut live, 60);
             }
-            // A tap that went to another page: back to the one under test.
-            if let Some(page) = o.page.as_ref().filter(|p| finger.is_none() && live.current_page != **p) {
+            // A tap that went to another page: back to the one under test
+            // (with `--fuzz-pages`, pages change on purpose).
+            if let Some(page) = o.page.as_ref().filter(|p| !o.fuzz_pages && finger.is_none() && live.current_page != **p) {
                 let _ = live.event_tx.send(paneld_ui::UiEvent::Goto { page: page.clone() });
                 settle(&mut live, 60);
+            }
+            // Now and then the picture too, once the page is in.
+            if o.fuzz_pages && finger.is_none() && n % 10 == 9 {
+                settle(&mut live, 200);
+                check(&mut live, &mut mem);
             }
         }
         if let Some((x, y)) = finger.take() {
@@ -2406,6 +2546,11 @@ fn run_shot(o: ShotOpts) -> ExitCode {
         return ExitCode::from(3);
     }
 
+    if perf_on() {
+        // What it ended with, to compare runs (`app:page_cache`).
+        let (cached, bytes) = paneld_ui::cache::stats();
+        eprintln!("perf end rss_kb={} cached_pages={cached} cache_bytes={bytes} cache_hits={}", rss_kb().unwrap_or(0), paneld_ui::cache::hits());
+    }
     let (w, h) = mem.size();
     let png = png::encode_rgb(w, h, &mem.rgb());
     live.sources_shutdown.stop();
@@ -2703,14 +2848,68 @@ fn fuzz_step(live: &mut LiveState, rng: &mut u64, runs: &mut Vec<(String, source
     }
 }
 
+/// `paneld shot --fuzz-pages`: now and then another page (or `back`),
+/// seldom a theme switch or a reload, so the changes of
+/// [`fuzz_step`] land on pages kept off screen (ADR 0024, page cache).
+fn fuzz_page(live: &mut LiveState, rng: &mut u64, config: &std::path::Path, screen: &paneld_ui::ui::Obj<'_>) {
+    let pick = |rng: &mut u64, n: usize| (next_rand(rng) as usize) % n.max(1);
+    let pages: Vec<String> = live
+        .ui_doc
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            paneld_config::parse::Item::Block(b) if b.kind.text == "page" => b.name.as_ref().map(|n| n.text.clone()),
+            _ => None,
+        })
+        .collect();
+    match next_rand(rng) % 24 {
+        0..=7 => {
+            let page = if next_rand(rng) % 4 == 0 { "back".to_string() } else { pages[pick(rng, pages.len())].clone() };
+            if go_to(live, &page) {
+                live.rebuild = true;
+            }
+        }
+        8 => {
+            let mut themes: Vec<String> = live
+                .doc
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    paneld_config::parse::Item::Block(b) if b.kind.text == "theme" => b.name.as_ref().map(|n| n.text.clone()),
+                    _ => None,
+                })
+                .collect();
+            themes.push("dark".into());
+            themes.push("light".into());
+            themes.retain(|t| paneld_config::check_theme_switch(&live.doc, t).is_ok());
+            if themes.is_empty() || next_rand(rng) % 3 == 0 {
+                if live.ctl_theme.take().is_some() {
+                    apply_active_theme(live);
+                }
+            } else {
+                live.ctl_theme = Some(themes[pick(rng, themes.len())].clone());
+                apply_active_theme(live);
+            }
+        }
+        9 if reload(live, config, screen).is_err() => eprintln!("paneld shot: --fuzz-pages: the reload failed"),
+        _ => {}
+    }
+}
+
 /// `paneld shot --verify`: the page as drawn now, and the same page
 /// built afresh on a scratch screen, pixel for pixel (animations at
-/// their end). Skipped while a dialog is up (the fresh page has none).
+/// their end). Skipped while a dialog is up (the fresh page has none),
+/// and while the page asked for is not drawn yet (asleep, a transition).
 fn verify_picture(ui: &paneld_ui::Ui, mem: &mut paneld_ui::MemDisplay, live: &LiveState, screen: &paneld_ui::ui::Obj<'_>) -> Result<(), String> {
     let exists = live.ui_doc.items.iter().any(|it| {
         matches!(it, paneld_config::parse::Item::Block(b) if b.kind.text == "page" && b.name.as_ref().is_some_and(|n| n.text == live.current_page))
     });
-    if !exists || live.pending.is_some() || paneld_ui::page_transition_running() {
+    if !exists
+        || live.pending.is_some()
+        || paneld_ui::page_transition_running()
+        || live.screen.asleep()
+        || live.rendered_page != live.current_page
+    {
         return Ok(());
     }
     // Let what moves (a value, a toggle's knob) arrive; what never
@@ -2727,6 +2926,9 @@ fn verify_picture(ui: &paneld_ui::Ui, mem: &mut paneld_ui::MemDisplay, live: &Li
     paneld_ui::set_call_states(live.calls.values().cloned().collect());
     let fresh = paneld_ui::scratch_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx);
     paneld_ui::show_screen(&fresh);
+    // Scrolled as the page shown is (a page kept in the cache keeps
+    // where it was scrolled to).
+    paneld_ui::match_scroll(&fresh);
     run(1500);
     let mut built = mem.rgb();
     restless.extend(paneld_ui::restless_areas(&fresh));
@@ -2819,6 +3021,10 @@ fn reload(
             paneld_ui::set_wake_sink(fresh.event_tx.clone());
             fresh.running = std::mem::take(&mut live.running);
             fresh.calls = std::mem::take(&mut live.calls);
+            // The page was drawn with the call states of the last pass:
+            // one that changed since (its change is dropped with the
+            // old state) shows at the next.
+            fresh.changes.call("*");
             fresh.stale_events = std::mem::take(&mut live.stale_events);
             let (tx, rx) = std::sync::mpsc::channel();
             drop(tx);
@@ -3047,6 +3253,13 @@ fn handle_request(
             let (records, made) = paneld_ui::nodes::table_size();
             m.insert("node_records".to_string(), Value::Int(records as i64));
             m.insert("node_objects".to_string(), Value::Int(made as i64));
+            // The page cache (ADR 0024): pages kept off screen, their
+            // estimated bytes, and pages shown from it since start.
+            let (cached, cache_bytes) = paneld_ui::cache::stats();
+            m.insert("cached_pages".to_string(), Value::Int(cached as i64));
+            m.insert("cache_bytes".to_string(), Value::Int(cache_bytes as i64));
+            m.insert("cache_hits".to_string(), Value::Int(paneld_ui::cache::hits() as i64));
+            m.insert("objects_made".to_string(), Value::Int(paneld_ui::nodes::made_count() as i64));
             // ADR 0024: LVGL objects on the screen and its top layer
             // (dialogs, toast), and the process's resident memory.
             let nodes = screen.descendant_count() + screen.top_layer().descendant_count();

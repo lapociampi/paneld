@@ -10,13 +10,12 @@ fn a_fade_starts_partly_in_and_lasts_its_duration() {
     let ui = Ui::init().unwrap();
     let _mem = ui.open_memory_display(40, 20);
     let screen = ui.screen();
-    screen.new_page_holder();
+    let old = screen.new_page_holder();
     ui.advance(40);
-    paneld_ui::begin_page_change(&screen);
-    screen.new_page_holder();
-    // The new page is the last child but the tap blocker added next.
-    let new = unsafe { sys::lv_obj_get_child(sys::lv_screen_active(), 1) };
-    paneld_ui::run_page_transition(&screen, false, false, 120);
+    paneld_ui::begin_page_change(&[old]);
+    let page = screen.new_page_holder();
+    let new = page.raw();
+    paneld_ui::run_page_transition(&screen, Some(&page), false, false, 120);
     let opa = || unsafe { sys::lv_obj_get_style_opa(new, 0) };
     // Before any frame: already partly in, not at once.
     let first = opa();

@@ -342,9 +342,28 @@ pub fn show_sleep_cover(absorb: bool, sink: Sender<UiEvent>) {
         SLEEP_COVER.with(|c| c.set(cover));
         // Nothing animates under the cover (a running button's
         // spinner, a value, a page coming in): each ends where it was
-        // going, and the wake redraws the page with fresh ones.
+        // going. The page's own (a spinner's turn, a scrolling label)
+        // wait in a stash and go on at the wake, which updates the page
+        // in place (ADR 0024); the rest (a dialog's) end for good.
+        finish_page_transition();
+        if let Some(holder) = crate::nodes::holder() {
+            let mut kept = park_holder(holder);
+            // Its keypads stay the page's: what is typed into them
+            // survives the page being built again meanwhile (a night
+            // theme switching while asleep).
+            if let Some(inputs) = kept.inputs.take() {
+                INPUTS.with(|v| *v.borrow_mut() = inputs);
+            }
+            SLEEP_KEPT.with(|k| *k.borrow_mut() = Some((holder, kept)));
+        }
         finish_motion();
     }
+}
+
+thread_local! {
+    /// The page shown when the screen went to sleep, and what it keeps
+    /// meanwhile ([`park_holder`]).
+    static SLEEP_KEPT: std::cell::RefCell<Option<(*mut sys::lv_obj_t, Kept)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Remove the sleep cover, if any. Called from the main loop, never
@@ -355,6 +374,23 @@ pub fn hide_sleep_cover() {
         unsafe { sys::lv_obj_delete(cover) };
         *wake_sink().lock().unwrap() = None;
     }
+    // The page under it goes on, if it is still the one drawn.
+    if let Some((holder, kept)) = SLEEP_KEPT.with(|k| k.borrow_mut().take()) {
+        if crate::nodes::holder() == Some(holder) {
+            unpark_holder(kept);
+        }
+    }
+}
+
+/// The page asleep under the cover is going (the screen is cleared,
+/// or the page is left): what it kept goes with it.
+pub(crate) fn forget_sleep_kept(holder: Option<*mut sys::lv_obj_t>) {
+    SLEEP_KEPT.with(|k| {
+        let mut k = k.borrow_mut();
+        if holder.is_none() || k.as_ref().is_some_and(|(h, _)| Some(*h) == holder) {
+            *k = None;
+        }
+    });
 }
 
 thread_local! {
@@ -901,23 +937,33 @@ fn bg_acquire(key: BgKey) -> *mut sys::lv_draw_buf_t {
         let bytes = unsafe { (*buf).data_size } as usize;
         c.bytes += bytes;
         c.entries.push(BgEntry { key, buf, bytes, refs: 1, used: tick });
-        // Over budget: free the least recently used unshown ones.
-        while c.bytes > BG_CACHE_BYTES {
-            let Some(i) = c.entries.iter().enumerate().filter(|(_, e)| e.refs == 0).min_by_key(|(_, e)| e.used).map(|(i, _)| i)
-            else {
-                break;
-            };
-            let e = c.entries.swap_remove(i);
-            c.bytes -= e.bytes;
-            // SAFETY: no object shows it (refs 0); LVGL's caches may
-            // still know the pointer, so they drop it first.
-            unsafe {
-                sys::lv_paneld_image_cache_drop(e.buf as *const std::ffi::c_void);
-                sys::lv_draw_buf_destroy(e.buf);
-            }
-        }
+        bg_trim(&mut c);
         buf
     })
+}
+
+/// Over budget: free the least recently used unshown entries.
+fn bg_trim(c: &mut BgCache) {
+    while c.bytes > BG_CACHE_BYTES {
+        let Some(i) = c.entries.iter().enumerate().filter(|(_, e)| e.refs == 0).min_by_key(|(_, e)| e.used).map(|(i, _)| i)
+        else {
+            break;
+        };
+        let e = c.entries.swap_remove(i);
+        c.bytes -= e.bytes;
+        // SAFETY: no object shows it (refs 0); LVGL's caches may
+        // still know the pointer, so they drop it first.
+        unsafe {
+            sys::lv_paneld_image_cache_drop(e.buf as *const std::ffi::c_void);
+            sys::lv_draw_buf_destroy(e.buf);
+        }
+    }
+}
+
+/// Free what the image cache holds past its budget now (pages it was
+/// kept for were dropped).
+pub(crate) fn trim_images() {
+    BG_CACHE.with(|c| bg_trim(&mut c.borrow_mut()));
 }
 
 fn bg_release(buf: *mut sys::lv_draw_buf_t) {
@@ -1439,6 +1485,10 @@ impl<'ui> Pump<'ui> {
 
 impl Drop for Ui {
     fn drop(&mut self) {
+        // What the page cache and a sleep keep (stashes LVGL allocated)
+        // goes first.
+        crate::cache::forget();
+        forget_sleep_kept(None);
         // SAFETY: paired with `lv_init` in `Ui::init`.
         unsafe { sys::lv_deinit() };
         LVGL_INITIALIZED.store(false, Ordering::SeqCst);
@@ -3279,6 +3329,30 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_set_style_text_font(self.raw, f, sel()) };
     }
 
+    /// [`Self::set_font`], unless it is this object's own font already:
+    /// setting one restyles everything under it (on the screen, the
+    /// pages kept off screen too, whose scrolling labels and keypad
+    /// cursors would start again).
+    pub fn set_font_once(&self, font: &paneld_config::fonts::Font) {
+        let f = ttf_font(font).unwrap_or_else(|| bitmap_font(font.size));
+        let same = local_prop(self.raw, sys::_lv_style_id_t_LV_STYLE_TEXT_FONT).is_some_and(|v| unsafe { v.ptr } == f.cast());
+        if !same {
+            unsafe { sys::lv_obj_set_style_text_font(self.raw, f, sel()) };
+        }
+    }
+
+    /// [`Self::set_text_color_hex`], unless it is already (as
+    /// [`Self::set_font_once`]).
+    pub fn set_text_color_once(&self, rgb: u32, opa: u8) {
+        let want = unsafe { sys::lv_color_hex(rgb) };
+        let color = local_prop(self.raw, sys::_lv_style_id_t_LV_STYLE_TEXT_COLOR)
+            .is_some_and(|v| unsafe { v.color.red == want.red && v.color.green == want.green && v.color.blue == want.blue });
+        let alpha = local_prop(self.raw, sys::_lv_style_id_t_LV_STYLE_TEXT_OPA).is_some_and(|v| unsafe { v.num } == i32::from(opa));
+        if !(color && alpha) {
+            self.set_text_color_hex(rgb, opa);
+        }
+    }
+
     /// Free every TTF font, so a reloaded config starts with an empty
     /// cache (and sees edited `.ttf` files). Call on the screen after
     /// its children and the top layer's are deleted: the fonts the
@@ -3347,8 +3421,14 @@ impl<'ui> Obj<'ui> {
     /// so a caller can rebuild the tree in place. Used by the live
     /// re-render path when a source value changes.
     pub fn clear_children(&self) {
+        let screen = self.raw == unsafe { sys::lv_screen_active() };
+        if screen {
+            // The pages kept off screen go with the rest.
+            crate::cache::forget();
+            forget_sleep_kept(None);
+        }
         unsafe { sys::lv_obj_clean(self.raw) };
-        if self.raw == unsafe { sys::lv_screen_active() } {
+        if screen {
             // A page transition's objects went with the rest.
             if PAGE_TR.with(|p| p.borrow_mut().take()).is_some() {
                 unsafe { sys::lv_obj_set_scrollable(self.raw, true) };
@@ -4618,22 +4698,22 @@ pub fn tick_ms() -> u32 {
     unsafe { sys::lv_tick_get() }
 }
 
-/// Before drawing the next page over `screen`: keep what it shows now
-/// (the page being left) for [`run_page_transition`].
-pub fn begin_page_change(screen: &Obj<'_>) {
+/// Before the next page shows: keep `old`, what the page being left
+/// has on the screen (its holder: ADR 0024, not every child of the
+/// screen), for [`run_page_transition`].
+pub fn begin_page_change(old: &[Obj<'_>]) {
     finish_page_transition();
-    let old = (0..screen.child_count()).filter_map(|i| screen.child(i)).map(|c| c.raw).collect();
-    OLD_PAGE.with(|o| *o.borrow_mut() = old);
+    OLD_PAGE.with(|o| *o.borrow_mut() = old.iter().map(|o| o.raw).collect());
 }
 
-/// Bring in what was drawn on `screen` since [`begin_page_change`],
-/// over `ms`: fading in over the page being left, or sliding in from
-/// the right (from the left with `back`) while it slides out. The old
-/// page is deleted at the end; taps wait until then.
-pub fn run_page_transition(screen: &Obj<'_>, slide: bool, back: bool, ms: u32) {
+/// Bring in `new` (a page holder on `screen`) over `ms`: fading in over
+/// the page being left ([`begin_page_change`]), or sliding in from the
+/// right (from the left with `back`) while it slides out. At the end
+/// the old page is hidden when the page cache keeps it, else deleted;
+/// taps wait until then.
+pub fn run_page_transition(screen: &Obj<'_>, new: Option<&Obj<'_>>, slide: bool, back: bool, ms: u32) {
     let old = OLD_PAGE.with(|o| std::mem::take(&mut *o.borrow_mut()));
-    let new: Vec<_> =
-        (0..screen.child_count()).filter_map(|i| screen.child(i)).map(|c| c.raw).filter(|c| !old.contains(c)).collect();
+    let new: Vec<_> = new.map(|n| n.raw).into_iter().collect();
     let width = unsafe { sys::lv_obj_get_width(screen.raw) };
     unsafe {
         // A page moved aside is not something to scroll to (no
@@ -4672,7 +4752,14 @@ fn end_page_transition() {
             sys::lv_obj_set_style_translate_x(n, 0, 0);
         }
         for o in tr.old {
-            sys::lv_obj_delete(o);
+            // A page the cache keeps waits hidden, where it was.
+            if crate::cache::is_parked(o) {
+                sys::lv_obj_set_hidden(o, true);
+                sys::lv_obj_set_style_opa(o, 255, 0);
+                sys::lv_obj_set_style_translate_x(o, 0, 0);
+            } else {
+                sys::lv_obj_delete(o);
+            }
         }
         let screen = sys::lv_obj_get_parent(tr.blocker);
         sys::lv_obj_delete(tr.blocker);
@@ -4694,6 +4781,130 @@ pub fn finish_motion() {
     FINISHING.with(|f| f.set(true));
     unsafe { sys::lv_anim_delete_all() };
     FINISHING.with(|f| f.set(false));
+}
+
+// ---------------------------------------------------------------------------
+// The page cache (ADR 0024 section 3): a page left waits hidden under
+// the screen in its holder, with nothing of it running.
+// ---------------------------------------------------------------------------
+
+/// `obj` is the page a transition (under way, or about to start) is
+/// taking off screen: it deletes or hides it at its end.
+pub(crate) fn leaving(obj: *mut sys::lv_obj_t) -> bool {
+    PAGE_TR.with(|p| p.borrow().as_ref().is_some_and(|t| t.old.contains(&obj))) || OLD_PAGE.with(|o| o.borrow().contains(&obj))
+}
+
+/// What a page holder keeps while its page is off screen: the
+/// animations that run for good (a spinner's turn, a scrolling label),
+/// taken off LVGL's list, and its keypads.
+pub(crate) struct Kept {
+    anims: *mut std::ffi::c_void,
+    /// Its keypads, by the key of their node, as [`INPUTS`] has them
+    /// (`None`: left there).
+    inputs: Option<Vec<(*mut sys::lv_obj_t, u64)>>,
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        // SAFETY: a stash from lv_paneld_anims_stash (or null), freed once.
+        unsafe { sys::lv_paneld_anims_free(self.anims) };
+    }
+}
+
+/// The page in `holder` leaves the screen for the cache: motion's
+/// tweens on it end at their targets (those only, per object: LVGL's
+/// own go to the stash), the animations that run for good wait in a
+/// stash, an open list closes, a finger on it is let go of, and its
+/// keypads are put aside with it.
+pub(crate) fn park_holder(holder: *mut sys::lv_obj_t) -> Kept {
+    let mut moving: Vec<usize> = TWEENS.with(|t| t.borrow().iter().map(|(o, _, _)| *o).collect());
+    moving.sort_unstable();
+    moving.dedup();
+    FINISHING.with(|f| f.set(true));
+    for o in moving {
+        if is_within(o as *mut sys::lv_obj_t, &[holder]) {
+            unsafe { sys::lv_paneld_anim_delete_custom(o as *mut std::ffi::c_void, Some(tween_exec)) };
+        }
+    }
+    FINISHING.with(|f| f.set(false));
+    let open: Vec<usize> = OPEN_LISTS.with(|o| o.borrow().clone());
+    for d in open {
+        if is_within(d as *mut sys::lv_obj_t, &[holder]) {
+            // Its CANCEL takes it off OPEN_LISTS.
+            unsafe { sys::lv_dropdown_close(d as *mut sys::lv_obj_t) };
+        }
+    }
+    unsafe {
+        sys::lv_paneld_indev_release_under(holder);
+    }
+    let anims = unsafe { sys::lv_paneld_anims_stash(holder, Some(tween_exec)) };
+    let inputs = Some(INPUTS.with(|v| std::mem::take(&mut *v.borrow_mut())));
+    Kept { anims, inputs }
+}
+
+/// Whatever of `holder` (kept off screen) runs again (an object of it
+/// restyled from above starts its label scrolling or cursor blinking
+/// again) goes into its stash too.
+pub(crate) fn restash_holder(holder: *mut sys::lv_obj_t, kept: &mut Kept) {
+    kept.anims = unsafe { sys::lv_paneld_anims_stash_more(holder, Some(tween_exec), kept.anims) };
+}
+
+/// A page from the cache is the page drawn again (still hidden): its
+/// animations go on from where they were, its keypads are the page's.
+pub(crate) fn unpark_holder(mut kept: Kept) {
+    if let Some(inputs) = kept.inputs.take() {
+        INPUTS.with(|v| *v.borrow_mut() = inputs);
+    }
+    let anims = std::mem::replace(&mut kept.anims, std::ptr::null_mut());
+    unsafe { sys::lv_paneld_anims_unstash(anims) };
+}
+
+/// Show a page from the cache, over the pages on the screen.
+pub(crate) fn show_holder(holder: *mut sys::lv_obj_t) {
+    unsafe {
+        sys::lv_obj_set_hidden(holder, false);
+        sys::lv_obj_move_to_index(holder, -1);
+    }
+}
+
+/// Hide a page holder kept off screen.
+pub(crate) fn hide_holder(holder: *mut sys::lv_obj_t) {
+    unsafe { sys::lv_obj_set_hidden(holder, true) };
+}
+
+/// Delete a page holder (a page the cache dropped, or one not kept).
+pub(crate) fn delete_holder(holder: *mut sys::lv_obj_t) {
+    forget_sleep_kept(Some(holder));
+    unsafe { sys::lv_obj_delete(holder) };
+}
+
+/// About how many bytes the objects under `root` hold.
+pub(crate) fn tree_bytes(root: *mut sys::lv_obj_t) -> usize {
+    unsafe { sys::lv_paneld_tree_bytes(root) as usize }
+}
+
+/// The bytes of the image cache entries only image backgrounds under
+/// `root` show: what deleting `root` frees (an image other objects show
+/// too, a theme's `background_image`, stays).
+pub(crate) fn images_only_under(root: *mut sys::lv_obj_t) -> usize {
+    let mut under: Vec<(*mut sys::lv_draw_buf_t, u32)> = Vec::new();
+    BG_OBJS.with(|o| {
+        for b in o.borrow().iter().filter(|b| !b.buf.is_null() && is_within(b.obj, &[root])) {
+            match under.iter_mut().find(|(buf, _)| *buf == b.buf) {
+                Some((_, n)) => *n += 1,
+                None => under.push((b.buf, 1)),
+            }
+        }
+    });
+    BG_CACHE.with(|c| {
+        let c = c.borrow();
+        under.iter().filter_map(|(buf, n)| c.entries.iter().find(|e| e.buf == *buf && e.refs <= *n)).map(|e| e.bytes).sum()
+    })
+}
+
+/// The image cache is past its budget (the images shown hold it).
+pub(crate) fn images_over_budget() -> bool {
+    BG_CACHE.with(|c| c.borrow().bytes > BG_CACHE_BYTES)
 }
 
 thread_local! {
@@ -5227,6 +5438,14 @@ impl<'ui> Obj<'ui> {
 /// A keypad's keys in a parent as tall as its content: four rows.
 const KEYBOARD_PX: i32 = 200;
 
+/// `obj`'s local style property `prop` for the selector in force, if
+/// it has one.
+fn local_prop(obj: *mut sys::lv_obj_t, prop: u32) -> Option<sys::lv_style_value_t> {
+    let mut v = sys::lv_style_value_t::default();
+    let found = unsafe { sys::lv_obj_get_local_style_prop(obj, prop as sys::lv_style_prop_t, &mut v, sel()) };
+    (found == sys::lv_style_res_t_LV_STYLE_RES_FOUND).then_some(v)
+}
+
 /// What a new dropdown lists (LVGL's own placeholder options).
 pub(crate) const DROPDOWN_DEFAULT: &str = "Option 1\nOption 2\nOption 3";
 
@@ -5258,14 +5477,48 @@ const COLOR_PROPS: &[u32] = &[
     sys::_lv_style_id_t_LV_STYLE_DROP_SHADOW_COLOR,
 ];
 
+/// Scroll what is on `fresh` (a scratch screen with a fresh render of
+/// the page drawn) as the page drawn is scrolled, object by object, as
+/// far as the two trees agree (`paneld shot --verify`).
+pub fn match_scroll(fresh: &Obj<'_>) {
+    fn walk(a: *mut sys::lv_obj_t, b: *mut sys::lv_obj_t) {
+        unsafe {
+            let (x, y) = (sys::lv_obj_get_scroll_x(a), sys::lv_obj_get_scroll_y(a));
+            if (x, y) != (sys::lv_obj_get_scroll_x(b), sys::lv_obj_get_scroll_y(b)) {
+                sys::lv_obj_scroll_to(b, x, y, false);
+            }
+            let n = sys::lv_obj_get_child_count(a).min(sys::lv_obj_get_child_count(b));
+            for i in 0..n {
+                let (ca, cb) = (sys::lv_obj_get_child(a, i as i32), sys::lv_obj_get_child(b, i as i32));
+                if Obj::from_raw(ca).class_name() == Obj::from_raw(cb).class_name() {
+                    walk(ca, cb);
+                }
+            }
+        }
+    }
+    let Some(live) = crate::nodes::holder() else { return };
+    let Some(page) = fresh.child(0) else { return };
+    unsafe {
+        sys::lv_obj_update_layout(live);
+        sys::lv_obj_update_layout(fresh.raw);
+    }
+    walk(live, page.raw);
+}
+
 /// The areas (x1, y1, x2, y2) under `root` that never hold still: a
-/// spinner, a scrolling label. `paneld shot --verify` leaves them out.
+/// spinner, a scrolling label, a keypad's blinking cursor. `paneld shot
+/// --verify` leaves them out.
 pub fn restless_areas(root: &Obj<'_>) -> Vec<(i32, i32, i32, i32)> {
     fn walk(obj: *mut sys::lv_obj_t, out: &mut Vec<(i32, i32, i32, i32)>) {
         let o = Obj::from_raw(obj);
+        // Not drawn (a page kept off screen too).
+        if o.is_hidden() {
+            return;
+        }
         let class = o.class_name();
         unsafe {
             let restless = class == "spinner"
+                || class == "textarea"
                 || (class == "label"
                     && matches!(
                         sys::lv_label_get_long_mode(obj),
@@ -5548,7 +5801,10 @@ fn dump_obj(obj: *mut sys::lv_obj_t, depth: usize, root: bool, moving: bool, out
             let _ = write!(rest, " on={binds:?}");
         }
         // Animations that run for good (a spinner's turn), not motion's.
-        let anims = sys::lv_paneld_anim_count(obj.cast(), Some(tween_exec));
+        // A keypad's cursor blinks while it is focused, which the user
+        // changes (a press elsewhere takes the focus): left out, as the
+        // focused state is.
+        let anims = if class == "textarea" { 0 } else { sys::lv_paneld_anim_count(obj.cast(), Some(tween_exec)) };
         if anims > 0 {
             let _ = write!(rest, " anims={anims}");
         }

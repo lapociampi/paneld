@@ -17,6 +17,17 @@ fn tmp(label: &str) -> PathBuf {
         N.fetch_add(1, Ordering::SeqCst)
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    // A socket path has at most ~107 bytes: a target folder deep down
+    // (a git worktree's) is reached through a short link instead, which
+    // the daemon removes when dropped. One left by an earlier run (the
+    // same pid and number) is replaced.
+    if dir.join("ctl.sock").as_os_str().len() > 100 {
+        let link = std::env::temp_dir().join(dir.file_name().unwrap());
+        let _ = std::fs::remove_file(&link);
+        if std::os::unix::fs::symlink(&dir, &link).is_ok() || std::fs::canonicalize(&link).ok() == std::fs::canonicalize(&dir).ok() {
+            return link;
+        }
+    }
     dir
 }
 
@@ -130,6 +141,10 @@ impl Drop for Daemon {
         // An LVGL error is a bug even when the test's checks pass (not
         // asserted while already failing: a second panic aborts).
         let log = std::fs::read_to_string(self.dir.join("lvgl.log")).unwrap_or_default();
+        // The short link to its folder ([`tmp`]), if it has one.
+        if std::fs::symlink_metadata(&self.dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            let _ = std::fs::remove_file(&self.dir);
+        }
         if !std::thread::panicking() {
             assert!(!log.contains("[Error]"), "LVGL logged an error:\n{log}");
         }
@@ -188,8 +203,9 @@ fn ctl_reads_and_changes_the_running_state() {
     // check on a good config: no issues.
     let check = d.ok(&["--json", "check"]);
     assert!(check.contains("\"result\":[]"), "{check}");
+    let real = std::fs::canonicalize(&dir).unwrap();
     d.stop();
-    assert!(!dir.join("ctl.sock").exists(), "the socket outlived the daemon");
+    assert!(!real.join("ctl.sock").exists(), "the socket outlived the daemon");
 }
 
 #[test]
@@ -824,5 +840,209 @@ fn the_clock_redraws_only_pages_that_read_it_and_as_often_as_they_read() {
     let n = renders() - before;
     assert!((2..=4).contains(&n), "{n} redraws in 3 s of a seconds clock");
     assert_eq!(status_num(&d, "renders"), built, "a tick built the page again");
+    d.stop();
+}
+
+/// Wait until `field` of `ctl status` is `want`.
+#[track_caller]
+fn wait_status(d: &Daemon, field: &str, want: i64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while status_num(d, field) != want {
+        assert!(Instant::now() < deadline, "`{field}` stayed {}, not {want}: {}", status_num(d, field), d.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_page_left_is_kept_and_shown_again_with_what_changed_meanwhile() {
+    // ADR 0024 page cache (on by default, 3 pages). Verify is on: a
+    // page shown from the cache that differs from a fresh render ends
+    // the daemon (exit 3).
+    let dir = tmp("cache");
+    let d = Daemon::start(
+        &dir,
+        "var v: int = 0\n\
+         page home { nav = 1; column {\n\
+             text { value = {{ vars.v }} }\n\
+             text { value = {{ now.second }} }\n\
+             spinner { width = 40; height = 40 }\n\
+             text { width = 60; overflow = scroll; value = a long text that scrolls and scrolls }\n\
+             keypad { length = 4 }\n\
+         } }\n\
+         page two { nav = 2; text { value = two } }\n\
+         page three { nav = 3; text { value = three } }\n",
+    );
+    // What runs for good on `home`: the spinner, the scrolling label,
+    // the keypad's cursor.
+    let turning = wait_turning(&d);
+    assert_eq!((status_num(&d, "cached_pages"), status_num(&d, "cache_bytes")), (0, 0));
+    // Left: kept off screen, estimated, all of it stopped while `two`
+    // is built (the loop sleeps its whole idle step on `two`).
+    d.ok(&["goto", "two"]);
+    wait_status(&d, "cached_pages", 1);
+    let bytes = status_num(&d, "cache_bytes");
+    assert!((1_000..200_000).contains(&bytes), "cache_bytes {bytes}");
+    wait_idle(&d);
+    // Changed while away, and a second or more later: shown again with
+    // the new value and second, no object made, nothing built.
+    d.ok(&["set", "vars.v=5"]);
+    std::thread::sleep(Duration::from_millis(1_100));
+    let (made, renders) = (status_num(&d, "objects_made"), status_num(&d, "renders"));
+    d.ok(&["goto", "home"]);
+    wait_status(&d, "cache_hits", 1);
+    assert_eq!(status_num(&d, "objects_made"), made, "going back made objects");
+    assert_eq!(status_num(&d, "renders"), renders, "going back built the page");
+    // What turned turns again, once the page transition is over; `two`
+    // is kept now.
+    assert_eq!(wait_turning(&d), turning, "not all that turned turns again");
+    assert_eq!(status_num(&d, "cached_pages"), 1);
+    // Built afresh while `home` is kept: `home` stays still.
+    d.ok(&["goto", "three"]);
+    wait_status(&d, "renders", renders + 1);
+    wait_idle(&d);
+    // A reload and a theme switch drop every page kept.
+    wait_status(&d, "cached_pages", 2);
+    let renders = status_num(&d, "renders");
+    d.ok(&["theme", "dark"]);
+    wait_status(&d, "cached_pages", 0);
+    // (`three` drawn in the new theme first: then it is kept.)
+    wait_status(&d, "renders", renders + 1);
+    d.ok(&["goto", "two"]);
+    wait_status(&d, "cached_pages", 1);
+    d.ok(&["reload"]);
+    wait_status(&d, "cached_pages", 0);
+    d.ok(&["goto", "two"]);
+    wait_status(&d, "cached_pages", 1);
+    assert_eq!(d.eval("vars.v"), "5");
+    d.stop();
+}
+
+/// What turns on the page for good once the rest has ended (a page
+/// transition, a value moving): the same count twice, half a second
+/// apart.
+fn wait_turning(d: &Daemon) -> i64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = -1;
+    loop {
+        let n = status_num(d, "animations");
+        if n == last && n >= 1 {
+            return n;
+        }
+        assert!(Instant::now() < deadline, "nothing turning: {}", d.ok(&["--json", "status"]));
+        last = n;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[test]
+fn the_page_cache_keeps_what_its_limits_allow() {
+    let pages = "page home { nav = 1; text { value = home } }\n\
+                 page two { nav = 2; text { value = two } }\n\
+                 page three { nav = 3; text { value = three } }\n";
+    // Two pages: the one shown and the last one left.
+    let dir = tmp("cache-limits");
+    let d = Daemon::start(&dir, &format!("app:page_cache = 2\n{pages}"));
+    d.ok(&["goto", "two"]);
+    wait_status(&d, "cached_pages", 1);
+    d.ok(&["goto", "three"]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(status_num(&d, "cached_pages"), 1, "more than one page kept");
+    // `home` was dropped (least recently shown): built again; `three`
+    // is kept, and comes back from the cache.
+    let (renders, hits) = (status_num(&d, "renders"), status_num(&d, "cache_hits"));
+    d.ok(&["goto", "home"]);
+    wait_status(&d, "renders", renders + 1);
+    assert_eq!(status_num(&d, "cache_hits"), hits);
+    d.ok(&["goto", "three"]);
+    wait_status(&d, "cache_hits", hits + 1);
+    d.stop();
+    // 0: none kept, as before the cache; and a byte budget too small
+    // for any page.
+    for (label, opt) in [("cache-off", "app:page_cache = 0"), ("cache-bytes", "app:page_cache_bytes = 1KiB")] {
+        let dir = tmp(label);
+        let d = Daemon::start(&dir, &format!("{opt}\n{pages}"));
+        let renders = status_num(&d, "renders");
+        d.ok(&["goto", "two"]);
+        d.ok(&["goto", "home"]);
+        wait_status(&d, "renders", renders + 2);
+        assert_eq!((status_num(&d, "cached_pages"), status_num(&d, "cache_hits")), (0, 0), "{opt}");
+        d.stop();
+    }
+}
+
+#[test]
+fn a_wake_updates_the_page_in_place_and_its_spinner_turns_again() {
+    // ADR 0024: asleep, what changes is kept; the wake updates the page
+    // (no build, every value at once) and what turns on it goes on.
+    let dir = tmp("wake");
+    let log = dir.join("screen.log");
+    let d = Daemon::start(
+        &dir,
+        &format!(
+            "var v: int = 10\n\
+             screen {{\n\
+                 idle = 2s\n\
+                 off = sh -c 'echo off >> \"$$0\"' {log}\n\
+                 on = sh -c 'echo on >> \"$$0\"' {log}\n\
+             }}\n\
+             page home {{ nav = 1; column {{ bar {{ width = 200; value = {{{{ vars.v }}}} }}; spinner {{ width = 40; height = 40 }} }} }}\n",
+            log = log.display()
+        ),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let turning = status_num(&d, "animations");
+    assert!(turning >= 1, "no spinner turning");
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while read() != "off\n" {
+        assert!(Instant::now() < deadline, "the screen did not sleep: `{}`", read());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Asleep: nothing turns.
+    wait_idle(&d);
+    d.ok(&["set", "vars.v=70"]);
+    let renders = status_num(&d, "renders");
+    d.ok(&["alert", "fire", "c", "severity=critical"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while read() != "off\non\n" {
+        assert!(Instant::now() < deadline, "the screen did not wake: `{}`", read());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(status_num(&d, "renders"), renders, "the wake built the page");
+    assert!(status_num(&d, "updates") > 0);
+    // The spinner turns again (verify compares those too); the bar is
+    // at its value at once.
+    assert_eq!(status_num(&d, "animations"), turning, "{}", d.ok(&["--json", "status"]));
+    d.stop();
+}
+
+#[test]
+fn a_page_shown_from_the_cache_at_a_wake_moves_its_next_value() {
+    // Review: going to a kept page while asleep, the wake shows it from
+    // the cache at once; that must not make the change after it jump
+    // too (the bar moves: an animation).
+    let dir = tmp("wake-cached");
+    let d = Daemon::start(
+        &dir,
+        "theme t { value_transition = 600ms; page_transition = fade 100ms }\n\
+         var v: int = 10\n\
+         screen { idle = 2s }\n\
+         page home { nav = 1; column { bar { width = 200; value = {{ vars.v }} } } }\n\
+         page two { nav = 2; text { value = two } }\n",
+    );
+    d.ok(&["goto", "two"]);
+    wait_status(&d, "cached_pages", 1);
+    // Asleep (idle 2 s), the page asked for waits for the wake.
+    std::thread::sleep(Duration::from_millis(3_000));
+    d.ok(&["goto", "home"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(status_num(&d, "cache_hits"), 0, "a page was shown while asleep");
+    d.ok(&["alert", "fire", "c", "severity=critical"]);
+    wait_status(&d, "cache_hits", 1);
+    wait_idle(&d);
+    d.ok(&["set", "vars.v=90"]);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(status_num(&d, "animations") >= 1, "the value jumped");
     d.stop();
 }

@@ -293,16 +293,18 @@ fn render_page_body(
 
     // The theme's `font` is the text font of everything on the page,
     // the dialogs on the top layer included; a node's `font` wins.
-    apply_font(screen, "font", theme_of(ctx));
+    // Set on the screen only when it is not so already: that restyles
+    // every object on it, the pages kept off screen too (ADR 0024).
+    apply_font_once(screen, theme_of(ctx));
     // (A scratch copy leaves the real top layer alone: setting it, even
     // to the same font, redraws the whole screen.)
     if nodes::mode() != Mode::Scratch {
-        apply_font(&screen.top_layer(), "font", theme_of(ctx));
+        apply_font_once(&screen.top_layer(), theme_of(ctx));
     }
     // And `text` its text color (a dark theme's light text); widgets
     // with a box of their own keep theirs.
     if let Some((rgb, opa)) = color_of("text", ctx) {
-        screen.set_text_color_hex(rgb, opa);
+        screen.set_text_color_once(rgb, opa);
     }
 
     // The whole page in one holder, which a page transition moves.
@@ -944,8 +946,11 @@ fn after_children(node: &Block, ctx: &Scope<'_>, obj: &Obj<'_>) {
 /// only what is under it is walked, and if any of it was set up
 /// again, the node does again what it does with its children.
 fn walk_children(node: &Block, idx: usize, doc: &Document, ctx: &Scope<'_>, slot: Option<&SlotCtx<'_>>, sink: &Sender<UiEvent>) {
+    // Only these draw their blocks as nodes (a chart's `series` are
+    // its own: drawn with it).
+    let draws_children = matches!(node.kind.text.as_str(), "column" | "row" | "stack" | "grid" | "scroll" | "button");
     let has_children = node.items.iter().any(|it| matches!(it, Item::Block(b) if !is_event_handler_block(&b.kind.text)) || matches!(it, Item::Repeat(_)));
-    if !has_children {
+    if !draws_children || !has_children {
         return;
     }
     let Some(&raw) = nodes::objs(idx).first() else { return };
@@ -2233,8 +2238,10 @@ pub fn set_styles(styles: std::collections::BTreeMap<String, Vec<Item>>) {
     PARSED.with(|p| p.borrow_mut().clear());
     PARSED_INTERP.with(|p| p.borrow_mut().clear());
     nodes::clear_reads();
-    // Other styles: every page is built afresh.
+    // Other styles: every page is built afresh, and the pages kept
+    // off screen go (before the old theme's fonts are freed).
     nodes::forget();
+    crate::cache::clear();
 }
 
 type ParseKey = (String, paneld_config::source::FileId, u32);
@@ -2793,6 +2800,15 @@ fn apply_font(obj: &Obj<'_>, text: &str, theme: Option<&Theme>) {
                 obj.set_font_size(n);
             }
         }
+    }
+}
+
+/// The theme's `font` on a screen or layer, set only when it is
+/// another than it has ([`Obj::set_font_once`]).
+fn apply_font_once(obj: &Obj<'_>, theme: Option<&Theme>) {
+    match resolve_font("font", theme) {
+        Ok(font) => crate::perf::time(crate::perf::Slot::Font, || obj.set_font_once(&font)),
+        Err(_) => apply_font(obj, "font", theme),
     }
 }
 

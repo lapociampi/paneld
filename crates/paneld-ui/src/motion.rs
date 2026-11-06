@@ -144,6 +144,53 @@ pub fn forget() {
     STATE.with(|s| s.borrow_mut().fresh = true);
 }
 
+/// What a page kept off screen showed (the page cache, ADR 0024):
+/// every value at its target, as its tweens were ended there.
+pub(crate) struct Saved {
+    page: String,
+    shown: HashMap<u64, Shown>,
+}
+
+/// The page drawn is left for the cache: what it shows, at its
+/// targets; nothing is remembered for the next page.
+pub(crate) fn park() -> Saved {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let shown = std::mem::take(&mut s.prev)
+            .into_iter()
+            .map(|(k, v)| {
+                let v = match v {
+                    Shown::Gauge { to, start, .. } => Shown::Gauge { from: to, to, start, ms: 0 },
+                    Shown::Chart { to, start, .. } => Shown::Chart { from: to.clone(), to, start, ms: 0 },
+                    Shown::Entered { start, .. } => Shown::Entered { from: 1.0, start, ms: 0 },
+                };
+                (k, v)
+            })
+            .collect();
+        Saved { page: std::mem::take(&mut s.page), shown }
+    })
+}
+
+/// A page from the cache is the page drawn again: its next update
+/// moves from what it showed.
+pub(crate) fn unpark(saved: Saved) {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.page = saved.page;
+        s.prev = saved.shown;
+    });
+}
+
+/// Whether the next render is instant ([`next_render_instant`]).
+pub(crate) fn instant_pending() -> bool {
+    STATE.with(|s| s.borrow().next_instant)
+}
+
+/// Drop a [`next_render_instant`] that no render took.
+pub fn cancel_instant() {
+    STATE.with(|s| s.borrow_mut().next_instant = false);
+}
+
 /// Start drawing `page` under `theme`.
 pub(crate) fn begin(page: &str, theme: Option<&BTreeMap<String, Value>>) {
     STATE.with(|s| {

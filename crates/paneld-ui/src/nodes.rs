@@ -1296,6 +1296,48 @@ pub fn table_size() -> (usize, usize) {
     TABLE.with(|t| t.borrow().as_ref().map_or((0, 0), |t| (t.recs.len(), t.recs.iter().map(|r| r.made.len()).sum())))
 }
 
+/// The table of a page kept off screen (the page cache, ADR 0024
+/// section 3): taken from the page drawn when it is left, put back
+/// when it shows again.
+pub(crate) struct Saved(Table);
+
+impl Saved {
+    pub(crate) fn page(&self) -> &str {
+        &self.0.page
+    }
+
+    /// What anything on the page reads: its dep index, which the
+    /// changes made while it is away are checked against.
+    pub(crate) fn deps(&self) -> Vec<Dep> {
+        let mut out = Vec::new();
+        for r in &self.0.recs {
+            union(&mut out, &r.own);
+        }
+        out
+    }
+
+    /// Records and objects made (a part of what the page costs).
+    pub(crate) fn size(&self) -> (usize, usize) {
+        (self.0.recs.len(), self.0.recs.iter().map(|r| r.made.len()).sum())
+    }
+}
+
+/// Take the table of the page drawn, if it can be kept: drawn whole,
+/// on its holder, and updatable in place.
+pub(crate) fn take_table() -> Option<Saved> {
+    TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        let ok = t.as_ref().is_some_and(|t| t.broken.is_none() && !t.holder.is_null() && !t.page_root.is_null());
+        let table = t.take();
+        ok.then(|| table.map(Saved)).flatten()
+    })
+}
+
+/// Make `saved` the table of the page drawn again.
+pub(crate) fn put_table(saved: Saved) {
+    TABLE.with(|t| *t.borrow_mut() = Some(saved.0));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
