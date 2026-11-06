@@ -685,16 +685,16 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     let now_instant = std::time::Instant::now();
     let now_wall = std::time::SystemTime::now();
     if live.alerts.tick(&alerts_ctx, now_instant, now_wall) {
-        live.changes.alerts = true;
+        note_alerts(live);
     }
     if live.reminders.tick(&mut live.alerts, &alerts_ctx, now_wall) {
-        live.changes.alerts = true;
+        note_alerts(live);
     }
     // Keep the state file (ADR 0014) in sync. `note` is cheap:
     // it only flags a pending write when the set actually
     // changed. `flush_if_due` writes at most once per 10s.
     if live.alerts.note_resolved(now_wall) {
-        live.changes.alerts = true;
+        note_alerts(live);
     }
     live.state.note(live.alerts.active_alerts(), live.reminders.dates(), live.alerts.history());
     live.state.flush_if_due(now_instant);
@@ -784,7 +784,14 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     for name in running.symmetric_difference(&live.last_running) {
         live.changes.source(name, ["running"]);
     }
-    let ctx = build_ctx_running(&live.source_values, &live.theme, &live.vars, Some(&live.alerts), &running);
+    // `sources.x.age` moves on `ago()`'s steps (or a new `at`), not each
+    // second: the page's context has it as of then, so an update and a
+    // fresh render of the page agree on it. A page built afresh takes
+    // every age now.
+    let build_all = live.rebuild || live.current_page != live.rendered_page || live.release_fonts || !updates_on();
+    let age_changes = (!build_all).then(|| live.changes.clone());
+    note_ages(live, age_changes.as_ref(), clock::unix_now());
+    let ctx = sources::with_ages_seen(&live.ages_seen, || build_ctx_running(&live.source_values, &live.theme, &live.vars, Some(&live.alerts), &running));
     live.last_running = running;
     // The clock as the context has it: a minute (or second) that turned
     // since it was looked at above counts here too.
@@ -803,6 +810,10 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // the diff above).
     if let Some(paneld_ui::Value::Map(vars)) = ctx.get("vars") {
         diff_vars(live, vars.clone());
+    }
+    // And its alerts (a snooze that ran out since the tick above).
+    if let Some(paneld_ui::Value::Map(alerts)) = ctx.get("alerts") {
+        diff_alerts(live, alerts.clone());
     }
     let perf_ctx = lap(&mut perf_lap);
     paneld_ui::set_call_states(live.calls.values().cloned().collect());
@@ -1081,6 +1092,43 @@ fn end_dialog(live: &mut LiveState) {
     }
 }
 
+/// The sources whose `age` the page shows from now on as of `at` (Unix
+/// seconds): those `changes` names it for (`None`: a build, all).
+fn note_ages(live: &mut LiveState, changes: Option<&paneld_ui::Changes>, at: i64) {
+    let names: Vec<String> = live.source_values.lock().unwrap().keys().cloned().collect();
+    for name in names {
+        let hit = changes.is_none_or(|c| c.ago || c.sources.get(&name).is_some_and(|f| f.contains("age") || f.contains("*")));
+        if hit {
+            live.ages_seen.insert(name, at);
+        }
+    }
+}
+
+/// The fields of `alerts` that changed since the page last saw them
+/// (ADR 0024, phase 4: an acknowledged alert moves `active` and
+/// `shown`, not `count`).
+fn note_alerts(live: &mut LiveState) {
+    if let paneld_ui::Value::Map(now) = live.alerts.context_value() {
+        diff_alerts(live, now);
+    }
+}
+
+/// The fields of `alerts` in `now` that differ from what the page last
+/// saw, as changes; `now` is what it sees from here on.
+fn diff_alerts(live: &mut LiveState, now: std::collections::BTreeMap<String, paneld_ui::Value>) {
+    for (k, v) in &now {
+        if live.last_alerts.get(k) != Some(v) {
+            live.changes.alert(k);
+        }
+    }
+    for k in live.last_alerts.keys() {
+        if !now.contains_key(k) {
+            live.changes.alert(k);
+        }
+    }
+    live.last_alerts = now;
+}
+
 /// The vars that changed since the page last saw them.
 fn note_vars(live: &mut LiveState) {
     let now = live.vars.lock().unwrap().clone();
@@ -1175,12 +1223,10 @@ fn source_update(live: &mut LiveState, update: sources::SourceUpdate) {
         &live.vars,
         Some(&live.alerts),
     );
-    let _ = live.alerts.ingest_event(
-        &update.name,
-        &event_value,
-        &event_ctx,
-        std::time::SystemTime::now(),
-    );
+    // An `alert { from = <this source> }` fired or resolved by it.
+    if live.alerts.ingest_event(&update.name, &event_value, &event_ctx, std::time::SystemTime::now()) {
+        note_alerts(live);
+    }
 }
 
 /// Everything the main loop re-creates on a `reload`.
@@ -1252,6 +1298,12 @@ struct LiveState {
     rebuild: bool,
     /// The vars as the page last saw them, to tell which changed.
     last_vars: std::collections::BTreeMap<String, paneld_ui::Value>,
+    /// `alerts` as the page last saw it, to tell which fields changed.
+    last_alerts: std::collections::BTreeMap<String, paneld_ui::Value>,
+    /// Per source, when the `age` the page's context has was taken (on
+    /// `ago()`'s steps or a new `at`, not each second); the fresh
+    /// render of `verify` uses the same.
+    ages_seen: std::collections::BTreeMap<String, i64>,
     /// The minute the page was drawn or updated in.
     minute_drawn: Option<i64>,
     /// The sources running as the page last saw them.
@@ -1569,6 +1621,11 @@ fn setup_live_state(
     paneld_ui::render_page(&ui_doc, &current_page, &ctx, &event_tx, screen);
     let ago_due = paneld_ui::page_ago_due();
     let last_vars = vars_shared.lock().unwrap().clone();
+    let ages_seen = source_values.lock().unwrap().keys().map(|k| (k.clone(), drawn_at)).collect();
+    let last_alerts = match ctx.get("alerts") {
+        Some(paneld_ui::Value::Map(m)) => m.clone(),
+        _ => Default::default(),
+    };
     RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     visible::show(&current_page);
     let clock_drawn = visible::clock_on_page().map(|t| (t, t.key(drawn_at)));
@@ -1607,6 +1664,8 @@ fn setup_live_state(
         held: paneld_ui::Changes::default(),
         rebuild: false,
         last_vars,
+        last_alerts,
+        ages_seen,
         minute_drawn: Some(clock::Tick::Minute.key(drawn_at)),
         last_running: sources::running_names(),
         screen: screen_state,
@@ -1784,7 +1843,7 @@ fn run_builtin(live: &mut LiveState, call: &actions::Call) -> Result<(), ctl::Ct
     if !found {
         return Err(ctl::CtlError::msg(format!("no active alert `{id}`")));
     }
-    live.changes.alerts = true;
+    note_alerts(live);
     Ok(())
 }
 
@@ -2526,8 +2585,11 @@ fn run_shot(o: ShotOpts) -> ExitCode {
                 let _ = live.event_tx.send(paneld_ui::UiEvent::Goto { page: page.clone() });
                 settle(&mut live, 60);
             }
-            // Now and then the picture too, once the page is in.
-            if o.fuzz_pages && finger.is_none() && n % 10 == 9 {
+            // Now and then the picture too, once the page is in: as the
+            // screen shows it, redrawn only where the updates asked
+            // (a redraw they missed), then redrawn whole against a fresh
+            // render (`verify_picture`).
+            if finger.is_none() && n % 10 == 9 {
                 settle(&mut live, 200);
                 check(&mut live, &mut mem);
             }
@@ -2614,6 +2676,17 @@ fn inject_source(live: &mut LiveState, name: &str, value: paneld_ui::Value) {
     map.insert("ok".into(), Value::Bool(true));
     map.insert("error".into(), Value::String(String::new()));
     let update = sources::SourceUpdate { name: name.to_string(), value: Value::Map(map), status: false, started: std::time::Instant::now(), began: false };
+    source_update(live, update);
+}
+
+/// A failed run of source `name` (`paneld shot --fuzz`): its `ok` and
+/// `error` change, its last value stays (as a poll that fails).
+fn fail_source(live: &mut LiveState, name: &str) {
+    use paneld_ui::Value;
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("ok".to_string(), Value::Bool(false));
+    map.insert("error".to_string(), Value::String("fuzz: exit 1".into()));
+    let update = sources::SourceUpdate { name: name.to_string(), value: Value::Map(map), status: true, started: std::time::Instant::now(), began: false };
     source_update(live, update);
 }
 
@@ -2761,7 +2834,13 @@ fn fuzz_step(live: &mut LiveState, rng: &mut u64, runs: &mut Vec<(String, source
                 (1, Value::Null) => Value::List(fuzz_list(rng, &[])),
                 _ => Value::Double(numbers[pick(rng, numbers.len())]),
             };
-            inject_source(live, &name, value);
+            // Now and then the run fails instead (`ok`, `error`; a
+            // remote's `ok`, `error` and `status`).
+            if next_rand(rng) % 8 == 0 {
+                fail_source(live, &name);
+            } else {
+                inject_source(live, &name, value);
+            }
         }
         2 => {
             let vars: Vec<(String, String)> = live.var_types.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -2785,13 +2864,34 @@ fn fuzz_step(live: &mut LiveState, rng: &mut u64, runs: &mut Vec<(String, source
         3 => {
             let id = format!("fuzz{}", pick(rng, 3));
             let now = std::time::SystemTime::now();
-            if next_rand(rng) % 2 == 0 {
-                let severity = ["critical", "warning", "info"][pick(rng, 3)];
-                live.alerts.fire_external(&id, severity, &id, "fuzz", "", now);
-            } else {
-                live.alerts.resolve_external(&id);
+            // Fired, resolved, acknowledged or snoozed: the last two move
+            // `active` and `shown` but not `count` (ADR 0024, phase 4).
+            match next_rand(rng) % 4 {
+                0 | 1 => {
+                    let severity = ["critical", "warning", "info"][pick(rng, 3)];
+                    live.alerts.fire_external(&id, severity, &id, "fuzz", "", now);
+                }
+                2 => {
+                    live.alerts.resolve_external(&id);
+                }
+                _ => {
+                    let full = format!("{}:{id}", alerts::CTL_RULE);
+                    match next_rand(rng) % 3 {
+                        0 => {
+                            live.alerts.ack(&full);
+                        }
+                        // A short one runs out during the run (`shown`
+                        // changes with no call).
+                        1 => {
+                            live.alerts.snooze(&full, now + std::time::Duration::from_secs(1));
+                        }
+                        _ => {
+                            live.alerts.snooze(&full, now + std::time::Duration::from_secs(3600));
+                        }
+                    }
+                }
             }
-            live.changes.alerts = true;
+            note_alerts(live);
         }
         4 => {
             let names: Vec<String> = live.actions.keys().cloned().collect();
@@ -2920,9 +3020,15 @@ fn verify_picture(ui: &paneld_ui::Ui, mem: &mut paneld_ui::MemDisplay, live: &Li
         }
     };
     run(1500);
+    // First what the screen shows having been redrawn only where the
+    // page asked (ADR 0024, phase 4: an update redraws what it moved or
+    // changed), then all of it redrawn: a redraw the page missed is
+    // where the two differ.
+    let mut partial = mem.rgb_incremental();
     let mut shown = mem.rgb();
     let mut restless = paneld_ui::restless_areas(screen);
-    let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+    // Ages as the page shows them (drawn on `ago()`'s steps).
+    let ctx = sources::with_ages_seen(&live.ages_seen, || build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts)));
     paneld_ui::set_call_states(live.calls.values().cloned().collect());
     let fresh = paneld_ui::scratch_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx);
     paneld_ui::show_screen(&fresh);
@@ -2942,20 +3048,46 @@ fn verify_picture(ui: &paneld_ui::Ui, mem: &mut paneld_ui::MemDisplay, live: &Li
                 let i = (y as usize * w as usize + x as usize) * 3;
                 shown[i..i + 3].fill(0);
                 built[i..i + 3].fill(0);
+                partial[i..i + 3].fill(0);
             }
         }
+    }
+    let dump = |name: &str, px: &[u8]| {
+        if let Some(dir) = std::env::var_os("PANELD_VERIFY_DIR") {
+            let _ = std::fs::write(std::path::PathBuf::from(dir).join(name), png::encode_rgb(w, h, px));
+        }
+    };
+    if partial != shown {
+        dump("partial.png", &partial);
+        dump("updated.png", &shown);
+        let (n, bbox) = differ(&partial, &shown, w as usize);
+        return Err(format!(
+            "page `{}`: {n} px were not redrawn (the screen redrawn only where the page asked differs from it redrawn whole), within {},{} - {},{}",
+            live.current_page, bbox.0, bbox.1, bbox.2, bbox.3
+        ));
     }
     if shown == built {
         return Ok(());
     }
     // Both pictures, to look at: next to the shot's own.
-    if let Some(dir) = std::env::var_os("PANELD_VERIFY_DIR") {
-        let dir = std::path::PathBuf::from(dir);
-        let _ = std::fs::write(dir.join("updated.png"), png::encode_rgb(w, h, &shown));
-        let _ = std::fs::write(dir.join("fresh.png"), png::encode_rgb(w, h, &built));
-    }
+    dump("updated.png", &shown);
+    dump("fresh.png", &built);
     let first = shown.iter().zip(&built).position(|(a, b)| a != b).unwrap_or(0) / 3;
     Err(format!("page `{}`: the picture differs from a fresh render, first at {},{}", live.current_page, first % w as usize, first / w as usize))
+}
+
+/// How many pixels of two RGB8 pictures `w` wide differ, and the box
+/// (x1, y1, x2, y2) holding them.
+fn differ(a: &[u8], b: &[u8], w: usize) -> (usize, (usize, usize, usize, usize)) {
+    let (mut n, mut bbox) = (0, (usize::MAX, usize::MAX, 0, 0));
+    for (i, (p, q)) in a.chunks(3).zip(b.chunks(3)).enumerate() {
+        if p != q {
+            let (x, y) = (i % w, i / w);
+            n += 1;
+            bbox = (bbox.0.min(x), bbox.1.min(y), bbox.2.max(x), bbox.3.max(y));
+        }
+    }
+    (n, bbox)
 }
 
 /// `paneld hash-pin`: read one line (the PIN) from stdin and print
@@ -3066,7 +3198,7 @@ fn raise_display_problem(live: &mut LiveState) {
     if let Some(Some(problem)) = DISPLAY_PROBLEM.get() {
         let now = std::time::SystemTime::now();
         if live.alerts.fire_rule("paneld", "display", "warning", "Display config not used", problem, "", now) {
-            live.changes.alerts = true;
+            note_alerts(live);
         }
     }
 }
@@ -3180,7 +3312,7 @@ fn handle_request(
             let text = req.opt_arg("text").unwrap_or_default();
             let link = req.opt_arg("link").unwrap_or_default();
             if live.alerts.fire_external(&id, &severity, &title, &text, &link, std::time::SystemTime::now()) {
-                live.changes.alerts = true;
+                note_alerts(live);
             }
             Ok(Value::String(format!("{}:{id}", alerts::CTL_RULE)))
         }
@@ -3208,7 +3340,7 @@ fn handle_request(
         "alert_resolve" => {
             let id = req.arg("id")?;
             if live.alerts.resolve_external(&id) {
-                live.changes.alerts = true;
+                note_alerts(live);
                 Ok(Value::String("resolved".into()))
             } else {
                 Err(ctl::CtlError::msg(format!("no active ctl alert `{id}`")))

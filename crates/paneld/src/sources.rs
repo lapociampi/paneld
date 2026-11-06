@@ -88,15 +88,30 @@ pub fn running_names() -> std::collections::BTreeSet<String> {
     RUNNING.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
 }
 
+/// While set: per source, the time its `age` was last drawn at, used
+/// for its `age` instead of now (`paneld shot --verify`'s fresh render
+/// shows ages as the page does: drawn on `ago()`'s steps).
+static AGES_SEEN: Mutex<Option<BTreeMap<String, i64>>> = Mutex::new(None);
+
+/// Run `f` with each source's `age` taken at `seen`'s time for it.
+pub fn with_ages_seen<R>(seen: &BTreeMap<String, i64>, f: impl FnOnce() -> R) -> R {
+    *AGES_SEEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(seen.clone());
+    let r = f();
+    *AGES_SEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    r
+}
+
 /// Schema 4's fields that follow the clock and the runs, put into each
 /// source map as a context is built: `running`, and `age` (whole
 /// seconds since `at`, for a source that has a result).
 pub fn add_live_fields(sources: &mut BTreeMap<String, Value>, now_unix: i64, running: &std::collections::BTreeSet<String>) {
+    let seen = AGES_SEEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for (name, v) in sources.iter_mut() {
         let Value::Map(m) = v else { continue };
         m.insert("running".into(), Value::Bool(running.contains(name)));
         if let Some(Value::Int(at)) = m.get("at") {
-            let age = now_unix.saturating_sub(*at).max(0);
+            let now = seen.as_ref().and_then(|s| s.get(name)).copied().unwrap_or(now_unix);
+            let age = now.saturating_sub(*at).max(0);
             m.insert("age".into(), Value::Int(age));
         }
     }

@@ -71,8 +71,8 @@ function docExamples(): [string, string][] {
 test("no rule leaks past its line in any config or doc example", () => {
   const files: [string, string][] = [
     ...confs(repo).map((p) => [p, readFileSync(p, "utf8")] as [string, string]),
-    // Configs of your own, when they are checked out beside this repo.
-    ...confs(join(repo, "..", "paneld-configs")).map((p) => [p, readFileSync(p, "utf8")] as [string, string]),
+    // More configs from a folder of your own, when PANELD_CONFIGS names one.
+    ...(process.env.PANELD_CONFIGS ? confs(process.env.PANELD_CONFIGS) : []).map((p) => [p, readFileSync(p, "utf8")] as [string, string]),
     ...docExamples(),
   ];
   expect(files.length).toBeGreaterThan(5);

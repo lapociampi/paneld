@@ -1,7 +1,8 @@
 ---
 title: "ADR 0023: Motion runs once, from what was shown, and never while asleep"
-description: "The theme's motion levels and tokens, how a page rebuilt whole still animates values, and how animations end so the panel sleeps again."
+description: "The theme's motion levels and tokens, how values animate from what was shown when a page is drawn again, and how animations end so the panel sleeps again."
 date: 2026-11-05
+updated: 2026-11-06
 tags: [paneld, adr, themes, rendering]
 series: paneld
 order: 30
@@ -14,7 +15,7 @@ order: 30
 
 The docs promised page transitions, tap feedback, animated values and an alert banner entrance under a theme's `motion = full | reduced | none`; nothing animated. Three things make it harder than an `lv_anim` per widget:
 
-- A page is rebuilt whole on every value change (and on navigation), so a new `bar` has no previous value to move from.
+- A page is rebuilt whole on every value change (and on navigation), so a new `bar` has no previous value to move from. (So it was when this was decided. Since [ADR 0024](0024-in-place-updates.md) a value change updates the widgets that show it in place, and a page left is kept; a page is still built afresh the first time it shows, after a reload or a theme switch, and a subtree when its shape changes. The remembered values below serve those, and an update reads them the same way.)
 - Idle must stay asleep: no timer may keep running once an animation is done.
 - The Pi draws in software; a full-screen effect redraws 800x480 on every frame.
 

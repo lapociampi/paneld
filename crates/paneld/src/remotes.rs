@@ -78,8 +78,8 @@ pub fn is_remote(block: &Block) -> bool {
 /// Put `sources` into `ctx` for expressions: plain sources under
 /// `sources`, each remote instance under its own name (schema 17).
 pub fn expose(ctx: &mut Context, mut sources: BTreeMap<String, Value>, running: &std::collections::BTreeSet<String>) {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    crate::sources::add_live_fields(&mut sources, now, running);
+    // The clock the page reads (`now`, held still by `shot --verify`).
+    crate::sources::add_live_fields(&mut sources, crate::clock::unix_now(), running);
     let remotes = current();
     for (name, root) in remotes.roots(&sources) {
         ctx.insert(name, root);

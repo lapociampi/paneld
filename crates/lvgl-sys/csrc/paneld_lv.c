@@ -796,6 +796,258 @@ void lv_paneld_size_again(lv_obj_t * obj)
     lv_obj_mark_layout_as_dirty(obj);
 }
 
+#include "src/core/lv_obj_draw_private.h"
+#include "src/indev/lv_indev_private.h"
+
+/* What an object covered before a layout pass: where it was drawn
+ * (coords with its extra draw size, turned and scaled by its own
+ * transform) and whether it was shown; a scrollable one's scrollbars. */
+typedef struct {
+    lv_obj_t * obj;
+    lv_area_t area;
+    lv_area_t sb_hor;
+    lv_area_t sb_ver;
+    bool shown;
+    bool scrolls;
+    /* A child of it moved, resized, hid or showed. */
+    bool content;
+} paneld_place_t;
+
+void lv_paneld_drawn_area(const lv_obj_t * obj, lv_area_t * a)
+{
+    *a = obj->coords;
+    int32_t ext = lv_obj_get_ext_draw_size(obj);
+    lv_area_increase(a, ext, ext);
+    /* Its own transform (a `scale`): its parent's is applied when the
+     * area is invalidated through the parent. */
+    lv_area_t plain = *a;
+    lv_obj_get_transformed_area(obj, a, LV_OBJ_POINT_TRANSFORM_FLAG_NONE);
+    /* A transformed layer is drawn antialiased: a pixel past its edges. */
+    if(!lv_area_is_equal(a, &plain)) lv_area_increase(a, 1, 1);
+}
+
+void lv_paneld_invalidate_drawn(lv_obj_t * obj, const lv_area_t * a)
+{
+    /* Through the parent, which clips it (and turns it by its own
+     * transform), as LVGL invalidates an object. */
+    lv_obj_t * parent = lv_obj_get_parent(obj);
+    if(parent != NULL) lv_obj_invalidate_area(parent, a);
+    else lv_obj_invalidate(obj);
+}
+
+/* The scrollbars of the scrollable objects shown when an update
+ * began (lv_paneld_scrollbars_note): what they were drawn as before
+ * the update deleted, hid or added content. */
+typedef struct {
+    lv_obj_t * obj;
+    lv_area_t hor;
+    lv_area_t ver;
+} paneld_sb_note_t;
+
+static paneld_sb_note_t * sb_notes;
+static uint32_t sb_count, sb_cap;
+
+static void note_scrollbars(lv_obj_t * obj)
+{
+    if(lv_obj_is_hidden(obj)) return;
+    if(lv_obj_is_scrollable(obj)) {
+        if(sb_count == sb_cap) {
+            uint32_t more = sb_cap ? sb_cap * 2 : 16;
+            paneld_sb_note_t * grown = lv_realloc(sb_notes, more * sizeof(paneld_sb_note_t));
+            if(grown != NULL) {
+                sb_notes = grown;
+                sb_cap = more;
+            }
+        }
+        if(sb_count < sb_cap) {
+            paneld_sb_note_t * n = &sb_notes[sb_count++];
+            n->obj = obj;
+            lv_obj_get_scrollbar_area(obj, &n->hor, &n->ver);
+        }
+    }
+    uint32_t cnt = lv_obj_get_child_count(obj);
+    for(uint32_t i = 0; i < cnt; i++) note_scrollbars(lv_obj_get_child(obj, (int32_t)i));
+}
+
+void lv_paneld_scrollbars_note(lv_obj_t * obj)
+{
+    sb_count = 0;
+    lv_obj_t * scr = lv_obj_get_screen(obj);
+    if(scr != NULL) note_scrollbars(scr);
+}
+
+/* Every object of `obj`'s tree that is shown, and the hidden ones
+ * themselves (not what is under them: nothing there is drawn). False
+ * when memory ran out. */
+static bool collect_places(lv_obj_t * obj, paneld_place_t ** arr, uint32_t * n, uint32_t * cap)
+{
+    if(*n == *cap) {
+        uint32_t more = *cap ? *cap * 2 : 128;
+        paneld_place_t * grown = lv_realloc(*arr, more * sizeof(paneld_place_t));
+        if(grown == NULL) return false;
+        *arr = grown;
+        *cap = more;
+    }
+    paneld_place_t * p = &(*arr)[(*n)++];
+    p->obj = obj;
+    p->shown = !lv_obj_is_hidden(obj);
+    lv_paneld_drawn_area(obj, &p->area);
+    p->scrolls = p->shown && lv_obj_is_scrollable(obj);
+    p->content = false;
+    if(p->scrolls) {
+        lv_obj_get_scrollbar_area(obj, &p->sb_hor, &p->sb_ver);
+        for(uint32_t i = 0; i < sb_count; i++) {
+            if(sb_notes[i].obj == obj) {
+                p->sb_hor = sb_notes[i].hor;
+                p->sb_ver = sb_notes[i].ver;
+                break;
+            }
+        }
+    }
+    if(!p->shown) return true;
+    uint32_t cnt = lv_obj_get_child_count(obj);
+    for(uint32_t i = 0; i < cnt; i++) {
+        if(!collect_places(lv_obj_get_child(obj, (int32_t)i), arr, n, cap)) return false;
+    }
+    return true;
+}
+
+static void scroll_back_in(lv_obj_t * obj, lv_anim_enable_t anim);
+
+/* Nothing moves `obj`'s scroll now: no drag or throw in it, no scroll
+ * animation (an elastic edge going back) on it. */
+static bool scroll_at_rest(lv_obj_t * obj)
+{
+    for(lv_indev_t * i = lv_indev_get_next(NULL); i != NULL; i = lv_indev_get_next(i)) {
+        if(i->pointer.scroll_obj == obj) return false;
+    }
+    lv_ll_t * ll = &LV_GLOBAL_DEFAULT()->anim_state.anim_ll;
+    for(lv_anim_t * x = lv_ll_get_head(ll); x != NULL; x = lv_ll_get_next(ll, x)) {
+        if(x->var == obj && x->custom_exec_cb == NULL && x->exec_cb != NULL) return false;
+    }
+    return true;
+}
+
+/* The strips of `obj` its scrollbars run in, along its whole length:
+ * its content changed, and where its bars were drawn (or whether) is
+ * not known any more (a child hidden or deleted by the update already
+ * counts out of its content). */
+static void invalidate_scrollbar_strips(lv_obj_t * obj)
+{
+    lv_dir_t dir = lv_obj_get_scroll_dir(obj);
+    const lv_area_t * c = &obj->coords;
+    if(dir & LV_DIR_VER) {
+        int32_t w = lv_obj_get_style_width(obj, LV_PART_SCROLLBAR) + lv_obj_get_style_pad_right(obj, LV_PART_SCROLLBAR) +
+                    lv_obj_get_style_pad_left(obj, LV_PART_SCROLLBAR) + 2;
+        lv_area_t right = {c->x2 - w, c->y1, c->x2, c->y2};
+        lv_area_t left = {c->x1, c->y1, c->x1 + w, c->y2};
+        lv_obj_invalidate_area(obj, &right);
+        if(lv_obj_get_style_base_dir(obj, LV_PART_MAIN) == LV_BASE_DIR_RTL) lv_obj_invalidate_area(obj, &left);
+    }
+    if(dir & LV_DIR_HOR) {
+        int32_t h = lv_obj_get_style_height(obj, LV_PART_SCROLLBAR) + lv_obj_get_style_pad_bottom(obj, LV_PART_SCROLLBAR) +
+                    lv_obj_get_style_pad_top(obj, LV_PART_SCROLLBAR) + 2;
+        lv_area_t bottom = {c->x1, c->y2 - h, c->x2, c->y2};
+        lv_obj_invalidate_area(obj, &bottom);
+    }
+}
+
+static bool paneld_listed(const lv_obj_t * obj, lv_obj_t * const * list, uint32_t n)
+{
+    for(uint32_t i = 0; i < n; i++) {
+        if(list[i] == obj) return true;
+    }
+    return false;
+}
+
+int32_t lv_paneld_layout_settled(lv_obj_t * obj, lv_obj_t * const * shown_now, uint32_t n_shown)
+{
+    lv_obj_t * scr = lv_obj_get_screen(obj);
+    if(scr == NULL) return 0;
+    if(!scr->scr_layout_inv) {
+        for(uint32_t i = 0; i < n_shown; i++) lv_obj_invalidate(shown_now[i]);
+        return 0;
+    }
+    paneld_place_t * places = NULL;
+    uint32_t n = 0, cap = 0;
+    if(!collect_places(scr, &places, &n, &cap)) {
+        /* No memory to tell what moved: laid out with LVGL's own
+         * redraws, and the screen redrawn whole besides (those were
+         * left out for what was shown or moved before). */
+        lv_free(places);
+        lv_obj_update_layout(scr);
+        lv_obj_invalidate(scr);
+        return -1;
+    }
+    lv_display_t * disp = lv_obj_get_display(scr);
+    /* The layout's own invalidations (an object shrunk to its content
+     * and stretched back, a row placed where it was) are left out... */
+    lv_display_enable_invalidation(disp, false);
+    lv_obj_update_layout(scr);
+    /* Content that shrank under a scroll position (rows gone, hidden)
+     * leaves it past its end: back within its content, as a fresh page
+     * shows it (LVGL only does so when its bottom was scrolled in and
+     * its top out). What that moves is redrawn below. */
+    for(uint32_t i = 0; i < n; i++) {
+        paneld_place_t * p = &places[i];
+        if(p->scrolls && !lv_obj_is_hidden(p->obj) && scroll_at_rest(p->obj)) scroll_back_in(p->obj, LV_ANIM_OFF);
+    }
+    lv_display_enable_invalidation(disp, true);
+    /* ...for what it moved, resized, hid or showed, where it was and
+     * where it is now, and scrollbars that moved, where they were and
+     * are. */
+    int32_t moved = 0;
+    for(uint32_t i = 0; i < n; i++) {
+        paneld_place_t * p = &places[i];
+        bool shown = !lv_obj_is_hidden(p->obj);
+        lv_area_t now;
+        lv_paneld_drawn_area(p->obj, &now);
+        /* Shown in this update: where it was is where it was last laid
+         * out while hidden, nothing drawn there; where it is, always. */
+        bool new_here = paneld_listed(p->obj, shown_now, n_shown);
+        if(!new_here && shown == p->shown && (!shown || lv_area_is_equal(&now, &p->area))) continue;
+        moved++;
+        if(p->shown && !new_here) lv_paneld_invalidate_drawn(p->obj, &p->area);
+        if(shown) lv_obj_invalidate(p->obj);
+        /* Its parent's content changed (places run parents first). */
+        lv_obj_t * parent = lv_obj_get_parent(p->obj);
+        for(uint32_t k = i; k-- > 0;) {
+            if(places[k].obj == parent) {
+                places[k].content = true;
+                break;
+            }
+        }
+    }
+    /* Scrollbars that moved, or whose content changed. */
+    for(uint32_t i = 0; i < n; i++) {
+        paneld_place_t * p = &places[i];
+        if(!p->scrolls || lv_obj_is_hidden(p->obj)) continue;
+        lv_area_t hor, ver;
+        lv_obj_get_scrollbar_area(p->obj, &hor, &ver);
+        if(p->content || !lv_area_is_equal(&hor, &p->sb_hor) || !lv_area_is_equal(&ver, &p->sb_ver)) {
+            invalidate_scrollbar_strips(p->obj);
+        }
+    }
+    lv_free(places);
+    sb_count = 0;
+    return moved;
+}
+
+void lv_paneld_move_to_index_quiet(lv_obj_t * obj, int32_t index)
+{
+    lv_obj_t * parent = lv_obj_get_parent(obj);
+    if(parent == NULL || lv_obj_get_style_layout(parent, LV_PART_MAIN) == LV_LAYOUT_NONE) {
+        lv_obj_move_to_index(obj, index);
+        return;
+    }
+    /* In a flex or grid the order is the place: the layout pass moves
+     * it, and lv_paneld_layout_settled redraws where it was and is. */
+    lv_display_t * disp = lv_obj_get_display(obj);
+    lv_display_enable_invalidation(disp, false);
+    lv_obj_move_to_index(obj, index);
+    lv_display_enable_invalidation(disp, true);
+}
+
 #include "src/indev/lv_indev_private.h"
 
 lv_obj_t * lv_paneld_indev_pressed_obj(const lv_indev_t * indev)
@@ -918,6 +1170,47 @@ static bool obj_under(lv_obj_t * obj, const lv_obj_t * root)
     return false;
 }
 
+/* Scroll `obj` back within its content if a drag left it past an
+ * edge (LVGL's release pulls it back; a reset press never releases). */
+static void scroll_back_in(lv_obj_t * obj, lv_anim_enable_t anim)
+{
+    lv_obj_update_layout(obj);
+    int32_t sx = lv_obj_get_scroll_x(obj);
+    int32_t sy = lv_obj_get_scroll_y(obj);
+    int32_t max_y = LV_MAX(0, lv_obj_get_scroll_top(obj) + lv_obj_get_scroll_bottom(obj));
+    int32_t max_x = LV_MAX(0, lv_obj_get_scroll_left(obj) + lv_obj_get_scroll_right(obj));
+    int32_t ty = LV_CLAMP(0, sy, max_y);
+    int32_t tx = lv_obj_get_style_base_dir(obj, LV_PART_MAIN) == LV_BASE_DIR_RTL ? LV_CLAMP(-max_x, sx, 0) : LV_CLAMP(0, sx, max_x);
+    if(tx != sx || ty != sy) lv_obj_scroll_by(obj, sx - tx, sy - ty, anim);
+}
+
+static void scroll_end_cb(lv_event_t * e)
+{
+    /* LVGL pulls a list dragged past an edge back at the end of the
+     * drag only while it can still scroll: one whose content shrank to
+     * fit under the finger (an item gone) stayed past its edge. */
+    scroll_back_in(lv_event_get_current_target(e), LV_ANIM_ON);
+}
+
+void lv_paneld_scroll_keep_in(lv_obj_t * obj)
+{
+    uint32_t n = lv_obj_get_event_count(obj);
+    for(uint32_t i = 0; i < n; i++) {
+        lv_event_dsc_t * d = lv_obj_get_event_dsc(obj, i);
+        if(lv_event_dsc_get_cb(d) == scroll_end_cb) return;
+    }
+    lv_obj_add_event_cb(obj, scroll_end_cb, LV_EVENT_SCROLL_END, NULL);
+}
+
+void lv_paneld_indev_cancel(lv_indev_t * indev, lv_obj_t * obj, bool animate)
+{
+    /* A drag under way may have pulled what it scrolls past its edge. */
+    lv_obj_t * scrolled = indev->pointer.scroll_obj;
+    lv_indev_reset(indev, obj);
+    lv_indev_wait_release(indev);
+    if(scrolled != NULL) scroll_back_in(scrolled, animate ? LV_ANIM_ON : LV_ANIM_OFF);
+}
+
 bool lv_paneld_indev_release_under(lv_obj_t * root)
 {
     bool any = false;
@@ -928,9 +1221,8 @@ bool lv_paneld_indev_release_under(lv_obj_t * root)
         if(obj_under(i->pointer.act_obj, root) || obj_under(i->pointer.scroll_obj, root)) {
             /* Sends the pressed object LV_EVENT_INDEV_RESET (it leaves
              * its pressed state), and the rest of the touch goes
-             * nowhere. */
-            lv_indev_reset(i, NULL);
-            lv_indev_wait_release(i);
+             * nowhere. A page left: it shows again within its content. */
+            lv_paneld_indev_cancel(i, NULL, false);
             any = true;
         }
     }

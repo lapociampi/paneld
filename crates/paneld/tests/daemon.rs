@@ -239,6 +239,41 @@ fn alerts_fired_over_ctl_go_through_ack_snooze_and_resolve() {
 }
 
 #[test]
+fn a_page_reading_the_alert_count_is_not_updated_when_an_alert_is_acknowledged() {
+    // ADR 0024 phase 4: `alerts.<field>` change names. An ack or snooze
+    // changes `active` and `shown`, not `count`: a page (without the
+    // shipped shell, whose banner reads `shown`) that only shows the
+    // count is left alone; one that reads `shown` is updated.
+    let dir = tmp("alert-fields");
+    let d = Daemon::start(
+        &dir,
+        "component shell { slot { } }\n\
+         page home { nav = 1; text { value = {{ alerts.count }} alerts } }\n\
+         page banner { nav = 2; text { value = {{ len(alerts.shown) }} shown } }\n",
+    );
+    let updates = || status_num(&d, "updates");
+    d.ok(&["alert", "fire", "disk", "severity=critical"]);
+    wait_status(&d, "updates", 1);
+    d.ok(&["alert", "fire", "temp", "severity=warning"]);
+    wait_status(&d, "updates", 2);
+    d.ok(&["alert", "ack", "disk"]);
+    d.ok(&["alert", "snooze", "temp", "1h"]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(updates(), 2, "an ack or a snooze updated a page that reads only the count");
+    d.ok(&["alert", "resolve", "disk"]);
+    wait_status(&d, "updates", 3);
+    // A page that reads `shown` is updated by an ack.
+    d.ok(&["goto", "banner"]);
+    let before = updates();
+    d.ok(&["alert", "fire", "fan", "severity=warning"]);
+    wait_status(&d, "updates", before + 1);
+    let before = updates();
+    d.ok(&["alert", "ack", "fan"]);
+    wait_status(&d, "updates", before + 1);
+    d.stop();
+}
+
+#[test]
 fn an_acknowledged_rule_alert_stays_acknowledged_after_a_restart() {
     let dir = tmp("restart");
     let conf = "source c { run = echo 5; parse = number }\n\

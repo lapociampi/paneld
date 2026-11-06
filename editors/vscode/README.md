@@ -27,4 +27,4 @@ bun install
 bun test
 ```
 
-The test runs the grammar over every `.conf` in the repo (and `../paneld-configs` when it is beside it) and the config examples in `docs/`, and checks that no rule runs past its line.
+The test runs the grammar over every `.conf` in the repo (and every `.conf` under `$PANELD_CONFIGS` when it is set) and the config examples in `docs/`, and checks that no rule runs past its line.

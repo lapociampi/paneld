@@ -36,6 +36,15 @@ pub fn unix_now() -> i64 {
     }
 }
 
+/// Now, as [`unix_now`] reads it: held still with it (`shot --verify`),
+/// else the wall clock.
+pub fn system_now() -> SystemTime {
+    match FROZEN.load(std::sync::atomic::Ordering::Relaxed) {
+        i64::MIN => SystemTime::now(),
+        t => UNIX_EPOCH + std::time::Duration::from_secs(t.max(0) as u64),
+    }
+}
+
 /// `paneld shot --verify`: `now` reads `t` until `freeze(None)`, so a
 /// page and the fresh render it is compared with see the same second.
 pub fn freeze(t: Option<i64>) {

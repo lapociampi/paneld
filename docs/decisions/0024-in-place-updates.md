@@ -8,7 +8,7 @@ series: paneld
 order: 31
 ---
 
-- Status: Accepted; Phases 0, 1, 2 and 3 done (results below). Changes the rendering of [ADR 0003](0003-ui-model.md) ("every update rebuilds the page") and the "rebuilt whole" basis of [ADR 0023](0023-motion.md); keeps [ADR 0004](0004-cel.md) and [ADR 0010](0010-threads.md) (all LVGL work stays on the UI thread).
+- Status: Accepted; all phases done (results below). Changes the rendering of [ADR 0003](0003-ui-model.md) ("every update rebuilds the page") and the "rebuilt whole" basis of [ADR 0023](0023-motion.md); keeps [ADR 0004](0004-cel.md) and [ADR 0010](0010-threads.md) (all LVGL work stays on the UI thread).
 - Date: 2026-11-06
 
 ## Context
@@ -125,9 +125,9 @@ Dep keys (one analysis, moved from `visible.rs` into `paneld-config` and used by
 | `sources.x.f` (field `f`: `value`, `ok`, `error`, `at`, `history`, `exit`, ...) | `sources.x.f` |
 | `sources.x` whole, `sources.x[expr]` | `sources.x.*` |
 | `sources` whole, `sources[expr]` | `sources.*` |
-| remote member `dev.temp`, `dev.status.temp` | as `visible.rs`, plus the field as above |
+| remote member `dev.temp`, `dev.status.temp` | as `visible.rs`, plus the field as above (phase 4: `dev.temp` is `sources.dev.temp.value`, `dev.status.temp.f` that field; `dev.ok`, `dev.error`, `dev` whole every member) |
 | `vars.y` / `vars` whole | `vars.y` / `vars.*` |
-| `alerts` (any part) | `alerts` |
+| `alerts` (any part) | `alerts` (phase 4: `alerts.f` by field, `count`, `shown`, ...; `alerts` whole or by a computed key, every field) |
 | `now.<minute field>` / `now.second`, `now.unix`, `now` whole | `now:minute` / `now:second` |
 | `ago(...)` | `ago` (run when its `due` passes) |
 | `theme.*` | none: constant until a theme switch, which rebuilds |
@@ -143,7 +143,7 @@ A read the analysis does not understand gets the widest key of its root (`source
 | --- | --- |
 | Source update (605, 628) | `sources.x.f` for each field of the new map that differs from the old one. A poll with the same output changes only `at` (and `history`): only readers of those run. `ok` / `error` status updates: those two fields |
 | `VarsChanged` (563), inline sets (531, 559), `ctl var set` (2196) | the vars whose value differs from the last pass's snapshot |
-| Alert tick, reminders, `note_resolved` (643, 646, 652), builtin ack / snooze (1395), display problem (2111), `ctl alert_fire` / `alert_resolve` (2225, 2253) | `alerts` |
+| Alert tick, reminders, `note_resolved` (643, 646, 652), builtin ack / snooze (1395), display problem (2111), `ctl alert_fire` / `alert_resolve` (2225, 2253), an event alert (`alert { from = src }`) a source's result fires or resolves | `alerts` (phase 4: the fields of `alerts` that differ from what the page last saw, told apart again from the pass's context as the vars are) |
 | Clock (676) | `now:minute`, or `now:second` + `now:minute` |
 | `ago_due` (689) | `ago` |
 | Call started (1557), `call_done` (378, 512) | `call:<action>` |
@@ -357,6 +357,60 @@ With phase 2, pages with `repeat`s, measured the same way (lists empty: `--no-so
 
 A kept page costs 25-45 KB estimated and about 60-85 KB of RSS on x86, within the 1 MiB default. The first frame is still a full-screen draw (the fade); on the Pi the build saved is the ~8-12 ms of Phase 0's figures. Pi figures were not taken here.
 
+### Phase 4 results
+
+Done: change names by field where a page reads one field, and a redraw that covers only what an update changed.
+
+| What | As built |
+| --- | --- |
+| `alerts.<field>` | `alerts.count`, `shown`, `active`, `worst`, `history`, `recent`, `snooze` are change names of their own: each site that changes alerts (tick, reminders, ack, snooze, `ctl alert`, the display problem, an event alert's source result) compares `alerts` with what the page last saw, and the pass compares it again with its context (a snooze running out between the two). An ack or a snooze moves `active` and `shown`, not `count`: the rack's home tile (`alerts.count`, `alerts.worst`) is not walked for it. `alerts` whole or by a computed key reads every field |
+| Remote members | `dev.temp` reads `sources.dev.temp.value`, `dev.status.temp.ok` that field; `dev.ok`, `dev.error` and `dev` whole every member, as before. The rack's `pve.pools` poll (every 2 minutes, its run starting and ending) no longer walks the home page's `pve.stats` tile |
+| The layout pass after an update | Run at the end of the update with LVGL's own redraws off; then each object it moved, resized, hid or showed is redrawn where it was (its area turned and scaled by its own transform, through its parent, which clips it) and where it is; a scroll whose content changed, or whose bars are not where they were when the update began (noted then: what the update deletes or hides changes them before the layout pass looks), has the strips its bars run in redrawn whole. What it only placed again where it was is not redrawn. What the update set itself (a text, a value, a restyle) redraws as before. Without memory to note where everything was, the layout runs with LVGL's redraws and the screen is redrawn whole |
+| Scrolled past the end | A scroll at rest (no drag, no throw, no scroll animation in it) whose content shrank under its position goes back within its content at once after the layout, as a fresh render shows it (LVGL only does so when its bottom was scrolled in and its top out) |
+| Restyles | A style that changes the drawn area (padding, gaps, shadow, transform, line and arc width, a background image or gradient cleared) set on an object the update noted is set without LVGL's redraw: the update's end restyles (and redraws) it only if its styles or states now differ, and then also where it was drawn when noted (LVGL redraws a restyled object where it is drawn now: a `scale` taken off, or a state with a larger scale left, left the larger area). A component root set up again with its call's padding is not redrawn. A grid laid out again with the same tracks keeps its track arrays (new arrays made it look restyled, and redrew it whole with its children) |
+| Items moved | Moving an object among its parent's children redrew the whole parent (`lv_obj_move_to_index`); in a parent that lays them out (flex, grid) it moves quietly and the layout pass redraws the rows that moved. A `stack` (no layout: order is drawing order) redraws as before |
+| Shown by an update | Shown without LVGL's redraw at the place it was last laid out (while hidden: nothing drawn there), and redrawn where the layout puts it |
+| Keypad in a row | In a row as wide as its content (and not grown), the keys get 240 px of their own, as phase 2 gave them 200 px of height in a column as tall as its content; LVGL made them as wide as the row, which widened the row on every layout pass |
+
+What was not narrowed:
+
+| Point | Why |
+| --- | --- |
+| The rack `alerts` page, items changed | Most of phase 2's 270000 px is the shell's banner: an alert fired, acknowledged or resolved changes `alerts.shown`, the banner shows or hides (with its entrance), and the whole page body under it moves 47 px, so it is all redrawn, rightly. What phase 4 takes off is the parent redrawn for each kept item moved: over the same 200 random changes on the Pi, 267000 -> 166000 px (median); a list that moves no banner (the `host` page's pools, a pool added, reordered, removed): 162000 -> 91000 px |
+| The layout pass itself | Still runs whenever an update set something up again: a grid whose child was set up again measures its children again (a stretched child whose content changed must shrink back), about 0.1 ms of a 0.3 ms update on x86, 0.3-0.4 ms on the Pi. Only its redraws are narrowed |
+
+Review: `shot --verify` and the fuzz compared pictures redrawn whole (`MemDisplay::rgb` redraws the screen first), so a redraw an update missed never showed. `verify_picture` now first takes the frame as the screen has it, redrawn only where the page asked (the memory display draws in DIRECT mode: the buffer keeps every earlier frame, as the DRM shadow buffer does), then the frame redrawn whole, and fails on any difference (count and box of the pixels, both pictures in `PANELD_VERIFY_DIR`). Every `--verify` test and fuzz run is a partial-redraw test since. It found, in phase 4: an object scaled above 1 moved by the layout left its edges (its old area was its box, not its scaled area); a scale taken off (by a style or a state) left the larger area; a scrollbar's old place was never redrawn; and, older: a scroll scrolled down stayed past its end when an update shrank its content (no drag). And a verify false positive, older: `sources.x.age` is drawn on `ago()`'s steps, while the fresh render took its age when it was built; the page's context now has each source's age as of its last step (or new `at`, or a page built afresh), so an update, a widget redrawn for something else and a fresh render read the same age. Another, found by the fuzz's short snoozes: `alerts.shown` read the wall clock for a snooze running out, so a fresh render built a moment after the page could show a banner the page did not; it reads the page's clock (`now`, held still by `shot --verify`) now. A remaining bar of a list whose last rows were deleted (no row moved) was missed until the bars were noted at the update's start.
+
+Found on the way, older than phase 4, by the fuzz now comparing pictures in every run (was: only with `--fuzz-pages`): a press cancelled (an update moving what the finger held, or the page left under the finger) during a drag that had pulled a `scroll` past its edge left it there (LVGL pulls it back on a release, and a cancelled press never releases): it goes back within its content now; and LVGL pulls a list back at the end of a drag only while it can still scroll, so a list whose content shrank to fit under the finger (rows hidden) stayed past its top: a `scroll` goes back within its content at the end of every drag or throw, and (review) after an update's layout when nothing scrolls it.
+
+Tests (each fails without its part): a tile's text in a grid of component cards redraws under 6000 px (the rack's home: 55944 before), checked with each of the settled layout, the quiet restyle and the kept grid tracks switched off; two items trading places redraw two rows, not the list; a page reading `alerts.count` is not updated by an ack or a snooze, one reading `shown` is; a poll of one remote member leaves the readers of another; a keypad in a content-sized row compares as a fresh render; a list pulled past its top comes back when the press is cancelled (page left under the finger) and when its content shrinks under the drag. Two more guard what already held and must stay: a header label (a clock) redraws only itself, and a history chart's poll redraws only the chart. Review round: a scaled object moved by the layout, a scale taken off, a scrollbar moved, a list scrolled down whose content shrinks (in a `scroll` and in the shell's body), an `age` between two steps (each fails with its fix off; the first three pass with the fix off when pictures are compared redrawn whole, as before the review), and an event alert reaching the readers of its fields (a guard: the pass's own comparison of `alerts` also catches it). `--fuzz` (with `--fuzz-taps`, eight seeds on each rack page) now checks pixels every 10 steps; it also acknowledges and snoozes alerts (some snoozes run out within the run) and fails source runs now and then (a remote's `ok`, `error`, `status`).
+
+Measured on the Pi 3B+, the static aarch64 build run by hand as the `paneld` user beside the running service, a real homelab config read only, against the phase 3 build (6ff603c) and `PANELD_UPDATES=0` (builds on every change). Changes: `paneld shot --no-sources` (software drawing into memory, as DRM draws before its copy to the screen), medians, the update and the frame after it:
+
+| Change | `PANELD_UPDATES=0` | Phase 3 | Phase 4 |
+| --- | --- | --- | --- |
+| Rack `home`, a tile's value (10 polls) | 13.3 + 14.3 ms (384000 px) | 1.3 + 2.4 ms (55944 px) | 1.4 + 0.6 ms (4746 px) |
+| `home` with a seconds clock in the shell's header (21 ticks) | 13.0 + 13.8 ms (384000 px) | 0.7 + 0.3 ms (2838 px) | 0.8 + 0.3 ms (2838 px) |
+| `host`, its pools added, reordered, removed (10) | 14.5 + 16.0 ms (384000 px) | 3.4 + 6.3 ms (161784 px) | 3.6 + 4.4 ms (91164 px) |
+| `alerts`, 200 random changes, items changed | 8.5 + 11.5 ms (384000 px) | 2.3 + 3.2 ms (267296 px) | 2.9 + 1.7 ms (165861 px) |
+| `alerts`, values only | | 1.1 + 0.6 ms (37600 px) | 1.1 + 0.6 ms (43249 px, see below) |
+| Navigation, page not kept (`page_cache = 0`) | | | 13.4 ms build + 24.3 ms first frame (the fade's) |
+| Navigation, page kept (`page_cache = 3`, three pages round) | | 1.4 + 17.6 ms | 0.6 + 17.2 ms |
+
+An update's time now holds its layout pass (before, the frame's). The two `alerts` rows are not the same changes: phase 4's fuzz also acknowledges and snoozes alerts (the phase 3 build's only fires and resolves), so the same seed makes another sequence, with more banner flips (a banner shown or hidden moves the whole body, see above); for a given change phase 4 redraws a part of what phase 3 did (a banner shown no longer redraws where it was last laid out, under the header, as well). The rack's own home page has no clock; the second row adds one to the shipped shell's header. Its tick was already narrow in phase 3 (the label's own area): under 2 ms either way.
+
+The daemon, the same way beside the service (on `/dev/fb0`, no touch, no backlight, its own socket and state file), against the deployed build (c654a99, built on every change):
+
+| | c654a99 | Phase 4 |
+| --- | --- | --- |
+| A poll changing the home page (median) | 15.8 ms build, then a full-screen frame | 1.4 ms update |
+| An alert fired, acked, snoozed, resolved on the `alerts` page (10) | 16.6 ms build | 3.8 ms update |
+| Navigation, page built | 18.8 ms | 13.2 ms |
+| CPU over 3 minutes on `home` (its polls) | 0.37% of a core | 0.17% (redraws: 7, against 14) |
+| RSS on `home`, then after all pages twice | 4.06, 4.16 MB | 4.45, 4.78 MB (`page_cache = 3`); 4.45, 4.59 MB (`0`) |
+
+With `PANELD_UPDATES=0` the same build used 0.88% (49 builds in those 3 minutes: it builds for every change name, a run starting or a same-output poll too, where c654a99 had one dirty flag). The page cache costs about 0.2 MB of RSS on the rack (three pages kept).
+
 ## What stays a full rebuild
 
 - Reload (every key may mean another node; motion `forget`), theme switch (tokens, styles, fonts, components), a display size change.
@@ -370,7 +424,7 @@ A kept page costs 25-45 KB estimated and about 60-85 KB of RSS on x86, within th
 - LVGL state an update keeps and a rebuild reset: scroll position, focus, an open list. Intended (the touch rule relies on it), but a list scrolled down now stays scrolled after a poll.
 - Moving today's globals into `RenderPass` / holders touches most of `render.rs` and `ui.rs`; Phase 1 is the large one.
 - A dangling `obj` after something deletes an object behind the renderer (`clear_children` elsewhere, a modal): records are dropped only through the renderer, and a delete event on owned objects asserts in debug builds.
-- Layout cost does not shrink by itself: a content-sized label in a flex row dirties its parents (Phase 4).
+- Layout cost does not shrink by itself: a content-sized label in a flex row dirties its parents (Phase 4: what a layout pass after an update only placed again is not redrawn; the pass itself still runs, see Phase 4 results).
 - Parked pages on a 1 GB shared Pi: bounded by N, the byte budget and the image cache rule.
 - The dep analysis misses a read: the widest key is the default, and verify catches the rest in tests.
 - More work in the first build (records, bindings): Phase 0's savings should cover it; Phase 1 must not make a first build slower than today.

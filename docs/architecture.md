@@ -2,6 +2,7 @@
 title: "Architecture"
 description: "How the single native process is split into modules and threads."
 date: 2026-10-29
+updated: 2026-11-06
 tags: [paneld, architecture, rust, lvgl]
 series: paneld
 order: 2
@@ -40,8 +41,13 @@ config files --> [config] --> [engine] --> resolved tree --> [ui] --> screen
 
 ## Updates
 
-- The engine knows which bindings read which source. When a source changes, only those bindings are re-evaluated, and only the changed properties reach the UI thread.
-- A structural change (a `repeat` list changing length, a `visible` flip, a config reload) rebuilds the affected subtree only.
+As built ([ADR 0024](decisions/0024-in-place-updates.md)):
+
+- A page drawn keeps a node table: per node its LVGL objects and what its expressions read (`sources.x.value`, `vars.y`, `alerts.count`, `now:minute`, a call's state).
+- Each pass of the main loop names what changed (a source's fields, vars, `alerts` fields, the clock, call states). An update walks the page and sets up again only the nodes that read one of those and now evaluate otherwise; the rest keep their objects untouched.
+- A node that now makes other objects, or a `repeat` whose items changed, is built again where it is (kept items keep their objects); a reload or a theme switch builds the page whole.
+- Only what an update changed is redrawn: the layout pass after it redraws what it moved, resized, hid or showed, not what it placed again where it was.
+- Pages left are kept, hidden, and updated when they show again: `app:page_cache` (default 3) counts the page on screen, so 2 by default.
 - With nothing changing, the program sleeps: no redraws, no polling of the screen.
 
 ## Build

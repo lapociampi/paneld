@@ -744,7 +744,10 @@ impl Engine {
             .unwrap_or_else(|| "none".into());
 
         // Not acknowledged and not snoozed: what the banner shows.
-        let now = SystemTime::now();
+        // The clock the page reads (held still by `shot --verify`, so a
+        // snooze running out between a page and its fresh render does
+        // not tell them apart).
+        let now = crate::clock::system_now();
         let shown: Vec<Value> = sorted
             .iter()
             .filter(|a| !a.acked && a.snoozed_until.is_none_or(|t| t <= now))

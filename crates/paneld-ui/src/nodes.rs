@@ -35,7 +35,8 @@ pub enum Dep {
     Remote(String),
     /// `vars.y`; `None`: `vars` whole.
     Var(Option<String>),
-    Alerts,
+    /// `alerts.f` (`count`, `shown`, ...); `None`: `alerts` whole.
+    Alerts(Option<String>),
     NowMinute,
     NowSecond,
     /// An `ago()` text, run again when it is due.
@@ -53,7 +54,8 @@ pub struct Changes {
     pub sources: BTreeMap<String, BTreeSet<String>>,
     /// Var names (`*`: all).
     pub vars: BTreeSet<String>,
-    pub alerts: bool,
+    /// Fields of `alerts` that changed (`*`: all).
+    pub alerts: BTreeSet<String>,
     pub now_minute: bool,
     pub now_second: bool,
     pub ago: bool,
@@ -91,6 +93,11 @@ impl Changes {
         self.calls.insert(action.to_string());
     }
 
+    /// Field `field` of `alerts` changed (`count`, `shown`, ...).
+    pub fn alert(&mut self, field: &str) {
+        self.alerts.insert(field.to_string());
+    }
+
     /// Everything in `other` too.
     pub fn merge(&mut self, other: Changes) {
         for (k, v) in other.sources {
@@ -98,7 +105,7 @@ impl Changes {
         }
         self.vars.extend(other.vars);
         self.calls.extend(other.calls);
-        self.alerts |= other.alerts;
+        self.alerts.extend(other.alerts);
         self.now_minute |= other.now_minute;
         self.now_second |= other.now_second;
         self.ago |= other.ago;
@@ -119,7 +126,8 @@ impl Changes {
             }
             Dep::Var(None) => !self.vars.is_empty(),
             Dep::Var(Some(v)) => self.vars.contains(v) || self.vars.contains(ALL),
-            Dep::Alerts => self.alerts,
+            Dep::Alerts(None) => !self.alerts.is_empty(),
+            Dep::Alerts(Some(f)) => self.alerts.contains(f) || self.alerts.contains(ALL),
             Dep::NowMinute => self.now_minute,
             Dep::NowSecond => self.now_second || self.now_minute,
             Dep::Ago => self.ago,
@@ -139,9 +147,7 @@ impl Changes {
             out.extend(v.iter().map(|f| format!("sources.{k}.{f}")));
         }
         out.extend(self.vars.iter().map(|v| format!("vars.{v}")));
-        if self.alerts {
-            out.push("alerts".into());
-        }
+        out.extend(self.alerts.iter().map(|f| format!("alerts.{f}")));
         if self.now_minute {
             out.push("now:minute".into());
         }
@@ -288,7 +294,7 @@ fn read_deps(r: &Read, out: &mut Vec<Dep>) {
             (Some(n), None) => Dep::Source(n, None),
         }),
         "vars" => out.push(Dep::Var(step(0))),
-        "alerts" => out.push(Dep::Alerts),
+        "alerts" => out.push(Dep::Alerts(step(0))),
         "now" => {
             let second = step(0).is_none_or(|f| paneld_config::cel::NOW_SECOND_FIELDS.contains(&f.as_str()));
             out.push(if second { Dep::NowSecond } else { Dep::NowMinute });
@@ -296,8 +302,22 @@ fn read_deps(r: &Read, out: &mut Vec<Dep>) {
         root => match local_deps(root) {
             Some(d) => out.extend(d.iter().cloned()),
             None if GLOBALS.contains(&root) => {}
-            None => out.push(Dep::Remote(root.to_string())),
+            None => out.push(remote_dep(root, r)),
         },
+    }
+}
+
+/// A read of remote instance `inst` (schema 17): a member's value
+/// (`dev.temp`) is its source's `value`, a member's status field
+/// (`dev.status.temp.ok`) that field; `dev.ok`, `dev.error` and the
+/// instance whole read every member (ADR 0024, phase 4: a poll of one
+/// member, or a run starting, does not touch the readers of another).
+fn remote_dep(inst: &str, r: &Read) -> Dep {
+    let step = |i: usize| r.path.get(i).map(|s| s.name.as_str());
+    match (step(0), step(1)) {
+        (Some("status"), Some(m)) => Dep::Source(format!("{inst}.{m}"), step(2).map(str::to_string)),
+        (None | Some("ok" | "error" | "status"), _) => Dep::Remote(inst.to_string()),
+        (Some(m), _) => Dep::Source(format!("{inst}.{m}"), Some("value".into())),
     }
 }
 
@@ -1365,6 +1385,13 @@ mod tests {
         assert!(m.hits(&Dep::NowSecond) && !m.hits(&Dep::NowMinute));
         let a = Changes { ago: true, ..Default::default() };
         assert!(a.hits(&Dep::Source("x".into(), Some("age".into()))) && !a.hits(&Dep::Source("x".into(), Some("value".into()))));
+        // An alert acknowledged: `active` and `shown`, not `count`.
+        let mut al = Changes::default();
+        al.alert("active");
+        al.alert("shown");
+        assert!(al.hits(&Dep::Alerts(Some("shown".into()))) && al.hits(&Dep::Alerts(None)) && !al.hits(&Dep::Alerts(Some("count".into()))));
+        al.alert(ALL);
+        assert!(al.hits(&Dep::Alerts(Some("count".into()))));
         let mut k = Changes::default();
         k.call("vm_stop");
         assert!(k.hits(&Dep::Call(Some("vm_stop".into()))) && k.hits(&Dep::Call(None)) && !k.hits(&Dep::Call(Some("x".into()))));
@@ -1383,7 +1410,7 @@ mod tests {
         let outer = current_frame();
         let _call = push_frame(vec![("value".into(), vec![Dep::Source("cpu".into(), Some("value".into()))])]);
         let mut d = Vec::new();
-        let e = parse("value > 1 && page.title != '' && vars.x && sources.y.ok && now.time != '' && ago(sources.y.at) != '' && d1.temp > 1");
+        let e = parse("value > 1 && page.title != '' && vars.x && sources.y.ok && now.time != '' && ago(sources.y.at) != '' && d1.temp > 1 && d1.status.load.running && d1.status.fan[0] && d2.ok && len(alerts.shown) > 0 && alerts['count'] > 0 && alerts[vars.x] != null");
         expr_deps(1, &e, &mut d);
         union(&mut d, &[]);
         let mut want = vec![
@@ -1393,7 +1420,13 @@ mod tests {
             Dep::Source("y".into(), Some("ok".into())),
             Dep::NowMinute,
             Dep::Source("y".into(), Some("at".into())),
-            Dep::Remote("d1".into()),
+            Dep::Source("d1.temp".into(), Some("value".into())),
+            Dep::Source("d1.load".into(), Some("running".into())),
+            Dep::Source("d1.fan".into(), None),
+            Dep::Remote("d2".into()),
+            Dep::Alerts(Some("shown".into())),
+            Dep::Alerts(Some("count".into())),
+            Dep::Alerts(None),
             Dep::Ago,
         ];
         want.sort();
@@ -1405,7 +1438,7 @@ mod tests {
             let _slot = switch_frame(outer);
             let mut d = Vec::new();
             expr_deps(2, &parse("value + dev.x"), &mut d);
-            assert_eq!(d, vec![Dep::Remote("dev".into())]);
+            assert_eq!(d, vec![Dep::Source("dev.x".into(), Some("value".into()))]);
         }
         assert_eq!(all_local_deps().len(), 2);
         clear_reads();

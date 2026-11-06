@@ -2957,14 +2957,13 @@ fn a_running_button_and_its_end_look_as_a_fresh_render() {
 }
 
 /// The configs random changes are checked over: the shipped shell and
-/// alerts page, the examples, and the rack config when it is next to
-/// this repo (read only, nothing of it runs).
+/// alerts page, the examples, and the config in `PANELD_FUZZ_CONFIG`
+/// when it is set (read only, nothing of it runs).
 fn fuzz_configs() -> Vec<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut out: Vec<PathBuf> = ["homelab", "smart-home", "system"].iter().map(|e| root.join("examples").join(e).join("paneld.conf")).collect();
-    let rack = root.join("../paneld-configs/paneld.conf");
-    if rack.is_file() {
-        out.push(rack);
+    if let Some(extra) = std::env::var_os("PANELD_FUZZ_CONFIG").map(PathBuf::from).filter(|p| p.is_file()) {
+        out.push(extra);
     }
     out
 }
@@ -3041,8 +3040,8 @@ fn demo_sources(conf: &Path) -> Vec<String> {
 /// update and picture compared with a fresh render.
 fn fuzz_config(conf: &Path) {
     let d = tmp("fuzz");
-    // Taps run what they touch: the examples' actions only sleep; the
-    // rack config's reach real devices, so there they run nothing.
+    // Taps run what they touch: the examples' actions only sleep; a
+    // real config's reach real devices, so there they run nothing.
     let example = conf.starts_with(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples"));
     let demo = demo_sources(conf);
     for page in pages_of(conf) {
@@ -3869,4 +3868,376 @@ fn a_keypad_that_lost_its_focus_to_a_tap_compares_as_a_fresh_one() {
     )
     .unwrap();
     shot(&conf, &["--tap", "140,85", "--tap", "70,370", "--set", "n=2"]);
+}
+
+// ---- ADR 0024 phase 4: narrowing ----
+
+/// The `px` of the first frame after each `perf update` of a
+/// `shot_perf` log.
+fn px_after_updates(log: &str) -> Vec<u64> {
+    let lines: Vec<&str> = log.lines().filter(|l| !l.starts_with("perf event")).collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("perf update"))
+        .map(|(at, _)| {
+            let frame = lines[at..].iter().find(|l| l.starts_with("perf t=")).expect("a frame after the update");
+            field(frame, "px").parse().unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn a_tile_in_a_grid_redraws_only_its_text() {
+    // The rack's home page: tiles (component roots with a padded card
+    // and a tap, whose binding reads every param) in a grid. A value in
+    // one tile set its card up again (its styles, padding among them,
+    // each set redrawing the card), and the
+    // grid, laid out again, gave itself new track arrays (restyled
+    // whole) and measured each tile again (shrunk to its content and
+    // stretched back): ~56000 px on the rack for a few letters.
+    let d = tmp("grid-tile");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "theme t { style .card { background = #334455; padding = 12; radius = 10 } }\n\
+         var n: int = 1\n\
+         component tile {\n\
+             param label: string\n\
+             param value: string\n\
+             param tap: action = none\n\
+             column { class = card; gap = 4; on_tap = {{ tap }}\n\
+                 text { value = {{ label }} }\n\
+                 text { value = {{ value }}; overflow = dots }\n\
+             }\n\
+         }\n\
+         page home { column { width = 100%\n\
+             grid { columns = 4; gap = 10\n\
+                 tile { label = A; value = one }\n\
+                 tile { label = B; value = {{ string(vars.n) }}% CPU }\n\
+                 tile { label = C; value = three }\n\
+                 tile { label = D; value = four }\n\
+             }\n\
+         } }\n",
+    )
+    .unwrap();
+    let log = shot_perf(&conf, &["--verify", "--set", "n=12", "--set", "n=57", "--set", "n=8"]);
+    assert!(perf_lines(&log, "perf build").is_empty(), "{log}");
+    let px = px_after_updates(&log);
+    assert_eq!(px.len(), 3, "{log}");
+    // The value's label (about 90 x 25), not the tiles (about 180 x 60).
+    assert!(px.iter().all(|&p| p < 6_000), "{px:?} px redrawn for a tile's text\n{log}");
+}
+
+#[test]
+fn a_text_in_a_header_row_redraws_only_itself() {
+    // The shell's header: a title and a clock in a row spread apart. A
+    // new time as wide as the old one is the label's own area; one of
+    // another width moves nothing else (the row places its children
+    // again where they were).
+    let d = tmp("header-text");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var t: string = \"12:59\"\n\
+         component shell { column { width = 100%; height = 100%\n\
+             row { width = 100%; padding = 12; justify = between; background = #223344\n\
+                 text { value = {{ page.title }} }\n\
+                 text { value = {{ vars.t }} }\n\
+             }\n\
+             slot { }\n\
+         } }\n\
+         page home { text { value = body } }\n",
+    )
+    .unwrap();
+    let log = shot_perf(&conf, &["--verify", "--set", "t=\"13:00\"", "--set", "t=\"13:01\"", "--set", "t=\"9:41 pm\""]);
+    let px = px_after_updates(&log);
+    assert_eq!(px.len(), 3, "{log}");
+    assert!(px.iter().all(|&p| p < 4_000), "{px:?} px redrawn for a clock\n{log}");
+}
+
+#[test]
+fn items_trading_places_redraw_only_their_rows() {
+    // A `repeat` whose last two items swap: their rows move, the rest of
+    // the list stays. Moving an object among its parent's children
+    // redrew the whole parent (LVGL's own `lv_obj_move_to_index`).
+    let d = tmp("repeat-swap");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "var l: string = \"a,b,c,d,e,f\"\n\
+             page home {{ column {{ width = 600; gap = 0\n\
+                 repeat it in {LIST} {{\n\
+                     row {{ width = 100%; height = 40; text {{ value = {{{{ it.id }}}} }} }}\n\
+                 }}\n\
+             }} }}\n"
+        ),
+    )
+    .unwrap();
+    let log = shot_perf(&conf, &["--verify", "--set", "l=\"a,b,c,d,f,e\""]);
+    let px = px_after_updates(&log);
+    assert_eq!(px.len(), 1, "{log}");
+    // Two rows of 600 x 40 (and their labels' ink beyond them), not six.
+    assert!(px[0] <= 2 * 600 * 40 + 2_000, "{px:?} px redrawn for two rows\n{log}");
+}
+
+#[test]
+fn a_history_chart_poll_redraws_only_the_chart() {
+    // A poll with the same output: `at` and `history` move, the chart
+    // takes the new point; the text beside it reads the same.
+    let d = tmp("chart-poll");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "source cpu { run = echo 1; poll = 1h; history = 10m }\n\
+         page home { column {\n\
+             text { value = CPU {{ sources.cpu.value }} }\n\
+             chart { width = 400; height = 150; series { values = {{ sources.cpu.history }} } }\n\
+             text { value = other }\n\
+         } }\n",
+    )
+    .unwrap();
+    let log = shot_perf(&conf, &["--verify", "--no-sources", "--source", "cpu=10", "--wait", "1100", "--source", "cpu=10", "--wait", "1100"]);
+    let px = px_after_updates(&log);
+    assert_eq!(px.len(), 2, "{log}");
+    // The chart's box (400 x 150), nothing else.
+    assert!(px[1] <= 400 * 150, "{px:?}\n{log}");
+}
+
+#[test]
+fn a_keypad_in_a_row_as_wide_as_its_content_keeps_its_width() {
+    // The row counterpart of the column fixed in phase 2: LVGL makes the
+    // keys as wide as their parent, and a row as wide as its content
+    // widened by them on every layout pass (a column 177100 px wide was
+    // seen). Verify compares the page after each update with a fresh
+    // render: they were of different widths.
+    let d = tmp("keypad-row");
+    let conf = d.join("p.conf");
+    std::fs::write(&conf, "var n: int = 0\npage home { column { row { text { value = Code {{ vars.n }} }; keypad { length = 4 } } } }\n").unwrap();
+    let img = shot(&conf, &["--verify", "--set", "n=1", "--wait", "300", "--set", "n=2"]);
+    // The keys (grey on the light theme) beside the field, in a box of
+    // their own width, ending well inside the screen.
+    let keys = bbox(&img, |p| close(p, [0xdd, 0xdd, 0xdd], 8)).expect("no keys drawn");
+    assert!(keys.2 < 700, "{keys:?}");
+}
+
+#[test]
+fn a_poll_of_one_remote_member_leaves_the_readers_of_another() {
+    // ADR 0024 phase 4: `dev.temp` reads the member's source's `value`,
+    // `dev.status.load.ok` that field: a poll of `load` (or its run
+    // starting) does not walk the page for a text that reads `temp`.
+    let d = tmp("remote-member");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "remote_kind box {\n via = local\n value temp { run = echo 1; parse = number; poll = 1h }\n value load { run = echo 2; parse = number; poll = 1h }\n}\n\
+         remote dev: box { }\n\
+         page home { column {\n\
+             text { value = {{ dev.temp }} C }\n\
+             text { value = {{ dev.status.load.ok ? 'up' : 'down' }} }\n\
+         } }\n",
+    )
+    .unwrap();
+    // `load` polled twice with another value: only its `ok` reader may
+    // look, and that reads the same; then `temp` changes.
+    let log = shot_perf(&conf, &["--verify", "--no-sources", "--source", "dev.load=5", "--source", "dev.load=6", "--source", "dev.temp=30"]);
+    let updates = perf_lines(&log, "perf update");
+    // The first poll of `load` turns its `ok` on (one text set up); the
+    // second changes only its value, which nothing on the page reads.
+    let loads: Vec<&&str> = updates.iter().filter(|l| field(l, "changes").contains("dev.load") && !field(l, "changes").contains("dev.temp")).collect();
+    assert_eq!(loads.len(), 1, "{log}");
+    assert!(field(updates.last().unwrap(), "changes").contains("dev.temp.value"), "{log}");
+}
+
+#[test]
+fn a_list_pulled_past_its_top_comes_back_when_the_press_is_cancelled() {
+    // A drag pulls a `scroll` past its top (LVGL's elastic edge); its
+    // release pulls it back. A press cancelled instead (the page left
+    // under the finger, or what it held moved) never released: the list
+    // stayed scrolled above its top, where a fresh render of the page
+    // shows it at its top (found by `--fuzz-taps` on the rack's alerts
+    // page once the fuzz compared pictures without `--fuzz-pages`).
+    let d = tmp("scroll-cancel");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "page home { nav = 1; scroll { height = 100%\n\
+             rect { width = 300; height = 200; background = #ff0000 }\n\
+             rect { width = 300; height = 200; background = #00ff00 }\n\
+             rect { width = 300; height = 200; background = #0000ff }\n\
+         } }\n\
+         page two { nav = 2; text { value = two } }\n",
+    )
+    .unwrap();
+    // Down on the list, pulled down, the page left and shown again (the
+    // cache keeps it) with the finger still down, then lifted.
+    let drag = ["--down", "200,120", "--down", "200,160", "--down", "200,200", "--down", "200,240", "--goto", "two", "--goto", "home", "--up"];
+    let img = shot(&conf, &[&["--verify"][..], &drag].concat());
+    let red = bbox(&img, |p| close(p, [0xff, 0, 0], 16)).expect("no red rect");
+    let fresh = bbox(&shot(&conf, &[]), |p| close(p, [0xff, 0, 0], 16)).unwrap();
+    assert_eq!(red.1, fresh.1, "the list stayed pulled down: {red:?} vs {fresh:?}");
+}
+
+#[test]
+fn a_list_that_shrinks_under_a_drag_comes_back_to_its_top() {
+    // A drag pulls a `scroll` past its top; meanwhile its content
+    // shrinks to fit (rows hidden: not a change of structure, so it is
+    // not held for the release). LVGL pulls a list back at the end of
+    // a drag only while it can still scroll: this one stayed past its
+    // top (found by `--fuzz-taps` on the rack's alerts page).
+    let d = tmp("scroll-shrink");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var more: bool = true\n\
+         page home { scroll { height = 100%\n\
+             rect { width = 300; height = 100; background = #ff0000 }\n\
+             rect { width = 300; height = 200; background = #00ff00; visible = {{ vars.more }} }\n\
+             rect { width = 300; height = 200; background = #0000ff; visible = {{ vars.more }} }\n\
+         } }\n",
+    )
+    .unwrap();
+    let drag = ["--down", "200,90", "--down", "200,130", "--down", "200,170", "--down", "200,210", "--set", "more=false", "--up", "--wait", "1500"];
+    let img = shot(&conf, &[&["--verify"][..], &drag].concat());
+    let red = bbox(&img, |p| close(p, [0xff, 0, 0], 16)).expect("no red rect");
+    let fresh = bbox(&shot(&conf, &["--set", "more=false"]), |p| close(p, [0xff, 0, 0], 16)).unwrap();
+    assert_eq!(red.1, fresh.1, "the list stayed pulled down: {red:?} vs {fresh:?}");
+}
+
+#[test]
+fn an_event_alert_updates_the_readers_of_its_fields() {
+    // `alert { from = src }` fires and resolves on a source's results
+    // (event mode): the `alerts` fields it changes reach the page in the
+    // same update as the result (ADR 0024 phase 4, change names by field).
+    let d = tmp("event-alert");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "source feed { run = echo '{}'; parse = json; poll = 1h }\n\
+         alert ev {\n from = feed\n when = {{ true }}\n id = {{ event.value.id }}\n state = {{ event.value.state }}\n severity = warning\n title = {{ event.value.id }}\n}\n\
+         component shell { slot { } }\n\
+         page home { text { value = C {{ alerts.count }} } }\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("up.json"), r#"{"id": "disk", "state": "firing"}"#).unwrap();
+    std::fs::write(d.join("down.json"), r#"{"id": "disk", "state": "resolved"}"#).unwrap();
+    let up = format!("feed=@{}", d.join("up.json").display());
+    let down = format!("feed=@{}", d.join("down.json").display());
+    let log = shot_perf(&conf, &["--verify", "--no-sources", "--source", &up, "--source", &down]);
+    let updates = perf_lines(&log, "perf update");
+    assert_eq!(updates.len(), 2, "{log}");
+    for u in &updates {
+        let changes = field(u, "changes");
+        assert!(changes.contains("sources.feed.value") && changes.contains("alerts.count"), "{u}");
+        assert_eq!(field(u, "reapplied"), "1", "{u}");
+    }
+}
+
+// ---- ADR 0024 phase 4, review: redraws checked as the screen shows
+// them (`--verify` compares the frame redrawn only where the page asked
+// with the frame redrawn whole) ----
+
+/// `shot --verify` passes on `conf` after `steps`.
+fn verified(name: &str, conf: &str, steps: &[&str]) {
+    let d = tmp(name);
+    let path = d.join("p.conf");
+    std::fs::write(&path, conf).unwrap();
+    shot(&path, &[&["--verify"][..], steps].concat());
+}
+
+#[test]
+fn a_scaled_object_moved_by_the_layout_leaves_no_ghost() {
+    // Its old place is its scaled area, not its box: redrawing only the
+    // box left the scaled edges where it was.
+    verified(
+        "scaled-moved",
+        "theme t { style .big { scale = 1.5 } }\n\
+         var h: int = 20\n\
+         page home { column { width = 100%; height = 100%; gap = 0; padding = 60\n\
+             rect { width = 50; height = {{ vars.h }}; background = #2222dd }\n\
+             rect { width = 120; height = 80; background = #dd2222; class = big }\n\
+         } }\n",
+        &["--set", "h=60", "--set", "h=10"],
+    );
+}
+
+#[test]
+fn a_scale_taken_off_redraws_the_area_it_covered() {
+    // A restyle redraws an object where it is drawn now: a smaller
+    // scale left the edges of the larger one.
+    verified(
+        "scale-shrunk",
+        "theme t { style .big { scale = {{ vars.s }} } }\n\
+         var s: string = \"1.5\"\n\
+         page home { column { width = 100%; height = 100%; align = center; justify = center\n\
+             rect { width = 120; height = 80; background = #dd2222; class = big }\n\
+         } }\n",
+        &["--set", "s=\"1.0\"", "--set", "s=\"2\"", "--set", "s=\"1\""],
+    );
+}
+
+#[test]
+fn a_scrollbar_redraws_where_it_was() {
+    // The list shrinks and grows: the bar moves and changes length, and
+    // where it was is redrawn too.
+    verified(
+        "scrollbar-moved",
+        &format!(
+            "var l: string = \"a,b,c,d,e,f,g,h,i,j\"\n\
+             page home {{ scroll {{ width = 400; height = 300\n\
+                 column {{ width = 100%; gap = 0\n\
+                     repeat it in {LIST} {{ row {{ width = 100%; height = 40; text {{ value = {{{{ it.id }}}} }} }} }}\n\
+                 }}\n\
+             }} }}\n"
+        ),
+        &["--set", "l=\"a,b\"", "--set", "l=\"a,b,c,d,e,f,g,h,i,j\"", "--set", "l=\"a,b,c\""],
+    );
+}
+
+#[test]
+fn a_list_scrolled_down_comes_back_when_its_content_shrinks() {
+    // Scrolled to the end (a drag that ended there), then a row hides:
+    // the list stayed scrolled past its new end, where a fresh page
+    // shows it at its top, and its scrollbar was not redrawn.
+    verified(
+        "shrink-scroll",
+        "var more: bool = true\n\
+         page home { scroll { height = 100%\n\
+           rect { width = 300; height = 150; background = #ff0000 }\n\
+           rect { width = 300; height = 150; background = #00ff00 }\n\
+           rect { width = 300; height = 150; background = #0000ff; visible = {{ vars.more }} }\n\
+         } }\n",
+        &["--down", "200,300", "--down", "200,100", "--up", "--wait", "1500", "--set", "more=false"],
+    );
+    // The same with the shell's own body scrolled (a page as a column).
+    verified(
+        "shrink-body",
+        "var more: bool = true\n\
+         page home { column {\n\
+           rect { width = 300; height = 150; background = #ff0000 }\n\
+           rect { width = 300; height = 150; background = #00ff00 }\n\
+           rect { width = 300; height = 150; background = #0000ff; visible = {{ vars.more }} }\n\
+         } }\n",
+        &["--down", "200,300", "--down", "200,100", "--up", "--wait", "1500", "--set", "more=false"],
+    );
+}
+
+#[test]
+fn an_age_drawn_on_ago_steps_compares_as_a_fresh_render() {
+    // `sources.x.age` is redrawn on `ago()`'s steps, not each second; a
+    // fresh render built seconds later showed another age (verify's own
+    // false positive), now both read the age of the last step.
+    let d = tmp("age-steps");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "source temp { run = echo 1; parse = number; poll = 1h }\n\
+         page home { column {\n\
+           text { value = T {{ sources.temp.value }} }\n\
+           text { value = A {{ sources.temp.age }} }\n\
+         } }\n",
+    )
+    .unwrap();
+    shot(&conf, &["--verify", "--wait", "1500", "--wait", "1500", "--wait", "1500"]);
 }

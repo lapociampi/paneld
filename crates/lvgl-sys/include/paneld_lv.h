@@ -119,6 +119,33 @@ lv_event_code_t lv_paneld_event_dsc_code(const lv_event_dsc_t * dsc);
  * parent's layout gave it (a grid cell it was stretched to). */
 void lv_paneld_size_again(lv_obj_t * obj);
 
+/* Lay out `obj`'s screen, if it needs it, redrawing only what the
+ * layout moved, resized, hid or showed (where it was and where it is),
+ * not what it only placed again where it was. `shown_now` (`n_shown`):
+ * objects shown since the last layout without a redraw of their own
+ * (where they are is redrawn, not where they were). Returns how many
+ * objects moved (-1: no memory to tell, laid out with LVGL's own
+ * redraws). */
+/* Note the scrollbars on `obj`'s screen as an update begins, for the
+ * next lv_paneld_layout_settled (what the update then deletes, hides or
+ * adds changes them before that layout pass looks). */
+void lv_paneld_scrollbars_note(lv_obj_t * obj);
+
+int32_t lv_paneld_layout_settled(lv_obj_t * obj, lv_obj_t * const * shown_now, uint32_t n_shown);
+
+/* Where `obj` is drawn, in its parent's space: coords with its extra
+ * draw size, turned and scaled by its own transform. */
+void lv_paneld_drawn_area(const lv_obj_t * obj, lv_area_t * area);
+
+/* Redraw `area` (from lv_paneld_drawn_area, maybe taken earlier: where
+ * `obj` was) through `obj`'s parent, which clips it. */
+void lv_paneld_invalidate_drawn(lv_obj_t * obj, const lv_area_t * area);
+
+/* lv_obj_move_to_index without redrawing the whole parent when it
+ * lays out its children (flex, grid): the layout pass places it, and
+ * lv_paneld_layout_settled redraws what moved. */
+void lv_paneld_move_to_index_quiet(lv_obj_t * obj, int32_t index);
+
 /* The object a pointer `indev` holds pressed (a press, a drag), or
  * NULL when it is up. */
 lv_obj_t * lv_paneld_indev_pressed_obj(const lv_indev_t * indev);
@@ -146,6 +173,15 @@ void * lv_paneld_anims_stash_more(lv_obj_t * root, lv_anim_custom_exec_cb_t not_
  * object leaves its pressed state and gets nothing more of this touch
  * (a page leaving the screen). Whether one was. */
 bool lv_paneld_indev_release_under(lv_obj_t * root);
+
+/* Cancel `indev`'s press (lv_indev_reset with `obj`, then wait for the
+ * release); what a drag in it scrolled past an edge goes back within
+ * its content (animated or not), as a release would bring it. */
+void lv_paneld_indev_cancel(lv_indev_t * indev, lv_obj_t * obj, bool animate);
+
+/* At the end of each drag or throw, scroll `obj` back within its
+ * content if it was left past an edge (once per object). */
+void lv_paneld_scroll_keep_in(lv_obj_t * obj);
 
 /* About how many bytes the objects under `root` (itself included)
  * hold: the objects, their local styles, event lists, label text and

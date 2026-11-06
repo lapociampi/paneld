@@ -1581,6 +1581,20 @@ impl MemDisplay {
             sys::lv_obj_invalidate(sys::lv_screen_active());
             sys::lv_refr_now(self.display);
         }
+        self.pixels_rgb()
+    }
+
+    /// Draw what is waiting to be drawn, and only that, and return the
+    /// frame as [`Self::rgb`] does: in DIRECT mode the buffer keeps
+    /// every earlier frame, so this is what a screen redrawn only where
+    /// the page asked shows (the DRM shadow buffer). Compared with
+    /// [`Self::rgb`] right after, it shows a redraw the page missed.
+    pub fn rgb_incremental(&mut self) -> Vec<u8> {
+        unsafe { sys::lv_refr_now(self.display) };
+        self.pixels_rgb()
+    }
+
+    fn pixels_rgb(&self) -> Vec<u8> {
         let cf = unsafe { sys::lv_display_get_color_format(self.display) };
         let n = (self.width * self.height) as usize;
         let bytes: &[u8] = unsafe {
@@ -2026,7 +2040,7 @@ impl<'ui> Obj<'ui> {
     /// Line width and rounded ends of a `line`, in `color` (rgb, alpha).
     pub fn set_line_style(&self, width: i32, rounded: bool, color: Option<(u32, u8)>) {
         unsafe {
-            sys::lv_obj_set_style_line_width(self.raw, width, 0);
+            quiet(self.raw, || sys::lv_obj_set_style_line_width(self.raw, width, 0));
             sys::lv_obj_set_style_line_rounded(self.raw, rounded, 0);
             if let Some((rgb, opa)) = color {
                 sys::lv_obj_set_style_line_color(self.raw, sys::lv_color_hex(rgb), 0);
@@ -2639,8 +2653,17 @@ impl<'ui> Obj<'ui> {
             // as its content (and not grown into the room left) that
             // grows the parent on every layout pass (two keypads there,
             // without end). A height of its own then.
-            if sys::lv_obj_get_style_height(self.raw, 0) == LV_SIZE_CONTENT_LOCAL && sys::lv_obj_get_style_flex_grow(self.raw, 0) == 0 {
+            let grown = sys::lv_obj_get_style_flex_grow(self.raw, 0) != 0;
+            if sys::lv_obj_get_style_height(self.raw, 0) == LV_SIZE_CONTENT_LOCAL && !grown {
                 sys::lv_obj_set_height(raw, KEYBOARD_PX);
+            }
+            // And as wide as it: in a row as wide as its content, whose
+            // width is the sum of its children's, that widens the row on
+            // every layout pass, without end. A width of its own there.
+            let in_row = sys::lv_obj_get_style_layout(self.raw, 0) == sys::lv_layout_t_LV_LAYOUT_FLEX as u16
+                && sys::lv_obj_get_style_flex_flow(self.raw, 0) as u32 & sys::_LV_FLEX_COLUMN == 0;
+            if in_row && sys::lv_obj_get_style_width(self.raw, 0) == LV_SIZE_CONTENT_LOCAL && !grown {
+                sys::lv_obj_set_width(raw, KEYBOARD_WIDTH_PX);
             }
         }
         // Keys in the track on a `surface` panel; OK in the accent.
@@ -2735,8 +2758,10 @@ impl<'ui> Obj<'ui> {
     pub fn set_arc_thickness(&self, px: i32) {
         let indicator = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
         unsafe {
-            sys::lv_obj_set_style_arc_width(self.raw, px, sel());
-            sys::lv_obj_set_style_arc_width(self.raw, px, sel() | indicator);
+            quiet(self.raw, || {
+                sys::lv_obj_set_style_arc_width(self.raw, px, sel());
+                sys::lv_obj_set_style_arc_width(self.raw, px, sel() | indicator);
+            });
         }
     }
 
@@ -2861,22 +2886,22 @@ impl<'ui> Obj<'ui> {
 
     /// Padding per side, px.
     pub fn set_padding_sides(&self, top: i32, right: i32, bottom: i32, left: i32) {
-        unsafe {
+        quiet(self.raw, || unsafe {
             sys::lv_obj_set_style_pad_top(self.raw, top, sel());
             sys::lv_obj_set_style_pad_right(self.raw, right, sel());
             sys::lv_obj_set_style_pad_bottom(self.raw, bottom, sel());
             sys::lv_obj_set_style_pad_left(self.raw, left, sel());
-        }
+        })
     }
 
     /// Space between rows (of a grid, or of wrapped flex tracks).
     pub fn set_row_gap(&self, px: i32) {
-        unsafe { sys::lv_obj_set_style_pad_row(self.raw, px, sel()) };
+        quiet(self.raw, || unsafe { sys::lv_obj_set_style_pad_row(self.raw, px, sel()) });
     }
 
     /// Space between columns.
     pub fn set_column_gap(&self, px: i32) {
-        unsafe { sys::lv_obj_set_style_pad_column(self.raw, px, sel()) };
+        quiet(self.raw, || unsafe { sys::lv_obj_set_style_pad_column(self.raw, px, sel()) });
     }
 
     /// `align = stretch` on a row / column (`column`: its children's
@@ -3076,6 +3101,10 @@ impl<'ui> Obj<'ui> {
         };
         unsafe {
             sys::lv_obj_set_scrollable(self.raw, true);
+            // Back within its content when a drag ends past an edge
+            // (LVGL leaves it there when the content shrank to fit
+            // meanwhile).
+            sys::lv_paneld_scroll_keep_in(self.raw);
             if horizontal {
                 sys::lv_obj_set_scroll_dir(self.raw, sys::lv_dir_t_LV_DIR_HOR as sys::lv_dir_t);
                 sys::lv_obj_set_scroll_snap_x(self.raw, snap);
@@ -3114,11 +3143,11 @@ impl<'ui> Obj<'ui> {
     }
 
     pub fn set_padding(&self, px: i32) {
-        unsafe { sys::lv_obj_set_style_pad_all(self.raw, px, sel()) };
+        quiet(self.raw, || unsafe { sys::lv_obj_set_style_pad_all(self.raw, px, sel()) });
     }
 
     pub fn set_gap(&self, px: i32) {
-        unsafe { sys::lv_obj_set_style_pad_gap(self.raw, px, sel()) };
+        quiet(self.raw, || unsafe { sys::lv_obj_set_style_pad_gap(self.raw, px, sel()) });
     }
 
     /// Background in `rgb` at `opa` (255 opaque, from `#rrggbbaa`).
@@ -3135,11 +3164,11 @@ impl<'ui> Obj<'ui> {
     /// style, say), so the color set next is what shows.
     pub fn clear_background_paint(&self) {
         let selector = sel();
-        unsafe {
+        quiet(self.raw, || unsafe {
             sys::lv_obj_set_style_bg_grad(self.raw, std::ptr::null(), selector);
             sys::lv_obj_set_style_bg_grad_dir(self.raw, sys::lv_grad_dir_t_LV_GRAD_DIR_NONE, selector);
             sys::lv_obj_set_style_bg_image_src(self.raw, std::ptr::null(), selector);
-        }
+        });
         bg_forget(self.raw, Some(selector));
     }
 
@@ -3260,14 +3289,14 @@ impl<'ui> Obj<'ui> {
     /// `shadow` (schema 8.1): blur `size` px (0: none) in `rgb` at
     /// `opa`, moved by `x`, `y`.
     pub fn set_shadow(&self, size: i32, rgb: u32, opa: u8, x: i32, y: i32) {
-        unsafe {
+        quiet(self.raw, || unsafe {
             sys::lv_obj_set_style_shadow_width(self.raw, size.max(0), sel());
             sys::lv_obj_set_style_shadow_color(self.raw, sys::lv_color_hex(rgb), sel());
             sys::lv_obj_set_style_shadow_opa(self.raw, if size > 0 { opa } else { 0 }, sel());
             sys::lv_obj_set_style_shadow_offset_x(self.raw, x, sel());
             sys::lv_obj_set_style_shadow_offset_y(self.raw, y, sel());
             sys::lv_obj_set_style_shadow_spread(self.raw, 0, sel());
-        }
+        })
     }
 
     pub fn set_radius(&self, px: i32) {
@@ -3289,13 +3318,13 @@ impl<'ui> Obj<'ui> {
     /// `scale`: 1.0 is the node's own size (a pressed button at 0.96).
     pub fn set_scale(&self, scale: f64) {
         let v = (scale.clamp(0.1, 10.0) * 256.0).round() as i32;
-        unsafe {
+        quiet(self.raw, || unsafe {
             sys::lv_obj_set_style_transform_scale(self.raw, v, sel());
             // About its middle, in every state (a pressed button shrinks
             // in place).
             sys::lv_obj_set_style_transform_pivot_x(self.raw, Size::Percent(50).to_lvgl(), 0);
             sys::lv_obj_set_style_transform_pivot_y(self.raw, Size::Percent(50).to_lvgl(), 0);
-        }
+        })
     }
 
     /// 0.0 transparent .. 1.0 opaque.
@@ -3516,11 +3545,18 @@ impl<'ui> Obj<'ui> {
         let mut row_dsc: Vec<i32> = row_tracks.iter().map(|t| t.lvgl()).collect();
         row_dsc.push(GRID_TEMPLATE_LAST);
         // LVGL keeps these pointers: they live with the grid, until it
-        // is laid out again.
-        let col_dsc = col_dsc.into_boxed_slice();
-        let row_dsc = row_dsc.into_boxed_slice();
-        let (col_ptr, row_ptr) = (col_dsc.as_ptr(), row_dsc.as_ptr());
-        let old = owned(self.raw, |o| o.tracks.replace((col_dsc, row_dsc)));
+        // is laid out again. The same tracks keep the arrays they had,
+        // so a grid laid out again as it was does not look restyled
+        // (an update would redraw it whole).
+        let same = OWNED.with(|m| {
+            m.borrow().get(&(self.raw as usize)).and_then(|o| o.tracks.as_ref()).is_some_and(|(c, r)| **c == *col_dsc && **r == *row_dsc)
+        });
+        let old = if same {
+            None
+        } else {
+            owned(self.raw, |o| o.tracks.replace((col_dsc.into_boxed_slice(), row_dsc.into_boxed_slice())))
+        };
+        let (col_ptr, row_ptr) = owned(self.raw, |o| o.tracks.as_ref().map(|(c, r)| (c.as_ptr(), r.as_ptr()))).expect("set above");
         unsafe {
             sys::lv_obj_set_layout(self.raw, sys::lv_layout_t_LV_LAYOUT_GRID);
             sys::lv_obj_set_grid_dsc_array(self.raw, col_ptr, row_ptr);
@@ -3558,7 +3594,19 @@ impl<'ui> Obj<'ui> {
     pub fn set_hidden(&self, hidden: bool) {
         unsafe {
             if sys::lv_obj_is_hidden(self.raw) != hidden {
-                sys::lv_obj_set_hidden(self.raw, hidden);
+                if !hidden && UPDATING.with(|u| u.get()) {
+                    // Within an update: LVGL would redraw it where it was
+                    // last laid out before it hid, and the layout pass
+                    // after the update moves it; [`settle_layout`] redraws
+                    // it where it lands.
+                    let disp = sys::lv_obj_get_display(self.raw);
+                    sys::lv_display_enable_invalidation(disp, false);
+                    sys::lv_obj_set_hidden(self.raw, false);
+                    sys::lv_display_enable_invalidation(disp, true);
+                    SHOWN_NOW.with(|s| s.borrow_mut().push(self.raw));
+                } else {
+                    sys::lv_obj_set_hidden(self.raw, hidden);
+                }
             }
         }
         // Hidden by its own `visible` now, not by a running button.
@@ -4972,6 +5020,9 @@ struct Before {
     obj: *mut sys::lv_obj_t,
     styles: *mut std::ffi::c_void,
     state: sys::lv_state_t,
+    /// Where it was drawn (a `scale` taken off redraws less than it
+    /// covered: LVGL redraws a restyled object where it is now).
+    area: sys::lv_area_t,
 }
 
 impl Drop for Before {
@@ -4987,6 +5038,9 @@ thread_local! {
     /// way costs no redraw.
     static UPDATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TOUCHED: std::cell::RefCell<Vec<Before>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Objects an update showed, redrawn by [`settle_layout`] where
+    /// the layout puts them.
+    static SHOWN_NOW: std::cell::RefCell<Vec<*mut sys::lv_obj_t>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Start an update of a page in place: nothing is restyled until
@@ -5007,8 +5061,29 @@ pub(crate) fn touch(obj: *mut sys::lv_obj_t) {
             return;
         }
         let (styles, state) = unsafe { (sys::lv_paneld_local_styles_save(obj), sys::lv_obj_get_state(obj)) };
-        t.push(Before { obj, styles, state });
+        let mut area = sys::lv_area_t::default();
+        unsafe { sys::lv_paneld_drawn_area(obj, &mut area) };
+        t.push(Before { obj, styles, state, area });
     });
+}
+
+/// Run `f`, which only sets local styles of `obj`, without the redraw
+/// LVGL asks for when a style that changes the drawn area is set
+/// (padding, gaps, shadow, transform, line and arc widths), when `obj`
+/// was noted by [`touch`] in this update: [`end_update`] restyles it,
+/// redrawing where it was and where it is, if its styles now differ,
+/// and an object set up again as it was (a component root getting its
+/// call's padding again) is not redrawn at all.
+fn quiet<R>(obj: *mut sys::lv_obj_t, f: impl FnOnce() -> R) -> R {
+    let noted = UPDATING.with(|u| u.get()) && TOUCHED.with(|t| t.borrow().iter().any(|b| b.obj == obj));
+    if !noted {
+        return f();
+    }
+    let disp = unsafe { sys::lv_obj_get_display(obj) };
+    unsafe { sys::lv_display_enable_invalidation(disp, false) };
+    let r = f();
+    unsafe { sys::lv_display_enable_invalidation(disp, true) };
+    r
 }
 
 /// End an update: restyle (and so redraw) the objects that look
@@ -5022,9 +5097,11 @@ pub(crate) fn end_update() -> usize {
         unsafe {
             let state = sys::lv_obj_get_state(b.obj);
             if state != b.state {
+                sys::lv_paneld_invalidate_drawn(b.obj, &b.area);
                 sys::lv_paneld_state_settled(b.obj, b.state);
                 changed += 1;
             } else if !sys::lv_paneld_local_styles_equal(b.obj, b.styles) {
+                sys::lv_paneld_invalidate_drawn(b.obj, &b.area);
                 sys::lv_obj_refresh_style(b.obj, sys::lv_part_t_LV_PART_ANY as sys::lv_part_t, sys::_lv_style_id_t_LV_STYLE_PROP_ANY as sys::lv_style_prop_t);
                 changed += 1;
             }
@@ -5148,10 +5225,10 @@ pub(crate) fn cancel_moved(presses: &[Press]) -> usize {
         }
         unsafe { sys::lv_obj_update_layout(sys::lv_obj_get_screen(p.obj)) };
         if place_of(p.obj) != p.at {
-            unsafe {
-                sys::lv_indev_reset(p.indev, p.obj);
-                sys::lv_indev_wait_release(p.indev);
-            }
+            // What a drag had pulled past an edge goes back, as on a
+            // release (it stayed there: verify found a list left scrolled
+            // above its top).
+            unsafe { sys::lv_paneld_indev_cancel(p.indev, p.obj, true) };
             n += 1;
         }
     }
@@ -5168,9 +5245,33 @@ pub(crate) fn index_of(obj: *mut sys::lv_obj_t) -> u32 {
 }
 
 /// Put `obj` at place `i` among its parent's children.
+/// Within an update: in a parent that lays its children out, only
+/// what the move moves is redrawn ([`settle_layout`]).
 pub(crate) fn move_to_index(obj: *mut sys::lv_obj_t, i: u32) {
     if index_of(obj) != i {
-        unsafe { sys::lv_obj_move_to_index(obj, i as i32) };
+        unsafe { sys::lv_paneld_move_to_index_quiet(obj, i as i32) };
+    }
+}
+
+/// Note what [`settle_layout`] compares with from before the update
+/// (the scrollbars on `obj`'s screen).
+pub(crate) fn note_before_update(obj: *mut sys::lv_obj_t) {
+    if !obj.is_null() {
+        unsafe { sys::lv_paneld_scrollbars_note(obj) };
+    }
+}
+
+/// Lay out the screen `obj` is on after an update (ADR 0024, phase 4):
+/// what the layout only placed again where it was (a grid measuring
+/// its children again, a row placing a label whose text changed but
+/// not its size) is not redrawn; what moved, resized, hid or showed
+/// is, where it was and where it is.
+pub(crate) fn settle_layout(obj: *mut sys::lv_obj_t) {
+    // Shown in this update (and still there: a subtree built again
+    // deletes what it had).
+    let shown: Vec<*mut sys::lv_obj_t> = SHOWN_NOW.with(|s| std::mem::take(&mut *s.borrow_mut())).into_iter().filter(|&o| alive(o)).collect();
+    if !obj.is_null() {
+        unsafe { sys::lv_paneld_layout_settled(obj, shown.as_ptr(), shown.len() as u32) };
     }
 }
 
@@ -5267,8 +5368,8 @@ impl<'ui> Obj<'ui> {
     /// ([`begin_update`]): nothing is restyled until it ends.
     pub(crate) fn restore(&self, p: &Pristine) {
         touch(self.raw);
+        quiet(self.raw, || unsafe { sys::lv_paneld_local_styles_restore(self.raw, p.styles) });
         unsafe {
-            sys::lv_paneld_local_styles_restore(self.raw, p.styles);
             if sys::lv_obj_is_clickable(self.raw) != p.clickable {
                 sys::lv_obj_set_clickable(self.raw, p.clickable);
             }
@@ -5437,6 +5538,8 @@ impl<'ui> Obj<'ui> {
 
 /// A keypad's keys in a parent as tall as its content: four rows.
 const KEYBOARD_PX: i32 = 200;
+/// Their width in a row as wide as its content: three keys across.
+const KEYBOARD_WIDTH_PX: i32 = 240;
 
 /// `obj`'s local style property `prop` for the selector in force, if
 /// it has one.

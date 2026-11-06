@@ -156,6 +156,7 @@ pub fn update_page(
     let Some(page) = find_page(doc, page_name) else { return Updated::Rebuild("no such page") };
     let scope = &Scope::root(ctx);
     crate::motion::begin_update(theme_of(scope));
+    crate::ui::note_before_update(start.page_root);
     crate::ui::begin_update();
     nodes::with_mode(Mode::Update, || {
         let locals = page_locals(doc, page, scope);
@@ -166,6 +167,7 @@ pub fn update_page(
     });
     let redrawn = crate::ui::end_update();
     crate::motion::end_update();
+    crate::ui::settle_layout(start.page_root);
     crate::ui::settle_backgrounds();
     crate::ui::cancel_moved(&presses);
     for (o, before) in held_before {

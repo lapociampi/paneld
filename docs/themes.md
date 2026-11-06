@@ -2,7 +2,7 @@
 title: "Themes"
 description: "What a theme is and what it can change, layout included."
 date: 2026-10-29
-updated: 2026-11-05
+updated: 2026-11-06
 tags: [paneld, themes, ui]
 series: paneld
 order: 5
@@ -79,7 +79,7 @@ theme dim {
 
 ### Cost
 
-Measured on x86 (one core, release build), a page with 12 cards on a 4-column grid, 800x480. A page is rebuilt and drawn whole on every value change (a poll, a tap), so the second column is what a page with a changing value costs each time:
+Measured on x86 (one core, release build), a page with 12 cards on a 4-column grid, 800x480. The second column is what a page costs when it is built: shown the first time (or after it left the page cache), after a reload or a theme switch. A value change (a poll, a tap) updates the page in place and redraws only the widgets that show it ([ADR 0024](decisions/0024-in-place-updates.md)): a card's text, not the 12 cards and the background behind them:
 
 | Page | ms per full redraw | ms per rebuild and redraw |
 | --- | --- | --- |
