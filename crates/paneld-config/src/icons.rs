@@ -106,6 +106,28 @@ pub fn suggest(name: &str) -> Option<&'static str> {
     best.map(|(_, n)| n)
 }
 
+/// The name in `candidates` closest to `name`, for a "did you mean"
+/// hint on any name (a var, a param, a theme token): one that starts
+/// with it, else the nearest within 2 edits, at most one per two
+/// letters of `name` (so `tab` does not suggest `nav`).
+pub fn nearest<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let mut prefix = None;
+    let mut best: Option<(usize, &'a str)> = None;
+    for c in candidates {
+        if c == name {
+            continue;
+        }
+        if name.len() >= 3 && c.starts_with(name) && prefix.is_none() {
+            prefix = Some(c);
+        }
+        let d = distance(name, c);
+        if d <= 2 && 2 * d <= name.len() && best.is_none_or(|(b, _)| d < b) {
+            best = Some((d, c));
+        }
+    }
+    prefix.or(best.map(|(_, c)| c))
+}
+
 /// Levenshtein distance (short ASCII names).
 pub(crate) fn distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();

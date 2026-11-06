@@ -222,7 +222,7 @@ Each phase ships alone, keeps a full rebuild as the fallback for what it does no
 
 ### Phase 0 results
 
-Done: `Scope` in `expr.rs` (a component call's params, a `repeat` binding, a macro's variable, the page's `page` / `nav`, each over the scope around it, looked up innermost first); `render.rs` opens scopes instead of `ctx.clone()`; indexing, `len()` and macros read a path in place (`sources.x.history`) instead of copying it. `ctl status` has `nodes` and `rss_kb`. The pass's context (`build_ctx`, `ctx=` in the perf line, ~0.3 ms on the Pi) is still one copy per pass.
+Done: the read analysis (which names and paths an expression reads) is `paneld_config::reads`, used by `paneld check` (every name in scope, schema 16) and `visible.rs`, and next by the dep keys of section 1. `Scope` in `expr.rs` (a component call's params, a `repeat` binding, a macro's variable, the page's `page` / `nav`, each over the scope around it, looked up innermost first); `render.rs` opens scopes instead of `ctx.clone()`; indexing, `len()` and macros read a path in place (`sources.x.history`) instead of copying it. `ctl status` has `nodes` and `rss_kb`. The pass's context (`build_ctx`, `ctx=` in the perf line, ~0.3 ms on the Pi) is still one copy per pass.
 
 `perf build` medians, `us` (`clone` inside it) before -> after:
 

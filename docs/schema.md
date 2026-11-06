@@ -2,7 +2,7 @@
 title: "Schema"
 description: "Every item, category, building block and property the config can hold."
 date: 2026-10-29
-updated: 2026-11-05
+updated: 2026-11-06
 tags: [paneld, config, reference]
 series: paneld
 order: 4
@@ -94,8 +94,8 @@ In expressions, `sources.<name>`:
 | `ok` | bool, last run succeeded; `false` (with `value` null) before the first result, and after a failed run whose output does not parse. A run with no result (timeout, unparseable output, a stream that stopped or cannot start) changes only `ok` and `error`; the rest of the last result stays |
 | `error` | string, stderr or the reason |
 | `at` | timestamp of the last value |
-| `age` | duration since `at` |
-| `running` | bool |
+| `age` | int, whole seconds since `at` (none before the first result); a page that reads it by name (`sources.x.age`, not `sources.x` whole or `sources[n]`) is redrawn on the steps of `ago()` (section 16), not every second |
+| `running` | bool, a run is under way (a poll or a `refresh`; a stream: while its command lives); redrawn as it changes when read by name, like `age` |
 | `history` | list of `{at, value}` |
 
 `ctl` and the `refresh` action step run a source now.
@@ -183,6 +183,8 @@ Options:
 
 A value outside its type, `min` / `max` or `options` is refused before anything runs, with a notice on screen. A param that is not passed takes its default; with `ask`, a dialog asks for it instead (Cancel drops the call).
 
+A default may read the params declared before it, as passed or defaulted: with `param a: int = 1` and `param b: int = {{ a + 1 }}`, a call with `a = 5` gets `b = 6`. A default that reads its own param or a later one is a check error. `options` read no params.
+
 ## 7. Components
 
 ```
@@ -206,7 +208,7 @@ component stat_tile {
 }
 ```
 
-- One root node. Parameters are read by name in expressions.
+- One root node. Parameters are read by name in expressions. A component sees only its own params and the global roots (section 16, with `page` and `nav`), never the names where it is called (a caller's `repeat` binding or params): pass what it needs as args.
 - Using it: `stat_tile { label = CPU; value = {{ sources.cpu_temp.value }} }`. Common node properties (section 8.1) set on the call apply to the root node.
 - Children written inside the call go where the component places `slot { }`. Without a `slot`, children are an error.
 - Library components ship with the program; a config component of the same name replaces one, and the active theme's component replaces both, with the same params ([Themes](themes.md)).
@@ -316,7 +318,7 @@ Built-in icons: `home`, `settings`, `power`, `refresh`, `ok`, `close`, `plus`, `
 
 Inputs, buttons and the dialogs (PIN, `confirm`, `ask`, notices) are drawn in the theme's colors: `accent` for what is on or chosen (and a button, a keypad's OK, a dialog's buttons), the track for what is off (keys, option rows, a dialog's header), `surface` and `text` for boxes ([Themes](themes.md), "Inputs"). Inputs show the value from their `value` expression; a change runs `on_change` and the display follows the source of `value` (for example a `var` set by the action, or a refreshed source).
 
-`on_change` and `on_submit` take the same forms as `on_tap`: `= action`, `action { args }`, or an inline block. The new value arrives as `value` and `event.value`. An inline block with action keys (`run`, `pin`, `confirm`, `then`, ...) is an action of its own, gates included; one with only `set { }` just sets.
+`on_change` and `on_submit` take the same forms as `on_tap`: `= action`, `action { args }`, or an inline block. The new value arrives as `value` and `event.value`; in `action { args }` an arg that reads them is evaluated when the event fires. An inline block with action keys (`run`, `pin`, `confirm`, `then`, ...) is an action of its own, gates included; one with only `set { }` just sets.
 
 ## 9. Alerts
 
@@ -474,16 +476,21 @@ Rotation: `fbdev` rotates each drawn area in LVGL's driver; `drm` always draws i
 
 | Name | Where |
 | --- | --- |
-| `sources`, `vars`, `alerts`, `theme`, `now` | everywhere |
-| remote instances by name (section 17) | everywhere |
+| `sources`, `vars`, `theme`, `now`, remote instances by name (section 17) | everywhere but a source's `value` (only `out`, `now` and a kind's params) and `screen` commands |
+| `alerts` | everywhere but sources and alerts without `from`, which run before it is built |
 | `secrets` | only in `run` and `env` |
-| params by name | in components and actions |
-| `<repeat name>` | inside `repeat` |
+| `page`, `nav` | in pages, components and theme styles; not in an inline action (`on_tap { run = ... }`), which runs as an action |
+| params by name | in their component or action, a default reading only the params before it (section 6) |
+| `<repeat name>` | inside `repeat`, nested ones too |
 | `out` | in a source's `value` |
 | `event` | in an alert with `from` |
-| `value`, `event.value` | in `on_change` / `on_submit` calls |
-| `result` | in `then` / `else` |
-| `level` | in `screen:dim` |
+| `value`, `event.value` | in `on_change` / `on_submit` calls (an arg that reads them is evaluated when the event fires: `on_change set_level { level = {{ value }} }`), and in an action one of them names (declare `param value` to type it) |
+| `result` | in an action's `done`, `failed` and `then` / `else` blocks, and in an action a `then` / `else` names |
+| `output` | in an action's `done` |
+| `level` | in `screen:dim` (the other `screen` commands read nothing) |
+| a kind's params, `self` | in a remote kind: the params in its members and alerts, `self` in its alerts (section 17) |
+
+`paneld check` refuses a name that is not in scope where it is written, and a field that does not exist where the shape is known: `sources.<name>` (a defined source) and its fields (section 4), `vars.<name>`, `theme.<token>` (one some theme defines, or one of section 11), `now.<field>`, `alerts.<field>` (section 9), `page.<field>` (`name`, `title`, `icon`), `secrets.<name>`, `<remote>.<member>` and `<remote>.status.<member>.<field>`. The error names the closest known name (`vars.tabb`: did you mean `tab`?). A macro's name (`x` in `l.map(x, ...)`) is in scope in that macro only.
 
 Secret values (4 characters or more) are replaced with `****` in everything commands print before it is logged, shown, or put in `result` or a source's value: in parsed output each string, and each number whose digits hold a secret, then once more in the source's `value` (a masked number becomes the text `****`). Shorter secrets, and encoded forms (base64, URL escapes), are not caught. Prefer `env { TOKEN = {{ secrets.token }} }` over putting a secret in `run`: argv items are visible to every local user in `/proc/<pid>/cmdline`, the environment is not.
 
@@ -509,6 +516,7 @@ Redraws: a page whose expressions (its own, its components' and the shell's) rea
 | no `now`, no `ago()` | never by the clock |
 | any field but `second` and `unix` | at the start of each minute |
 | `ago(t)` | when a text it shows would change (`5m ago` to `6m ago`): each minute under an hour, then each hour, then each day |
+| `sources.x.age` | on the same steps, counted from `x`'s `at` |
 | `now.second`, `now.unix`, or `now` whole (`size(now)`, `now[k]`) | every second |
 
 While the screen sleeps nothing is redrawn; it is drawn as it is on waking. No redraw of the page shown (the clock, a new source value) happens while the user is in the middle of something on it: a finger down (a press, a slider or roller dragged) or a dropdown's list open. It waits until that ends, then follows at once; a navigation goes ahead. Each redraw rebuilds the whole page: a seconds clock costs about 0.3% of an x86 core on a simple page (measured over 30 s, 34 redraws), roughly 10 times that on the Pi 3B+ and more on a busy page, and keeps the loop waking each second. Prefer `now.time` unless the seconds matter. `ago(t)` counts from `now.unix` (`ago(now.unix)` is `just now`); a page with `ago()` costs one redraw per change of a text it shows, no more.

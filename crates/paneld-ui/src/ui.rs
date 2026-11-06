@@ -26,6 +26,12 @@ pub enum UiEvent {
     /// run that action's `run` command, with the already-evaluated
     /// `args` overlaid on the eval context as named bindings.
     Action { name: String, args: Vec<ActionArg> },
+    /// `on_change name { level = {{ value }} }`: an action call whose
+    /// `late` args read the new value. `args` holds the others, then
+    /// `value` and `event`; the main loop evaluates each `late` arg
+    /// with those and the current context, then calls as for
+    /// [`UiEvent::Action`].
+    LateAction { name: String, args: Vec<ActionArg>, late: Vec<InlineSetItem> },
     /// `on_tap { goto = page_name }` -- switch to that page.
     Goto { page: String },
     /// `on_tap { set { k = v; ... } }` -- apply these writes to the
@@ -139,6 +145,8 @@ enum Binding {
         kind: ChangeKind,
         action: String,
         args: Vec<ActionArg>,
+        /// Args that read `value` / `event`: evaluated when it fires.
+        late: Vec<InlineSetItem>,
         sink: Sender<UiEvent>,
     },
 }
@@ -375,7 +383,7 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
         guard.get(idx).cloned()
     };
     match bind {
-        Some(Binding::ChangeAction { kind, action, mut args, sink }) => {
+        Some(Binding::ChangeAction { kind, action, mut args, late, sink }) => {
             use crate::expr::Value;
             let value = match widget_value(kind, target) {
                 Some(EventValue::Bool(b)) => Value::Bool(b),
@@ -387,7 +395,7 @@ unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
             let event = std::collections::BTreeMap::from([("value".to_string(), value.clone())]);
             args.push(ActionArg { name: "value".into(), value });
             args.push(ActionArg { name: "event".into(), value: Value::Map(event) });
-            let _ = sink.send(UiEvent::Action { name: action, args });
+            let _ = sink.send(if late.is_empty() { UiEvent::Action { name: action, args } } else { UiEvent::LateAction { name: action, args, late } });
         }
         Some(Binding::AskValue { kind }) => {
             let v = widget_value(kind, target);
@@ -2298,7 +2306,9 @@ impl<'ui> Obj<'ui> {
     /// goes along as the `value` and `event.value` args, after `args`.
     /// Fires when an inline `set` would (see the `on_change_*`
     /// methods).
-    pub fn on_change_action(&self, widget: ValueWidget, sink: Sender<UiEvent>, action: String, args: Vec<ActionArg>) {
+    /// `late`: args that read the new value, evaluated by the main
+    /// loop when it fires ([`UiEvent::LateAction`]).
+    pub fn on_change_action(&self, widget: ValueWidget, sink: Sender<UiEvent>, action: String, args: Vec<ActionArg>, late: Vec<InlineSetItem>) {
         let (kind, code) = match widget {
             ValueWidget::Toggle => (ChangeKind::Toggle, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Slider => (ChangeKind::Slider, sys::lv_event_code_t_LV_EVENT_RELEASED),
@@ -2309,7 +2319,7 @@ impl<'ui> Obj<'ui> {
         };
         let idx = {
             let mut g = bindings().lock().unwrap();
-            g.push(Binding::ChangeAction { kind, action, args, sink });
+            g.push(Binding::ChangeAction { kind, action, args, late, sink });
             g.len() - 1
         };
         unsafe {

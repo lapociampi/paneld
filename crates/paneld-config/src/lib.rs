@@ -15,6 +15,7 @@ pub mod motion;
 pub mod overrides;
 pub mod paint;
 pub mod parse;
+pub mod reads;
 pub mod remote;
 pub mod schema;
 pub mod source;

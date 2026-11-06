@@ -189,6 +189,9 @@ fn param_value(ty: &str, v: Value) -> Option<Value> {
 /// pass through. `defaults = false` leaves missing params out (the
 /// built-in actions pick their own).
 pub fn prepare_args(def: &ActionDef, mut args: Vec<ActionArg>, ctx: &Context, defaults: bool) -> Prepared {
+    // The params checked so far: a default reads those declared
+    // before it (schema 6).
+    let mut earlier = Context::new();
     for p in &def.params {
         let given = args.iter().position(|a| a.name == p.name);
         let raw = match given {
@@ -197,7 +200,7 @@ pub fn prepare_args(def: &ActionDef, mut args: Vec<ActionArg>, ctx: &Context, de
             // Not passed: ask for it, else take the default.
             None if p.ask.is_some() => return Prepared::Ask(Box::new(p.clone())),
             None => match &p.default {
-                Some(d) => match paneld_ui::resolve_value(&d.raw, d.span, ctx) {
+                Some(d) => match paneld_ui::resolve_value_in(&d.raw, d.span, &paneld_ui::Scope::root(ctx).with(&earlier)) {
                     Some(v) => v,
                     None => return Prepared::Refused(format!("the default of `{}` did not evaluate", p.name)),
                 },
@@ -236,6 +239,7 @@ pub fn prepare_args(def: &ActionDef, mut args: Vec<ActionArg>, ctx: &Context, de
                 return Prepared::Refused(format!("`{}` = {shown} is not one of its options", p.name));
             }
         }
+        earlier.insert(p.name.clone(), v.clone());
         match given {
             Some(i) => args[i].value = v,
             None => args.push(ActionArg { name: p.name.clone(), value: v }),
@@ -707,18 +711,22 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
                 continue;
             };
             let started = std::time::Instant::now();
-            match crate::sources::resolve_one(
+            let run = crate::sources::Run::start(src_name, Some(&wctx.source_tx));
+            let resolved = crate::sources::resolve_one(
                 block,
                 &ctx,
                 &wctx.config_dir,
                 wctx.app_defaults,
-            ) {
+            );
+            drop(run);
+            match resolved {
                 Ok(v) => {
                     let _ = wctx.source_tx.send(crate::sources::SourceUpdate {
                         name: src_name.clone(),
                         value: v,
                         status: false,
                         started,
+                        began: false,
                     });
                 }
                 Err(e) => {
@@ -730,6 +738,7 @@ fn run_call(wctx: &WorkerCtx, call: Call, def: ActionDef, key: String) {
                         value: crate::sources::not_ok(&e),
                         status: true,
                         started,
+                        began: false,
                     });
                 }
             }
@@ -900,6 +909,28 @@ pub fn apply_inline_set(
         changed = true;
     }
     changed
+}
+
+/// The args of `on_change name { level = {{ value }} }` that read the
+/// new value, evaluated now that it is known: over `ctx`, the names
+/// where the node was drawn and then `args` (the evaluated ones,
+/// `value` and `event`). An arg that does not evaluate is left out,
+/// as at a tap.
+pub fn late_args(late: &[InlineSetItem], args: &[ActionArg], ctx: &Context) -> Vec<ActionArg> {
+    let span = paneld_config::source::Span { file: paneld_config::source::FileId::default(), start: 0, end: 0 };
+    let mut out = Vec::new();
+    for item in late {
+        let mut c = Context::new();
+        for a in item.locals.iter().chain(args) {
+            c.insert(a.name.clone(), a.value.clone());
+        }
+        let scope = paneld_ui::Scope::root(ctx);
+        match paneld_ui::resolve_value_in(&item.value_raw, span, &scope.with(&c)) {
+            Some(v) => out.push(ActionArg { name: item.key.clone(), value: v }),
+            None => eprintln!("paneld: `{}`: the arg did not evaluate", item.key),
+        }
+    }
+    out
 }
 
 fn find_simple_with_span<'a>(
@@ -1143,6 +1174,19 @@ mod tests {
         }
         // Built-ins: missing params stay missing.
         assert!(matches!(prepare_args(&def, Vec::new(), &ctx, false), Prepared::Ready(a) if a.is_empty()));
+    }
+
+    #[test]
+    fn a_param_default_reads_the_params_before_it() {
+        let doc = parse_doc("action a {\n param n: int = 1\n param m: int = {{ n * 10 }}\n run = /bin/true\n}\n");
+        let def = collect(&doc).remove("a").unwrap();
+        let ctx = Context::new();
+        let m = |args: Vec<ActionArg>| match prepare_args(&def, args, &ctx, true) {
+            Prepared::Ready(a) => a.into_iter().find(|a| a.name == "m").unwrap().value,
+            _ => panic!("should be ready"),
+        };
+        assert_eq!(m(vec![ActionArg { name: "n".into(), value: Value::Int(5) }]), Value::Int(50), "as passed");
+        assert_eq!(m(Vec::new()), Value::Int(10), "as defaulted");
     }
 
     #[test]

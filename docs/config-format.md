@@ -2,7 +2,7 @@
 title: "Config format"
 description: "The hypr-style syntax of paneld config files."
 date: 2026-10-29
-updated: 2026-11-05
+updated: 2026-11-06
 tags: [paneld, config]
 series: paneld
 order: 3
@@ -115,7 +115,7 @@ page home {
 - An expression mixed with text makes a string: `label = CPU {{ round(x, 1) }} C`.
 - `\{{` is a literal `{{`.
 - `\\` is a literal backslash, so `\\{{ ... }}` is a backslash followed by a real expression (not an escaped opener). To write a literal backslash directly before an expression without the opener firing, use `\\\{{` (literal backslash, then an escaped `{{`).
-- Expressions are compiled and type-checked at load.
+- Expressions are compiled and type-checked at load. `paneld check` resolves every name an expression reads against what is in scope where it is written, and the fields whose shape is known (`sources.x`, `vars.y`, `theme.t`, `now.f`, `alerts.f`, a remote's members): an unknown one is an error with its file, line and column and the closest known name ([Schema](schema.md), section 16).
 
 ## Value types
 

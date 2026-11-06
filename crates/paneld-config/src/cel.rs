@@ -1229,97 +1229,6 @@ pub const NOW_FIELDS: &[&str] = &[
 /// at most once a minute.
 pub const NOW_SECOND_FIELDS: &[&str] = &["second", "unix"];
 
-fn check_now_field(name: &str, span: Span, written: &str, diags: &mut Vec<Diagnostic>) {
-    if !NOW_FIELDS.contains(&name) {
-        diags.push(Diagnostic::new(
-            span,
-            format!("unknown field `{name}` in `{written}`; `now` has {}", NOW_FIELDS.join(", ")),
-        ));
-    }
-}
-
-/// Walk a parsed CEL expression and append diagnostics for any
-/// `sources.<name>` whose `<name>` is not in `known_sources`, and any
-/// `now.<field>` that `now` does not have. Other
-/// identifier roots are left alone -- they may be component / action
-/// params, `item` from a `repeat`, or `theme` tokens that a theme
-/// adds freely.
-pub fn walk_source_refs(
-    expr: &Expr,
-    known_sources: &std::collections::HashSet<String>,
-    diags: &mut Vec<Diagnostic>,
-) {
-    match &expr.kind {
-        ExprKind::Field(inner, name) => {
-            if let ExprKind::Ident(root) = &inner.kind {
-                if root == "sources" && !known_sources.contains(name) {
-                    diags.push(Diagnostic::new(
-                        expr.span,
-                        format!("unknown source `{name}` in `sources.{name}`"),
-                    ));
-                }
-                if root == "now" {
-                    check_now_field(name, expr.span, &format!("now.{name}"), diags);
-                }
-            }
-            walk_source_refs(inner, known_sources, diags);
-        }
-        ExprKind::Method(inner, _, args) => {
-            walk_source_refs(inner, known_sources, diags);
-            for a in args {
-                walk_source_refs(a, known_sources, diags);
-            }
-        }
-        ExprKind::Index(inner, idx) => {
-            // `sources["name"]` is a sometimes-used CEL idiom equivalent
-            // to `sources.name`. Cross-ref the key when the base is the
-            // literal `sources` identifier.
-            if let (ExprKind::Ident(root), ExprKind::StringLit(name)) =
-                (&inner.kind, &idx.kind)
-            {
-                if root == "sources" && !known_sources.contains(name) {
-                    diags.push(Diagnostic::new(
-                        expr.span,
-                        format!("unknown source `{name}` in `sources[\"{name}\"]`"),
-                    ));
-                }
-                if root == "now" {
-                    check_now_field(name, expr.span, &format!("now[\"{name}\"]"), diags);
-                }
-            }
-            walk_source_refs(inner, known_sources, diags);
-            walk_source_refs(idx, known_sources, diags);
-        }
-        ExprKind::Call(_, args) => {
-            for a in args {
-                walk_source_refs(a, known_sources, diags);
-            }
-        }
-        ExprKind::Unary(_, inner) => walk_source_refs(inner, known_sources, diags),
-        ExprKind::Binary(_, l, r) => {
-            walk_source_refs(l, known_sources, diags);
-            walk_source_refs(r, known_sources, diags);
-        }
-        ExprKind::Conditional(c, t, e) => {
-            walk_source_refs(c, known_sources, diags);
-            walk_source_refs(t, known_sources, diags);
-            walk_source_refs(e, known_sources, diags);
-        }
-        ExprKind::List(items) => {
-            for i in items {
-                walk_source_refs(i, known_sources, diags);
-            }
-        }
-        ExprKind::Map(items) => {
-            for (k, v) in items {
-                walk_source_refs(k, known_sources, diags);
-                walk_source_refs(v, known_sources, diags);
-            }
-        }
-        _ => {}
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Interp walker: extract each `{{ ... }}` from an interpolated raw
 // value, and parse it. Used by the schema check so a value like
@@ -1546,29 +1455,6 @@ mod tests {
     fn trailing_garbage_errors() {
         let (_, d) = parse("1 + 2 banana");
         assert!(!d.is_empty());
-    }
-
-    #[test]
-    fn unknown_source_ref_flagged() {
-        let (e, _) = parse("sources.ghost.value");
-        let e = e.unwrap();
-        let mut known = std::collections::HashSet::new();
-        known.insert("cpu_temp".to_string());
-        let mut diags = Vec::new();
-        walk_source_refs(&e, &known, &mut diags);
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("unknown source `ghost`"));
-    }
-
-    #[test]
-    fn known_source_ref_not_flagged() {
-        let (e, _) = parse("sources.cpu_temp.value");
-        let e = e.unwrap();
-        let mut known = std::collections::HashSet::new();
-        known.insert("cpu_temp".to_string());
-        let mut diags = Vec::new();
-        walk_source_refs(&e, &known, &mut diags);
-        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

@@ -35,7 +35,9 @@
 //! What is still deferred (future phases):
 //!
 //! - Theme body validation (section 11: tokens, styles, overrides).
-//! - CEL parsing + type checking of `{{ }}` expression bodies.
+//! - CEL type checking of `{{ }}` expression bodies (they are parsed,
+//!   their calls checked, and every name they read resolved in
+//!   `schema/scope.rs`).
 //!
 //! Diagnostics include file:line:col thanks to the [`SourceMap`].
 
@@ -49,6 +51,7 @@ use crate::value::{
 use crate::{SourceMap, Span};
 
 pub(crate) mod remote;
+mod scope;
 
 // ---------------------------------------------------------------------------
 // Structural tables
@@ -1631,7 +1634,6 @@ fn check_inner(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     resolve_refs(doc, &names, &mut diags);
     check_theme_only_calls(doc, &applied, &mut diags);
     check_ssh_runs(doc, &mut diags);
-    remote::check_self_use(doc, &mut diags);
     check_override_targets(doc, &mut diags);
     check_reminder_schedules(doc, &mut diags);
     check_reserved_bindings(&doc.items, &mut diags);
@@ -1639,7 +1641,10 @@ fn check_inner(doc: &Document, source: &SourceMap) -> Vec<Diagnostic> {
     // Phase 10: parse every `{{ ... }}` fragment as CEL, surface parse
     // errors, and cross-reference `sources.<name>` against the collected
     // source names.
-    check_cel_in_doc(doc, &names, &mut diags);
+    check_cel_in_doc(doc, &mut diags);
+    // Schema 16: every name an expression reads is in scope there,
+    // on the config as it runs (overrides folded in).
+    scope::check_scopes(&applied, &names, &mut diags);
 
     diags
 }
@@ -4490,15 +4495,15 @@ fn check_source_list(
 // errors with file:line:col, and cross-reference `sources.<name>`
 // against the collected source names.
 
-fn check_cel_in_doc(doc: &Document, names: &Names, diags: &mut Vec<Diagnostic>) {
+fn check_cel_in_doc(doc: &Document, diags: &mut Vec<Diagnostic>) {
     for item in &doc.items {
-        check_cel_in_item(item, names, false, diags);
+        check_cel_in_item(item, false, diags);
     }
 }
 
 /// `in_env`: inside an `env { }` block, where (like in `run`) schema
 /// 16 allows `secrets`.
-fn check_cel_in_item(item: &Item, names: &Names, in_env: bool, diags: &mut Vec<Diagnostic>) {
+fn check_cel_in_item(item: &Item, in_env: bool, diags: &mut Vec<Diagnostic>) {
     match item {
         Item::Assign(a) => {
             // `run = ...`, or overridden as `action[x]:run` /
@@ -4513,12 +4518,12 @@ fn check_cel_in_item(item: &Item, names: &Names, in_env: bool, diags: &mut Vec<D
                 }
                 _ => false,
             };
-            check_cel_in_raw_value(&a.value, names, in_env || is_run, diags)
+            check_cel_in_raw_value(&a.value, in_env || is_run, diags)
         }
         Item::Block(b) => {
             let in_env = in_env || b.kind.text == "env" || b.kind.text == "headers";
             for child in &b.items {
-                check_cel_in_item(child, names, in_env, diags);
+                check_cel_in_item(child, in_env, diags);
             }
         }
         Item::Repeat(r) => {
@@ -4528,31 +4533,29 @@ fn check_cel_in_item(item: &Item, names: &Names, in_env: bool, diags: &mut Vec<D
                 crate::cel::parse_fragment(&r.source.body, r.source.span.file, body_offset);
             diags.append(&mut ds);
             if let Some(e) = &expr {
-                crate::cel::walk_source_refs(e, &names.sources, diags);
                 crate::cel::check_calls(e, diags);
                 flag_secrets(e, false, diags);
             }
             for inner in &r.items {
-                check_cel_in_item(inner, names, in_env, diags);
+                check_cel_in_item(inner, in_env, diags);
             }
         }
         Item::Param(p) => {
             if let Some(default) = &p.default {
-                check_cel_in_raw_value(default, names, false, diags);
+                check_cel_in_raw_value(default, false, diags);
             }
             if let Some(opts) = &p.options {
                 for inner in &opts.items {
-                    check_cel_in_item(inner, names, false, diags);
+                    check_cel_in_item(inner, false, diags);
                 }
             }
         }
-        Item::Var(v) => check_cel_in_raw_value(&v.default, names, false, diags),
+        Item::Var(v) => check_cel_in_raw_value(&v.default, false, diags),
     }
 }
 
 fn check_cel_in_raw_value(
     v: &crate::parse::RawValue,
-    names: &Names,
     secrets_ok: bool,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -4575,7 +4578,6 @@ fn check_cel_in_raw_value(
                 crate::cel::parse_fragment(body, v.span.file, body_offset);
             diags.append(&mut ds);
             if let Some(e) = expr {
-                crate::cel::walk_source_refs(&e, &names.sources, diags);
                 crate::cel::check_calls(&e, diags);
                 flag_secrets(&e, secrets_ok, diags);
             }
@@ -4589,7 +4591,6 @@ fn check_cel_in_raw_value(
                 crate::cel::parse_interp(&v.text, v.span.file, v.span.start);
             diags.append(&mut ds);
             for e in &exprs {
-                crate::cel::walk_source_refs(e, &names.sources, diags);
                 crate::cel::check_calls(e, diags);
                 flag_secrets(e, secrets_ok, diags);
             }
@@ -4775,7 +4776,7 @@ mod tests {
     #[test]
     fn a_handler_expression_names_known_actions_and_no_event_value() {
         let d = check_text(
-            "action bump { }\npage p {\n button { on_tap = {{ vars.x ? 'bmup' : 'bump' }} }\n\
+            "var x: bool = false\naction bump { }\npage p {\n button { on_tap = {{ vars.x ? 'bmup' : 'bump' }} }\n\
              slider { on_change = {{ value > 5 ? 'bump' : 'none' }} }\n button { on_tap = {{ true ? 'bump' : 'none' }} }\n}\n",
         );
         assert_msg(&d, "unknown action `bmup`");
@@ -5215,10 +5216,10 @@ reminder restore_test {
         assert_msg(&check_text("action a { run = sh -c 'echo {{ vars.x }} > /tmp/f' }\n"), "pastes the value");
         assert_msg(&check_text("screen { dim = /bin/bash -c 'echo {{ level }}' }\n"), "pastes the value");
         // As an argument after the script, or with no shell: fine.
-        assert!(check_text("action a { run = sh -c 'echo \"$$1\" > /tmp/f' sh {{ vars.x }} }\n").is_empty());
+        assert!(check_text("var x: string = \"\"\naction a { run = sh -c 'echo \"$$1\" > /tmp/f' sh {{ vars.x }} }\n").is_empty());
         // (Not an inline script: ssh's `-c` is a cipher; `--` keeps the
         // host from being read as an option.)
-        assert!(check_text("action a { run = ssh -c aes128-ctr -- {{ vars.x }} }\n").is_empty());
+        assert!(check_text("var x: string = \"\"\naction a { run = ssh -c aes128-ctr -- {{ vars.x }} }\n").is_empty());
         // Review round 7: ways around the first version.
         for cmd in [
             "sh -ec 'echo {{ vars.x }}'",
@@ -5258,12 +5259,12 @@ reminder restore_test {
         ] {
             assert_msg(&check_text(&format!("action a {{ run = {cmd} }}\n")), "pastes the value");
         }
-        assert!(check_text("action a { run = kubectl exec deploy/python -c {{ vars.x }} -- ls }\n").is_empty());
-        assert!(check_text("action a { run = php -dfoo=bar {{ vars.x }} }\n").is_empty());
-        assert!(check_text("action a { run = env FOO=1 mycmd {{ vars.x }} }\n").is_empty());
-        assert!(check_text("action a { run = sudo systemctl restart {{ vars.x }} }\n").is_empty());
-        assert!(check_text("action a { run = python3 /opt/x.py {{ vars.x }} }\n").is_empty());
-        assert!(check_text("action a { run = curl -H {{ vars.x }} http://x }\n").is_empty());
+        assert!(check_text("var x: string = \"\"\naction a { run = kubectl exec deploy/python -c {{ vars.x }} -- ls }\n").is_empty());
+        assert!(check_text("var x: string = \"\"\naction a { run = php -dfoo=bar {{ vars.x }} }\n").is_empty());
+        assert!(check_text("var x: string = \"\"\naction a { run = env FOO=1 mycmd {{ vars.x }} }\n").is_empty());
+        assert!(check_text("var x: string = \"\"\naction a { run = sudo systemctl restart {{ vars.x }} }\n").is_empty());
+        assert!(check_text("var x: string = \"\"\naction a { run = python3 /opt/x.py {{ vars.x }} }\n").is_empty());
+        assert!(check_text("var x: string = \"\"\naction a { run = curl -H {{ vars.x }} http://x }\n").is_empty());
     }
 
     #[test]
@@ -5447,7 +5448,7 @@ page home {
         let text = r#"
 action vm_stop { param vm: string; run = cat }
 page home {
-    text { value = Hi; on_tap vm_stop { vm = {{ item.id }} } }
+    repeat item in {{ [] }} { text { value = Hi; on_tap vm_stop { vm = {{ item.id }} } } }
 }
 "#;
         let diags = check_text(text);
@@ -5832,7 +5833,8 @@ alert a { severity = info; title = x; action = restart }
     fn expression_reference_is_not_checked_against_names() {
         // `{{ ... }}` is opaque at this layer; CEL will check it.
         let text = r#"
-page home { text { on_tap = {{ some_expr }} } }
+var some_expr: string = ""
+page home { text { on_tap = {{ vars.some_expr }} } }
 "#;
         let diags = check_text(text);
         assert!(diags.is_empty(), "unexpected: {diags:?}");

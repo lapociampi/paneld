@@ -45,6 +45,56 @@ pub struct SourceUpdate {
     /// update older than the one it shows (a slow run overtaken by a
     /// newer one, as after a reload).
     pub started: Instant,
+    /// Only a run started (`running` turned true); nothing else changed.
+    pub began: bool,
+}
+
+/// How many runs of each source are under way (a poll and a refresh
+/// can overlap; a stream counts while its command lives): schema 4's
+/// `running`.
+static RUNNING: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+/// Counts a run of a source while it is held.
+pub struct Run(String);
+
+impl Run {
+    /// A run of `name` starts: `running` is true until it is dropped.
+    /// `tx`, when given, hears of it so a page showing `running` is
+    /// redrawn (the end comes with the run's own update).
+    pub fn start(name: &str, tx: Option<&Sender<SourceUpdate>>) -> Run {
+        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()).entry(name.to_string()).or_default() += 1;
+        if let Some(tx) = tx {
+            let _ = tx.send(SourceUpdate { name: name.to_string(), value: Value::Null, status: false, started: Instant::now(), began: true });
+        }
+        Run(name.to_string())
+    }
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        let mut r = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = r.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                r.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Schema 4's fields that follow the clock and the runs, put into each
+/// source map as a context is built: `running`, and `age` (whole
+/// seconds since `at`, for a source that has a result).
+pub fn add_live_fields(sources: &mut BTreeMap<String, Value>, now_unix: i64) {
+    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    for (name, v) in sources.iter_mut() {
+        let Value::Map(m) = v else { continue };
+        m.insert("running".into(), Value::Bool(running.contains_key(name)));
+        if let Some(Value::Int(at)) = m.get("at") {
+            let age = now_unix.saturating_sub(*at).max(0);
+            m.insert("age".into(), Value::Int(age));
+        }
+    }
 }
 
 /// Resolve every top-level `source` block in `doc`, producing the
@@ -150,7 +200,7 @@ pub fn resolve_all_in_background(
     thread::spawn(move || {
         let started = Instant::now();
         for (name, value) in resolve_all(&doc, &ctx, &base_cwd, app_defaults) {
-            if tx.send(SourceUpdate { status: is_failure(&value), name, value, started }).is_err() {
+            if tx.send(SourceUpdate { status: is_failure(&value), name, value, started, began: false }).is_err() {
                 return;
             }
         }
@@ -327,7 +377,9 @@ fn poll_loop(
             continue;
         }
         last_run = Instant::now();
+        let run = Run::start(&name, Some(&tx));
         let result = resolve_one(&block, &ctx, &cwd, app_defaults);
+        drop(run);
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
@@ -335,7 +387,7 @@ fn poll_loop(
             Ok(v) => {
                 delay = interval;
                 next = Instant::now() + delay;
-                if tx.send(SourceUpdate { name: name.clone(), value: v, status: false, started: last_run }).is_err() {
+                if tx.send(SourceUpdate { name: name.clone(), value: v, status: false, started: last_run, began: false }).is_err() {
                     // Receiver dropped; the daemon is shutting down.
                     return;
                 }
@@ -345,7 +397,7 @@ fn poll_loop(
                 delay = next_backoff(delay, max_delay);
                 next = Instant::now() + delay;
                 // `ok` turns false; the main loop keeps the last value.
-                if tx.send(SourceUpdate { name: name.clone(), value: not_ok(&e), status: true, started: last_run }).is_err() {
+                if tx.send(SourceUpdate { name: name.clone(), value: not_ok(&e), status: true, started: last_run, began: false }).is_err() {
                     return;
                 }
             }
@@ -405,7 +457,7 @@ fn stream_loop(
         let mut command = match request.and_then(|r| runner::prepared_command(&r.argv, &opts)) {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(SourceUpdate { name: name.clone(), value: not_ok(&mask.apply(&e.to_string())), status: true, started: Instant::now() });
+                let _ = tx.send(SourceUpdate { name: name.clone(), value: not_ok(&mask.apply(&e.to_string())), status: true, started: Instant::now(), began: false });
                 eprintln!("paneld: source `{name}`: {}; retrying in {:?}", mask.apply(&e.to_string()), delay);
                 sleep_or_shutdown(delay, &shutdown);
                 delay = next_backoff(delay, RESTART_CEILING);
@@ -420,6 +472,7 @@ fn stream_loop(
                     value: not_ok(&format!("spawn: {}", mask.apply(&e.to_string()))),
                     status: true,
                     started: Instant::now(),
+                    began: false,
                 });
                 eprintln!("paneld: source `{name}`: spawn: {}; retrying in {:?}", mask.apply(&e.to_string()), delay);
                 sleep_or_shutdown(delay, &shutdown);
@@ -427,9 +480,11 @@ fn stream_loop(
                 continue;
             }
         };
+        // Running while the command lives (dropped with this pass).
+        let _run = Run::start(&name, None);
         // Running again: healthy until it says otherwise.
         let up = Value::Map(BTreeMap::from([("ok".to_string(), Value::Bool(true)), ("error".to_string(), Value::String(String::new()))]));
-        if tx.send(SourceUpdate { name: name.clone(), value: up, status: true, started: Instant::now() }).is_err() {
+        if tx.send(SourceUpdate { name: name.clone(), value: up, status: true, started: Instant::now(), began: false }).is_err() {
             runner::kill_group(runner::Pid::from_raw(child.id() as i32), runner::Signal::SIGTERM);
             let _ = child.wait();
             return;
@@ -507,7 +562,7 @@ fn stream_loop(
             let parsed = mask.apply_value(parsed);
             // `value` can put masked pieces back together: mask it too.
             let value = mask.apply_value(finish_stream_value(&block, &ctx, parsed));
-            if tx.send(SourceUpdate { name: name.clone(), value, status: false, started: Instant::now() }).is_err() {
+            if tx.send(SourceUpdate { name: name.clone(), value, status: false, started: Instant::now(), began: false }).is_err() {
                 // Receiver dropped: daemon is going down.
                 runner::kill_group(pid, runner::Signal::SIGTERM);
                 let _ = child.wait();
@@ -532,7 +587,7 @@ fn stream_loop(
         if sent_any && started.elapsed() >= RESET_AFTER {
             delay = RESTART_FLOOR;
         }
-        if tx.send(SourceUpdate { name: name.clone(), value: not_ok("the stream stopped; restarting"), status: true, started: Instant::now() }).is_err() {
+        if tx.send(SourceUpdate { name: name.clone(), value: not_ok("the stream stopped; restarting"), status: true, started: Instant::now(), began: false }).is_err() {
             return;
         }
         eprintln!(
@@ -1121,6 +1176,32 @@ impl<'a> JsonParser<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn running_and_age_follow_the_runs_and_the_clock() {
+        let mut m = BTreeMap::from([
+            ("a".to_string(), Value::Map(BTreeMap::from([("at".to_string(), Value::Int(1000))]))),
+            ("b".to_string(), not_ok("not run yet")),
+        ]);
+        let field = |m: &BTreeMap<String, Value>, s: &str, f: &str| match &m[s] {
+            Value::Map(x) => x.get(f).cloned(),
+            _ => None,
+        };
+        let run = Run::start("a", None);
+        let overlapping = Run::start("a", None);
+        add_live_fields(&mut m, 1090);
+        assert_eq!(field(&m, "a", "running"), Some(Value::Bool(true)));
+        assert_eq!(field(&m, "a", "age"), Some(Value::Int(90)));
+        assert_eq!(field(&m, "b", "running"), Some(Value::Bool(false)));
+        assert_eq!(field(&m, "b", "age"), None, "no result, no age");
+        drop(run);
+        add_live_fields(&mut m, 1100);
+        assert_eq!(field(&m, "a", "running"), Some(Value::Bool(true)), "a refresh still runs");
+        drop(overlapping);
+        add_live_fields(&mut m, 1100);
+        assert_eq!(field(&m, "a", "running"), Some(Value::Bool(false)));
+        assert_eq!(field(&m, "a", "age"), Some(Value::Int(100)));
+    }
     use super::*;
 
     fn parse_doc(src: &str) -> paneld_config::parse::Document {

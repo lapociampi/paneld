@@ -403,6 +403,13 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                     route_call(live, screen, actions::Call::new(name, args), false);
                 }
             }
+            paneld_ui::UiEvent::LateAction { name, mut args, late } => {
+                if live.pending.is_none() {
+                    let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+                    args.extend(actions::late_args(&late, &args, &ctx));
+                    route_call(live, screen, actions::Call::new(name, args), false);
+                }
+            }
             paneld_ui::UiEvent::Chained { name, args } => {
                 // A `then` / `else` chain is kept until any modal
                 // closes, then gets its own gates.
@@ -580,10 +587,19 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // ctx including the current `alerts` map for symmetry with
     // the render-side ctx.
     while let Ok(update) = live.source_rx.try_recv() {
+        // A run started: only `running` changed.
+        if update.began {
+            dirty |= visible::running_on_page(&update.name);
+            continue;
+        }
         // A run that started before the value on screen was taken is
         // stale (a slow refresh overtaken by a poll).
         match live.source_started.get(&update.name) {
-            Some(shown) if update.started < *shown => continue,
+            // Its run is over all the same: `running` may have changed.
+            Some(shown) if update.started < *shown => {
+                dirty |= visible::running_on_page(&update.name);
+                continue;
+            }
             _ => {
                 live.source_started.insert(update.name.clone(), update.started);
             }
@@ -776,7 +792,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         );
         let perf_render = lap(&mut perf_lap);
         let perf_fine = if perf_t0.is_some() { paneld_ui::perf::take() } else { String::new() };
-        live.ago_due = paneld_ui::take_ago_next();
+        live.ago_due = min_due(paneld_ui::take_ago_next(), age_due(live));
         if same_page {
             paneld_ui::restore_inputs(&typed);
         }
@@ -2335,6 +2351,34 @@ fn build_ctx(
     }
     clock::insert(&mut ctx);
     ctx
+}
+
+/// When a `sources.x.age` the page on screen shows is next drawn
+/// again: on `ago()`'s steps (each minute under an hour, ...), not
+/// each second, so a page showing an age costs what one with `ago()`
+/// does.
+fn age_due(live: &LiveState) -> Option<i64> {
+    let names = visible::ages_on_page();
+    if names.is_empty() {
+        return None;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let values = live.source_values.lock().unwrap();
+    let at = |v: &paneld_ui::Value| match v {
+        paneld_ui::Value::Map(m) => match m.get("at") {
+            Some(paneld_ui::Value::Int(t)) => Some(*t),
+            _ => None,
+        },
+        _ => None,
+    };
+    names.iter().filter_map(|k| values.get(k).and_then(at)).map(|t| paneld_ui::ago_due(now, now - t)).min()
+}
+
+fn min_due(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
 }
 
 /// `VmRSS` of this process in KiB, for `ctl status` (`rss_kb`).

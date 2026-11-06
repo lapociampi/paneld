@@ -854,6 +854,14 @@ pub fn take_ago_next() -> Option<i64> {
     AGO_NEXT.with(|n| n.take())
 }
 
+/// When something `secs` old at `now` should be shown again, on
+/// `ago()`'s steps (each minute under an hour, then each hour, then
+/// each day), in Unix seconds: how a page showing `sources.x.age` is
+/// timed.
+pub fn ago_due(now: i64, secs: i64) -> i64 {
+    now + ago_changes_in(secs)
+}
+
 /// Seconds until `ago_text(secs)` changes.
 fn ago_changes_in(secs: i64) -> i64 {
     let unit = match secs {

@@ -3,14 +3,16 @@
 //! sources a page shows is worked out at load from its expressions,
 //! those of the components it uses and the shell; sources an alert
 //! reads always count as shown (ADR 0013: alerts never go stale).
+//! What an expression reads comes from `paneld_config::reads`, the
+//! analysis `paneld check` uses too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
-use paneld_config::cel::{self, Expr, ExprKind};
+use paneld_config::cel;
 use paneld_config::parse::{Block, Document, Item, RawValue};
-use paneld_config::value::{classify, ValueShape};
+use paneld_config::reads::{self, Read};
 
 #[derive(Default)]
 struct State {
@@ -121,6 +123,31 @@ pub fn on_page(name: &str) -> bool {
     })
 }
 
+/// Whether the page on screen shows `sources.<name>.running`, so a
+/// run starting needs a redraw (its end comes with its value).
+pub fn running_on_page(name: &str) -> bool {
+    // Not through `ALL`: a computed name does not subscribe.
+    let key = format!("{name}:running");
+    with(|s| match &s.shown {
+        Some(p) if !s.asleep => s.pages.get(p).is_some_and(|set| set.contains(&key)),
+        _ => false,
+    })
+}
+
+/// The sources whose `age` the page on screen reads by name
+/// (`sources.x.age`), timed by the main loop as `ago()` texts are.
+/// Empty before a page is drawn and asleep.
+pub fn ages_on_page() -> Vec<String> {
+    with(|s| match &s.shown {
+        Some(p) if !s.asleep => s
+            .pages
+            .get(p)
+            .map(|set| set.iter().filter_map(|k| k.strip_suffix(":age").map(str::to_string)).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    })
+}
+
 /// How often the clock must redraw the page on screen: what it (with
 /// its shell) reads of `now` (`ago()` texts are timed by the main loop). `None` when it reads no
 /// time, before any page is drawn, and asleep (the wake redraws).
@@ -213,7 +240,9 @@ fn walk<'a>(
             Item::Assign(a) => value_refs(&a.value, remotes, out),
             Item::Repeat(r) => {
                 if let (Some(e), _) = cel::parse_fragment(&r.source.body, r.source.span.file, r.source.span.start) {
-                    expr_refs(&e, remotes, out);
+                    for read in reads::reads(&e) {
+                        read_keys(&read, remotes, out);
+                    }
                 }
                 walk(&r.items, components, remotes, path, out);
             }
@@ -242,100 +271,59 @@ fn walk<'a>(
 }
 
 fn value_refs(v: &RawValue, remotes: &BTreeMap<String, Vec<String>>, out: &mut BTreeSet<String>) {
-    let exprs: Vec<Expr> = match classify(&v.text) {
-        ValueShape::Literal(_) => return,
-        ValueShape::Expression(body) => cel::parse_fragment(body, v.span.file, v.span.start).0.into_iter().collect(),
-        ValueShape::Interp(_) => cel::parse_interp(&v.text, v.span.file, v.span.start).0,
-    };
-    for e in &exprs {
-        expr_refs(e, remotes, out);
+    for r in reads::value_reads(v) {
+        read_keys(&r, remotes, out);
     }
 }
 
+/// What one read (`paneld_config::reads`) needs polled or redrawn.
 /// `sources.x` and `sources['x']` read `x`; `sources` otherwise (a
 /// computed name, passed whole) reads every source. `device1.temp`
 /// and `device1.status.temp` read that member; `device1` otherwise
 /// (`device1.ok`, passed whole) reads all its members.
-fn expr_refs(e: &Expr, remotes: &BTreeMap<String, Vec<String>>, out: &mut BTreeSet<String>) {
-    let ident = |e: &Expr| match &e.kind {
-        ExprKind::Ident(n) => Some(n.clone()),
-        _ => None,
-    };
-    let all_of = |r: &str, out: &mut BTreeSet<String>| {
-        for m in &remotes[r] {
-            out.insert(format!("{r}.{m}"));
+fn read_keys(r: &Read, remotes: &BTreeMap<String, Vec<String>>, out: &mut BTreeSet<String>) {
+    let step = |i: usize| r.path.get(i).map(|s| s.name.as_str());
+    // `age` and `running` of source `name`, when the read names the
+    // field at `i`. A whole map (`has(sources.x)`, passed to a
+    // component) does not count: those fields must be read by name to
+    // be redrawn as they change (schema 4).
+    let live = |name: &str, i: usize, out: &mut BTreeSet<String>| {
+        if let Some(f @ ("age" | "running")) = step(i) {
+            out.insert(format!("{name}:{f}"));
         }
     };
-    let now_field = |f: &str, out: &mut BTreeSet<String>| {
-        let second = paneld_config::cel::NOW_SECOND_FIELDS.contains(&f);
-        out.insert(if second { NOW_SECOND } else { NOW_MINUTE }.to_string());
-    };
-    match &e.kind {
-        ExprKind::Ident(n) if n == "sources" => {
-            out.insert(ALL.to_string());
-        }
-        ExprKind::Ident(n) if n == "now" => {
-            out.insert(NOW_SECOND.to_string());
-        }
-        ExprKind::Field(inner, field) if ident(inner).as_deref() == Some("now") => now_field(field, out),
-        ExprKind::Index(inner, idx) if ident(inner).as_deref() == Some("now") => match &idx.kind {
-            ExprKind::StringLit(f) => now_field(f, out),
-            _ => {
-                out.insert(NOW_SECOND.to_string());
-                expr_refs(idx, remotes, out);
-            }
-        },
-        ExprKind::Ident(n) if remotes.contains_key(n) => all_of(n, out),
-        ExprKind::Field(inner, field) if ident(inner).as_deref() == Some("sources") => {
-            out.insert(field.clone());
-        }
-        ExprKind::Index(inner, idx) if ident(inner).as_deref() == Some("sources") => match &idx.kind {
-            ExprKind::StringLit(name) => {
-                out.insert(name.clone());
-            }
-            _ => {
-                out.insert(ALL.to_string());
-                expr_refs(idx, remotes, out);
-            }
-        },
-        ExprKind::Field(inner, field) if ident(inner).is_some_and(|r| remotes.contains_key(&r)) => {
-            let r = ident(inner).unwrap();
-            if remotes[&r].contains(field) {
-                out.insert(format!("{r}.{field}"));
-            } else {
-                all_of(&r, out);
+    match r.root.as_str() {
+        "sources" => {
+            out.insert(step(0).unwrap_or(ALL).to_string());
+            if let Some(name) = step(0) {
+                live(name, 1, out);
             }
         }
-        // `device1.status.temp`
-        ExprKind::Field(inner, member) if matches!(&inner.kind, ExprKind::Field(r, s) if s == "status" && ident(r).is_some_and(|r| remotes.contains_key(&r))) => {
-            let ExprKind::Field(r, _) = &inner.kind else { unreachable!() };
-            let r = ident(r).unwrap();
-            if remotes[&r].contains(member) {
-                out.insert(format!("{r}.{member}"));
-            } else {
-                all_of(&r, out);
+        "now" => {
+            let second = step(0).is_none_or(|f| paneld_config::cel::NOW_SECOND_FIELDS.contains(&f));
+            out.insert(if second { NOW_SECOND } else { NOW_MINUTE }.to_string());
+        }
+        root => {
+            let Some(members) = remotes.get(root) else { return };
+            let member = match (step(0), step(1)) {
+                (Some("status"), Some(m)) if members.iter().any(|x| x == m) => Some((m, true)),
+                (Some(m), _) if members.iter().any(|x| x == m) => Some((m, false)),
+                _ => None,
+            };
+            match member {
+                Some((m, status)) => {
+                    out.insert(format!("{root}.{m}"));
+                    if status {
+                        live(&format!("{root}.{m}"), 2, out);
+                    }
+                }
+                None => {
+                    for m in members {
+                        out.insert(format!("{root}.{m}"));
+                    }
+                }
             }
         }
-        ExprKind::Field(a, _) | ExprKind::Unary(_, a) => expr_refs(a, remotes, out),
-        ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) => {
-            expr_refs(a, remotes, out);
-            expr_refs(b, remotes, out);
-        }
-        ExprKind::Conditional(a, b, c) => {
-            expr_refs(a, remotes, out);
-            expr_refs(b, remotes, out);
-            expr_refs(c, remotes, out);
-        }
-        ExprKind::Call(_, args) | ExprKind::List(args) => args.iter().for_each(|a| expr_refs(a, remotes, out)),
-        ExprKind::Method(a, _, args) => {
-            expr_refs(a, remotes, out);
-            args.iter().for_each(|x| expr_refs(x, remotes, out));
-        }
-        ExprKind::Map(pairs) => pairs.iter().for_each(|(k, v)| {
-            expr_refs(k, remotes, out);
-            expr_refs(v, remotes, out);
-        }),
-        _ => {}
     }
 }
 
@@ -427,6 +415,36 @@ mod tests {
         assert_eq!(clock_on_page(), Some(Tick::Second));
         set_asleep(true);
         assert_eq!(clock_on_page(), None, "asleep");
+        set_asleep(false);
+    }
+
+    #[test]
+    fn age_and_running_readers_are_marked() {
+        let d = doc(
+            "page a { text { value = {{ sources.x.age }} {{ sources.y.value }} } }\n\
+             page b { text { value = {{ sources.x.running }} {{ d1.status.t.age }} } }\n\
+             page c { text { value = {{ size(sources.x) }} {{ has(sources.x) }} } }\n\
+             page e { text { value = {{ sources[vars.n].age }} } }\n",
+        );
+        let (pages, _) = analyse(&d, &remotes(&[("d1", &["t"])]));
+        assert_eq!(pages["a"], set(&["x", "x:age", "y"]));
+        assert_eq!(pages["b"], set(&["d1.t", "d1.t:age", "x", "x:running"]));
+        // Read whole, not by name: no redraws for `age` / `running`.
+        assert_eq!(pages["c"], set(&["x"]));
+        assert_eq!(pages["e"], set(&["*"]));
+        let _g = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        install(&d, &remotes(&[("d1", &["t"])]));
+        set_asleep(false);
+        show("a");
+        assert_eq!(ages_on_page(), vec!["x".to_string()]);
+        assert!(!running_on_page("x"));
+        show("b");
+        assert!(running_on_page("x") && !running_on_page("y"));
+        set_asleep(true);
+        assert!(ages_on_page().is_empty(), "asleep");
+        set_asleep(false);
+        show("e");
+        assert!(ages_on_page().is_empty() && !running_on_page("x"), "a computed name does not subscribe");
         set_asleep(false);
     }
 

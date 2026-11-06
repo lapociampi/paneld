@@ -22,8 +22,8 @@ pub mod motion;
 pub mod render;
 pub mod ui;
 
-pub use expr::{eval, take_ago_next, Context, EvalError, Value};
-pub use render::{interpolate, render_page, render_toast, resolve_value, set_call_states, set_styles, shows_call, CallState, RunState};
+pub use expr::{ago_due, eval, take_ago_next, Context, EvalError, Scope, Value};
+pub use render::{interpolate, render_page, render_toast, resolve_value, resolve_value_in, set_call_states, set_styles, shows_call, CallState, RunState};
 pub use ui::{
     begin_page_change, finish_motion, hide_sleep_cover, idle_hint_ms, inactive_ms, page_transition_running, run_page_transition, running_animations, reset_action_bindings, restore_inputs, set_ask_value, set_asset_dir, set_dialog_backdrop, set_wake_sink, show_sleep_cover, wake_within, interacting,
     snapshot_inputs, trigger_activity, wake, ActionArg, ActionTrigger, Backdrop, EventValue, InlineSetItem, MemDisplay, Ui, UiEvent, WakingSender,

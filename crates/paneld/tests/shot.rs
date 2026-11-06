@@ -133,6 +133,28 @@ fn component_number_param_drives_the_warning_color() {
 }
 
 #[test]
+fn a_param_default_reads_the_params_before_it() {
+    // `b` defaults from `a` as passed (5), not as defaulted (1) and
+    // not null: a rect 5 * 20 = 100 px wide in the warning color.
+    let d = tmp("param-order");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "component c {\n\
+             param a: int = 1\n\
+             param b: int = {{ a * 20 }}\n\
+             rect { width = {{ b }}; height = 40; background = {{ theme.warning }} }\n\
+         }\n\
+         page home { c { a = 5 } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--size", "400x200", "--settle", "50"]);
+    let warn = |p| close(p, [0xef, 0x6c, 0x00], 24);
+    let width = (0..img.h).map(|y| (0..img.w).filter(|&x| warn(img.px(x, y))).count()).max().unwrap_or(0);
+    assert!((96..=104).contains(&width), "rect is {width} px wide, want 100");
+}
+
+#[test]
 fn grid_places_repeated_children_in_separate_columns() {
     // Three tiles in a 3-column grid. Before the fix every child sat in
     // cell (0, 0), so the right two thirds of the row stayed empty.
@@ -318,6 +340,27 @@ fn inline_handler_confirm_gates_its_set() {
     // Tap, then OK (right footer button of the centered modal).
     let done = shot(&conf, &["--tap", "100,95", "--tap", "463,282", "--settle", "200"]);
     assert!(done.any(green), "set did not run after OK");
+}
+
+#[test]
+fn a_named_on_change_call_reads_the_new_value_in_its_args() {
+    // `level = {{ value }}` is evaluated when the toggle flips, with
+    // its new state, not when the page is drawn (no value then), and
+    // still sees `page` where it was drawn.
+    let d = tmp("late-arg");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var on: bool = false\n\
+         action set_on { param level: bool\n param where: string\n run = /bin/true\n set { on = {{ level && where == 'home' }} } }\n\
+         page home {\n\
+             toggle { on_change set_on { level = {{ value && event.value }}; where = {{ value ? page.name : '' }} } }\n\
+             rect { width = 100; height = 40; background = {{ vars.on ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--tap", "38,77", "--settle", "300"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the arg did not get the new value");
 }
 
 #[test]
@@ -874,7 +917,7 @@ fn every_widget_draws_and_a_bad_repeat_says_why() {
                  stack { width = 60; height = 60; rect { width = 30; height = 30; background = #0000ff } }\n\
              }\n\
              repeat x in {{ 5 }} { rect { width = 10; height = 10; background = #ff0000 } }\n\
-             repeat y in {{ nope }} { rect { width = 10; height = 10; background = #ff0000 } }\n\
+             repeat y in {{ [1][5] }} { rect { width = 10; height = 10; background = #ff0000 } }\n\
          }\n",
     )
     .unwrap();
@@ -2713,8 +2756,9 @@ fn scope_checks(taps: &[&str]) -> (usize, usize) {
          component inner {\n\
              param a: int\n\
              param b: int\n\
-             # The caller's names are seen (as before); its own `a` wins.\n\
-             ok { c = {{ a == 5 && b == 2 && outer_only == 9 }} }\n\
+             # Its own `a` wins over the caller's; the caller's other\n\
+             # names are not in scope (`paneld check`).\n\
+             ok { c = {{ a == 5 && b == 2 }} }\n\
          }\n\
          component outer {\n\
              param a: int\n\

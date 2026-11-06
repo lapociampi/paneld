@@ -761,7 +761,7 @@ fn find_component<'a>(doc: &'a Document, name: &str) -> Option<&'a Block> {
 
 /// Expand a user-component call: evaluate each `arg = value` from
 /// the call site against the outer context, fill in defaults for
-/// omitted args, bind them as top-level identifiers in a fresh
+/// omitted args (each reading the params before it), bind them as top-level identifiers in a fresh
 /// Context, and render the component's single UI root into
 /// `parent`.
 ///
@@ -782,7 +782,10 @@ fn expand_component(
         let bound = if let Some((raw, span)) = find_raw(call, &p.name.text) {
             resolve_expr_value(raw, span, outer_ctx).unwrap_or(Value::Null)
         } else if let Some(default) = &p.default {
-            resolve_expr_value(&default.text, default.span, outer_ctx).unwrap_or(Value::Null)
+            // Schema 6: a default reads the params declared before it,
+            // bound so far; `paneld check` refuses a later one, itself
+            // and the caller's names.
+            resolve_expr_value(&default.text, default.span, &outer_ctx.with(&locals)).unwrap_or(Value::Null)
         } else {
             Value::Null
         };
@@ -906,6 +909,12 @@ pub fn resolve_value(
     ctx: &Context,
 ) -> Option<Value> {
     resolve_expr_value(raw, span, &Scope::root(ctx))
+}
+
+/// [`resolve_value`] in a [`Scope`]: names bound over the context
+/// without copying it (an action's params before the one defaulted).
+pub fn resolve_value_in(raw: &str, span: paneld_config::source::Span, ctx: &Scope<'_>) -> Option<Value> {
+    resolve_expr_value(raw, span, ctx)
 }
 
 /// Evaluate a `key = <raw>` as either a literal string (for a
@@ -1896,7 +1905,7 @@ fn bind_change_action(
 ) -> Option<Vec<InlineSetItem>> {
     if let Some((raw, span)) = find_raw(node, handler) {
         if let Some(action) = action_name(raw, span, ctx) {
-            obj.on_change_action(widget, sink.clone(), action, local_args(ctx));
+            obj.on_change_action(widget, sink.clone(), action, local_args(ctx), Vec::new());
             return None;
         }
     }
@@ -1906,11 +1915,13 @@ fn bind_change_action(
             continue;
         }
         if let Some(name) = &child.name {
-            obj.on_change_action(widget, sink.clone(), name.text.clone(), collect_action_args(child, ctx));
+            // Args that read the new value wait for it (schema 8.4).
+            let (args, late) = change_call_args(child, ctx);
+            obj.on_change_action(widget, sink.clone(), name.text.clone(), args, late);
             return None;
         }
         if child.is_inline_action() {
-            obj.on_change_action(widget, sink.clone(), child.inline_action_name(), local_args(ctx));
+            obj.on_change_action(widget, sink.clone(), child.inline_action_name(), local_args(ctx), Vec::new());
             return None;
         }
         if let Some(set_block) = find_block(child, "set") {
@@ -1952,15 +1963,42 @@ fn collect_action_args(call: &Block, ctx: &Scope<'_>) -> Vec<ActionArg> {
     out
 }
 
-fn collect_inline_set(set_block: &Block, ctx: &Scope<'_>) -> Vec<InlineSetItem> {
-    // `page` and `nav` too: only a drawn page has them (they are not
-    // action args, which would change what counts as the same call).
+/// The args of `on_change name { ... }`: those that read `value` or
+/// `event` (the new value) left as text, with the names where the node
+/// is drawn, for the main loop to evaluate when it fires; the rest
+/// evaluated now, as for a tap.
+fn change_call_args(call: &Block, ctx: &Scope<'_>) -> (Vec<ActionArg>, Vec<InlineSetItem>) {
+    let mut now = Vec::new();
+    let mut late = Vec::new();
+    for item in &call.items {
+        let Item::Assign(a) = item else { continue };
+        let AssignTarget::Simple { key } = &a.target else { continue };
+        let reads_event = paneld_config::reads::value_reads(&a.value).iter().any(|r| matches!(r.root.as_str(), "value" | "event"));
+        if reads_event {
+            late.push(InlineSetItem { key: key.text.clone(), value_raw: a.value.text.clone(), locals: drawn_locals(ctx) });
+        } else if let Some(v) = resolve_expr_value(&a.value.text, a.value.span, ctx) {
+            now.push(ActionArg { name: key.text.clone(), value: v });
+        }
+    }
+    (now, late)
+}
+
+/// [`local_args`] plus `page` and `nav`: what an expression evaluated
+/// later (an inline `set`, a late `on_change` arg) read where drawn.
+/// Not action args themselves, which would change what counts as
+/// the same call.
+fn drawn_locals(ctx: &Scope<'_>) -> Vec<ActionArg> {
     let mut locals = local_args(ctx);
     for k in ["page", "nav"] {
         if let Some(v) = ctx.get(k) {
             locals.push(ActionArg { name: k.into(), value: v.clone() });
         }
     }
+    locals
+}
+
+fn collect_inline_set(set_block: &Block, ctx: &Scope<'_>) -> Vec<InlineSetItem> {
+    let locals = drawn_locals(ctx);
     let mut out = Vec::new();
     for item in &set_block.items {
         let Item::Assign(a) = item else { continue };

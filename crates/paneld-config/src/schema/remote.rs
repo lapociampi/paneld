@@ -329,7 +329,7 @@ pub(super) fn check_kind(b: &Block, source: &SourceMap, diags: &mut Vec<Diagnost
     let connection = |items: &[Item], diags: &mut Vec<Diagnostic>| {
         for it in items {
             let Item::Assign(a) = it else { continue };
-            for e in exprs_of(&a.value) {
+            for e in crate::reads::value_exprs(&a.value) {
                 for (name, span) in crate::cel::idents(&e) {
                     if name != "secrets" && !param_names.contains(&name.as_str()) {
                         diags.push(Diagnostic::new(
@@ -428,18 +428,6 @@ fn is_plain_name(s: &str) -> bool {
         && !matches!(s, "in" | "true" | "false" | "null")
 }
 
-/// The parsed `{{ }}` expressions of a raw value.
-fn exprs_of(v: &crate::parse::RawValue) -> Vec<crate::cel::Expr> {
-    match classify(&v.text) {
-        ValueShape::Literal(_) => Vec::new(),
-        ValueShape::Expression(body) => {
-            let open = v.text.find("{{").unwrap_or(0) as u32;
-            crate::cel::parse_fragment(body, v.span.file, v.span.start + open + 2).0.into_iter().collect()
-        }
-        ValueShape::Interp(_) => crate::cel::parse_interp(&v.text, v.span.file, v.span.start).0,
-    }
-}
-
 /// Where a kind may use `secrets` and its `secret` params: what goes
 /// to the command's stdin or environment, never its argv over ssh, a
 /// request path, or text that reaches the screen.
@@ -469,7 +457,7 @@ fn check_secret_use(b: &Block, via: &str, diags: &mut Vec<Diagnostic>) {
                             _ => false,
                         };
                     let strict = via == "ssh" && key == "run" && depth > 0;
-                    for e in exprs_of(&a.value) {
+                    for e in crate::reads::value_exprs(&a.value) {
                         if !allowed {
                             for name in secret_params {
                                 if let Some(span) = crate::cel::find_ident(&e, name) {
@@ -655,29 +643,6 @@ fn shadowing(doc: &Document, name: &str) -> Vec<Span> {
     let mut out = Vec::new();
     walk(&doc.items, name, &mut out);
     out
-}
-
-/// `self` (the instance) exists only in a remote kind's alerts: refuse
-/// it everywhere else, where it would be an unknown name at run time.
-pub(super) fn check_self_use(doc: &Document, diags: &mut Vec<Diagnostic>) {
-    fn walk(items: &[Item], in_kind: bool, diags: &mut Vec<Diagnostic>) {
-        for it in items {
-            match it {
-                Item::Assign(a) => {
-                    for e in exprs_of(&a.value) {
-                        if let Some(span) = crate::cel::find_ident(&e, "self") {
-                            diags.push(Diagnostic::new(span, "`self` is the instance in a remote kind's alerts only; elsewhere use its name"));
-                        }
-                    }
-                }
-                Item::Block(b) if in_kind && b.kind.text == "alert" => {}
-                Item::Block(b) => walk(&b.items, in_kind || b.kind.text == "remote_kind", diags),
-                Item::Repeat(r) => walk(&r.items, in_kind, diags),
-                _ => {}
-            }
-        }
-    }
-    walk(&doc.items, false, diags);
 }
 
 /// References inside a kind's members: a sibling member by its bare
