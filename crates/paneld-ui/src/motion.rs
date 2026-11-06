@@ -238,6 +238,11 @@ pub(crate) fn item_key(item: &Value, index: usize) -> String {
     format!("#{index}")
 }
 
+/// The key `node` is known by where the render is now.
+pub(crate) fn node_key(node: &Block) -> u64 {
+    STATE.with(|s| key_of(&s.borrow(), node))
+}
+
 fn key_of(s: &State, node: &Block) -> u64 {
     key_tagged(s, node, 0)
 }
@@ -257,7 +262,21 @@ fn record(s: &mut State, key: u64, shown: Shown) {
     let map = if s.updating { &mut s.prev } else { &mut s.next };
     if map.len() < MAX_ENTRIES || map.contains_key(&key) {
         map.insert(key, shown);
+        // Its node keeps the key, to forget it when it goes.
+        crate::nodes::note_motion(key);
     }
+}
+
+/// The nodes that showed `keys` went (`repeat` items no longer listed):
+/// what they showed is forgotten, and one coming back enters anew.
+pub(crate) fn forget_keys(keys: &[u64]) {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        for k in keys {
+            s.prev.remove(k);
+            s.next.remove(k);
+        }
+    });
 }
 
 /// An `arc` or `bar` of `node` shows `to`: where to start it from and

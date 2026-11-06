@@ -115,4 +115,12 @@ const char * lv_paneld_class_name(const lv_obj_t * obj);
 /* The event code an event descriptor is for, without the flag bits. */
 lv_event_code_t lv_paneld_event_dsc_code(const lv_event_dsc_t * dsc);
 
+/* `obj` takes its own size again at the next layout, not the one its
+ * parent's layout gave it (a grid cell it was stretched to). */
+void lv_paneld_size_again(lv_obj_t * obj);
+
+/* The object a pointer `indev` holds pressed (a press, a drag), or
+ * NULL when it is up. */
+lv_obj_t * lv_paneld_indev_pressed_obj(const lv_indev_t * indev);
+
 #endif

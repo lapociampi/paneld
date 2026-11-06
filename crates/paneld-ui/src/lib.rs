@@ -26,7 +26,7 @@ pub mod ui;
 pub use expr::{ago_due, eval, Context, EvalError, Scope, Value};
 pub use nodes::Changes;
 pub use render::{
-    interpolate, page_ago_due, render_page, render_toast, resolve_value, resolve_value_in, scratch_page, show_screen, delete_screen, set_call_states, set_styles, update_page, verify_page,
+    interpolate, page_ago_due, render_page, render_toast, resolve_value, resolve_value_in, scratch_page, show_screen, delete_screen, set_call_states, set_styles, update_page, verify_held, verify_page,
     CallState, RunState, Updated,
 };
 pub use ui::{

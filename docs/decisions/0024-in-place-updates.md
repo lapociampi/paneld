@@ -8,7 +8,7 @@ series: paneld
 order: 31
 ---
 
-- Status: Accepted; Phase 0 and Phase 1 done (results below). Changes the rendering of [ADR 0003](0003-ui-model.md) ("every update rebuilds the page") and the "rebuilt whole" basis of [ADR 0023](0023-motion.md); keeps [ADR 0004](0004-cel.md) and [ADR 0010](0010-threads.md) (all LVGL work stays on the UI thread).
+- Status: Accepted; Phases 0, 1 and 2 done (results below). Changes the rendering of [ADR 0003](0003-ui-model.md) ("every update rebuilds the page") and the "rebuilt whole" basis of [ADR 0023](0023-motion.md); keeps [ADR 0004](0004-cel.md) and [ADR 0010](0010-threads.md) (all LVGL work stays on the UI thread).
 - Date: 2026-11-06
 
 ## Context
@@ -279,11 +279,56 @@ Measured, `perf update` against `perf build same=true` (`PANELD_UPDATES=0`), med
 
 RSS on the Pi after 90 s on `home`: 5.7 MB (`node_records` 38, `node_objects` 45, 48 LVGL objects).
 
+### Phase 2 results
+
+Done: a `repeat` item is a record of its own (its key, what it draws under it); a node that makes other objects is built again where it was; a finger on the page holds only what it touches.
+
+| What | As built |
+| --- | --- |
+| Same keys | Each item walked in place with its new value (as in phase 1) |
+| Other keys | Keyed diff: the repeat's records are cut out of the table by item; kept keys go back where the new list has them (their objects moved with `lv_obj_move_to_index`) and are walked in place; new keys are built in place (with `enter` if set); the rest are deleted, and motion forgets what they showed. A list without `id` / `name` keeps its items by position (each updated in place, the tail added or removed) |
+| Duplicate keys | `id:x`, `id:x#1`, `id:x#2` by order among them, logged once per `repeat` |
+| A `repeat` that draws no items | Its text (`[repeat eval: ...]`) is its own object: to and from it the repeat is drawn again in place (was: the page could only be built again) |
+| Another shape | A node whose setup made other objects (button shortcut shape, icon glyph <-> PNG or another glyph size, select `style = buttons` options, image `src` empty <-> set, keypad `masked` / `length`, a QR code with <-> without data) is built again with its subtree, at its place in its parent; typed keypad text is carried over, motion goes on from what was shown, a component root gets its call's keys again. An unknown node's text is recorded too (was: the page) |
+| Building within an update | The same build code in build mode, recorded at the end of the table and spliced in at the walk's place; what the walk is in (the records open) grows or shrinks around it. Objects are styled as they are made; new ones are noted, so the update restyles them if it sets them after |
+| Dep keys within an update | The frames of a fresh build are bound in an update too (a call's params as recorded, the `repeat` binding, `page` / `nav`), so a subtree built in an update reads what a fresh build would |
+| Touch | An update goes ahead while a finger is down or a list is open, with what the finger is on kept as the user sees it. Held, with their fingerprints, until the release: the node whose objects are, or are under, what a pointer holds pressed (or an open dropdown), with its subtree; every node around it (its `visible`, its size: walked into, not set up again); the whole `repeat` item it is in (so a row and the args of its button agree, also for a list keyed by position); and every change of structure (a diff, a node of another shape). A finger on the page's background or on a `scroll`'s own background (a drag that started there) holds no node, only structure; a drag that started on a child of a `scroll` holds that child. Anything else may change, also around it; if that moves what the finger holds (a sibling shown above it) or hides it, the press is cancelled, so lifting the finger taps nothing. The update says so (`held`), and its changes run again on release (a release wakes the loop); verify compares the page then, not while changes wait, and checks after each update that what a finger holds is still there and shows the same |
+
+Deviations from section 2, kept simpler with the same guarantee:
+
+| Point | As built |
+| --- | --- |
+| Rebuild rows | Not listed in the code: the node is set up as in phase 1, and a maker of another kind or with other fixed args, or another count of objects, marks it; what that setup made is dropped (made off the page) and the node is built again. One path for every row marked 2 |
+| Unit | A node with its subtree, not a key: what is under it is built again too |
+| Position keys | Kept by position and updated in place, not built again from the first changed position: fewer objects made, the same result |
+| Touch, the held part | Not marked stale per binding: the whole change set runs again on release, and fingerprints skip what already shows it. An `ago()` text held is not timed until then; the page's other `ago()` texts go on |
+| Keypad text | Kept by the key of its node (motion's), not by position: a full build of the same page (a wake, a dialog closed) puts typed digits back into the same `repeat` item's keypad wherever it is now |
+| Stale hidden subtrees | Not done: what is under a hidden node is still updated (verify compares hidden objects too) |
+
+Fixes that came out of the wider fuzz, all older than phase 2: a grid's content row kept the height of a child hidden since (LVGL keeps the size it stretched a child to; children are measured again when a grid is laid out again); a QR code without data showed the palette its new buffer happened to hold (set when made); a text whose failed `{{ }}` part changed its error kept the old message (its fingerprint took any failed part as the same); a QR code whose data stopped resolving kept the old code (with and without data are other shapes now); an open dropdown is in LVGL's checked state (compared as the user's, as a toggle's); a button two running calls cover (a call with args and one without) showed the busy text of whichever came first in a hash map, so an unrelated call could turn it (call states are kept in a fixed order); a minute that turned between the loop's look at the clock and the update's context was drawn one pass late (now looked at again with the context's time); `shot --verify` raced the clock the same way; `shot` ran the config's screen commands (the rack's backlight); the fuzz test went over only the rack config's alerts page (its pages are in included files); an `ago()` in a `repeat`'s list was never timed; a keypad in a parent as tall as its content grew it on every layout pass (its keys were half the parent's height; they get 200 px of their own there).
+
+Coverage: new `shot.rs` tests for a `repeat` gaining, losing and reordering items (objects made: the new item's only), items with the same `id`, a `repeat` to and from its error text, nodes of another shape, a slider dragged while a rect beside it changes (and the var's value landing on release), items changing under a finger only after the release, the QR, error text and grid fixes; each fails without its change. The fuzz (`--fuzz`) changes lists: items gone, copied (same key), added with a new key, swapped, reversed, turned, a key or another field changed, lists in maps too; it seeds the examples' sources with their demo data (`--source name=@file.json`), taps and keeps a finger down (dragging now and then) through one to four passes' changes (`--fuzz-taps`; in the rack config with `--no-actions`), and goes back to the page under test when a tap left it; every page of the rack config, three seeds each.
+
+Measured with `paneld shot --no-sources --fuzz 200 --seed 7` per page and `PANELD_PERF=1`: medians of `perf update` with and without `restructured`, against `perf build same=true` with `PANELD_UPDATES=0` (the same changes). Over all these runs no update fell back to a build.
+
+| Where | Built (before) | Items changed, updated | Values only, updated |
+| --- | --- | --- | --- |
+| x86, rack `alerts` | 0.43 ms | 0.17 ms | 0.08 ms |
+| x86, rack `host` (pools) | 0.61 ms | 0.27 ms | 0.15 ms |
+| x86, homelab `overview` (services grid) | 1.05 ms | 0.31 ms | 0.07 ms |
+| x86, homelab `vms` | 1.08 ms | 0.28 ms | 0.07 ms |
+| Pi, rack `alerts` | 8.5 ms (p90 10.4) | 2.5 ms (p90 4.0) | 1.4 ms |
+| Pi, rack `host` | 11.0 ms | 3.7 ms | 2.6 ms |
+| Pi, rack `network` (steps) | 12.4 ms | 0.7 ms (3 changes) | 1.4 ms |
+| Pi, rack `home` | 12.6 ms | - | 2.2 ms |
+
+On the Pi: the static aarch64 build run by hand as the `paneld` user beside the running service, a real homelab config read only. A build is not slower for the item records: x86 rack `alerts` 0.41 -> 0.39 ms, `home` 0.56 -> 0.55 ms (phase 1 -> phase 2, `PANELD_UPDATES=0`). The frame after a change of items is not smaller than a build's when the list moves what is under it: on the rack `alerts` page a median of 270000 of 384000 px.
+
 ## What stays a full rebuild
 
 - Reload (every key may mean another node; motion `forget`), theme switch (tokens, styles, fonts, components), a display size change.
-- A page drawn the first time or evicted from the cache.
-- In Phase 1 only: a change hitting a rebuild row, or a `repeat` whose items changed.
+- A page drawn the first time or evicted from the cache; navigation and the wake until phase 3.
+- A page that is not there (`page not found`).
 - Errors: a config error keeps the last good config (and its trees); a node that fails to build shows its error text as today and rebuilds whenever its bindings change.
 
 ## Risks

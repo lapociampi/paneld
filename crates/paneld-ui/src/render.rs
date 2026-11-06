@@ -117,8 +117,11 @@ pub enum Updated {
     /// Nothing on the page reads what changed.
     Nothing,
     /// Updated: records walked into, nodes set up again, objects
-    /// restyled.
-    Done { visited: usize, reapplied: usize, redrawn: usize },
+    /// restyled, subtrees built again and `repeat`s whose items
+    /// changed; `held`: what a finger holds (and any change of
+    /// structure) waits for the release, when the same changes are to
+    /// be run again.
+    Done { visited: usize, reapplied: usize, redrawn: usize, restructured: usize, held: bool },
     /// It cannot be done in place: build the page again.
     Rebuild(&'static str),
 }
@@ -126,8 +129,11 @@ pub enum Updated {
 /// Update the page drawn last (`page_name`, by [`render_page`]) in
 /// place for `changes`, from `ctx` as it is now: only the nodes that
 /// read what changed are set up again, each as a fresh render would
-/// make it. [`Updated::Rebuild`] when that cannot be done (the caller
-/// renders the page again).
+/// make it; a node of another shape is built again where it was, and
+/// a `repeat` whose items changed keeps the ones it still lists. While
+/// the user touches the page, what is held and every change of
+/// structure wait ([`Updated::Done`] `held`). [`Updated::Rebuild`]
+/// when it cannot be done (the caller renders the page again).
 pub fn update_page(
     doc: &Document,
     page_name: &str,
@@ -135,7 +141,14 @@ pub fn update_page(
     sink: &Sender<UiEvent>,
     changes: &nodes::Changes,
 ) -> Updated {
-    let start = match nodes::begin_update(page_name, changes) {
+    let hold = crate::ui::interacting().then(crate::ui::held_objects);
+    let presses = hold.as_deref().map(crate::ui::presses).unwrap_or_default();
+    // Verify: what a finger holds, as it was before the update.
+    let held_before: Vec<(*mut lvgl_sys::lv_obj_t, Vec<String>)> = match &hold {
+        Some(h) if verify_held_on() => h.iter().map(|&o| (o, crate::ui::held_dump(o))).collect(),
+        _ => Vec::new(),
+    };
+    let start = match nodes::begin_update(page_name, changes, hold) {
         Err(why) => return Updated::Rebuild(why),
         Ok(None) => return Updated::Nothing,
         Ok(Some(s)) => s,
@@ -147,16 +160,49 @@ pub fn update_page(
     nodes::with_mode(Mode::Update, || {
         let locals = page_locals(doc, page, scope);
         let pctx = scope.with(&locals);
+        let _frame = nodes::push_frame(page_frame(doc, page));
         let page_root = Obj::from_raw(start.page_root);
         page_items(page, doc, &pctx, sink, &page_root);
     });
     let redrawn = crate::ui::end_update();
     crate::motion::end_update();
     crate::ui::settle_backgrounds();
+    crate::ui::cancel_moved(&presses);
+    for (o, before) in held_before {
+        let problem = if !crate::ui::alive(o) {
+            Some("was deleted".to_string())
+        } else if crate::ui::held_dump(o) != before {
+            Some(format!("changed: {:?} -> {:?}", before, crate::ui::held_dump(o)))
+        } else {
+            None
+        };
+        if let Some(p) = problem {
+            HELD_PROBLEM.with(|h| {
+                h.borrow_mut().get_or_insert(format!("an object a finger holds {p}"));
+            });
+        }
+    }
     match nodes::end_update() {
-        Ok((visited, reapplied)) => Updated::Done { visited, reapplied, redrawn },
+        Ok(w) => Updated::Done { visited: w.visited, reapplied: w.reapplied, redrawn, restructured: w.restructured, held: w.held },
         Err(why) => Updated::Rebuild(why),
     }
+}
+
+thread_local! {
+    /// Verify: what an update did to something a finger held.
+    static HELD_PROBLEM: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `PANELD_VERIFY_UPDATES` set at start (as the daemon reads it).
+fn verify_held_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PANELD_VERIFY_UPDATES").is_some_and(|v| v != "0"))
+}
+
+/// Verify: `Err` when an update since the last call deleted or changed
+/// what a finger held (it must stay as it was until the release).
+pub fn verify_held() -> Result<(), String> {
+    HELD_PROBLEM.with(|h| h.borrow_mut().take()).map_or(Ok(()), Err)
 }
 
 /// When the soonest `ago()` text on the page drawn reads otherwise
@@ -384,8 +430,10 @@ fn is_event_handler_block(kind: &str) -> bool {
 /// Expand a `repeat BIND in {{ EXPR }} { ... }`: evaluate the
 /// source expression, iterate the resulting list, and render the
 /// contained items for each element with `BIND` bound to the item.
-/// Updating in place, the items are walked again only when their keys
-/// are the ones drawn (else the page is built again: ADR 0024 phase 1).
+/// Updating in place, items with the keys drawn are walked in place;
+/// other keys are a keyed diff (ADR 0024 phase 2): kept items keep
+/// their objects (moved into place), new ones are built, the rest
+/// deleted.
 fn expand_repeat(
     r: &paneld_config::parse::Repeat,
     doc: &Document,
@@ -414,59 +462,235 @@ fn expand_repeat(
         }
         Mode::Off | Mode::Scratch => None,
     };
-    let finish = |rec: Option<usize>| match (mode, rec) {
-        (Mode::Build, Some(i)) => nodes::close(i),
-        (Mode::Update, Some(i)) => nodes::leave(i),
-        _ => {}
-    };
+    // Its items, or the text saying why it has none.
     let (expr, diags) = (&parsed.0, &parsed.1);
-    let failed = |text: String| {
-        nodes::mark_broken("a repeat that does not draw");
-        if mode != Mode::Update {
-            parent.new_label(&text);
+    // An `ago()` in the list is timed with the repeat.
+    let ago_saved = crate::expr::take_ago_next();
+    let items: Result<Vec<Value>, String> = if let Some(d) = diags.first() {
+        Err(format!("[repeat parse: {}]", d.message))
+    } else {
+        match expr.as_ref().map(|e| eval_in(e, ctx)) {
+            None => Ok(Vec::new()),
+            Some(Ok(Value::List(xs))) => Ok(xs),
+            Some(Ok(other)) => Err(format!("[repeat: expected a list, got {}]", display_type(&other))),
+            Some(Err(e)) => Err(format!("[repeat eval: {}]", e.message)),
         }
     };
-    if !diags.is_empty() {
-        failed(format!("[repeat parse: {}]", diags[0].message));
-        return finish(rec);
+    let ago_due = crate::expr::take_ago_next();
+    if let Some(i) = rec {
+        nodes::set_ago(i, ago_due);
     }
-    let Some(expr) = expr.as_ref() else {
-        return finish(rec);
+    crate::expr::restore_ago_next(min_opt(ago_saved, ago_due));
+    let keys = match &items {
+        Ok(xs) => item_keys(xs, r),
+        Err(_) => Vec::new(),
     };
-    let items = match eval_in(expr, ctx) {
-        Ok(Value::List(xs)) => xs,
-        Ok(other) => {
-            failed(format!("[repeat: expected a list, got {}]", display_type(&other)));
-            return finish(rec);
-        }
-        Err(e) => {
-            failed(format!("[repeat eval: {}]", e.message));
-            return finish(rec);
-        }
-    };
-    let keys: Vec<String> = items.iter().enumerate().map(|(i, item)| crate::motion::item_key(item, i)).collect();
-    match (mode, rec) {
-        (Mode::Build, Some(i)) => nodes::set_keys(i, keys.clone()),
-        (Mode::Update, Some(i)) if nodes::keys(i) != keys => {
-            // Phase 2 diffs the items by key; until then, the page.
-            nodes::mark_broken("a repeat's items changed");
-            return finish(rec);
-        }
-        _ => {}
-    }
+    let failed = items.as_ref().err().cloned();
     // Every item's binding reads what the list does.
-    let _frame = match (mode, rec) {
-        (Mode::Build, Some(i)) => Some(nodes::push_frame(vec![(r.binding.text.clone(), nodes::own_of(i))])),
-        _ => None,
+    let _frame = rec.map(|i| nodes::push_frame_rc(vec![(r.binding.text.clone(), std::rc::Rc::new(nodes::own_of(i)))]));
+    let Some(i) = rec else {
+        return draw_repeat(r, items, &keys, doc, ctx, slot, sink, parent);
     };
-    for (i, item) in items.into_iter().enumerate() {
-        crate::motion::push_scope(&keys[i]);
-        let inner = ctx.with_one(&r.binding.text, &item);
-        render_item_list(&r.items, doc, &inner, slot, sink, parent);
-        crate::motion::pop_scope();
+    if mode == Mode::Build {
+        nodes::set_keys(i, keys.clone(), failed);
+        draw_repeat(r, items, &keys, doc, ctx, slot, sink, parent);
+        return nodes::close(i);
     }
-    drop(_frame);
-    finish(rec);
+    let (old_keys, old_failed) = nodes::repeat_state(i);
+    match items {
+        // The same items: each walked in place with its new value.
+        Ok(items) if old_failed.is_none() && old_keys == keys => {
+            for (n, item) in items.into_iter().enumerate() {
+                crate::motion::push_scope(&keys[n]);
+                let inner = ctx.with_one(&r.binding.text, &item);
+                if let Some(Visit::Look(k)) = nodes::visit(Kind::Item, block, false) {
+                    if nodes::holding() && nodes::item_holds(k) {
+                        // The item under a finger stays whole: what the
+                        // finger is on and what it is shown with agree
+                        // when it lifts.
+                        nodes::skip_held(k);
+                    } else {
+                        render_item_list(&r.items, doc, &inner, slot, sink, parent);
+                    }
+                    nodes::leave(k);
+                }
+                crate::motion::pop_scope();
+            }
+        }
+        Err(_) if old_failed == failed => {}
+        // Under a finger nothing is built or deleted: all of it waits.
+        _ if nodes::holding() => nodes::skip_held(i),
+        Ok(items) if old_failed.is_none() => {
+            diff_repeat(r, i, items, &keys, doc, ctx, slot, sink, parent);
+            nodes::set_keys(i, keys, failed);
+        }
+        // To or from the text saying why it has no items: drawn again.
+        items => {
+            let at = nodes::insert_index(i, parent.raw());
+            nodes::discard_own(i);
+            nodes::cut(i + 1, nodes::end_of(i)).discard(true);
+            let start = nodes::begin_sub();
+            let paused = crate::ui::pause_update();
+            nodes::with_mode(Mode::Build, || draw_repeat(r, items, &keys, doc, ctx, slot, sink, parent));
+            crate::ui::resume_update(paused);
+            nodes::end_sub(start, i + 1);
+            nodes::place(i, nodes::cursor(), parent.raw(), at);
+            nodes::set_keys(i, keys, failed);
+            REDONE_UNDER.with(|u| u.set(true));
+        }
+    }
+    nodes::leave(i);
+}
+
+/// Draw a `repeat`'s items (recorded each under an item record when
+/// building), or the text saying why it has none.
+#[allow(clippy::too_many_arguments)]
+fn draw_repeat(
+    r: &paneld_config::parse::Repeat,
+    items: Result<Vec<Value>, String>,
+    keys: &[String],
+    doc: &Document,
+    ctx: &Scope<'_>,
+    slot: Option<&SlotCtx<'_>>,
+    sink: &Sender<UiEvent>,
+    parent: &Obj<'_>,
+) {
+    let items = match items {
+        Ok(items) => items,
+        Err(text) => {
+            nodes::made(parent, "label", 0, |p| p.new_label(&text), |o| o.set_label_text(&text));
+            return;
+        }
+    };
+    for (n, item) in items.into_iter().enumerate() {
+        draw_item(r, &item, &keys[n], doc, ctx, slot, sink, parent);
+    }
+}
+
+/// One `repeat` item, `key`, drawn afresh.
+#[allow(clippy::too_many_arguments)]
+fn draw_item(
+    r: &paneld_config::parse::Repeat,
+    item: &Value,
+    key: &str,
+    doc: &Document,
+    ctx: &Scope<'_>,
+    slot: Option<&SlotCtx<'_>>,
+    sink: &Sender<UiEvent>,
+    parent: &Obj<'_>,
+) {
+    crate::motion::push_scope(key);
+    let inner = ctx.with_one(&r.binding.text, item);
+    let rec = (nodes::mode() == Mode::Build).then(|| nodes::open(Kind::Item, r as *const paneld_config::parse::Repeat as usize, Vec::new(), "repeat item", r.source.span));
+    if let Some(k) = rec {
+        nodes::set_keys(k, vec![key.to_string()], None);
+    }
+    render_item_list(&r.items, doc, &inner, slot, sink, parent);
+    if let Some(k) = rec {
+        nodes::close(k);
+    }
+    crate::motion::pop_scope();
+}
+
+/// Update: `repeat` record `i` lists other keys now (`keys`, for
+/// `items`): the items it still lists keep their objects and are
+/// updated in place, moved where they now go; new keys are built; the
+/// rest are deleted.
+#[allow(clippy::too_many_arguments)]
+fn diff_repeat(
+    r: &paneld_config::parse::Repeat,
+    i: usize,
+    items: Vec<Value>,
+    keys: &[String],
+    doc: &Document,
+    ctx: &Scope<'_>,
+    slot: Option<&SlotCtx<'_>>,
+    sink: &Sender<UiEvent>,
+    parent: &Obj<'_>,
+) {
+    let block = r as *const paneld_config::parse::Repeat as usize;
+    let at = nodes::insert_index(i + 1, parent.raw());
+    let listed: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let mut kept: std::collections::HashMap<String, nodes::Segment> = std::collections::HashMap::new();
+    for (k, seg) in nodes::cut(i + 1, nodes::end_of(i)).into_items() {
+        if !listed.contains(k.as_str()) {
+            seg.discard(true);
+        } else if let Some(twice) = kept.insert(k, seg) {
+            twice.discard(true);
+        }
+    }
+    nodes::set_cursor(i + 1);
+    for (n, item) in items.into_iter().enumerate() {
+        let start = nodes::cursor();
+        match kept.remove(&keys[n]) {
+            Some(seg) => {
+                crate::motion::push_scope(&keys[n]);
+                let inner = ctx.with_one(&r.binding.text, &item);
+                nodes::splice(start, seg);
+                nodes::set_cursor(start);
+                if let Some(Visit::Look(k)) = nodes::visit(Kind::Item, block, false) {
+                    render_item_list(&r.items, doc, &inner, slot, sink, parent);
+                    nodes::leave(k);
+                }
+                crate::motion::pop_scope();
+            }
+            None => {
+                let sub = nodes::begin_sub();
+                let paused = crate::ui::pause_update();
+                nodes::with_mode(Mode::Build, || draw_item(r, &item, &keys[n], doc, ctx, slot, sink, parent));
+                crate::ui::resume_update(paused);
+                nodes::end_sub(sub, start);
+            }
+        }
+    }
+    nodes::place(i + 1, nodes::cursor(), parent.raw(), at);
+    nodes::note_restructured();
+    REDONE_UNDER.with(|u| u.set(true));
+}
+
+thread_local! {
+    /// `repeat`s already reported for items with the same key (bounded
+    /// like unknown icon names).
+    static DUP_KEYS: std::cell::RefCell<std::collections::HashSet<(paneld_config::source::FileId, u32)>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// The keys of a `repeat`'s items (ADR 0024): `id`, `name`, else the
+/// position; an item with the key of one before it is told apart by
+/// its place among them (`id:x`, `id:x#1`, `id:x#2`), logged once.
+fn item_keys(items: &[Value], r: &paneld_config::parse::Repeat) -> Vec<String> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(items.len());
+    let mut dups: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(items.len());
+    let mut shared = None;
+    for (i, item) in items.iter().enumerate() {
+        let key = crate::motion::item_key(item, i);
+        if used.insert(key.clone()) {
+            out.push(key);
+            continue;
+        }
+        let n = dups.entry(key.clone()).or_insert(0);
+        let unique = loop {
+            *n += 1;
+            let k = format!("{key}#{n}");
+            if !used.contains(&k) {
+                break k;
+            }
+        };
+        used.insert(unique.clone());
+        out.push(unique);
+        shared.get_or_insert(key);
+    }
+    if let Some(key) = shared {
+        let place = (r.source.span.file, r.source.span.start);
+        DUP_KEYS.with(|d| {
+            let mut d = d.borrow_mut();
+            if d.len() < UNKNOWN_ICONS_MAX && d.insert(place) {
+                eprintln!("paneld: repeat `{}`: items share the key `{key}`; each after the first is told apart by its place among them", r.binding.text);
+            }
+        });
+    }
+    out
 }
 
 /// The key a parse is known by in the node table's caches: its place
@@ -543,28 +767,12 @@ fn render_node(
     }
     let is_root = ROOT_PENDING.with(|r| r.replace(false));
     let forced = FORCE.with(|f| f.replace(false));
-    NODE_TAP.with(|t| t.set(ROOT_TAP.with(|r| r.replace(false))));
+    let call_taps = ROOT_TAP.with(|r| r.replace(false));
+    NODE_TAP.with(|t| t.set(call_taps));
     let block = node as *const Block as usize;
     let mut redone = true;
     match nodes::mode() {
-        Mode::Build => {
-            let mut own = Vec::new();
-            node_deps(node, ctx, &mut own);
-            if kind == "icon" {
-                // A theme PNG takes the text color of what it is in.
-                nodes::union(&mut own, &nodes::ancestor_deps());
-            }
-            let idx = nodes::open(Kind::Node, block, own, kind, node.kind.span);
-            let ago = crate::expr::take_ago_next();
-            build_widget(node, doc, ctx, slot, sink, parent);
-            let mine = crate::expr::take_ago_next();
-            nodes::set_ago(idx, mine.filter(|_| nodes::reads(idx, &Dep::Ago)));
-            crate::expr::restore_ago_next(min_opt(ago, mine));
-            if is_root {
-                ROOT_OBJ.with(|r| r.set(nodes::objs(idx).first().copied().unwrap_or(std::ptr::null_mut())));
-            }
-            nodes::close(idx);
-        }
+        Mode::Build => build_recorded(node, doc, ctx, slot, sink, parent, is_root),
         Mode::Update => {
             let Some(visit) = nodes::visit(Kind::Node, block, forced) else { return };
             let Visit::Look(idx) = visit else {
@@ -573,20 +781,52 @@ fn render_node(
                 }
                 return;
             };
+            if nodes::holding() && nodes::is_held(idx) {
+                // Under a finger: left as it is until the release, its
+                // fingerprint too (so it is set up then).
+                nodes::skip_held(idx);
+                nodes::leave(idx);
+                if is_root {
+                    ROOT_REDONE.with(|r| r.set(false));
+                }
+                return;
+            }
             if is_root {
                 ROOT_OBJ.with(|r| r.set(nodes::objs(idx).first().copied().unwrap_or(std::ptr::null_mut())));
             }
             let ago = crate::expr::take_ago_next();
+            let own = nodes::own_hit(idx);
+            // Around what a finger holds: not set up again (its
+            // `visible`, its size) until the release; what is under it
+            // is walked.
+            let around = (own || forced) && nodes::holding() && nodes::holds_under(idx);
+            if around {
+                nodes::clear_fp(idx);
+                nodes::defer();
+            }
             // The fingerprint is taken whenever the node is set up again
             // (forced too), so it is always that of what is shown.
-            let own = nodes::own_hit(idx);
-            let changed = (own || forced) && nodes::fp_changed(idx, node_fp(node, ctx, parent));
-            let reapply = forced || (own && (changed || nodes::call_hit(idx)));
+            let changed = !around && (own || forced) && nodes::fp_changed(idx, node_fp(node, ctx, parent));
+            let reapply = !around && (forced || (own && (changed || nodes::call_hit(idx))));
             if reapply {
                 nodes::begin_reuse(idx);
                 WIDGET_IS_ROOT.with(|r| r.set(is_root));
                 build_widget(node, doc, ctx, slot, sink, parent);
-                nodes::end_reuse(idx);
+                let (reshape, doomed) = nodes::end_reuse(idx);
+                if reshape && !nodes::holding() {
+                    // Another shape: built again where it was. What its
+                    // setup made off the page goes first (it may point at
+                    // the node's objects).
+                    doomed.delete();
+                    rebuild_node(idx, node, doc, ctx, slot, sink, parent, is_root, call_taps);
+                } else {
+                    if reshape {
+                        // Under a finger: set up again after the release.
+                        nodes::clear_fp(idx);
+                        nodes::defer();
+                    }
+                    doomed.later();
+                }
                 REDONE_UNDER.with(|r| r.set(true));
             } else {
                 redone = false;
@@ -604,6 +844,60 @@ fn render_node(
     if is_root {
         ROOT_REDONE.with(|r| r.set(redone));
     }
+}
+
+/// Build widget `node` afresh and record it (a page built, or a node
+/// built again within an update).
+fn build_recorded(node: &Block, doc: &Document, ctx: &Scope<'_>, slot: Option<&SlotCtx<'_>>, sink: &Sender<UiEvent>, parent: &Obj<'_>, is_root: bool) {
+    let kind = node.kind.text.as_str();
+    let mut own = Vec::new();
+    node_deps(node, ctx, &mut own);
+    if kind == "icon" {
+        // A theme PNG takes the text color of what it is in.
+        nodes::union(&mut own, &nodes::ancestor_deps());
+    }
+    let idx = nodes::open(Kind::Node, node as *const Block as usize, own, kind, node.kind.span);
+    let ago = crate::expr::take_ago_next();
+    build_widget(node, doc, ctx, slot, sink, parent);
+    let mine = crate::expr::take_ago_next();
+    nodes::set_ago(idx, mine.filter(|_| nodes::reads(idx, &Dep::Ago)));
+    crate::expr::restore_ago_next(min_opt(ago, mine));
+    if is_root {
+        ROOT_OBJ.with(|r| r.set(nodes::objs(idx).first().copied().unwrap_or(std::ptr::null_mut())));
+    }
+    nodes::close(idx);
+}
+
+/// Update: node `idx` makes other objects now (another shape): its
+/// subtree is built again in its place, as a fresh render builds it.
+/// What its keypads hold stays; motion carries on from what it showed.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_node(
+    idx: usize,
+    node: &Block,
+    doc: &Document,
+    ctx: &Scope<'_>,
+    slot: Option<&SlotCtx<'_>>,
+    sink: &Sender<UiEvent>,
+    parent: &Obj<'_>,
+    is_root: bool,
+    call_taps: bool,
+) {
+    // Its `ago()` timing is the new build's.
+    crate::expr::take_ago_next();
+    let at = nodes::insert_index(idx, parent.raw());
+    let old = nodes::take_node(idx);
+    let typed = old.typed();
+    old.discard(false);
+    let start = nodes::begin_sub();
+    NODE_TAP.with(|t| t.set(call_taps));
+    let paused = crate::ui::pause_update();
+    nodes::with_mode(Mode::Build, || build_recorded(node, doc, ctx, slot, sink, parent, is_root));
+    crate::ui::resume_update(paused);
+    let n = nodes::end_sub(start, idx);
+    nodes::reopen(idx);
+    nodes::place(idx, idx + n, parent.raw(), at);
+    nodes::restore_typed(idx, idx + n, &typed);
 }
 
 fn min_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
@@ -961,8 +1255,11 @@ fn build_widget(
             let size = find_simple(node, "size")
                 .and_then(|v| v.trim().parse::<i32>().ok())
                 .unwrap_or(128);
-            let obj = nodes::made(parent, "qr", size as u64, |p| p.new_qrcode(size), |_| {});
-            if let Some(data) = resolve_assign_value(node, "data", ctx) {
+            // A code shown cannot be taken back: one with data and one
+            // without are other shapes.
+            let data = resolve_assign_value(node, "data", ctx);
+            let obj = nodes::made(parent, "qr", sig_of(&(size, data.is_some())), |p| p.new_qrcode(size), |_| {});
+            if let Some(data) = data {
                 obj.set_qrcode_data(&data.to_display_string());
             }
             apply_props(node, ctx, sink, &obj);
@@ -1006,7 +1303,9 @@ fn build_widget(
                 .unwrap_or(false);
             let length = resolve_num(node, "length", ctx).unwrap_or(0.0) as u32;
             let ta = nodes::made(parent, "textarea", sig_of(&(masked, length)), |p| p.new_textarea(masked, length), |_| {});
-            ta.register_input();
+            if nodes::mode() != Mode::Scratch {
+                ta.register_input(crate::motion::node_key(node));
+            }
             let kb = nodes::made(parent, "keyboard", 0, |p| p.new_number_keyboard(), |_| {});
             kb.attach_keyboard_to(&ta);
             apply_props(node, ctx, sink, &ta);
@@ -1072,8 +1371,8 @@ fn build_widget(
             }
         }
         other => {
-            nodes::mark_broken("an unknown node");
-            parent.new_label(&format!("[{other}: not implemented yet]"));
+            let text = format!("[{other}: not implemented yet]");
+            nodes::made(parent, "label", 0, |p| p.new_label(&text), |o| o.set_label_text(&text));
         }
     }
 }
@@ -1221,8 +1520,13 @@ fn expand_component(
     // see the text.
     let ago_saved = crate::expr::take_ago_next();
     // Build: each param's deps, bound in turn (a default reads the
-    // params before it).
+    // params before it), and recorded; an update binds them again as
+    // recorded.
     let mut frames = Vec::new();
+    let mut params = Vec::new();
+    if let (Mode::Update, Some(i)) = (mode, rec) {
+        frames.push(nodes::push_frame_rc(nodes::params_of(i)));
+    }
     for item in &comp.items {
         let Item::Param(p) = item else { continue };
         let mut deps = Vec::new();
@@ -1247,8 +1551,12 @@ fn expand_component(
             deps.sort();
             deps.dedup();
             frames.push(nodes::push_frame(vec![(p.name.text.clone(), deps)]));
+            params.push((p.name.text.clone(), nodes::bound_deps(&p.name.text)));
         }
         locals.insert(p.name.text.clone(), typed_param(&p.ty.text, bound));
+    }
+    if let (Mode::Build, Some(i)) = (mode, rec) {
+        nodes::set_params(i, params);
     }
     let ago_due = crate::expr::take_ago_next();
     if let (Mode::Build | Mode::Update, Some(i)) = (mode, rec) {
@@ -1289,6 +1597,9 @@ fn expand_component(
         _ => parent.child(before),
     };
     if let Some(root) = root {
+        // Noted before its call's keys go on it (a root built again
+        // within the update is not yet).
+        crate::ui::touch(root.raw());
         let tap_call = bind_handlers(call, outer_ctx, sink, &root, false);
         let root_kind = comp.items.iter().find_map(|it| match it {
             Item::Block(b) => Some(b.kind.text.as_str()),
@@ -1332,6 +1643,13 @@ fn expand_component(
     }
     if is_root {
         ROOT_REDONE.with(|r| r.set(redone || mode != Mode::Update));
+    }
+    if let (Mode::Update, Some(i)) = (mode, rec) {
+        if force_root && !redone {
+            // Its root was under a finger: its keys go on it after the
+            // release, whatever they read then.
+            nodes::clear_fp(i);
+        }
     }
     match (mode, rec) {
         (Mode::Build, Some(i)) => nodes::close(i),
@@ -1528,9 +1846,17 @@ fn hash_items(items: &[Item], skip: &[&str], ctx: &Scope<'_>, h: &mut impl std::
                     continue;
                 }
                 key.text.hash(h);
-                match resolve_expr_value(&a.value.text, a.value.span, ctx) {
-                    Some(v) => hash_value(&v, h),
-                    None => 0xffu8.hash(h),
+                match classify(&a.value.text) {
+                    // As shown: a failed part shows its error, which
+                    // changes with what it reads (`got null`, `got list`).
+                    ValueShape::Interp(_) => {
+                        let parsed = parse_interp_cached(&a.value.text, a.value.span.file, a.value.span.start);
+                        splice(&a.value.text, &parsed.0, ctx, true).hash(h);
+                    }
+                    _ => match resolve_expr_value(&a.value.text, a.value.span, ctx) {
+                        Some(v) => hash_value(&v, h),
+                        None => 0xffu8.hash(h),
+                    },
                 }
                 handlers |= matches!(key.text.as_str(), "on_tap" | "on_hold" | "on_change" | "on_submit" | "action");
             }
@@ -1841,8 +2167,11 @@ thread_local! {
 }
 
 /// Install the action calls running or failed now, before drawing a
-/// page: its buttons show them (`:running`, `:failed`).
-pub fn set_call_states(states: Vec<CallState>) {
+/// page: its buttons show them (`:running`, `:failed`). Kept in a fixed
+/// order (by action and args), so a button two calls cover shows the
+/// same one whatever order they come in.
+pub fn set_call_states(mut states: Vec<CallState>) {
+    states.sort_by_cached_key(|c| (c.name.clone(), format!("{:?}", c.args)));
     CALL_STATES.with(|s| *s.borrow_mut() = states);
 }
 
@@ -2953,6 +3282,23 @@ fn parse_hex_color(s: &str) -> Option<(u32, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_button_two_calls_cover_shows_the_same_one_in_any_order() {
+        // Review (fuzz): the calls came in the order of a hash map, so
+        // an unrelated call changing could turn the busy text shown.
+        let call = |arg: i64, busy: &str| CallState {
+            name: "wake".into(),
+            args: vec![ActionArg { name: "n".into(), value: Value::Int(arg) }],
+            state: RunState::Running,
+            busy: Some(busy.into()),
+        };
+        set_call_states(vec![call(2, "two"), call(1, "one")]);
+        let a = call_state("wake", &[]).and_then(|c| c.busy);
+        set_call_states(vec![call(1, "one"), call(2, "two")]);
+        let b = call_state("wake", &[]).and_then(|c| c.busy);
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn parsed_expressions_are_kept_until_a_reload() {

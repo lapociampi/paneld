@@ -9,9 +9,12 @@
 //! page with the same render code: a subtree that reads nothing that
 //! changed is skipped, a node whose inputs changed is set up again
 //! from what it was made as (so it ends as a fresh render would make
-//! it), and the rest is walked through. Anything the walk cannot do in
-//! place (another shape, another list of `repeat` items) marks the
-//! table broken, and the caller builds the page again.
+//! it), and the rest is walked through. A node that now makes other
+//! objects (another shape) is built again where it was, alone; a
+//! `repeat` whose items changed keeps the items it still lists (moved
+//! into place, updated in place), builds the new ones and deletes the
+//! rest. What the walk cannot do at all (a page that is not there)
+//! marks the table broken, and the caller builds the page again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -200,14 +203,24 @@ impl Drop for FrameGuard {
 
 /// Bind `names` (with their deps) over the current frame.
 pub(crate) fn push_frame(names: Vec<(String, Vec<Dep>)>) -> FrameGuard {
+    push_frame_rc(names.into_iter().map(|(n, d)| (n, Rc::new(d))).collect())
+}
+
+/// [`push_frame`] with deps as kept in a record.
+pub(crate) fn push_frame_rc(names: Vec<(String, Rc<Vec<Dep>>)>) -> FrameGuard {
     let before = CUR.with(|c| c.get());
     let idx = FRAMES.with(|f| {
         let mut f = f.borrow_mut();
-        f.push(Frame { names: names.into_iter().map(|(n, d)| (n, Rc::new(d))).collect(), parent: before });
+        f.push(Frame { names, parent: before });
         f.len() - 1
     });
     CUR.with(|c| c.set(Some(idx)));
     FrameGuard(before)
+}
+
+/// The deps of local `name` where the walk is, as bound.
+pub(crate) fn bound_deps(name: &str) -> Rc<Vec<Dep>> {
+    local_deps(name).unwrap_or_default()
 }
 
 /// The current frame, to go back to (a `slot` draws in its caller's).
@@ -340,6 +353,8 @@ pub(crate) enum Kind {
     Call,
     /// A `repeat`: its items' keys.
     Repeat,
+    /// One item of a `repeat`: its key; what it draws follows.
+    Item,
 }
 
 /// One object a node made, as it was made, and by which maker.
@@ -362,13 +377,20 @@ pub(crate) struct Rec {
     end: usize,
     /// What its inputs evaluated to when it was set up last.
     fp: Option<u64>,
-    /// A `repeat`'s item keys.
+    /// A `repeat`'s item keys; an item's own key.
     pub keys: Vec<String>,
+    /// A `repeat` that draws no items: why (the text it shows).
+    failed: Option<String>,
+    /// A component call's params, each with the deps of what it was
+    /// made from: bound again when an update walks into it.
+    params: Vec<(String, Rc<Vec<Dep>>)>,
+    /// The keys motion knows its widgets by: forgotten when it goes.
+    motion: Vec<u64>,
     /// When an `ago()` text it shows reads otherwise (Unix seconds).
     ago: Option<i64>,
     /// Its kind and place in the config, for messages.
     what: String,
-    place: String,
+    place: paneld_config::source::Span,
 }
 
 struct Table {
@@ -403,9 +425,8 @@ thread_local! {
     static OPEN: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Update: the next record to visit.
     static CURSOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Update: the nodes being set up again, with the next of their
-    /// objects to reuse.
-    static REUSE: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Update: the nodes being set up again.
+    static REUSE: std::cell::RefCell<Vec<Reuse>> = const { std::cell::RefCell::new(Vec::new()) };
     static CHANGES: std::cell::RefCell<Changes> = std::cell::RefCell::new(Changes::default());
     /// Update: nodes set up again in this walk.
     static REAPPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -414,8 +435,16 @@ thread_local! {
     /// running button's overlay): an update that makes none keeps
     /// every object it had.
     static MADE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Update: where objects of another shape are made, off the page.
-    static DOOMED: std::cell::Cell<*mut lvgl_sys::lv_obj_t> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Update: screens of objects made off the page (another shape),
+    /// deleted when the walk ends.
+    static DOOMED: std::cell::RefCell<Vec<*mut lvgl_sys::lv_obj_t>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Update: what a finger holds (ADR 0024, "Touch"): left as it
+    /// is, and nothing is built again or deleted, until the release.
+    static HOLD: std::cell::RefCell<Option<Vec<*mut lvgl_sys::lv_obj_t>>> = const { std::cell::RefCell::new(None) };
+    /// Update: something waits for the release.
+    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Update: subtrees built again and `repeat`s that changed items.
+    static RESTRUCTURED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn count_made(n: u64) {
@@ -488,8 +517,22 @@ pub(crate) fn mark_broken(why: &'static str) {
 /// `own`; its objects and inner records follow until [`close`].
 pub(crate) fn open(kind: Kind, block: usize, own: Vec<Dep>, what: &str, span: paneld_config::source::Span) -> usize {
     let idx = with_table(|t| {
-        let place = format!("{:?} byte {}", span.file, span.start);
-        t.recs.push(Rec { kind, block, made: Vec::new(), sub: own.clone(), own, end: 0, fp: None, keys: Vec::new(), ago: None, what: what.to_string(), place });
+        t.recs.push(Rec {
+            kind,
+            block,
+            made: Vec::new(),
+            sub: own.clone(),
+            own,
+            end: 0,
+            fp: None,
+            keys: Vec::new(),
+            failed: None,
+            params: Vec::new(),
+            motion: Vec::new(),
+            ago: None,
+            what: what.to_string(),
+            place: span,
+        });
         t.recs.len() - 1
     });
     OPEN.with(|o| o.borrow_mut().push(idx));
@@ -513,9 +556,39 @@ pub(crate) fn close(idx: usize) {
     });
 }
 
-/// Build: a `repeat`'s item keys.
-pub(crate) fn set_keys(idx: usize, keys: Vec<String>) {
-    with_table(|t| t.recs[idx].keys = keys);
+/// A `repeat`'s item keys (an item's own), and why it draws none.
+pub(crate) fn set_keys(idx: usize, keys: Vec<String>, failed: Option<String>) {
+    with_table(|t| {
+        t.recs[idx].keys = keys;
+        t.recs[idx].failed = failed;
+    });
+}
+
+/// Build: a component call's params with their deps.
+pub(crate) fn set_params(idx: usize, params: Vec<(String, Rc<Vec<Dep>>)>) {
+    with_table(|t| t.recs[idx].params = params);
+}
+
+/// A component call's params as recorded.
+pub(crate) fn params_of(idx: usize) -> Vec<(String, Rc<Vec<Dep>>)> {
+    TABLE.with(|t| t.borrow().as_ref().and_then(|t| t.recs.get(idx)).map(|r| r.params.clone()).unwrap_or_default())
+}
+
+/// Motion recorded `key` for the node being drawn.
+pub(crate) fn note_motion(key: u64) {
+    let owner = match mode() {
+        Mode::Build => OPEN.with(|o| o.borrow().last().copied()),
+        Mode::Update => REUSE.with(|r| r.borrow().last().map(|e| e.idx)),
+        _ => None,
+    };
+    let Some(owner) = owner else { return };
+    with_table(|t| {
+        if let Some(r) = t.recs.get_mut(owner) {
+            if !r.motion.contains(&key) {
+                r.motion.push(key);
+            }
+        }
+    });
 }
 
 /// Make (or, setting a node up again, reuse) an object: `make` builds
@@ -544,12 +617,14 @@ pub(crate) fn made<'u>(
             obj
         }
         Mode::Update => {
+            // Once one object is of another shape, the node is built
+            // again: nothing more of it is reused.
             let next = REUSE.with(|r| {
                 let mut r = r.borrow_mut();
-                let (idx, pos) = r.last_mut()?;
-                let at = *pos;
-                *pos += 1;
-                Some((*idx, at))
+                let e = r.last_mut()?;
+                let at = e.pos;
+                e.pos += 1;
+                (!e.bad).then_some((e.idx, at))
             });
             let found = next.and_then(|(idx, at)| {
                 TABLE.with(|t| {
@@ -573,16 +648,26 @@ pub(crate) fn made<'u>(
                     obj
                 }
                 None => {
-                    // Another shape: the page is built again. Until then
-                    // (a dialog may hold it off) the page shows what it
-                    // did: this one is made off it, and deleted when the
-                    // walk ends.
-                    mark_broken("a node changed shape");
-                    let doomed = DOOMED.with(|d| {
-                        if d.get().is_null() {
-                            d.set(Obj::new_scratch_screen().raw());
+                    // Another shape: the node is built again when its
+                    // setup ends. Until then this one is made off the
+                    // page, and deleted then.
+                    // Each setup has its own screen for them: deleting one
+                    // (its node built again) leaves what a setup around
+                    // it still holds.
+                    let doomed = REUSE.with(|r| {
+                        let mut r = r.borrow_mut();
+                        let e = r.last_mut()?;
+                        e.bad = true;
+                        if e.doomed.is_null() {
+                            e.doomed = Obj::new_scratch_screen().raw();
                         }
-                        d.get()
+                        Some(e.doomed)
+                    });
+                    let doomed = doomed.unwrap_or_else(|| {
+                        mark_broken("a node changed shape");
+                        let d = Obj::new_scratch_screen().raw();
+                        DOOMED.with(|l| l.borrow_mut().push(d));
+                        d
                     });
                     make(&Obj::from_raw(doomed))
                 }
@@ -655,6 +740,7 @@ pub(crate) fn visit(kind: Kind, block: usize, force: bool) -> Option<Visit> {
     VISITED.with(|v| v.set(v.get() + 1));
     if hit || force {
         CURSOR.with(|c| c.set(idx + 1));
+        OPEN.with(|o| o.borrow_mut().push(idx));
         Some(Visit::Look(idx))
     } else {
         CURSOR.with(|c| c.set(end));
@@ -689,17 +775,53 @@ pub(crate) fn fp_changed(idx: usize, fp: u64) -> bool {
     })
 }
 
+/// A node being set up again: the next of its objects to reuse,
+/// whether one was of another shape, and where those were made.
+pub(crate) struct Reuse {
+    idx: usize,
+    pos: usize,
+    bad: bool,
+    doomed: *mut lvgl_sys::lv_obj_t,
+}
+
+/// What a setup that found another shape made off the page.
+pub(crate) struct Doomed(*mut lvgl_sys::lv_obj_t);
+
+impl Doomed {
+    /// Delete it now (before the node's own objects, which it may
+    /// point at).
+    pub(crate) fn delete(self) {
+        if !self.0.is_null() {
+            crate::ui::delete_objs(&[self.0]);
+        }
+    }
+
+    /// Delete it when the walk ends (the node stays as it is for now).
+    pub(crate) fn later(self) {
+        if !self.0.is_null() {
+            DOOMED.with(|l| l.borrow_mut().push(self.0));
+        }
+    }
+}
+
 /// Update: set node `idx` up again; its objects are reused in order.
 pub(crate) fn begin_reuse(idx: usize) {
-    REUSE.with(|r| r.borrow_mut().push((idx, 0)));
+    REUSE.with(|r| r.borrow_mut().push(Reuse { idx, pos: 0, bad: false, doomed: std::ptr::null_mut() }));
     REAPPLIED.with(|n| n.set(n.get() + 1));
 }
 
-pub(crate) fn end_reuse(idx: usize) {
+/// Update: node `idx` is set up; true when it made other objects than
+/// it had (another shape): the caller builds it again. With what that
+/// setup made off the page.
+pub(crate) fn end_reuse(idx: usize) -> (bool, Doomed) {
     let used = REUSE.with(|r| r.borrow_mut().pop());
     let all = with_table(|t| t.recs.get(idx).map(|r| r.made.len()));
-    if used.map(|(i, n)| (i, Some(n))) != Some((idx, all)) {
-        mark_broken("a node made other objects");
+    match used {
+        Some(e) if e.idx == idx => (e.bad || Some(e.pos) != all, Doomed(e.doomed)),
+        other => {
+            mark_broken("a node made other objects");
+            (false, Doomed(other.map_or(std::ptr::null_mut(), |e| e.doomed)))
+        }
     }
 }
 
@@ -709,6 +831,313 @@ pub(crate) fn leave(idx: usize) {
     if CURSOR.with(|c| c.get()) != end {
         mark_broken("the page's nodes are not where they were");
         CURSOR.with(|c| c.set(end));
+    }
+    let top = OPEN.with(|o| o.borrow_mut().pop());
+    if top != Some(idx) {
+        mark_broken("the page's nodes are not where they were");
+    }
+}
+
+/// Update: the walk passes over record `idx`'s subtree, left as it is
+/// for the release: its `ago()` texts are not due before then (they
+/// are timed again when it is set up).
+pub(crate) fn skip_held(idx: usize) {
+    let end = end_of(idx);
+    with_table(|t| {
+        let end = end.min(t.recs.len());
+        for r in &mut t.recs[idx..end] {
+            r.ago = None;
+        }
+    });
+    CURSOR.with(|c| c.set(end));
+    defer();
+}
+
+/// Update: a finger holds something on the page.
+pub(crate) fn holding() -> bool {
+    HOLD.with(|h| h.borrow().is_some())
+}
+
+/// Update: whether node `idx`'s objects are, or are under, what a
+/// finger holds.
+pub(crate) fn is_held(idx: usize) -> bool {
+    let objs = objs(idx);
+    HOLD.with(|h| h.borrow().as_ref().is_some_and(|held| objs.iter().any(|&o| crate::ui::is_within(o, held))))
+}
+
+/// Update: whether what a finger holds is under node `idx`'s object.
+pub(crate) fn holds_under(idx: usize) -> bool {
+    let Some(&obj) = objs(idx).first() else { return false };
+    HOLD.with(|h| h.borrow().as_ref().is_some_and(|held| held.iter().any(|&o| crate::ui::is_within(o, &[obj]))))
+}
+
+/// Update: whether what a finger holds is one of the objects of record
+/// `idx`'s subtree (a `repeat` item) or under one.
+pub(crate) fn item_holds(idx: usize) -> bool {
+    let objs: Vec<*mut lvgl_sys::lv_obj_t> = TABLE.with(|t| {
+        let t = t.borrow();
+        let Some(t) = t.as_ref() else { return Vec::new() };
+        let end = t.recs.get(idx).map_or(idx, |r| r.end).min(t.recs.len());
+        t.recs[idx..end].iter().flat_map(|r| r.made.iter().map(|m| m.obj)).collect()
+    });
+    HOLD.with(|h| h.borrow().as_ref().is_some_and(|held| held.iter().any(|&o| crate::ui::is_within(o, &objs))))
+}
+
+/// Update: something was left for the release (it is done then).
+pub(crate) fn defer() {
+    HELD.with(|h| h.set(true));
+}
+
+/// Record `idx` is set up when next looked at, whatever its inputs.
+pub(crate) fn clear_fp(idx: usize) {
+    with_table(|t| {
+        if let Some(r) = t.recs.get_mut(idx) {
+            r.fp = None;
+        }
+    });
+}
+
+/// The index past record `idx`'s subtree.
+pub(crate) fn end_of(idx: usize) -> usize {
+    with_table(|t| t.recs.get(idx).map(|r| r.end).unwrap_or(0))
+}
+
+pub(crate) fn cursor() -> usize {
+    CURSOR.with(|c| c.get())
+}
+
+pub(crate) fn set_cursor(at: usize) {
+    CURSOR.with(|c| c.set(at));
+}
+
+// ---------------------------------------------------------------------------
+// Structure in place (ADR 0024 phase 2): records cut out and put back
+// (a `repeat` item kept), subtrees built again where they were.
+// ---------------------------------------------------------------------------
+
+/// Records taken out of the table: their `end`s count from their start.
+pub(crate) struct Segment(Vec<Rec>);
+
+/// Update: cut records `start..end` (whole subtrees) out of the table.
+/// What the walk is in (the records open) shrinks around them.
+pub(crate) fn cut(start: usize, end: usize) -> Segment {
+    let len = end - start;
+    let open = OPEN.with(|o| o.borrow().clone());
+    Segment(with_table(|t| {
+        let mut seg: Vec<Rec> = t.recs.drain(start..end).collect();
+        for r in &mut seg {
+            r.end -= start;
+        }
+        for r in &mut t.recs[start..] {
+            r.end -= len;
+        }
+        for &i in &open {
+            if i < start {
+                t.recs[i].end -= len;
+            }
+        }
+        seg
+    }))
+}
+
+/// Update: put `seg` back in at `pos`; what the walk is in grows
+/// around it.
+pub(crate) fn splice(pos: usize, seg: Segment) -> usize {
+    let mut seg = seg.0;
+    let m = seg.len();
+    for r in &mut seg {
+        r.end += pos;
+    }
+    let open = OPEN.with(|o| o.borrow().clone());
+    with_table(|t| {
+        for r in &mut t.recs[pos..] {
+            r.end += m;
+        }
+        for &i in &open {
+            if i < pos {
+                t.recs[i].end += m;
+            }
+        }
+        t.recs.splice(pos..pos, seg);
+    });
+    m
+}
+
+impl Segment {
+    /// The items of a `repeat`'s records (cut from past the repeat's
+    /// own), each by its key.
+    pub(crate) fn into_items(self) -> Vec<(String, Segment)> {
+        let mut out = Vec::new();
+        let mut recs = self.0.into_iter().peekable();
+        let mut at = 0;
+        while let Some(first) = recs.next() {
+            let end = first.end;
+            let key = first.keys.first().cloned().unwrap_or_default();
+            let mut seg = vec![first];
+            while seg.len() < end - at {
+                match recs.next() {
+                    Some(r) => seg.push(r),
+                    None => break,
+                }
+            }
+            for r in &mut seg {
+                r.end -= at;
+            }
+            at = end;
+            out.push((key, Segment(seg)));
+        }
+        out
+    }
+
+    /// Delete what these records made; with `forget`, motion forgets
+    /// what they showed (they are gone for good, not built again).
+    pub(crate) fn discard(self, forget: bool) {
+        let objs: Vec<*mut lvgl_sys::lv_obj_t> = self.0.iter().flat_map(|r| r.made.iter().map(|m| m.obj)).collect();
+        crate::ui::delete_objs(&outermost(&objs));
+        if forget {
+            let keys: Vec<u64> = self.0.iter().flat_map(|r| r.motion.iter().copied()).collect();
+            crate::motion::forget_keys(&keys);
+        }
+    }
+
+    /// The text typed into the keypads it made, in order.
+    pub(crate) fn typed(&self) -> Vec<String> {
+        self.0.iter().flat_map(|r| r.made.iter().filter(|m| m.tag == "textarea").map(|m| crate::ui::textarea_text(m.obj))).collect()
+    }
+}
+
+/// Put `typed` (from [`Segment::typed`]) back into the keypads records
+/// `start..end` made, in order, when they are as many.
+pub(crate) fn restore_typed(start: usize, end: usize, typed: &[String]) {
+    let tas: Vec<*mut lvgl_sys::lv_obj_t> = TABLE.with(|t| {
+        let t = t.borrow();
+        let Some(t) = t.as_ref() else { return Vec::new() };
+        t.recs[start..end.min(t.recs.len())].iter().flat_map(|r| r.made.iter().filter(|m| m.tag == "textarea").map(|m| m.obj)).collect()
+    });
+    if tas.len() == typed.len() {
+        for (ta, text) in tas.into_iter().zip(typed) {
+            if !text.is_empty() {
+                crate::ui::set_textarea_text(ta, text);
+            }
+        }
+    }
+}
+
+/// Update: delete what record `idx` itself made (a `repeat`'s text
+/// saying why it draws no items).
+pub(crate) fn discard_own(idx: usize) {
+    let made = with_table(|t| t.recs.get_mut(idx).map(|r| std::mem::take(&mut r.made)).unwrap_or_default());
+    let objs: Vec<*mut lvgl_sys::lv_obj_t> = made.iter().map(|m| m.obj).collect();
+    crate::ui::delete_objs(&outermost(&objs));
+}
+
+/// Those of `objs` not under another of them: deleting these deletes
+/// all, each once.
+fn outermost(objs: &[*mut lvgl_sys::lv_obj_t]) -> Vec<*mut lvgl_sys::lv_obj_t> {
+    objs.iter().copied().filter(|&o| !crate::ui::is_within(crate::ui::parent_of(o), objs)).collect()
+}
+
+/// Update: node `idx` (open) is built again: its records go, it is no
+/// longer open. Returns what it had.
+pub(crate) fn take_node(idx: usize) -> Segment {
+    OPEN.with(|o| {
+        let mut o = o.borrow_mut();
+        if o.last() == Some(&idx) {
+            o.pop();
+        }
+    });
+    cut(idx, end_of(idx))
+}
+
+/// Update: open record `idx` again (built again in its place).
+pub(crate) fn reopen(idx: usize) {
+    OPEN.with(|o| o.borrow_mut().push(idx));
+}
+
+/// Update: delete the objects made off the page by setups that found
+/// another shape and were left as they were (the walk is over).
+fn clear_doomed() {
+    let doomed = DOOMED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    crate::ui::delete_objs(&doomed);
+}
+
+/// Update: start building records within an update (a subtree again,
+/// new `repeat` items); they go in place with [`end_sub`].
+pub(crate) fn begin_sub() -> usize {
+    with_table(|t| t.recs.len())
+}
+
+/// Update: the records built since [`begin_sub`] (`start`) go in at
+/// `pos`; what the walk is in reads what they read. The walk goes on
+/// past them. Returns how many.
+pub(crate) fn end_sub(start: usize, pos: usize) -> usize {
+    let open = OPEN.with(|o| o.borrow().clone());
+    let seg = with_table(|t| {
+        let mut seg: Vec<Rec> = t.recs.drain(start..).collect();
+        for r in &mut seg {
+            r.end -= start;
+        }
+        let mut sub = Vec::new();
+        for r in &seg {
+            union(&mut sub, &r.sub);
+            // Made as a fresh render makes them: restyled at the
+            // update's end if it sets them after.
+            for m in &r.made {
+                crate::ui::touch(m.obj);
+            }
+        }
+        for &i in &open {
+            union(&mut t.recs[i].sub, &sub);
+        }
+        seg
+    });
+    let m = splice(pos, Segment(seg));
+    CURSOR.with(|c| c.set(pos + m));
+    RESTRUCTURED.with(|n| n.set(n.get() + 1));
+    m
+}
+
+/// Update: a `repeat` changed its items in place.
+pub(crate) fn note_restructured() {
+    RESTRUCTURED.with(|n| n.set(n.get() + 1));
+}
+
+/// The objects of records `start..end` that are `parent`'s children,
+/// in render order.
+pub(crate) fn tops(start: usize, end: usize, parent: *mut lvgl_sys::lv_obj_t) -> Vec<*mut lvgl_sys::lv_obj_t> {
+    TABLE.with(|t| {
+        let t = t.borrow();
+        let Some(t) = t.as_ref() else { return Vec::new() };
+        t.recs[start.min(t.recs.len())..end.min(t.recs.len())]
+            .iter()
+            .flat_map(|r| r.made.iter().map(|m| m.obj))
+            .filter(|&o| crate::ui::parent_of(o) == parent)
+            .collect()
+    })
+}
+
+/// Where in `parent` the objects of the records from `start` on go:
+/// where the first of them is (theirs, else the next record's), else
+/// at the end (before a running button's overlay).
+pub(crate) fn insert_index(start: usize, parent: *mut lvgl_sys::lv_obj_t) -> u32 {
+    let first = TABLE.with(|t| {
+        let t = t.borrow();
+        let t = t.as_ref()?;
+        let len = t.recs.len();
+        t.recs[start.min(len)..]
+            .iter()
+            .flat_map(|r| r.made.iter().map(|m| m.obj))
+            .find(|&o| crate::ui::parent_of(o) == parent)
+    });
+    let end = crate::ui::content_end(parent);
+    first.map_or(end, |o| crate::ui::index_of(o).min(end))
+}
+
+/// Put the objects of records `start..end` that are `parent`'s
+/// children at `at` on, in render order.
+pub(crate) fn place(start: usize, end: usize, parent: *mut lvgl_sys::lv_obj_t, at: u32) {
+    for (k, o) in tops(start, end, parent).into_iter().enumerate() {
+        crate::ui::move_to_index(o, at + k as u32);
     }
 }
 
@@ -763,20 +1192,21 @@ pub(crate) fn objs(idx: usize) -> Vec<*mut lvgl_sys::lv_obj_t> {
     TABLE.with(|t| t.borrow().as_ref().and_then(|t| t.recs.get(idx)).map(|r| r.made.iter().map(|m| m.obj).collect()).unwrap_or_default())
 }
 
-/// A `repeat`'s item keys as drawn.
-pub(crate) fn keys(idx: usize) -> Vec<String> {
-    TABLE.with(|t| t.borrow().as_ref().and_then(|t| t.recs.get(idx)).map(|r| r.keys.clone()).unwrap_or_default())
+/// A `repeat`'s item keys as drawn, and why it drew none.
+pub(crate) fn repeat_state(idx: usize) -> (Vec<String>, Option<String>) {
+    TABLE.with(|t| t.borrow().as_ref().and_then(|t| t.recs.get(idx)).map(|r| (r.keys.clone(), r.failed.clone())).unwrap_or_default())
 }
 
 /// What an update walk needs to start: the page drawn, whole, and
 /// the objects it was drawn in.
 pub(crate) struct Start {
     pub page_root: *mut lvgl_sys::lv_obj_t,
+    holder: *mut lvgl_sys::lv_obj_t,
 }
 
 /// Start an update walk of `page` for `changes`, if the table can do
 /// it: `Err` says why not (the caller builds the page again).
-pub(crate) fn begin_update(page: &str, changes: &Changes) -> Result<Option<Start>, &'static str> {
+pub(crate) fn begin_update(page: &str, changes: &Changes, hold: Option<Vec<*mut lvgl_sys::lv_obj_t>>) -> Result<Option<Start>, &'static str> {
     let state = TABLE.with(|t| {
         let t = t.borrow();
         let Some(t) = t.as_ref() else { return Err("no page drawn") };
@@ -790,27 +1220,34 @@ pub(crate) fn begin_update(page: &str, changes: &Changes) -> Result<Option<Start
             return Err("no page drawn");
         }
         let hit = t.recs.iter().any(|r| changes.hits_any(&r.own));
-        Ok(hit.then_some(Start { page_root: t.page_root }))
+        Ok(hit.then_some(Start { page_root: t.page_root, holder: t.holder }))
     })?;
-    if state.is_some() {
+    // A finger on the page's own background holds no node of it (only
+    // its changes of structure wait).
+    if let Some(start) = &state {
+        let page = [start.holder, start.page_root, crate::ui::parent_of(start.holder)];
+        let hold = hold.map(|h| h.into_iter().filter(|o| !page.contains(o)).collect());
         reset_frames();
         CHANGES.with(|c| *c.borrow_mut() = changes.clone());
         CURSOR.with(|c| c.set(0));
         REUSE.with(|r| r.borrow_mut().clear());
+        OPEN.with(|o| o.borrow_mut().clear());
         REAPPLIED.with(|n| n.set(0));
         VISITED.with(|n| n.set(0));
+        RESTRUCTURED.with(|n| n.set(0));
+        HELD.with(|h| h.set(false));
+        HOLD.with(|h| *h.borrow_mut() = hold);
     }
     Ok(state)
 }
 
 /// End an update walk: `Err` when it found something it could not do
 /// in place.
-pub(crate) fn end_update() -> Result<(usize, usize), &'static str> {
+pub(crate) fn end_update() -> Result<Walked, &'static str> {
     CHANGES.with(|c| *c.borrow_mut() = Changes::default());
-    let doomed = DOOMED.with(|d| d.replace(std::ptr::null_mut()));
-    if !doomed.is_null() {
-        Obj::from_raw(doomed).delete();
-    }
+    HOLD.with(|h| *h.borrow_mut() = None);
+    OPEN.with(|o| o.borrow_mut().clear());
+    clear_doomed();
     let done = TABLE.with(|t| match t.borrow_mut().as_mut() {
         Some(t) => {
             if t.broken.is_none() && CURSOR.with(|c| c.get()) != t.recs.len() {
@@ -820,7 +1257,21 @@ pub(crate) fn end_update() -> Result<(usize, usize), &'static str> {
         }
         None => Err("no page drawn"),
     });
-    done.map(|()| (VISITED.with(|v| v.get()), REAPPLIED.with(|n| n.get())))
+    done.map(|()| Walked {
+        visited: VISITED.with(|v| v.get()),
+        reapplied: REAPPLIED.with(|n| n.get()),
+        restructured: RESTRUCTURED.with(|n| n.get()),
+        held: HELD.with(|h| h.get()),
+    })
+}
+
+/// What an update walk did.
+pub(crate) struct Walked {
+    pub visited: usize,
+    pub reapplied: usize,
+    pub restructured: usize,
+    /// Something under a finger waits for the release.
+    pub held: bool,
 }
 
 /// The page holder of the page drawn (to compare it with a fresh one).
@@ -834,7 +1285,7 @@ pub(crate) fn describe_obj(obj: *mut lvgl_sys::lv_obj_t) -> String {
         let t = t.borrow();
         let Some(t) = t.as_ref() else { return String::new() };
         match t.recs.iter().find(|r| r.made.iter().any(|m| m.obj == obj)) {
-            Some(r) => format!("made by `{}` at {}", r.what, r.place),
+            Some(r) => format!("made by `{}` at {:?} byte {}", r.what, r.place.file, r.place.start),
             None => "not made by a node of the page (a part of one, or the page itself)".to_string(),
         }
     })

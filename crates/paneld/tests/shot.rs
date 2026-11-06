@@ -2969,46 +2969,118 @@ fn fuzz_configs() -> Vec<PathBuf> {
     out
 }
 
-/// The pages of `conf` (`page <name>` at the start of a line), and the
-/// shipped alerts page.
+/// The files of `conf`: itself and what it includes (`include =`, a
+/// `*` in the file name taken as any).
+fn conf_files(conf: &Path) -> Vec<PathBuf> {
+    let mut out = vec![conf.to_path_buf()];
+    let dir = conf.parent().unwrap();
+    for line in std::fs::read_to_string(conf).unwrap().lines() {
+        let Some(inc) = line.trim().strip_prefix("include").map(str::trim).and_then(|r| r.strip_prefix('=')).map(str::trim) else { continue };
+        let path = dir.join(inc);
+        let (folder, name) = (path.parent().unwrap().to_path_buf(), path.file_name().unwrap().to_string_lossy().into_owned());
+        match name.split_once('*') {
+            Some((pre, post)) => {
+                let mut found: Vec<PathBuf> = std::fs::read_dir(&folder)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.file_name().is_some_and(|f| f.to_string_lossy().starts_with(pre) && f.to_string_lossy().ends_with(post)))
+                    .collect();
+                found.sort();
+                out.extend(found);
+            }
+            None if path.is_file() => out.push(path),
+            None => {}
+        }
+    }
+    out
+}
+
+/// The pages of `conf` and the files it includes (`page <name>` at the
+/// start of a line), and the shipped alerts page.
 fn pages_of(conf: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(conf).unwrap();
-    let mut pages: Vec<String> =
-        text.lines().filter_map(|l| l.strip_prefix("page ")).filter_map(|r| r.split_whitespace().next()).map(str::to_string).collect();
-    pages.push("alerts".into());
+    let mut pages: Vec<String> = Vec::new();
+    for f in conf_files(conf) {
+        let text = std::fs::read_to_string(f).unwrap();
+        for p in text.lines().filter_map(|l| l.strip_prefix("page ")).filter_map(|r| r.split_whitespace().next()) {
+            if !pages.iter().any(|q| q == p) {
+                pages.push(p.to_string());
+            }
+        }
+    }
+    if !pages.iter().any(|p| p == "alerts") {
+        pages.push("alerts".into());
+    }
     pages
 }
 
-#[test]
-fn random_changes_update_every_page_as_a_fresh_render_would_draw_it() {
-    // A minimal config: the shipped shell and alerts page.
+/// `--source name=@file` for each source of `conf` that reads demo data
+/// (`run = cat demo/x.json`): its lists, for the fuzz to change.
+fn demo_sources(conf: &Path) -> Vec<String> {
+    let dir = conf.parent().unwrap();
+    let text = std::fs::read_to_string(conf).unwrap();
+    let mut out = Vec::new();
+    let mut source = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix("source ").and_then(|r| r.split_whitespace().next()) {
+            source = Some(name.to_string());
+        } else if let (Some(name), Some(file)) = (&source, t.strip_prefix("run").map(str::trim).and_then(|r| r.strip_prefix('=')).and_then(|r| r.trim().strip_prefix("cat "))) {
+            if file.ends_with(".json") {
+                out.push("--source".to_string());
+                out.push(format!("{name}=@{}", dir.join(file.trim()).display()));
+            }
+            source = None;
+        }
+    }
+    out
+}
+
+/// Random changes on every page of `conf`, three seeds each, every
+/// update and picture compared with a fresh render.
+fn fuzz_config(conf: &Path) {
     let d = tmp("fuzz");
+    // Taps run what they touch: the examples' actions only sleep; the
+    // rack config's reach real devices, so there they run nothing.
+    let example = conf.starts_with(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples"));
+    let demo = demo_sources(conf);
+    for page in pages_of(conf) {
+        for seed in ["5", "17", "40"] {
+            let out = d.join(format!("fuzz-{page}-{seed}.png"));
+            let run = Command::new(env!("CARGO_BIN_EXE_paneld"))
+                .arg("shot")
+                .arg("-c")
+                .arg(conf)
+                .arg("-o")
+                .arg(&out)
+                .args(["--no-sources", "--settle", "50", "--verify", "--page", &page, "--fuzz", "80", "--seed", seed])
+                .args(&demo)
+                .arg("--fuzz-taps")
+                .args(if example { &[][..] } else { &["--no-actions"] })
+                .env("PANELD_VERIFY_UPDATES", "1")
+                .output()
+                .expect("run paneld shot");
+            assert!(run.status.success(), "{} page {page} seed {seed}: {}\n{}", conf.display(), run.status, String::from_utf8_lossy(&run.stderr));
+        }
+    }
+}
+
+#[test]
+fn random_changes_update_the_shipped_pages_as_a_fresh_render_would_draw_them() {
+    let d = tmp("fuzz-lib");
     let lib = d.join("p.conf");
     std::fs::write(&lib, "var x: int = 0\npage home { nav = 1; text { value = {{ vars.x }} } }\n").unwrap();
-    let mut configs = vec![lib];
-    configs.extend(fuzz_configs());
-    for conf in configs {
-        for page in pages_of(&conf) {
-            for seed in ["5", "17", "40"] {
-                let out = d.join(format!("fuzz-{page}-{seed}.png"));
-                let run = Command::new(env!("CARGO_BIN_EXE_paneld"))
-                    .arg("shot")
-                    .arg("-c")
-                    .arg(&conf)
-                    .arg("-o")
-                    .arg(&out)
-                    .args(["--no-sources", "--settle", "50", "--verify", "--page", &page, "--fuzz", "80", "--seed", seed])
-                    .env("PANELD_VERIFY_UPDATES", "1")
-                    .output()
-                    .expect("run paneld shot");
-                assert!(
-                    run.status.success(),
-                    "{} page {page} seed {seed}: {}\n{}",
-                    conf.display(),
-                    run.status,
-                    String::from_utf8_lossy(&run.stderr)
-                );
-            }
+    fuzz_config(&lib);
+}
+
+#[test]
+fn random_changes_update_the_examples_as_a_fresh_render_would_draw_them() {
+    // One config per thread: the slowest test of the suite otherwise.
+    let threads: Vec<_> = fuzz_configs().into_iter().map(|c| std::thread::spawn(move || fuzz_config(&c))).collect();
+    for t in threads {
+        if let Err(e) = t.join() {
+            std::panic::resume_unwind(e);
         }
     }
 }
@@ -3105,4 +3177,437 @@ fn a_var_set_while_the_page_is_updated_is_shown() {
         let img = decode(&std::fs::read(d.join("p.png")).unwrap());
         assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the set was not drawn");
     }
+}
+
+// ---- ADR 0024 phase 2: structure in place ----
+
+/// The `perf update` / `perf build` lines of a `shot_perf` log.
+fn perf_lines<'a>(log: &'a str, kind: &str) -> Vec<&'a str> {
+    log.lines().filter(|l| l.starts_with(kind)).collect()
+}
+
+/// A list of `{id}` items from a string var (`a,b,c`).
+const LIST: &str = "{{ vars.l == '' ? [] : vars.l.split(',').map(x, {'id': x}) }}";
+
+#[test]
+fn a_repeat_gaining_an_item_keeps_the_other_items() {
+    let d = tmp("repeat-keep");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "var l: string = \"a,b\"\nvar n: int = 0\n\
+             page home {{ column {{\n\
+                 repeat it in {LIST} {{\n\
+                     row {{ text {{ value = {{{{ it.id }}}} }} bar {{ width = 100; height = 10; value = {{{{ vars.n }}}} }} }}\n\
+                 }}\n\
+             }} }}\n"
+        ),
+    )
+    .unwrap();
+    // A new item between the two, the order turned, one gone, back to
+    // none and to some again: each an update, never a build.
+    let log = shot_perf(&conf, &["--verify", "--set", "l=\"a,x,b\"", "--set", "l=\"b,x,a\"", "--set", "n=50", "--set", "l=\"b,a\"", "--set", "l=\"\"", "--set", "l=\"c\""]);
+    assert!(perf_lines(&log, "perf build").is_empty(), "{log}");
+    let updates = perf_lines(&log, "perf update");
+    assert_eq!(updates.len(), 6, "{log}");
+    // The new item's row, text and bar are all that is made; turning,
+    // dropping and a value change make nothing.
+    let made: Vec<&str> = updates.iter().map(|l| field(l, "made")).collect();
+    assert_eq!(made, ["3", "0", "0", "0", "0", "3"], "{log}");
+    assert!(updates.iter().enumerate().all(|(i, l)| (field(l, "restructured") == "0") == (i == 2)), "{log}");
+}
+
+#[test]
+fn items_with_the_same_id_render_as_a_fresh_render() {
+    let d = tmp("repeat-dup");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "var l: string = \"a,a,b\"\n\
+             page home {{ column {{\n\
+                 repeat it in {LIST} {{ button {{ width = 200; height = 40; label = {{{{ it.id }}}} }} }}\n\
+             }} }}\n"
+        ),
+    )
+    .unwrap();
+    let log = shot_perf(&conf, &["--verify", "--set", "l=\"b,a,a,a\"", "--set", "l=\"a,b,a\"", "--set", "l=\"a\""]);
+    assert!(perf_lines(&log, "perf build").is_empty(), "{log}");
+    // Said once, not on every update.
+    assert_eq!(log.matches("items share the key `id:a`").count(), 1, "{log}");
+}
+
+#[test]
+fn a_repeat_that_cannot_draw_says_so_and_draws_again() {
+    let d = tmp("repeat-fail");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var m: int = 0\n\
+         page home { column {\n\
+             text { value = top }\n\
+             repeat x in {{ vars.m == 1 ? 5 : vars.m == 2 ? [1][4] : [1, 2] }} { rect { width = 40; height = 20; background = #ff0000 } }\n\
+             text { value = end }\n\
+         } }\n",
+    )
+    .unwrap();
+    let log = shot_perf(&conf, &["--verify", "--set", "m=1", "--set", "m=2", "--set", "m=0"]);
+    assert!(perf_lines(&log, "perf build").is_empty(), "{log}");
+    let img = shot(&conf, &["--set", "m=1"]);
+    assert!(!img.any(|p| close(p, [0xff, 0, 0], 8)), "the failed repeat still shows its items");
+}
+
+#[test]
+fn a_node_of_another_shape_is_built_again_alone() {
+    let d = tmp("reshape");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var m: int = 0\n\
+         page home { grid { columns = 3\n\
+             button { width = 200; height = 50; label = {{ vars.m == 1 ? '' : 'go' }}; icon = {{ vars.m >= 1 ? 'refresh' : '' }} }\n\
+             select { width = 200; style = buttons; options = {{ vars.m == 2 ? ['a', 'b'] : ['x', 'y', 'z'] }} }\n\
+             icon { name = {{ vars.m == 1 ? 'home' : 'power' }}; size = {{ vars.m == 2 ? 40 : 20 }} }\n\
+             qr { size = 60; data = {{ vars.m == 3 ? [1][2] : 'x' }} }\n\
+             text { value = {{ vars.m }} }\n\
+         } }\n",
+    )
+    .unwrap();
+    let log = shot_perf(&conf, &["--verify", "--set", "m=1", "--set", "m=2", "--set", "m=3", "--set", "m=0"]);
+    assert!(perf_lines(&log, "perf build").is_empty(), "{log}");
+    let updates = perf_lines(&log, "perf update");
+    assert_eq!(updates.len(), 4, "{log}");
+    assert!(updates.iter().all(|l| field(l, "restructured") != "0"), "{log}");
+    // Only the nodes of another shape: an icon glyph made again is one
+    // object, not the page's.
+    assert!(updates.iter().all(|l| field(l, "made").parse::<u32>().unwrap() < 12), "{log}");
+}
+
+#[test]
+fn a_qr_code_without_data_is_a_white_box() {
+    // Its buffer's palette was left as the allocator had it.
+    let d = tmp("qr-blank");
+    let conf = d.join("p.conf");
+    std::fs::write(&conf, "page home { column { width = 300; height = 200; background = #000000; qr { size = 100 } } }\n").unwrap();
+    let img = shot(&conf, &[]);
+    let black = bbox(&img, |p| p == [0, 0, 0]).expect("no black box");
+    let mut white = 0;
+    for y in black.1..=black.3 {
+        for x in black.0..=black.2 {
+            white += usize::from(img.px(x, y) == [0xff, 0xff, 0xff]);
+        }
+    }
+    assert_eq!(white, 100 * 100, "the code is not a white box");
+}
+
+#[test]
+fn a_text_whose_error_changes_shows_the_new_one() {
+    // Review: a text's fingerprint took a failed part as nothing, so a
+    // new error message (`got null`, then `got list`) was not shown.
+    let d = tmp("err-text");
+    let conf = d.join("p.conf");
+    std::fs::write(&conf, "var m: int = 0\npage home { column { text { value = Up {{ format(vars.m == 1 ? [1] : vars.m == 2 ? 'x' : null, 'bytes') }} } } }\n").unwrap();
+    // The first update sets the text up whatever it reads; the second
+    // goes by what it reads.
+    shot(&conf, &["--set", "m=1", "--set", "m=2"]);
+}
+
+#[test]
+fn a_grid_row_shrinks_when_its_tall_child_hides() {
+    // Review: a stretched child kept its cell's height, so the row kept
+    // the height of a child hidden since.
+    let d = tmp("grid-shrink");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var m: int = 0\n\
+         page home { grid { columns = 3\n\
+             text { value = a }\n\
+             column { visible = {{ vars.m != 3 }}; height = 120; text { value = x } }\n\
+             text { value = c }\n\
+         } }\n",
+    )
+    .unwrap();
+    shot(&conf, &["--verify", "--set", "m=3"]);
+}
+
+#[test]
+fn a_slider_dragged_keeps_its_value_while_a_rect_beside_it_changes() {
+    let d = tmp("drag-hold");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var v: int = 20\nvar c: int = 0\n\
+         page home { column {\n\
+             slider { width = 400; min = 0; max = 100; value = {{ vars.v }}; color = #0000ff }\n\
+             rect { width = 100; height = 40; background = {{ vars.c > 0 ? '#00ff00' : '#ff0000' }} }\n\
+         } }\n",
+    )
+    .unwrap();
+    // The slider's track runs from x 28 to 428 at y 82; the finger
+    // drags its knob to 80 while the vars change.
+    let steps = ["--down", "108,82", "--down", "348,82", "--set", "c=1", "--set", "v=50"];
+    let img = shot(&conf, &steps);
+    let blue = bbox(&img, |p| close(p, [0, 0, 0xff], 16)).expect("no slider indicator");
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the rect waited for the release");
+    assert!(blue.2 > 320, "the slider left the finger: {blue:?}");
+    // Released: the var's value lands (and verify compares it).
+    let mut up = steps.to_vec();
+    up.extend(["--up", "--verify"]);
+    let img = shot(&conf, &up);
+    let blue = bbox(&img, |p| close(p, [0, 0, 0xff], 16)).expect("no slider indicator");
+    assert!(blue.2 < 260, "the var's value did not land on release: {blue:?}");
+}
+
+#[test]
+fn items_change_under_a_finger_only_after_the_release() {
+    let d = tmp("hold-structure");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "var l: string = \"a,b\"\n\
+             page home {{ column {{\n\
+                 repeat it in {LIST} {{ button {{ width = 200; height = 40; label = {{{{ it.id }}}} }} }}\n\
+                 rect {{ width = 100; height = 40; background = {{{{ vars.l == 'a,b' ? '#ff0000' : '#00ff00' }}}} }}\n\
+             }} }}\n"
+        ),
+    )
+    .unwrap();
+    let green = |img: &Image| bbox(img, |p| close(p, [0, 0xff, 0], 16));
+    // A finger on `a`: the rect turns green, but no button comes in
+    // above it until the release.
+    let held = green(&shot(&conf, &["--down", "100,85", "--set", "l=\"x,a,b\""])).expect("the rect waited for the release");
+    let after = green(&shot(&conf, &["--down", "100,85", "--set", "l=\"x,a,b\"", "--up", "--verify"])).expect("no rect");
+    assert!(after.1 > held.1 + 30, "held at {held:?}, released at {after:?}");
+}
+
+#[test]
+fn a_finger_on_the_page_background_holds_nothing_of_it() {
+    // A press on the shell's `scroll` (or a drag scrolling it) holds no
+    // node it shows: their values change; only structure waits.
+    let d = tmp("hold-bg");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var c: int = 0\n\
+         page home { column { rect { width = 100; height = 40; background = {{ vars.c > 0 ? '#00ff00' : '#ff0000' }} } } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--down", "600,300", "--set", "c=1"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the rect waited for the release");
+}
+
+// ---- ADR 0024 phase 2 review ----
+
+#[test]
+fn typed_digits_stay_with_their_keypad_when_the_page_is_built_again() {
+    // Review: typed text was put back by position after a full build of
+    // the same page (here the wake), so a reordered list moved the
+    // digits into another item's keypad.
+    let d = tmp("keypad-key");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var l: string = \"a,b\"\nvar got: string = \"\"\nscreen { idle = 1s }\n\
+         page home { column {\n\
+             rect { width = 60; height = 30; background = {{ vars.got == 'b:9' ? '#00ff00' : '#ff0000' }} }\n\
+             row { repeat it in {{ vars.l.split(',').map(x, {'id': x}) }} {\n\
+                 column { width = 370; height = 330; text { value = {{ it.id }} }\n\
+                     keypad { length = 6; on_submit { set { got = {{ it.id + ':' + event.value }} } } } }\n\
+             } }\n\
+         } }\n",
+    )
+    .unwrap();
+    // 9 into b's keypad (right), b moves left, the screen sleeps and
+    // wakes (a full build), OK on the left keypad: b's.
+    let img = shot(&conf, &["--tap", "723,337", "--set", "l=\"b,a\"", "--wait", "1500", "--tap", "600,450", "--tap", "343,371"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "b's digits went to another keypad");
+}
+
+/// A pressed button's blue (darker while pressed).
+fn bluish(p: [u8; 3]) -> bool {
+    p[2] > 0xa0 && p[0] < 0x30 && p[1] < 0x30
+}
+
+#[test]
+fn what_is_around_a_pressed_button_stays_until_the_release() {
+    // Review: a column around the pressed button hid it mid-press, and
+    // the release still tapped the button no longer shown.
+    let d = tmp("hold-around");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var v: int = 0\nvar hit: int = 0\n\
+         page home { column {\n\
+             rect { width = 100; height = 40; background = {{ vars.hit > 0 ? '#00ff00' : '#ff0000' }} }\n\
+             column { visible = {{ vars.v == 0 }}; button { width = 200; height = 60; background = #0000ff; label = go; on_tap { set { hit = 1 } } } }\n\
+         } }\n",
+    )
+    .unwrap();
+    let held = shot(&conf, &["--down", "150,185", "--set", "v=1"]);
+    assert!(held.any(bluish), "the pressed button was hidden under the finger");
+    let after = shot(&conf, &["--down", "150,185", "--set", "v=1", "--up", "--verify"]);
+    assert!(after.any(|p| close(p, [0, 0xff, 0], 16)) && !after.any(bluish), "the tap or the hiding went missing");
+}
+
+#[test]
+fn a_repeat_item_under_a_finger_stays_whole() {
+    // Review: in a list keyed by position the row's text moved on to
+    // another host while its pressed button kept the old one's args.
+    let d = tmp("hold-item");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var l: string = \"vm-a,vm-b\"\nvar hit: string = \"\"\n\
+         page home { column {\n\
+             rect { width = 100; height = 40; background = {{ vars.hit == 'vm-a' ? '#00ff00' : '#ff0000' }} }\n\
+             repeat h in {{ vars.l.split(',') }} {\n\
+                 row { rect { width = 40; height = 40; background = {{ h == 'vm-a' ? '#00ffff' : '#ff00ff' }} }\n\
+                       button { width = 160; height = 50; background = #0000ff; label = go; on_tap { set { hit = {{ h }} } } } }\n\
+             }\n\
+         } }\n",
+    )
+    .unwrap();
+    // The first row is vm-a's when pressed; the list turns meanwhile.
+    let steps = ["--down", "180,180", "--set", "l=\"vm-b,vm-a\""];
+    let held = shot(&conf, &steps);
+    let first = bbox(&held, bluish).expect("no button");
+    let cyan = bbox(&held, |p| close(p, [0, 0xff, 0xff], 16)).expect("no vm-a row");
+    assert!(cyan.1 <= first.1 + 10, "the pressed row no longer shows vm-a: {cyan:?} {first:?}");
+    // Released: vm-a's button tapped, then the list as it is now.
+    let mut up = steps.to_vec();
+    up.extend(["--up", "--verify"]);
+    assert!(shot(&conf, &up).any(|p| close(p, [0, 0xff, 0], 16)), "the tap went to another row");
+}
+
+#[test]
+fn a_press_moved_from_under_the_finger_taps_nothing() {
+    // Review: a sibling shown above moved the pressed button away, and
+    // lifting the finger still tapped it.
+    let d = tmp("hold-shift");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var warn: bool = false\nvar hit: int = 0\n\
+         page home { column {\n\
+             rect { width = 100; height = 40; background = {{ vars.hit > 0 ? '#00ff00' : '#ff0000' }} }\n\
+             rect { visible = {{ vars.warn }}; width = 300; height = 70; background = #ffff00 }\n\
+             button { width = 200; height = 60; background = #0000ff; label = go; on_tap { set { hit = 1 } } }\n\
+         } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--down", "130,165", "--set", "warn=true", "--up", "--verify"]);
+    assert!(img.any(|p| close(p, [0xff, 0, 0], 16)), "the moved button was tapped");
+    // Not moved: tapped.
+    let img = shot(&conf, &["--down", "130,165", "--up"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the button took no tap");
+}
+
+#[test]
+fn an_ago_in_a_repeat_list_is_timed() {
+    // Review: the `repeat`'s own `ago()` had no due (verify: None vs a
+    // fresh render's).
+    let d = tmp("ago-repeat");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var t: int = 1793976783\nvar n: int = 0\n\
+         page home { column {\n\
+             text { value = {{ vars.n }} }\n\
+             repeat a in {{ [{'id': 'x', 's': ago(vars.t)}] }} { text { value = {{ a.s }} } }\n\
+         } }\n",
+    )
+    .unwrap();
+    shot(&conf, &["--set", "n=1", "--set", "n=2"]);
+}
+
+#[test]
+fn ago_texts_go_on_while_one_is_held() {
+    // Review: one `ago()` text under a finger stopped every other one on
+    // the page until the release.
+    let d = tmp("ago-held");
+    let conf = d.join("p.conf");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::fs::write(
+        &conf,
+        format!(
+            "var t1: int = {}\nvar t2: int = {}\n\
+             page home {{ column {{\n\
+                 button {{ width = 200; height = 60; label = {{{{ ago(vars.t1) }}}} }}\n\
+                 rect {{ width = 100; height = 40; background = {{{{ ago(vars.t2) == 'just now' ? '#ff0000' : '#00ff00' }}}} }}\n\
+             }} }}\n",
+            now - 58,
+            now - 56
+        ),
+    )
+    .unwrap();
+    // The button's text is due first (held), the rect's after.
+    let img = shot(&conf, &["--down", "130,95", "--wait", "6000"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the rect's ago() waited for the release");
+}
+
+#[test]
+fn shot_refuses_a_bad_source_file_and_a_lone_up() {
+    let d = tmp("shot-args");
+    let conf = d.join("p.conf");
+    std::fs::write(&conf, "source x { run = echo 1; poll = 1h }\npage home { column { text { value = {{ sources.x.value }} } } }\n").unwrap();
+    let bad = d.join("bad.json");
+    std::fs::write(&bad, "{ not json").unwrap();
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_paneld"))
+            .args(["shot", "-c", conf.to_str().unwrap(), "-o", d.join("p.png").to_str().unwrap(), "--no-sources"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let missing = format!("x=@{}", d.join("none.json").display());
+    let notjson = format!("x=@{}", bad.display());
+    for extra in [&["--source", missing.as_str()][..], &["--source", notjson.as_str()], &["--up"]] {
+        let out = run(extra);
+        assert!(!out.status.success() && !String::from_utf8_lossy(&out.stderr).is_empty(), "{extra:?} was taken");
+    }
+}
+
+#[test]
+fn a_node_built_again_inside_another_setup_leaves_it_intact() {
+    // Review: a child built again deleted what its button's setup had
+    // just made off the page, which the button's setup still used.
+    let d = tmp("doomed-nested");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var s: int = 0\n\
+         page home { column {\n\
+             button { width = 300; height = 120; label = go; icon = {{ vars.s == 1 ? 'home' : '' }}\n\
+                 qr { size = 40; data = {{ vars.s == 1 ? 'x' : null }} }\n\
+                 repeat it in {{ vars.s == 1 ? [{'id': 'a'}, {'id': 'b'}] : [{'id': 'b'}] }} { text { value = {{ it.id }} } }\n\
+             }\n\
+         } }\n",
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_paneld"))
+        .args(["shot", "-c", conf.to_str().unwrap(), "-o", d.join("p.png").to_str().unwrap(), "--verify"])
+        .args(["--set", "s=1", "--set", "s=0", "--set", "s=1"])
+        .env("PANELD_VERIFY_UPDATES", "1")
+        .env("MALLOC_CHECK_", "3")
+        .env("MALLOC_PERTURB_", "165")
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+}
+
+#[test]
+fn keypads_in_a_column_as_tall_as_its_content_keep_their_size() {
+    // Review: a keypad's keys were half their parent's height, which in
+    // a parent as tall as its content grew it on every layout pass.
+    let d = tmp("keypad-grow");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var n: int = 0\npage home { column { text { value = {{ vars.n }} } keypad { length = 4 } keypad { length = 4 } } }\n",
+    )
+    .unwrap();
+    shot(&conf, &["--set", "n=1", "--set", "n=2"]);
 }

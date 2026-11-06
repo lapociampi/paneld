@@ -358,53 +358,31 @@ pub fn hide_sleep_cover() {
 }
 
 thread_local! {
-    /// Page inputs (keypad textareas) of the current render, in
-    /// render order. LVGL objects are UI-thread only, hence a
-    /// thread-local; cleared with the bindings.
-    static INPUTS: std::cell::RefCell<Vec<*mut sys::lv_obj_t>> =
+    /// Page inputs (keypad textareas), each with the key of the node
+    /// that made it (motion's: its place in the config, the component
+    /// calls and `repeat` items it is under). LVGL objects are UI-thread
+    /// only, hence a thread-local; each leaves with its textarea.
+    static INPUTS: std::cell::RefCell<Vec<(*mut sys::lv_obj_t, u64)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Text typed into each page input, in render order. Call before
-/// clearing the screen for a re-render.
-pub fn snapshot_inputs() -> Vec<String> {
-    INPUTS.with(|v| {
-        v.borrow()
-            .iter()
-            .map(|&ta| {
-                let c = unsafe { sys::lv_textarea_get_text(ta) };
-                if c.is_null() {
-                    String::new()
-                } else {
-                    unsafe { std::ffi::CStr::from_ptr(c) }
-                        .to_string_lossy()
-                        .into_owned()
-                }
-            })
-            .collect()
-    })
+/// Text typed into each page input, by the key of its node. Call
+/// before clearing the screen for a re-render.
+pub fn snapshot_inputs() -> Vec<(u64, String)> {
+    INPUTS.with(|v| v.borrow().iter().map(|&(ta, key)| (key, textarea_text(ta))).collect())
 }
 
 /// Put text taken by [`snapshot_inputs`] back into the freshly
-/// rendered inputs, by position. Only meaningful when the same page
-/// was re-rendered.
-pub fn restore_inputs(texts: &[String]) {
-    INPUTS.with(|v| {
-        // Position is the only key, so only restore onto the same set
-        // of inputs; otherwise digits could land in another keypad.
-        if v.borrow().len() != texts.len() {
-            return;
+/// rendered inputs of the same nodes (a `repeat` item's keypad into
+/// that item's, wherever it is now). Only meaningful when the same
+/// page was re-rendered.
+pub fn restore_inputs(texts: &[(u64, String)]) {
+    let inputs = INPUTS.with(|v| v.borrow().clone());
+    for (ta, key) in inputs {
+        if let Some((_, text)) = texts.iter().find(|(k, t)| *k == key && !t.is_empty()) {
+            set_textarea_text(ta, text);
         }
-        for (&ta, text) in v.borrow().iter().zip(texts) {
-            if text.is_empty() {
-                continue;
-            }
-            if let Ok(c) = CString::new(text.as_str()) {
-                // lv_textarea_set_text copies the string.
-                unsafe { sys::lv_textarea_set_text(ta, c.as_ptr()) };
-            }
-        }
-    });
+    }
 }
 
 unsafe extern "C" fn on_tap_trampoline(e: *mut sys::lv_event_t) {
@@ -2214,7 +2192,14 @@ impl<'ui> Obj<'ui> {
     pub fn new_qrcode(&self, size: i32) -> Obj<'ui> {
         let raw = unsafe { sys::lv_qrcode_create(self.raw) };
         assert!(!raw.is_null());
-        unsafe { sys::lv_qrcode_set_size(raw, size) };
+        unsafe {
+            sys::lv_qrcode_set_size(raw, size);
+            // The new buffer's palette is left as the allocator had it
+            // (LVGL sets the colors only when they change): light and
+            // dark again, so a code with no data yet is a white box.
+            sys::lv_canvas_set_palette(raw, 0, sys::lv_color32_t { blue: 0xff, green: 0xff, red: 0xff, alpha: 0xff });
+            sys::lv_canvas_set_palette(raw, 1, sys::lv_color32_t { blue: 0, green: 0, red: 0, alpha: 0xff });
+        }
         Obj { raw, _ui: PhantomData }
     }
 
@@ -2403,18 +2388,24 @@ impl<'ui> Obj<'ui> {
         Obj { raw, _ui: PhantomData }
     }
 
-    /// Remember this textarea as a page input whose typed text should
-    /// survive a re-render of the same page (see [`snapshot_inputs`]).
-    pub fn register_input(&self) {
+    /// Remember this textarea as a page input of node `key` whose typed
+    /// text should survive a re-render of the same page (see
+    /// [`snapshot_inputs`]).
+    pub fn register_input(&self, key: u64) {
         unsafe extern "C" fn forget(e: *mut sys::lv_event_t) {
             // SAFETY: registered for DELETE on the textarea going.
             let ta = unsafe { sys::lv_event_get_target(e) } as *mut sys::lv_obj_t;
-            INPUTS.with(|v| v.borrow_mut().retain(|&t| t != ta));
+            INPUTS.with(|v| v.borrow_mut().retain(|&(t, _)| t != ta));
         }
-        if INPUTS.with(|v| v.borrow().contains(&self.raw)) {
+        let known = INPUTS.with(|v| {
+            let mut v = v.borrow_mut();
+            let e = v.iter_mut().find(|(t, _)| *t == self.raw);
+            e.map(|e| e.1 = key).is_some()
+        });
+        if known {
             return;
         }
-        INPUTS.with(|v| v.borrow_mut().push(self.raw));
+        INPUTS.with(|v| v.borrow_mut().push((self.raw, key)));
         unsafe { sys::lv_obj_add_event_cb(self.raw, Some(forget), sys::lv_event_code_t_LV_EVENT_DELETE, std::ptr::null_mut()) };
     }
 
@@ -2594,6 +2585,13 @@ impl<'ui> Obj<'ui> {
                 DIGIT_CTRL.as_ptr(),
             );
             sys::lv_keyboard_set_mode(raw, sys::lv_keyboard_mode_t_LV_KEYBOARD_MODE_NUMBER);
+            // LVGL makes it half its parent's height: in a parent as tall
+            // as its content (and not grown into the room left) that
+            // grows the parent on every layout pass (two keypads there,
+            // without end). A height of its own then.
+            if sys::lv_obj_get_style_height(self.raw, 0) == LV_SIZE_CONTENT_LOCAL && sys::lv_obj_get_style_flex_grow(self.raw, 0) == 0 {
+                sys::lv_obj_set_height(raw, KEYBOARD_PX);
+            }
         }
         // Keys in the track on a `surface` panel; OK in the accent.
         let c = input_colors();
@@ -3448,6 +3446,10 @@ impl<'ui> Obj<'ui> {
             sys::lv_obj_set_grid_dsc_array(self.raw, col_ptr, row_ptr);
             for (i, (&child, &(c, r, cs, rs))) in shown.iter().zip(&placed).enumerate() {
                 touch(child);
+                // A stretched child has the size of its cell: it is
+                // measured again first, or a content track keeps the size
+                // it had (one a child hidden since gave it).
+                sys::lv_paneld_size_again(child);
                 if explicit[i].is_none() {
                     owned(child, |o| o.grid_auto = true);
                 }
@@ -4820,6 +4822,173 @@ pub(crate) fn end_update() -> usize {
     changed
 }
 
+/// Make objects within an update as a fresh render makes them (a
+/// subtree built again, a `repeat`'s new items): styled as they are
+/// made. Returns whether an update was under way, for
+/// [`resume_update`].
+pub(crate) fn pause_update() -> bool {
+    let was = UPDATING.with(|u| u.replace(false));
+    if was {
+        unsafe { sys::lv_obj_enable_style_refresh(true) };
+    }
+    was
+}
+
+pub(crate) fn resume_update(was: bool) {
+    if was {
+        UPDATING.with(|u| u.set(true));
+        unsafe { sys::lv_obj_enable_style_refresh(false) };
+    }
+}
+
+/// Delete `objs` (none under another) within an update: what was
+/// noted of them and what is under them goes first.
+pub(crate) fn delete_objs(objs: &[*mut sys::lv_obj_t]) {
+    if objs.is_empty() {
+        return;
+    }
+    TOUCHED.with(|t| t.borrow_mut().retain(|b| !is_within(b.obj, objs)));
+    for &o in objs {
+        unsafe { sys::lv_obj_delete(o) };
+    }
+}
+
+/// `obj` is one of `roots` or under one.
+pub(crate) fn is_within(obj: *mut sys::lv_obj_t, roots: &[*mut sys::lv_obj_t]) -> bool {
+    let mut o = obj;
+    while !o.is_null() {
+        if roots.contains(&o) {
+            return true;
+        }
+        o = unsafe { sys::lv_obj_get_parent(o) };
+    }
+    false
+}
+
+/// The objects under a finger now (what each pointer holds pressed: a
+/// press, a slider or roller dragged) and the dropdowns whose list is
+/// open: an update leaves them and what is under them as they are
+/// (ADR 0024, "Touch"). A `scroll` pressed (dragged, or its background
+/// touched) holds nothing of what it shows.
+pub(crate) fn held_objects() -> Vec<*mut sys::lv_obj_t> {
+    let mut out: Vec<*mut sys::lv_obj_t> = OPEN_LISTS.with(|o| o.borrow().iter().map(|&d| d as *mut sys::lv_obj_t).collect());
+    unsafe {
+        let mut indev = sys::lv_indev_get_next(std::ptr::null_mut());
+        while !indev.is_null() {
+            let obj = sys::lv_paneld_indev_pressed_obj(indev);
+            let scroll = !obj.is_null()
+                && sys::lv_paneld_obj_flags(obj) & sys::lv_obj_flag_t_LV_OBJ_FLAG_SCROLLABLE != 0
+                && Obj::from_raw(obj).class_name() == "obj";
+            if !obj.is_null() && !scroll {
+                out.push(obj);
+            }
+            indev = sys::lv_indev_get_next(indev);
+        }
+    }
+    out
+}
+
+/// A press as it stands: the pointer, what it holds, where that is.
+pub(crate) struct Press {
+    indev: *mut sys::lv_indev_t,
+    obj: *mut sys::lv_obj_t,
+    at: Option<(i32, i32, i32, i32)>,
+}
+
+/// Where `obj` is on the screen, `None` when it (or what it is in) is
+/// hidden.
+fn place_of(obj: *mut sys::lv_obj_t) -> Option<(i32, i32, i32, i32)> {
+    let mut o = obj;
+    while !o.is_null() {
+        if unsafe { sys::lv_paneld_obj_flags(o) } & sys::lv_obj_flag_t_LV_OBJ_FLAG_HIDDEN != 0 {
+            return None;
+        }
+        o = parent_of(o);
+    }
+    let mut c: sys::lv_area_t = unsafe { std::mem::zeroed() };
+    unsafe { sys::lv_obj_get_coords(obj, &mut c) };
+    Some((c.x1, c.y1, c.x2, c.y2))
+}
+
+/// The presses on `held` objects now (before an update).
+pub(crate) fn presses(held: &[*mut sys::lv_obj_t]) -> Vec<Press> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut indev = sys::lv_indev_get_next(std::ptr::null_mut());
+        while !indev.is_null() {
+            let obj = sys::lv_paneld_indev_pressed_obj(indev);
+            if !obj.is_null() && held.contains(&obj) {
+                out.push(Press { indev, obj, at: place_of(obj) });
+            }
+            indev = sys::lv_indev_get_next(indev);
+        }
+    }
+    out
+}
+
+/// After an update: a press whose object moved from under the finger
+/// or was hidden (a sibling shown above it, a list grown) is
+/// cancelled: lifting the finger then taps nothing. Returns how many.
+pub(crate) fn cancel_moved(presses: &[Press]) -> usize {
+    let mut n = 0;
+    for p in presses {
+        if unsafe { sys::lv_paneld_indev_pressed_obj(p.indev) } != p.obj {
+            continue;
+        }
+        unsafe { sys::lv_obj_update_layout(sys::lv_obj_get_screen(p.obj)) };
+        if place_of(p.obj) != p.at {
+            unsafe {
+                sys::lv_indev_reset(p.indev, p.obj);
+                sys::lv_indev_wait_release(p.indev);
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
+pub(crate) fn parent_of(obj: *mut sys::lv_obj_t) -> *mut sys::lv_obj_t {
+    unsafe { sys::lv_obj_get_parent(obj) }
+}
+
+/// `obj`'s place among its parent's children.
+pub(crate) fn index_of(obj: *mut sys::lv_obj_t) -> u32 {
+    unsafe { sys::lv_obj_get_index(obj).max(0) as u32 }
+}
+
+/// Put `obj` at place `i` among its parent's children.
+pub(crate) fn move_to_index(obj: *mut sys::lv_obj_t, i: u32) {
+    if index_of(obj) != i {
+        unsafe { sys::lv_obj_move_to_index(obj, i as i32) };
+    }
+}
+
+/// Where a child goes after the last one a page made in `parent`: its
+/// end, before a running button's overlay.
+pub(crate) fn content_end(parent: *mut sys::lv_obj_t) -> u32 {
+    let n = unsafe { sys::lv_obj_get_child_count(parent) };
+    let overlay = OWNED.with(|m| m.borrow().get(&(parent as usize)).and_then(|o| o.busy.as_ref().map(|(ov, _)| *ov)));
+    match overlay {
+        Some(ov) if parent_of(ov) == parent => n.saturating_sub(1),
+        _ => n,
+    }
+}
+
+/// The text typed into a keypad's textarea.
+pub(crate) fn textarea_text(obj: *mut sys::lv_obj_t) -> String {
+    let c = unsafe { sys::lv_textarea_get_text(obj) };
+    if c.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(c) }.to_string_lossy().into_owned()
+}
+
+pub(crate) fn set_textarea_text(obj: *mut sys::lv_obj_t, text: &str) {
+    if let Ok(c) = CString::new(text) {
+        unsafe { sys::lv_textarea_set_text(obj, c.as_ptr()) };
+    }
+}
+
 /// Set (or clear) `bits` of `obj`'s state: raw during an update.
 fn set_state_bits(obj: *mut sys::lv_obj_t, bits: sys::lv_state_t, on: bool) {
     unsafe {
@@ -5055,6 +5224,9 @@ impl<'ui> Obj<'ui> {
 
 }
 
+/// A keypad's keys in a parent as tall as its content: four rows.
+const KEYBOARD_PX: i32 = 200;
+
 /// What a new dropdown lists (LVGL's own placeholder options).
 pub(crate) const DROPDOWN_DEFAULT: &str = "Option 1\nOption 2\nOption 3";
 
@@ -5174,6 +5346,25 @@ pub(crate) fn compare_trees(live: &Obj<'_>, fresh: &Obj<'_>) -> Result<(), Strin
     Ok(())
 }
 
+/// What `obj` and what is under it show, but where they are (verify:
+/// what a finger holds must not change under it).
+pub(crate) fn held_dump(obj: *mut sys::lv_obj_t) -> Vec<String> {
+    let mut lines = Vec::new();
+    dump_obj(obj, 0, true, true, &mut lines);
+    lines.into_iter().map(|l| format!("{}{}", l.head, l.rest)).collect()
+}
+
+/// Whether `obj` is still on a screen or layer of the display (not
+/// deleted): found by walking them, never by reading it.
+pub(crate) fn alive(obj: *mut sys::lv_obj_t) -> bool {
+    fn find(o: *mut sys::lv_obj_t, want: *mut sys::lv_obj_t) -> bool {
+        o == want || (0..unsafe { sys::lv_obj_get_child_count(o) }).any(|i| find(unsafe { sys::lv_obj_get_child(o, i as i32) }, want))
+    }
+    let disp = unsafe { sys::lv_display_get_default() };
+    let roots = unsafe { [sys::lv_display_get_screen_active(disp), sys::lv_display_get_layer_top(disp), sys::lv_display_get_layer_sys(disp)] };
+    roots.into_iter().filter(|r| !r.is_null()).any(|r| find(r, obj))
+}
+
 fn dump_obj(obj: *mut sys::lv_obj_t, depth: usize, root: bool, moving: bool, out: &mut Vec<Line>) {
     use std::fmt::Write;
     let o = Obj::from_raw(obj);
@@ -5204,8 +5395,9 @@ fn dump_obj(obj: *mut sys::lv_obj_t, depth: usize, root: bool, moving: bool, out
         }
         // A toggle's position is compared apart (`user`): the user may
         // have changed it, which an update keeps until what it shows
-        // changes.
-        let user_bits = if class == "switch" { sys::lv_state_t_LV_STATE_CHECKED as sys::lv_state_t } else { 0 };
+        // changes. A dropdown is checked while its list is open: the
+        // user's too.
+        let user_bits = if matches!(class.as_str(), "switch" | "dropdown") { sys::lv_state_t_LV_STATE_CHECKED as sys::lv_state_t } else { 0 };
         let _ = write!(head, " st={:x}", sys::lv_obj_get_state(obj) & MANAGED_STATES & !user_bits);
         if !moving {
             let mut c: sys::lv_area_t = std::mem::zeroed();
@@ -5338,6 +5530,9 @@ fn dump_obj(obj: *mut sys::lv_obj_t, depth: usize, root: bool, moving: bool, out
                 } else {
                     let _ = write!(rest, " src={}", !src.is_null());
                 }
+            }
+            "qrcode" => {
+                let _ = write!(rest, " data={:?}", OWNED.with(|m| m.borrow().get(&(obj as usize)).and_then(|o| o.qr.clone())));
             }
             "line" => {
                 let _ = write!(rest, " pts={:?}", OWNED.with(|m| m.borrow().get(&(obj as usize)).and_then(|o| o.line.as_ref().map(|l| l.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>()))));

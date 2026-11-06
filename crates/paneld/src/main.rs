@@ -71,12 +71,17 @@ enum Cmd {
 enum ShotStep {
     /// Press at (x, y) for `press_ms`, release, then `--settle`.
     Touch { x: i32, y: i32, press_ms: u32 },
+    /// `--down X,Y`: a finger down at (x, y) (or moved there, a drag),
+    /// kept down through the steps after it until `--up`.
+    Down { x: i32, y: i32 },
+    Up,
     /// Run the UI this long without touching it.
     Wait(u32),
     /// `--set name=value`: set a var as `paneld ctl set` does.
     Set { var: String, value: String },
     /// `--source name=value`: a new result of source `name` with this
-    /// `value` (a number, `true` / `false`, else text), as a poll gives.
+    /// `value` (a number, `true` / `false`, `@FILE` of JSON, else text),
+    /// as a poll gives.
     Source { name: String, value: String },
 }
 
@@ -99,6 +104,12 @@ struct ShotOpts {
     /// Then this many random changes (sources, vars, alerts, call
     /// states, the clock), each checked against a fresh render.
     fuzz: u32,
+    /// `--fuzz-taps`: random taps among them, and changes landing
+    /// while a finger is down (runs the actions tapped).
+    fuzz_taps: bool,
+    /// `--no-actions`: an action tapped runs nothing and ends at once,
+    /// as done (taps on a config whose actions reach real devices).
+    no_actions: bool,
     seed: u64,
     /// Run no source commands (values come from `--source` / `--fuzz`).
     no_sources: bool,
@@ -115,6 +126,8 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
         settle_ms: 300,
         verify: false,
         fuzz: 0,
+        fuzz_taps: false,
+        no_actions: false,
         seed: 1,
         no_sources: false,
     };
@@ -158,6 +171,26 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
                     press_ms: if a == "--hold" { 1000 } else { 100 },
                 });
             }
+            "--down" => {
+                let v = val(&mut i, a)?;
+                let (x, y) = v.split_once(',').ok_or("`--down` is X,Y")?;
+                o.taps.push(ShotStep::Down {
+                    x: x.trim().parse().map_err(|_| "bad `--down` x")?,
+                    y: y.trim().parse().map_err(|_| "bad `--down` y")?,
+                });
+            }
+            "--up" => {
+                // Only a finger that is down can be lifted.
+                let down = o.taps.iter().rev().find_map(|s| match s {
+                    ShotStep::Down { .. } => Some(true),
+                    ShotStep::Up => Some(false),
+                    _ => None,
+                });
+                if down != Some(true) {
+                    return Err("`--up` without a `--down` before it".into());
+                }
+                o.taps.push(ShotStep::Up);
+            }
             "--wait" => {
                 let ms = val(&mut i, a)?.parse().map_err(|_| "bad `--wait` ms")?;
                 o.taps.push(ShotStep::Wait(ms));
@@ -178,6 +211,8 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
             "--verify" => o.verify = true,
             "--no-sources" => o.no_sources = true,
             "--fuzz" => o.fuzz = val(&mut i, a)?.parse().map_err(|_| "bad `--fuzz` count")?,
+            "--fuzz-taps" => o.fuzz_taps = true,
+            "--no-actions" => o.no_actions = true,
             "--seed" => o.seed = val(&mut i, a)?.parse().map_err(|_| "bad `--seed`")?,
             s => return Err(format!("unexpected argument `{s}` to `shot`")),
         }
@@ -277,8 +312,10 @@ Usage:
                                       argon2 hash for security.pin
   paneld shot -o FILE.png [--page P] [--size WxH] [--settle MS]
               [--rotation DEG] [--tap X,Y | --hold X,Y | --wait MS
+               | --down X,Y | --up
                | --set VAR=VALUE | --source NAME=VALUE]... [--verify]
-              [--fuzz N [--seed S]] [--no-sources]
+              [--fuzz N [--seed S] [--fuzz-taps]] [--no-sources]
+              [--no-actions]
                                       Render the config headless to a PNG,
                                       after the given steps (runs sources
                                       and touched actions for real);
@@ -668,18 +705,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         let since_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let secs = since_epoch.as_secs() as i64;
-        if live.clock_drawn != Some((tick, tick.key(secs))) {
-            match tick {
-                clock::Tick::Second => {
-                    live.changes.now_second = true;
-                    if live.minute_drawn != Some(clock::Tick::Minute.key(secs)) {
-                        live.changes.now_minute = true;
-                    }
-                }
-                clock::Tick::Minute => live.changes.now_minute = true,
-            }
-        }
+        note_clock(live, tick, since_epoch.as_secs() as i64);
         // A little past the change, so the clock has moved when we look.
         paneld_ui::wake_within(tick.ms_to_next(since_epoch) + 2);
     }
@@ -698,6 +724,14 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     }
     // Vars the action worker wrote (a `set`) count whatever told us.
     note_vars(live);
+    // The user in the middle of something on the page: a finger down
+    // (a press, a slider or roller dragged) or a dropdown's list open.
+    let touch = live.current_page == live.rendered_page && paneld_ui::interacting();
+    // What waited for the release goes now.
+    if !touch && !live.held.is_empty() {
+        let held = std::mem::take(&mut live.held);
+        live.changes.merge(held);
+    }
     let dirty = live.rebuild || !live.changes.is_empty();
     // Asleep: no redraws (ADR 0001, idle means asleep); what changed
     // is kept for the wake, which builds the page afresh.
@@ -709,11 +743,12 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     if paneld_ui::page_transition_running() {
         return;
     }
-    // Nor while the user is in the middle of something on it (a finger
-    // down, a slider or roller dragged, a dropdown open): a redraw would
-    // drop the press or close the list. It follows as soon as that ends
-    // (a release wakes the loop). A navigation goes ahead.
-    if live.current_page == live.rendered_page && paneld_ui::interacting() {
+    // Nor built afresh while the user touches it: that would drop the
+    // press or close the list. It follows as soon as that ends (a
+    // release wakes the loop). An update goes ahead, leaving what is
+    // held and any change of structure for then (ADR 0024, "Touch").
+    // A navigation goes ahead.
+    if touch && (live.rebuild || live.instant || live.release_fonts || !updates_on()) {
         return;
     }
     let perf_t0 = perf_on().then(std::time::Instant::now);
@@ -729,7 +764,6 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     };
     let mut perf_lap = perf_t0;
     test_delay();
-    let drawn_at = clock::unix_now();
     // The runs as the context has them: a run that started or ended
     // since its source's message was read counts here, not later.
     let running = sources::running_names();
@@ -738,6 +772,18 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     }
     let ctx = build_ctx_running(&live.source_values, &live.theme, &live.vars, Some(&live.alerts), &running);
     live.last_running = running;
+    // The clock as the context has it: a minute (or second) that turned
+    // since it was looked at above counts here too.
+    let drawn_at = match ctx.get("now") {
+        Some(paneld_ui::Value::Map(m)) => match m.get("unix") {
+            Some(paneld_ui::Value::Int(t)) => *t,
+            _ => clock::unix_now(),
+        },
+        _ => clock::unix_now(),
+    };
+    if let Some(tick) = visible::clock_on_page() {
+        note_clock(live, tick, drawn_at);
+    }
     // What the page is updated from is this context: its vars are the
     // ones to tell changes by (the action worker may have set one since
     // the diff above).
@@ -755,21 +801,28 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         let made_before = paneld_ui::nodes::made_count();
         match paneld_ui::update_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, &changes) {
             paneld_ui::Updated::Nothing => {
-                // Nothing on the page reads it: so says a fresh render too.
-                if verify_on() {
+                // Nothing on the page reads it: so says a fresh render too
+                // (once nothing waits for a release).
+                if verify_on() && live.held.is_empty() {
                     if let Err(e) = paneld_ui::verify_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, screen) {
                         eprintln!("paneld: verify: page `{}` left as it was for {} differs from a fresh render: {e}", live.current_page, changes.describe());
                         std::process::exit(3);
                     }
                 }
             }
-            paneld_ui::Updated::Done { visited, reapplied, redrawn } => {
+            paneld_ui::Updated::Done { visited, reapplied, redrawn, restructured, held } => {
                 UPDATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if verify_on() {
+                    if let Err(e) = paneld_ui::verify_held() {
+                        eprintln!("paneld: verify: page `{}` updated for {}: {e}", live.current_page, changes.describe());
+                        std::process::exit(3);
+                    }
+                }
                 if let Some(t0) = perf_t0 {
                     let perf_walk = lap(&mut perf_lap);
                     let perf_fine = paneld_ui::perf::take();
                     eprintln!(
-                        "perf update page={} us={} ctx={} walk={} [{}] visited={visited} reapplied={reapplied} redrawn={redrawn} made={} changes={} at={}",
+                        "perf update page={} us={} ctx={} walk={} [{}] visited={visited} reapplied={reapplied} redrawn={redrawn} restructured={restructured} held={held} made={} changes={} at={}",
                         live.current_page,
                         t0.elapsed().as_micros(),
                         perf_ctx,
@@ -780,7 +833,10 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                         paneld_ui::perf::mono_us(),
                     );
                 }
-                if verify_on() {
+                if held {
+                    // Done again on release; compared then.
+                    live.held.merge(changes);
+                } else if verify_on() && live.held.is_empty() {
                     if let Err(e) = paneld_ui::verify_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, screen) {
                         eprintln!("paneld: verify: page `{}` updated for {} differs from a fresh render: {e}", live.current_page, changes.describe());
                         std::process::exit(3);
@@ -793,6 +849,10 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 }
                 full = true;
                 live.changes.merge(changes);
+                // Under a finger: built after the release.
+                if touch {
+                    return;
+                }
             }
         }
     }
@@ -805,6 +865,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     if full {
         live.rebuild = false;
         live.changes = paneld_ui::Changes::default();
+        live.held = paneld_ui::Changes::default();
         // A poll landing mid-entry must not wipe digits the user
         // is typing into a keypad on the same page.
         let typed = paneld_ui::snapshot_inputs();
@@ -878,6 +939,22 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     live.ago_due = min_due(paneld_ui::page_ago_due(), age_due(live));
     live.clock_drawn = visible::clock_on_page().map(|t| (t, t.key(drawn_at)));
     live.minute_drawn = Some(clock::Tick::Minute.key(drawn_at));
+}
+
+/// The clock the page shows (`tick`) has moved on by Unix time `secs`
+/// since it was drawn: its readers look again.
+fn note_clock(live: &mut LiveState, tick: clock::Tick, secs: i64) {
+    if live.clock_drawn != Some((tick, tick.key(secs))) {
+        match tick {
+            clock::Tick::Second => {
+                live.changes.now_second = true;
+                if live.minute_drawn != Some(clock::Tick::Minute.key(secs)) {
+                    live.changes.now_minute = true;
+                }
+            }
+            clock::Tick::Minute => live.changes.now_minute = true,
+        }
+    }
 }
 
 /// `PANELD_TEST_DELAY_MS`: a pause before the page's context is taken,
@@ -1074,8 +1151,12 @@ struct LiveState {
     toast_until: Option<std::time::Instant>,
     /// What changed since the page was drawn or updated (ADR 0024),
     /// for the next `process`; kept while it cannot be shown (asleep,
-    /// a page transition, a finger down).
+    /// a page transition).
     changes: paneld_ui::Changes,
+    /// Changes an update made while the user touched the page, with
+    /// what they hold (or a change of structure) left for the release:
+    /// run again then.
+    held: paneld_ui::Changes,
     /// The page must be built afresh (a navigation, a theme switch, a
     /// wake, or what an update cannot do).
     rebuild: bool,
@@ -1430,6 +1511,7 @@ fn setup_live_state(
         previous_page: None,
         toast_until: None,
         changes: paneld_ui::Changes::default(),
+        held: paneld_ui::Changes::default(),
         rebuild: false,
         last_vars,
         minute_drawn: Some(clock::Tick::Minute.key(drawn_at)),
@@ -1706,6 +1788,11 @@ struct ScreenJob {
 }
 
 fn run_screen_job(job: ScreenJob) {
+    // A shot draws the page, it does not drive the panel it may run
+    // beside (the backlight of the device's own daemon).
+    if IN_SHOT.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let mut ctx = paneld_ui::Context::new();
     if let Some(l) = job.level {
         ctx.insert("level".into(), paneld_ui::Value::Int(l.into()));
@@ -1766,6 +1853,13 @@ fn dispatch(live: &mut LiveState, call: actions::Call) {
             busy,
         },
     );
+    // `paneld shot --no-actions`: it ends at once, as done, having run
+    // nothing.
+    if NO_ACTIONS.load(std::sync::atomic::Ordering::Relaxed) {
+        let key = actions::run_key(&call.name, &call.args);
+        let _ = live.event_tx.send(paneld_ui::UiEvent::ActionDone { name: call.name, key, ok: true, result: paneld_ui::Value::Null });
+        return;
+    }
     let _ = live.action_tx.send(call);
 }
 
@@ -2164,6 +2258,8 @@ fn run_shot(o: ShotOpts) -> ExitCode {
     }
     let screen = ui.screen();
     NO_SOURCES.store(o.no_sources, std::sync::atomic::Ordering::Relaxed);
+    IN_SHOT.store(true, std::sync::atomic::Ordering::Relaxed);
+    NO_ACTIONS.store(o.no_actions, std::sync::atomic::Ordering::Relaxed);
     // A snapshot must never touch the real alert state file.
     let scratch_state = std::env::temp_dir().join(format!("paneld-shot-{}.state", std::process::id()));
     let mut live = match setup_live_state(&o.config, &screen, Some(&scratch_state), None) {
@@ -2190,16 +2286,38 @@ fn run_shot(o: ShotOpts) -> ExitCode {
     let mut verified = Ok(());
     let mut check = |live: &mut LiveState, mem: &mut paneld_ui::MemDisplay| {
         if o.verify && verified.is_ok() {
+            // A clock tick since the last pass is drawn first.
+            process(live, &screen);
+            let t = clock::unix_now();
             verified = verify_picture(&ui, mem, live, &screen);
+            // The clock moved on meanwhile: the fresh page shows a time
+            // the page is drawn with only once the loop sees the tick.
+            if verified.is_err() && clock::unix_now() != t {
+                process(live, &screen);
+                verified = verify_picture(&ui, mem, live, &screen);
+            }
         }
     };
     check(&mut live, &mut mem);
+    let mut finger: Option<(i32, i32)> = None;
     for step in &o.taps {
         match step {
             ShotStep::Touch { x, y, press_ms } => {
                 mem.set_pointer(*x, *y, true);
                 settle(&mut live, *press_ms);
                 mem.set_pointer(*x, *y, false);
+                settle(&mut live, o.settle_ms);
+            }
+            ShotStep::Down { x, y } => {
+                mem.set_pointer(*x, *y, true);
+                finger = Some((*x, *y));
+                settle(&mut live, o.settle_ms);
+                // What is drawn under a finger is compared after.
+                continue;
+            }
+            ShotStep::Up => {
+                let (x, y) = finger.take().unwrap_or((0, 0));
+                mem.set_pointer(x, y, false);
                 settle(&mut live, o.settle_ms);
             }
             ShotStep::Wait(ms) => settle(&mut live, *ms),
@@ -2211,20 +2329,71 @@ fn run_shot(o: ShotOpts) -> ExitCode {
                 settle(&mut live, o.settle_ms);
             }
             ShotStep::Source { name, value } => {
-                inject_source(&mut live, name, shot_value(value));
+                match shot_value(value) {
+                    Ok(v) => inject_source(&mut live, name, v),
+                    Err(e) => {
+                        eprintln!("paneld shot: --source {name}: {e}");
+                        live.sources_shutdown.stop();
+                        let _ = std::fs::remove_file(&scratch_state);
+                        return ExitCode::from(1);
+                    }
+                }
                 settle(&mut live, o.settle_ms);
             }
         }
-        check(&mut live, &mut mem);
+        if finger.is_none() {
+            check(&mut live, &mut mem);
+        }
     }
     if o.fuzz > 0 {
         let mut rng = o.seed.max(1);
         let mut runs = Vec::new();
+        let (w, h) = mem.size();
+        let mut held_for = 0;
         for _ in 0..o.fuzz {
+            let at = |rng: &mut u64| ((next_rand(rng) % w as u64) as i32, (next_rand(rng) % h as u64) as i32);
+            // A finger put down for one to four passes' changes (ADR
+            // 0024, "Touch"), dragged now and then; or a tap (which may
+            // open a dropdown and leave it open).
+            if o.fuzz_taps && finger.is_none() && next_rand(&mut rng) % 5 == 0 {
+                let (x, y) = at(&mut rng);
+                mem.set_pointer(x, y, true);
+                settle(&mut live, 40);
+                finger = Some((x, y));
+                held_for = 1 + next_rand(&mut rng) % 4;
+            } else if let Some((x, y)) = finger.filter(|_| next_rand(&mut rng) % 3 == 0) {
+                let (dx, dy) = ((next_rand(&mut rng) % 41) as i32 - 20, (next_rand(&mut rng) % 41) as i32 - 20);
+                let to = ((x + dx).clamp(0, w as i32 - 1), (y + dy).clamp(0, h as i32 - 1));
+                mem.set_pointer(to.0, to.1, true);
+                finger = Some(to);
+            }
             // Up to three changes land in one pass.
             for _ in 0..1 + next_rand(&mut rng) % 3 {
                 fuzz_step(&mut live, &mut rng, &mut runs);
             }
+            settle(&mut live, 40);
+            if let Some((x, y)) = finger {
+                held_for = held_for.saturating_sub(1);
+                if held_for == 0 {
+                    mem.set_pointer(x, y, false);
+                    finger = None;
+                    settle(&mut live, 40);
+                }
+            } else if o.fuzz_taps && next_rand(&mut rng) % 8 == 0 {
+                let (x, y) = at(&mut rng);
+                mem.set_pointer(x, y, true);
+                settle(&mut live, 60);
+                mem.set_pointer(x, y, false);
+                settle(&mut live, 60);
+            }
+            // A tap that went to another page: back to the one under test.
+            if let Some(page) = o.page.as_ref().filter(|p| finger.is_none() && live.current_page != **p) {
+                let _ = live.event_tx.send(paneld_ui::UiEvent::Goto { page: page.clone() });
+                settle(&mut live, 60);
+            }
+        }
+        if let Some((x, y)) = finger.take() {
+            mem.set_pointer(x, y, false);
             settle(&mut live, 40);
         }
         drop(runs);
@@ -2264,11 +2433,17 @@ fn shot_set(live: &mut LiveState, var: &str, raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A value written on the command line: a number, a bool, else text.
-fn shot_value(raw: &str) -> paneld_ui::Value {
+/// A value written on the command line: a number, a bool, else text;
+/// `@FILE`: the JSON in that file (a source's demo data), relative to
+/// the current directory.
+fn shot_value(raw: &str) -> Result<paneld_ui::Value, String> {
     use paneld_ui::Value;
     let t = raw.trim();
-    if let Ok(n) = t.parse::<i64>() {
+    if let Some(path) = t.strip_prefix('@') {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        return sources::parse_json(&text).ok_or_else(|| format!("{path}: not JSON"));
+    }
+    Ok(if let Ok(n) = t.parse::<i64>() {
         Value::Int(n)
     } else if let Ok(d) = t.parse::<f64>() {
         Value::Double(d)
@@ -2276,7 +2451,7 @@ fn shot_value(raw: &str) -> paneld_ui::Value {
         Value::Bool(b)
     } else {
         Value::String(raw.to_string())
-    }
+    })
 }
 
 /// A new result of source `name` whose `value` is `value`, the rest as
@@ -2305,6 +2480,82 @@ fn next_rand(state: &mut u64) -> u64 {
     x ^= x << 17;
     *state = x;
     x
+}
+
+/// `l` changed as a `repeat`'s list changes: an item gone, one more (a
+/// copy, so with the same key; or with a key of its own), two swapped,
+/// the order reversed or turned, an item's key or another field
+/// changed. Keys come from a small pool, so they come back.
+fn fuzz_list(rng: &mut u64, l: &[paneld_ui::Value]) -> Vec<paneld_ui::Value> {
+    use paneld_ui::Value;
+    let pick = |rng: &mut u64, n: usize| (next_rand(rng) as usize) % n.max(1);
+    let mut l = l.to_vec();
+    let key = |rng: &mut u64| Value::String(format!("fz{}", next_rand(rng) % 6));
+    // A new item: like one there, else made up.
+    let fresh = |rng: &mut u64, l: &[Value]| -> Value {
+        let mut m = match l.get(pick(rng, l.len())) {
+            Some(Value::Map(m)) => m.clone(),
+            Some(other) => return other.clone(),
+            None => {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("state".to_string(), Value::String(["ok", "critical", "warning"][pick(rng, 3)].into()));
+                m.insert("status".to_string(), Value::String(["running", "stopped"][pick(rng, 2)].into()));
+                m.insert("value".to_string(), Value::Double((next_rand(rng) % 100) as f64));
+                m
+            }
+        };
+        let k = key(rng);
+        m.insert("id".into(), k.clone());
+        m.insert("name".into(), k);
+        Value::Map(m)
+    };
+    let n = l.len();
+    match next_rand(rng) % 8 {
+        0 if n > 0 => {
+            l.remove(pick(rng, n));
+        }
+        1 if n > 0 => {
+            let copy = l[pick(rng, n)].clone();
+            l.insert(pick(rng, n + 1), copy);
+        }
+        2 if n > 1 => l.swap(pick(rng, n), pick(rng, n)),
+        3 => l.reverse(),
+        4 if n > 0 => l.rotate_left(1),
+        5 if n > 0 => {
+            let i = pick(rng, n);
+            if let Value::Map(m) = &mut l[i] {
+                let k = key(rng);
+                for f in ["id", "name"] {
+                    if m.contains_key(f) {
+                        m.insert(f.into(), k.clone());
+                    }
+                }
+            }
+        }
+        6 if n > 0 => {
+            let i = pick(rng, n);
+            if let Value::Map(m) = &mut l[i] {
+                let fields: Vec<String> = m.keys().filter(|k| !matches!(k.as_str(), "id" | "name")).cloned().collect();
+                if !fields.is_empty() {
+                    let f = fields[pick(rng, fields.len())].clone();
+                    let v = match m.get(&f) {
+                        Some(Value::Bool(b)) => Value::Bool(!b),
+                        Some(Value::Int(x)) => Value::Int(x + 1),
+                        Some(Value::Double(x)) => Value::Double(x + 7.5),
+                        Some(Value::String(_)) => Value::String(["ok", "critical", "running", "stopped", ""][pick(rng, 5)].into()),
+                        Some(other) => other.clone(),
+                        None => Value::Null,
+                    };
+                    m.insert(f, v);
+                }
+            }
+        }
+        _ => {
+            let item = fresh(rng, &l);
+            l.insert(pick(rng, n + 1), item);
+        }
+    }
+    l
 }
 
 /// One random change (`paneld shot --fuzz`): a source's value, a var,
@@ -2345,17 +2596,24 @@ fn fuzz_step(live: &mut LiveState, rng: &mut u64, runs: &mut Vec<(String, source
                 (0, v) => v.clone(),
                 (_, Value::Bool(b)) => Value::Bool(!b),
                 (_, Value::String(_)) => Value::String(texts[pick(rng, texts.len())].into()),
-                (_, Value::List(l)) if !l.is_empty() => {
-                    let mut l = l.clone();
-                    if next_rand(rng) % 2 == 0 {
-                        l.pop();
-                    } else {
-                        let first = l[0].clone();
-                        l.push(first);
+                // A list a `repeat` shows: items come, go, move, change
+                // keys (ADR 0024 phase 2).
+                (_, Value::List(l)) => Value::List(fuzz_list(rng, l)),
+                // One with lists in it (`value.rooms`): one of them.
+                (_, Value::Map(m)) => {
+                    let lists: Vec<&String> = m.iter().filter(|(_, v)| matches!(v, Value::List(_))).map(|(k, _)| k).collect();
+                    let mut m = m.clone();
+                    if !lists.is_empty() {
+                        let k = lists[pick(rng, lists.len())].clone();
+                        if let Some(Value::List(l)) = m.get(&k) {
+                            let l = fuzz_list(rng, l);
+                            m.insert(k, Value::List(l));
+                        }
                     }
-                    Value::List(l)
+                    Value::Map(m)
                 }
-                (_, Value::List(_)) | (_, Value::Map(_)) => old.clone(),
+                // No value yet (no source runs): sometimes a list.
+                (1, Value::Null) => Value::List(fuzz_list(rng, &[])),
                 _ => Value::Double(numbers[pick(rng, numbers.len())]),
             };
             inject_source(live, &name, value);
@@ -2886,6 +3144,11 @@ fn rss_kb() -> Option<i64> {
 static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// `paneld shot --no-sources`: no source command runs.
 static NO_SOURCES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `paneld shot --no-actions`: no action command runs (each ends at
+/// once, as done).
+static NO_ACTIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `paneld shot`: no screen command (`dim`, `power`) runs.
+static IN_SHOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Updates in place since start, for `ctl status` (`updates`).
 static UPDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

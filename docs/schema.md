@@ -285,7 +285,7 @@ Layout blocks are transparent and borderless: only a `background`, `border` or t
 | `stack` | | Children on top of each other, placed with `x`, `y`, `anchor` |
 | `scroll` | `direction` (`vertical`, `horizontal`), `snap` (`none`, `start`, `center`), `gap`, `align` | Children laid out as a column or row, scrollable along it. Fills the parent's width and, in a column, the space left, unless `height` or `grow` is set |
 | `slot` | | Inside components only |
-| `repeat <name> in {{ list }} { }` | | Body once per item |
+| `repeat <name> in {{ list }} { }` | | Body once per item. Items are told apart by their `id`, else `name`, else position: when the list changes, the items it still has keep their widgets (what the user changed in them, and their motion), new ones are added and the rest removed ([ADR 0024](decisions/0024-in-place-updates.md)). Items with the same `id` are told apart by their order among themselves (logged once) |
 
 ### 8.3 Visuals
 
@@ -519,7 +519,7 @@ Redraws: a page whose expressions (its own, its components' and the shell's) rea
 | `sources.x.age` | on the same steps, counted from `x`'s `at` |
 | `now.second`, `now.unix`, or `now` whole (`size(now)`, `now[k]`) | every second |
 
-While the screen sleeps nothing is redrawn; it is drawn as it is on waking. No redraw of the page shown (the clock, a new source value) happens while the user is in the middle of something on it: a finger down (a press, a slider or roller dragged) or a dropdown's list open. It waits until that ends, then follows at once; a navigation goes ahead. Each redraw rebuilds the whole page: a seconds clock costs about 0.3% of an x86 core on a simple page (measured over 30 s, 34 redraws), roughly 10 times that on the Pi 3B+ and more on a busy page, and keeps the loop waking each second. Prefer `now.time` unless the seconds matter. `ago(t)` counts from `now.unix` (`ago(now.unix)` is `just now`); a page with `ago()` costs one redraw per change of a text it shows, no more.
+While the screen sleeps nothing is redrawn; it is drawn as it is on waking. While the user is in the middle of something on the page shown (a finger down: a press, a slider or roller dragged; or a dropdown's list open), what changes (the clock, a new source value) is still shown, except on what the finger holds, what is under it and around it, and the `repeat` item it is in (a finger on a `scroll`'s or the page's background holds nothing of it), and except a change of structure (`repeat` items coming or going, a widget built again): those wait until it ends, then follow at once; a navigation goes ahead. If what changes moves what the finger holds or hides it, the press is cancelled: lifting the finger taps nothing. A change redraws only the widgets that show it ([ADR 0024](decisions/0024-in-place-updates.md)): a seconds clock costs one text redrawn each second, and keeps the loop waking each second. Prefer `now.time` unless the seconds matter. `ago(t)` counts from `now.unix` (`ago(now.unix)` is `just now`); a page with `ago()` costs one redraw per change of a text it shows, no more.
 
 Functions (`paneld check` refuses any other name, or a wrong number of arguments):
 

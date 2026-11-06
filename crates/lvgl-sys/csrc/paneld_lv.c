@@ -788,3 +788,18 @@ uint32_t lv_paneld_anim_count(void * var, lv_anim_custom_exec_cb_t not_cb)
     }
     return n;
 }
+
+void lv_paneld_size_again(lv_obj_t * obj)
+{
+    obj->w_layout = 0;
+    obj->h_layout = 0;
+    lv_obj_mark_layout_as_dirty(obj);
+}
+
+#include "src/indev/lv_indev_private.h"
+
+lv_obj_t * lv_paneld_indev_pressed_obj(const lv_indev_t * indev)
+{
+    if(indev == NULL || indev->state != LV_INDEV_STATE_PRESSED) return NULL;
+    return indev->pointer.act_obj;
+}
