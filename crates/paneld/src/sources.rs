@@ -82,14 +82,19 @@ impl Drop for Run {
     }
 }
 
+/// The sources with a run under way now (schema 4's `running`): one
+/// snapshot, so a context and the changes told from it agree.
+pub fn running_names() -> std::collections::BTreeSet<String> {
+    RUNNING.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+}
+
 /// Schema 4's fields that follow the clock and the runs, put into each
 /// source map as a context is built: `running`, and `age` (whole
 /// seconds since `at`, for a source that has a result).
-pub fn add_live_fields(sources: &mut BTreeMap<String, Value>, now_unix: i64) {
-    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+pub fn add_live_fields(sources: &mut BTreeMap<String, Value>, now_unix: i64, running: &std::collections::BTreeSet<String>) {
     for (name, v) in sources.iter_mut() {
         let Value::Map(m) = v else { continue };
-        m.insert("running".into(), Value::Bool(running.contains_key(name)));
+        m.insert("running".into(), Value::Bool(running.contains(name)));
         if let Some(Value::Int(at)) = m.get("at") {
             let age = now_unix.saturating_sub(*at).max(0);
             m.insert("age".into(), Value::Int(age));
@@ -331,6 +336,12 @@ pub struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
+    /// A handle with nothing to stop (no source runs: `paneld shot
+    /// --no-sources`).
+    pub fn idle() -> ShutdownHandle {
+        ShutdownHandle { flag: Arc::new(AtomicBool::new(false)), stream_pgids: Arc::new(Mutex::new(Vec::new())) }
+    }
+
     pub fn stop(&self) {
         self.flag.store(true, Ordering::SeqCst);
         // Pollers wait on the visibility signal: wake them to see it.
@@ -1189,16 +1200,16 @@ mod tests {
         };
         let run = Run::start("a", None);
         let overlapping = Run::start("a", None);
-        add_live_fields(&mut m, 1090);
+        add_live_fields(&mut m, 1090, &running_names());
         assert_eq!(field(&m, "a", "running"), Some(Value::Bool(true)));
         assert_eq!(field(&m, "a", "age"), Some(Value::Int(90)));
         assert_eq!(field(&m, "b", "running"), Some(Value::Bool(false)));
         assert_eq!(field(&m, "b", "age"), None, "no result, no age");
         drop(run);
-        add_live_fields(&mut m, 1100);
+        add_live_fields(&mut m, 1100, &running_names());
         assert_eq!(field(&m, "a", "running"), Some(Value::Bool(true)), "a refresh still runs");
         drop(overlapping);
-        add_live_fields(&mut m, 1100);
+        add_live_fields(&mut m, 1100, &running_names());
         assert_eq!(field(&m, "a", "running"), Some(Value::Bool(false)));
         assert_eq!(field(&m, "a", "age"), Some(Value::Int(100)));
     }

@@ -120,6 +120,12 @@ struct State {
     next_instant: bool,
     /// The next render starts afresh (a reload, a theme switch).
     fresh: bool,
+    /// An update in place (ADR 0024): what is drawn now is recorded
+    /// over what was shown, since the rest stays as it was.
+    updating: bool,
+    /// A fresh render to compare with: every value at its target,
+    /// nothing remembered.
+    scratch: bool,
 }
 
 thread_local! {
@@ -158,6 +164,33 @@ pub(crate) fn begin(page: &str, theme: Option<&BTreeMap<String, Value>>) {
     });
 }
 
+/// Start updating `page` in place (it is the page drawn last).
+pub(crate) fn begin_update(theme: Option<&BTreeMap<String, Value>>) {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.settings = Settings::from_theme(theme);
+        s.instant = std::mem::take(&mut s.next_instant);
+        s.first = false;
+        s.updating = true;
+        s.scope.clear();
+        s.chart_points = 0;
+    });
+}
+
+pub(crate) fn end_update() {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.updating = false;
+        s.scope.clear();
+    });
+}
+
+/// Draw a scratch copy (verify) from `on` until `off`: no motion, and
+/// nothing of it remembered.
+pub(crate) fn scratch(on: bool) {
+    STATE.with(|s| s.borrow_mut().scratch = on);
+}
+
 /// Done drawing: what was drawn is what the next render moves from.
 pub(crate) fn end() {
     STATE.with(|s| {
@@ -175,6 +208,9 @@ pub(crate) fn settings() -> Settings {
 /// Enter a `repeat` item (`key`: its `id` or `name`, else its
 /// position) or a component call (its place in the config).
 pub(crate) fn push_scope(key: impl Hash) {
+    if STATE.with(|s| s.borrow().scratch) {
+        return;
+    }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut h);
     STATE.with(|s| s.borrow_mut().scope.push(h.finish()));
@@ -182,6 +218,9 @@ pub(crate) fn push_scope(key: impl Hash) {
 
 pub(crate) fn pop_scope() {
     STATE.with(|s| {
+        if s.borrow().scratch {
+            return;
+        }
         s.borrow_mut().scope.pop();
     });
 }
@@ -215,8 +254,9 @@ fn key_tagged(s: &State, node: &Block, tag: u8) -> u64 {
 }
 
 fn record(s: &mut State, key: u64, shown: Shown) {
-    if s.next.len() < MAX_ENTRIES || s.next.contains_key(&key) {
-        s.next.insert(key, shown);
+    let map = if s.updating { &mut s.prev } else { &mut s.next };
+    if map.len() < MAX_ENTRIES || map.contains_key(&key) {
+        map.insert(key, shown);
     }
 }
 
@@ -225,6 +265,9 @@ fn record(s: &mut State, key: u64, shown: Shown) {
 pub(crate) fn gauge(node: &Block, to: i32) -> Option<(i32, u32)> {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
+        if s.scratch {
+            return None;
+        }
         let key = key_of(&s, node);
         let now = tick_ms();
         let ms = if s.instant { 0 } else { s.settings.value_ms() };
@@ -250,6 +293,9 @@ pub(crate) fn gauge(node: &Block, to: i32) -> Option<(i32, u32)> {
 pub(crate) fn chart(node: &Block, to: &[Vec<Option<i32>>]) -> Option<(Vec<SeriesTween>, u32)> {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
+        if s.scratch {
+            return None;
+        }
         let key = key_of(&s, node);
         let now = tick_ms();
         let points: usize = to.iter().map(Vec::len).sum();
@@ -323,10 +369,18 @@ fn shifted(shown: &[Option<i32>], was: &[Option<i32>], to: &[Option<i32>]) -> Ve
 pub(crate) fn enter(node: &Block, t: Transition, hidden: bool) -> Option<(bool, f64, u32)> {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
-        if hidden {
+        if s.scratch {
             return None;
         }
         let key = key_tagged(&s, node, 1);
+        if hidden {
+            // Hidden now: it comes in when it shows again, as after a
+            // render that did not show it.
+            if s.updating {
+                s.prev.remove(&key);
+            }
+            return None;
+        }
         let now = tick_ms();
         let can = !s.first && !s.instant && t.runs_at(s.settings.level);
         let (from, ms) = match s.prev.get(&key) {

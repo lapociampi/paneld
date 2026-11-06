@@ -112,28 +112,6 @@ pub fn is_shown(name: &str) -> (bool, u64) {
     })
 }
 
-/// Whether the page on screen (with its shell) reads source `name`,
-/// so a new value needs a redraw. Before any page is drawn, yes;
-/// asleep, no (the wake redraws).
-pub fn on_page(name: &str) -> bool {
-    with(|s| match &s.shown {
-        None => true,
-        Some(_) if s.asleep => false,
-        Some(p) => s.pages.get(p).is_some_and(|set| set.contains(name) || set.contains(ALL)),
-    })
-}
-
-/// Whether the page on screen shows `sources.<name>.running`, so a
-/// run starting needs a redraw (its end comes with its value).
-pub fn running_on_page(name: &str) -> bool {
-    // Not through `ALL`: a computed name does not subscribe.
-    let key = format!("{name}:running");
-    with(|s| match &s.shown {
-        Some(p) if !s.asleep => s.pages.get(p).is_some_and(|set| set.contains(&key)),
-        _ => false,
-    })
-}
-
 /// The sources whose `age` the page on screen reads by name
 /// (`sources.x.age`), timed by the main loop as `ago()` texts are.
 /// Empty before a page is drawn and asleep.
@@ -437,14 +415,12 @@ mod tests {
         set_asleep(false);
         show("a");
         assert_eq!(ages_on_page(), vec!["x".to_string()]);
-        assert!(!running_on_page("x"));
         show("b");
-        assert!(running_on_page("x") && !running_on_page("y"));
         set_asleep(true);
         assert!(ages_on_page().is_empty(), "asleep");
         set_asleep(false);
         show("e");
-        assert!(ages_on_page().is_empty() && !running_on_page("x"), "a computed name does not subscribe");
+        assert!(ages_on_page().is_empty(), "a computed name does not subscribe");
         set_asleep(false);
     }
 
@@ -467,13 +443,7 @@ mod tests {
         set_asleep(false);
         show("nope");
         assert!(!is_shown("x").0);
-        // A redraw follows the page alone: an alert's source is polled
-        // but not on it.
         show("a");
-        assert!(on_page("x") && !on_page("z") && !on_page("y"));
-        set_asleep(true);
-        assert!(!on_page("x"), "asleep, the wake redraws");
-        set_asleep(false);
         // A whole-`sources` read by an alert keeps every source going.
         install(&doc("alert a { when = {{ size(sources) > 1 }} }\npage p { }\n"), &BTreeMap::new());
         show("p");

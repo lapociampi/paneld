@@ -805,7 +805,7 @@ fn ctx_with_vars_and_args(
 ) -> Context {
     let mut ctx = base.clone();
     let sources_snapshot = sources.lock().unwrap().clone();
-    crate::remotes::expose(&mut ctx, sources_snapshot);
+    crate::remotes::expose(&mut ctx, sources_snapshot, &crate::sources::running_names());
     let snapshot = vars.lock().unwrap().clone();
     ctx.insert("vars".into(), Value::Map(snapshot));
     crate::clock::insert(&mut ctx);

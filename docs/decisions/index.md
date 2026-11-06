@@ -33,4 +33,4 @@ order: 7
 | [0021](0021-theme-folders.md) | Theme folders are found by name beside the config |
 | [0022](0022-backgrounds-shadows.md) | Backgrounds are a color, a gradient or a fitted image; shadows are capped |
 | [0023](0023-motion.md) | Motion runs once, from what was shown, and never while asleep |
-| [0024](0024-in-place-updates.md) | Pages update in place; recent pages are kept (proposed) |
+| [0024](0024-in-place-updates.md) | Pages update in place; recent pages are kept (phase 1 done) |

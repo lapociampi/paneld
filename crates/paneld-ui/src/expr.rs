@@ -854,6 +854,12 @@ pub fn take_ago_next() -> Option<i64> {
     AGO_NEXT.with(|n| n.take())
 }
 
+/// Put back what [`take_ago_next`] took (a scratch render evaluated
+/// `ago()` in between, for nothing on screen).
+pub(crate) fn restore_ago_next(v: Option<i64>) {
+    AGO_NEXT.with(|n| n.set(v));
+}
+
 /// When something `secs` old at `now` should be shown again, on
 /// `ago()`'s steps (each minute under an hour, then each hour, then
 /// each day), in Unix seconds: how a page showing `sources.x.age` is

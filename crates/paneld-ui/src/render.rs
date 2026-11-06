@@ -27,6 +27,7 @@ use paneld_config::parse::{AssignTarget, Block, Document, Item};
 use paneld_config::value::{classify, ValueShape};
 
 use crate::expr::{eval_in, Context, Scope, Value};
+use crate::nodes::{self, Dep, Kind, Mode, Visit};
 use crate::ui::{
     ActionArg, Anchor, FlexAlign, ImageFit, InlineSetItem, Obj, ScrollSnap, SelfAlign, Size, TextOverflow, Track, Tracks,
     Trigger, UiEvent, ValueWidget,
@@ -38,6 +39,8 @@ use crate::ui::{
 struct SlotCtx<'a> {
     children: &'a [Item],
     outer_ctx: &'a Scope<'a>,
+    /// The caller's names, as dep keys (ADR 0024).
+    frame: Option<usize>,
 }
 
 /// Show `text` as a toast on `layer` (the top layer), replacing any
@@ -64,7 +67,8 @@ pub fn render_toast(layer: &Obj<'_>, text: &str, background: &str, theme: &std::
 
 /// Render the page named `page_name` from `doc` into `screen`. If no
 /// such page exists, draws a plain "page not found" label as a
-/// diagnostic.
+/// diagnostic. The page is recorded for in-place updates
+/// ([`update_page`], ADR 0024).
 pub fn render_page(
     doc: &Document,
     page_name: &str,
@@ -72,24 +76,161 @@ pub fn render_page(
     sink: &Sender<UiEvent>,
     screen: &Obj<'_>,
 ) {
+    nodes::begin_build(page_name);
+    nodes::with_mode(Mode::Build, || draw_page(doc, page_name, ctx, sink, screen));
+}
+
+fn draw_page(doc: &Document, page_name: &str, ctx: &Context, sink: &Sender<UiEvent>, screen: &Obj<'_>) {
     let ctx = &Scope::root(ctx);
     let critical = color_of("critical", ctx);
     FAILED_BORDER.with(|c| c.set(critical.unwrap_or((0xf85149, 255))));
     // The inputs and the dialogs over this page in the theme's colors.
     crate::ui::set_input_colors(input_colors(ctx));
-    for item in &doc.items {
-        if let Item::Block(b) = item {
-            if b.kind.text == "page"
-                && b.name.as_ref().is_some_and(|n| n.text == page_name)
-            {
+    let scratch = nodes::mode() == Mode::Scratch;
+    match find_page(doc, page_name) {
+        Some(b) => {
+            if !scratch {
                 crate::motion::begin(page_name, theme_of(ctx));
-                render_page_body(b, doc, ctx, sink, screen);
+            }
+            render_page_body(b, doc, ctx, sink, screen);
+            if !scratch {
                 crate::motion::end();
-                return;
             }
         }
+        None => {
+            nodes::mark_broken("no such page");
+            screen.new_label(&format!("page `{page_name}` not found"));
+        }
     }
-    screen.new_label(&format!("page `{page_name}` not found"));
+}
+
+fn find_page<'a>(doc: &'a Document, page_name: &str) -> Option<&'a Block> {
+    doc.items.iter().find_map(|item| match item {
+        Item::Block(b) if b.kind.text == "page" && b.name.as_ref().is_some_and(|n| n.text == page_name) => Some(b),
+        _ => None,
+    })
+}
+
+/// What an update in place did (ADR 0024).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Updated {
+    /// Nothing on the page reads what changed.
+    Nothing,
+    /// Updated: records walked into, nodes set up again, objects
+    /// restyled.
+    Done { visited: usize, reapplied: usize, redrawn: usize },
+    /// It cannot be done in place: build the page again.
+    Rebuild(&'static str),
+}
+
+/// Update the page drawn last (`page_name`, by [`render_page`]) in
+/// place for `changes`, from `ctx` as it is now: only the nodes that
+/// read what changed are set up again, each as a fresh render would
+/// make it. [`Updated::Rebuild`] when that cannot be done (the caller
+/// renders the page again).
+pub fn update_page(
+    doc: &Document,
+    page_name: &str,
+    ctx: &Context,
+    sink: &Sender<UiEvent>,
+    changes: &nodes::Changes,
+) -> Updated {
+    let start = match nodes::begin_update(page_name, changes) {
+        Err(why) => return Updated::Rebuild(why),
+        Ok(None) => return Updated::Nothing,
+        Ok(Some(s)) => s,
+    };
+    let Some(page) = find_page(doc, page_name) else { return Updated::Rebuild("no such page") };
+    let scope = &Scope::root(ctx);
+    crate::motion::begin_update(theme_of(scope));
+    crate::ui::begin_update();
+    nodes::with_mode(Mode::Update, || {
+        let locals = page_locals(doc, page, scope);
+        let pctx = scope.with(&locals);
+        let page_root = Obj::from_raw(start.page_root);
+        page_items(page, doc, &pctx, sink, &page_root);
+    });
+    let redrawn = crate::ui::end_update();
+    crate::motion::end_update();
+    crate::ui::settle_backgrounds();
+    match nodes::end_update() {
+        Ok((visited, reapplied)) => Updated::Done { visited, reapplied, redrawn },
+        Err(why) => Updated::Rebuild(why),
+    }
+}
+
+/// When the soonest `ago()` text on the page drawn reads otherwise
+/// (Unix seconds).
+pub fn page_ago_due() -> Option<i64> {
+    nodes::page_ago()
+}
+
+/// The shell's or the page's items into the page root.
+fn page_items(page: &Block, doc: &Document, pctx: &Scope<'_>, sink: &Sender<UiEvent>, page_root: &Obj<'_>) {
+    match find_component(doc, "shell") {
+        // Schema 8: the `shell` component wraps every page; the page's
+        // nodes fill its `slot`.
+        Some(shell) => {
+            let slot = SlotCtx { children: &page.items, outer_ctx: pctx, frame: nodes::current_frame() };
+            render_item_list(&shell.items, doc, pctx, Some(&slot), sink, page_root);
+        }
+        None => render_item_list(&page.items, doc, pctx, None, sink, page_root),
+    }
+}
+
+/// Build page `page_name` afresh on a scratch screen, as
+/// [`render_page`] would now, and compare it with the page on screen
+/// (ADR 0024, "Correctness guard"): `Err` names the first node that
+/// differs. Nothing it draws is remembered; the scratch screen is
+/// deleted before it returns.
+pub fn verify_page(doc: &Document, page_name: &str, ctx: &Context, sink: &Sender<UiEvent>, screen: &Obj<'_>) -> Result<(), String> {
+    let Some(live) = nodes::holder() else { return Ok(()) };
+    let (scratch, due) = scratch_build(doc, page_name, ctx, sink);
+    screen.update_layout();
+    scratch.update_layout();
+    let fresh = scratch.child(0);
+    let result = match fresh {
+        Some(fresh) => crate::ui::compare_trees(&Obj::from_raw(live), &fresh),
+        None => Err("the fresh render drew nothing".to_string()),
+    };
+    scratch.delete();
+    result?;
+    // And the page is drawn again when an `ago()` on it reads otherwise,
+    // as a fresh page would be.
+    let ours = nodes::page_ago();
+    if ours != due {
+        return Err(format!("`ago()` texts timed for {ours:?}, a fresh render times them for {due:?}"));
+    }
+    Ok(())
+}
+
+/// A fresh render of `page_name` on a new screen that is not shown,
+/// with nothing of it remembered (no motion, no node table).
+pub fn scratch_page<'u>(doc: &Document, page_name: &str, ctx: &Context, sink: &Sender<UiEvent>) -> Obj<'u> {
+    scratch_build(doc, page_name, ctx, sink).0
+}
+
+/// [`scratch_page`], and when its soonest `ago()` text reads otherwise.
+fn scratch_build<'u>(doc: &Document, page_name: &str, ctx: &Context, sink: &Sender<UiEvent>) -> (Obj<'u>, Option<i64>) {
+    let scratch = Obj::new_scratch_screen();
+    let ago = crate::expr::take_ago_next();
+    crate::motion::scratch(true);
+    nodes::with_mode(Mode::Scratch, || draw_page(doc, page_name, ctx, sink, &scratch));
+    crate::motion::scratch(false);
+    let due = crate::expr::take_ago_next();
+    crate::expr::restore_ago_next(ago);
+    (scratch, due)
+}
+
+/// Show `screen` on the display (a scratch page for `paneld shot
+/// --verify`, then the real one again).
+pub fn show_screen(screen: &Obj<'_>) {
+    screen.load_screen();
+}
+
+/// Delete a scratch screen made by [`scratch_page`].
+pub fn delete_screen(screen: Obj<'_>) {
+    screen.delete();
 }
 
 fn render_page_body(
@@ -100,13 +241,18 @@ fn render_page_body(
     screen: &Obj<'_>,
 ) {
     // `page` and `nav` are visible to the shell and to the page body.
-    let locals = Context::from([("page".into(), page_info(page, ctx)), ("nav".into(), nav_entries(doc, page, ctx))]);
+    let locals = page_locals(doc, page, ctx);
     let pctx = ctx.with(&locals);
+    let _frame = (nodes::mode() == Mode::Build).then(|| nodes::push_frame(page_frame(doc, page)));
 
     // The theme's `font` is the text font of everything on the page,
     // the dialogs on the top layer included; a node's `font` wins.
     apply_font(screen, "font", theme_of(ctx));
-    apply_font(&screen.top_layer(), "font", theme_of(ctx));
+    // (A scratch copy leaves the real top layer alone: setting it, even
+    // to the same font, redraws the whole screen.)
+    if nodes::mode() != Mode::Scratch {
+        apply_font(&screen.top_layer(), "font", theme_of(ctx));
+    }
     // And `text` its text color (a dark theme's light text); widgets
     // with a box of their own keep theirs.
     if let Some((rgb, opa)) = color_of("text", ctx) {
@@ -143,23 +289,27 @@ fn render_page_body(
         page_root.set_text_color_hex(rgb, opa);
     }
 
-    match find_component(doc, "shell") {
-        // Schema 8: the `shell` component wraps every page; the page's
-        // nodes fill its `slot`.
-        Some(shell) => {
-            page_root.set_padding(0);
-            page_root.set_gap(0);
-            let slot = SlotCtx { children: &page.items, outer_ctx: &pctx };
-            render_item_list(&shell.items, doc, &pctx, Some(&slot), sink, &page_root);
-        }
-        None => {
-            page_root.set_padding(16);
-            page_root.set_gap(8);
-            render_item_list(&page.items, doc, &pctx, None, sink, &page_root);
-        }
+    if find_component(doc, "shell").is_some() {
+        page_root.set_padding(0);
+        page_root.set_gap(0);
+    } else {
+        page_root.set_padding(16);
+        page_root.set_gap(8);
     }
+    nodes::set_roots(&holder, &page_root);
+    page_items(page, doc, &pctx, sink, &page_root);
     // Image backgrounds are fitted to their node's size, known now.
     crate::ui::settle_backgrounds();
+}
+
+/// `page` and `nav`; an `ago()` in a title is timed with the page.
+fn page_locals(doc: &Document, page: &Block, ctx: &Scope<'_>) -> Context {
+    let saved = crate::expr::take_ago_next();
+    let locals = Context::from([("page".into(), page_info(page, ctx)), ("nav".into(), nav_entries(doc, page, ctx))]);
+    let due = crate::expr::take_ago_next();
+    nodes::set_page_ago(due);
+    crate::expr::restore_ago_next(min_opt(saved, due));
+    locals
 }
 
 /// `{ name, title, icon }` of a page; `title` defaults to the name.
@@ -234,6 +384,8 @@ fn is_event_handler_block(kind: &str) -> bool {
 /// Expand a `repeat BIND in {{ EXPR }} { ... }`: evaluate the
 /// source expression, iterate the resulting list, and render the
 /// contained items for each element with `BIND` bound to the item.
+/// Updating in place, the items are walked again only when their keys
+/// are the ones drawn (else the page is built again: ADR 0024 phase 1).
 fn expand_repeat(
     r: &paneld_config::parse::Repeat,
     doc: &Document,
@@ -242,36 +394,85 @@ fn expand_repeat(
     sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
 ) {
+    let mode = nodes::mode();
+    let block = r as *const paneld_config::parse::Repeat as usize;
     let body_offset = r.source.span.start + 2;
     let parsed = parse_fragment_cached(&r.source.body, r.source.span.file, body_offset);
+    let rec = match mode {
+        Mode::Update => match nodes::visit(Kind::Repeat, block, false) {
+            None | Some(Visit::Skip) => return,
+            Some(Visit::Look(i)) => Some(i),
+        },
+        Mode::Build => {
+            let mut own = Vec::new();
+            if let Some(e) = parsed.0.as_ref() {
+                nodes::expr_deps(parse_key(&parsed), e, &mut own);
+            }
+            own.sort();
+            own.dedup();
+            Some(nodes::open(Kind::Repeat, block, own, "repeat", r.source.span))
+        }
+        Mode::Off | Mode::Scratch => None,
+    };
+    let finish = |rec: Option<usize>| match (mode, rec) {
+        (Mode::Build, Some(i)) => nodes::close(i),
+        (Mode::Update, Some(i)) => nodes::leave(i),
+        _ => {}
+    };
     let (expr, diags) = (&parsed.0, &parsed.1);
+    let failed = |text: String| {
+        nodes::mark_broken("a repeat that does not draw");
+        if mode != Mode::Update {
+            parent.new_label(&text);
+        }
+    };
     if !diags.is_empty() {
-        parent.new_label(&format!("[repeat parse: {}]", diags[0].message));
-        return;
+        failed(format!("[repeat parse: {}]", diags[0].message));
+        return finish(rec);
     }
     let Some(expr) = expr.as_ref() else {
-        return;
+        return finish(rec);
     };
     let items = match eval_in(expr, ctx) {
         Ok(Value::List(xs)) => xs,
         Ok(other) => {
-            parent.new_label(&format!(
-                "[repeat: expected a list, got {}]",
-                display_type(&other)
-            ));
-            return;
+            failed(format!("[repeat: expected a list, got {}]", display_type(&other)));
+            return finish(rec);
         }
         Err(e) => {
-            parent.new_label(&format!("[repeat eval: {}]", e.message));
-            return;
+            failed(format!("[repeat eval: {}]", e.message));
+            return finish(rec);
         }
     };
+    let keys: Vec<String> = items.iter().enumerate().map(|(i, item)| crate::motion::item_key(item, i)).collect();
+    match (mode, rec) {
+        (Mode::Build, Some(i)) => nodes::set_keys(i, keys.clone()),
+        (Mode::Update, Some(i)) if nodes::keys(i) != keys => {
+            // Phase 2 diffs the items by key; until then, the page.
+            nodes::mark_broken("a repeat's items changed");
+            return finish(rec);
+        }
+        _ => {}
+    }
+    // Every item's binding reads what the list does.
+    let _frame = match (mode, rec) {
+        (Mode::Build, Some(i)) => Some(nodes::push_frame(vec![(r.binding.text.clone(), nodes::own_of(i))])),
+        _ => None,
+    };
     for (i, item) in items.into_iter().enumerate() {
-        crate::motion::push_scope(crate::motion::item_key(&item, i));
+        crate::motion::push_scope(&keys[i]);
         let inner = ctx.with_one(&r.binding.text, &item);
         render_item_list(&r.items, doc, &inner, slot, sink, parent);
         crate::motion::pop_scope();
     }
+    drop(_frame);
+    finish(rec);
+}
+
+/// The key a parse is known by in the node table's caches: its place
+/// in the parse cache.
+fn parse_key<T>(p: &std::rc::Rc<T>) -> usize {
+    std::rc::Rc::as_ptr(p) as *const () as usize
 }
 
 fn display_type(v: &Value) -> &'static str {
@@ -286,7 +487,192 @@ fn display_type(v: &Value) -> &'static str {
     }
 }
 
+thread_local! {
+    /// The next widget drawn is a component call's root: set by the
+    /// call, taken by that widget (or a nested call).
+    static ROOT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The root of the call under way was built or set up again (its
+    /// call's own keys go on it then), and its object.
+    static ROOT_REDONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ROOT_OBJ: std::cell::Cell<*mut lvgl_sys::lv_obj_t> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Update: the next widget (a call's root) is set up again whatever
+    /// it reads (its call's own keys changed).
+    static FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Update: a node under the one being walked was set up again (its
+    /// parent lays out its children again).
+    static REDONE_UNDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The widget being built is a component call's root.
+    static WIDGET_IS_ROOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The widget kinds (what is not a `slot` or a component call).
+const WIDGETS: &[&str] = &[
+    "column", "row", "stack", "grid", "scroll", "text", "button", "icon", "rect", "bar", "arc", "line", "image", "chart", "spinner",
+    "qr", "toggle", "slider", "keypad", "select",
+];
+
 fn render_node(
+    node: &Block,
+    doc: &Document,
+    ctx: &Scope<'_>,
+    slot: Option<&SlotCtx<'_>>,
+    sink: &Sender<UiEvent>,
+    parent: &Obj<'_>,
+) {
+    let kind = node.kind.text.as_str();
+    if kind == "slot" {
+        // Expand the caller's child-items here, resolving them
+        // against the OUTER context (not the component's inner
+        // scope). If there's no enclosing component call, the
+        // slot renders nothing.
+        if let Some(s) = slot {
+            let _frame = nodes::switch_frame(s.frame);
+            render_item_list(s.children, doc, s.outer_ctx, None, sink, parent);
+        }
+        return;
+    }
+    if !WIDGETS.contains(&kind) {
+        // A user-defined component: its body in place, each arg bound
+        // in a scope of its own.
+        if let Some(comp) = find_component(doc, kind) {
+            expand_component(node, comp, doc, ctx, sink, parent);
+        } else {
+            build_widget(node, doc, ctx, slot, sink, parent);
+        }
+        return;
+    }
+    let is_root = ROOT_PENDING.with(|r| r.replace(false));
+    let forced = FORCE.with(|f| f.replace(false));
+    NODE_TAP.with(|t| t.set(ROOT_TAP.with(|r| r.replace(false))));
+    let block = node as *const Block as usize;
+    let mut redone = true;
+    match nodes::mode() {
+        Mode::Build => {
+            let mut own = Vec::new();
+            node_deps(node, ctx, &mut own);
+            if kind == "icon" {
+                // A theme PNG takes the text color of what it is in.
+                nodes::union(&mut own, &nodes::ancestor_deps());
+            }
+            let idx = nodes::open(Kind::Node, block, own, kind, node.kind.span);
+            let ago = crate::expr::take_ago_next();
+            build_widget(node, doc, ctx, slot, sink, parent);
+            let mine = crate::expr::take_ago_next();
+            nodes::set_ago(idx, mine.filter(|_| nodes::reads(idx, &Dep::Ago)));
+            crate::expr::restore_ago_next(min_opt(ago, mine));
+            if is_root {
+                ROOT_OBJ.with(|r| r.set(nodes::objs(idx).first().copied().unwrap_or(std::ptr::null_mut())));
+            }
+            nodes::close(idx);
+        }
+        Mode::Update => {
+            let Some(visit) = nodes::visit(Kind::Node, block, forced) else { return };
+            let Visit::Look(idx) = visit else {
+                if is_root {
+                    ROOT_REDONE.with(|r| r.set(false));
+                }
+                return;
+            };
+            if is_root {
+                ROOT_OBJ.with(|r| r.set(nodes::objs(idx).first().copied().unwrap_or(std::ptr::null_mut())));
+            }
+            let ago = crate::expr::take_ago_next();
+            // The fingerprint is taken whenever the node is set up again
+            // (forced too), so it is always that of what is shown.
+            let own = nodes::own_hit(idx);
+            let changed = (own || forced) && nodes::fp_changed(idx, node_fp(node, ctx, parent));
+            let reapply = forced || (own && (changed || nodes::call_hit(idx)));
+            if reapply {
+                nodes::begin_reuse(idx);
+                WIDGET_IS_ROOT.with(|r| r.set(is_root));
+                build_widget(node, doc, ctx, slot, sink, parent);
+                nodes::end_reuse(idx);
+                REDONE_UNDER.with(|r| r.set(true));
+            } else {
+                redone = false;
+                walk_children(node, idx, doc, ctx, slot, sink);
+            }
+            let mine = crate::expr::take_ago_next();
+            if nodes::reads(idx, &Dep::Ago) && nodes::own_hit(idx) {
+                nodes::set_ago(idx, mine);
+            }
+            crate::expr::restore_ago_next(min_opt(ago, mine));
+            nodes::leave(idx);
+        }
+        Mode::Off | Mode::Scratch => build_widget(node, doc, ctx, slot, sink, parent),
+    }
+    if is_root {
+        ROOT_REDONE.with(|r| r.set(redone));
+    }
+}
+
+fn min_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
+}
+
+/// A hash of `v`, for what an object was made with.
+fn sig_of(v: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+/// A layout block's object.
+fn layout<'u>(parent: &Obj<'u>) -> Obj<'u> {
+    nodes::made(parent, "layout", 0, |p| p.new_layout(), |_| {})
+}
+
+/// What a container does with its children once they are drawn: a
+/// grid places them, `align = stretch` sizes them.
+fn after_children(node: &Block, ctx: &Scope<'_>, obj: &Obj<'_>) {
+    match node.kind.text.as_str() {
+        "grid" => {
+            let cols = resolve_assign_value(node, "columns", ctx).and_then(|v| parse_tracks(&v)).unwrap_or(Tracks::Count(2));
+            let rows = resolve_assign_value(node, "rows", ctx).and_then(|v| parse_tracks(&v));
+            obj.layout_grid(&cols, rows.as_ref());
+        }
+        "row" | "column" | "scroll" if find_simple(node, "align").map(str::trim) == Some("stretch") => {
+            let column = match node.kind.text.as_str() {
+                "scroll" => find_simple(node, "direction").map(str::trim) != Some("horizontal"),
+                k => k == "column",
+            };
+            obj.stretch_children(column);
+        }
+        _ => {}
+    }
+}
+
+/// Update: widget `node` (record `idx`) reads the same as it did:
+/// only what is under it is walked, and if any of it was set up
+/// again, the node does again what it does with its children.
+fn walk_children(node: &Block, idx: usize, doc: &Document, ctx: &Scope<'_>, slot: Option<&SlotCtx<'_>>, sink: &Sender<UiEvent>) {
+    let has_children = node.items.iter().any(|it| matches!(it, Item::Block(b) if !is_event_handler_block(&b.kind.text)) || matches!(it, Item::Repeat(_)));
+    if !has_children {
+        return;
+    }
+    let Some(&raw) = nodes::objs(idx).first() else { return };
+    let obj = Obj::from_raw(raw);
+    let before = REDONE_UNDER.with(|r| r.replace(false));
+    render_item_list(&node.items, doc, ctx, slot, sink, &obj);
+    let under = REDONE_UNDER.with(|r| r.get());
+    REDONE_UNDER.with(|r| r.set(before || under));
+    if under {
+        after_children(node, ctx, &obj);
+        if node.kind.text == "button" {
+            // A child shown again by its own `visible` stays hidden
+            // while the button's call runs.
+            obj.reassert_busy();
+        }
+    }
+}
+
+/// Build widget `node` (a fresh render), or set it up again on the
+/// objects it made (an update: [`nodes::made`] hands them back).
+fn build_widget(
     node: &Block,
     doc: &Document,
     ctx: &Scope<'_>,
@@ -296,7 +682,7 @@ fn render_node(
 ) {
     match node.kind.text.as_str() {
         "column" | "row" => {
-            let obj = parent.new_layout();
+            let obj = layout(parent);
             // Taps go to the enclosing node (a button) unless it has
             // an `on_tap` / `on_hold` of its own.
             obj.set_enabled(false);
@@ -322,12 +708,10 @@ fn render_node(
                 );
             }
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
-            if find_simple(node, "align").map(str::trim) == Some("stretch") {
-                obj.stretch_children(node.kind.text == "column");
-            }
+            after_children(node, ctx, &obj);
         }
         "stack" => {
-            let obj = parent.new_layout();
+            let obj = layout(parent);
             obj.set_enabled(false);
             obj.set_size(Size::Content, Size::Content);
             // Children are placed by `x` / `y` from its corner.
@@ -339,15 +723,13 @@ fn render_node(
             // A grid fills its parent's width (its columns are
             // fractions of it) and grows with its rows; `width` /
             // `height` props override.
-            let obj = parent.new_layout();
+            let obj = layout(parent);
             obj.set_enabled(false);
             obj.set_size(Size::Percent(100), Size::Content);
             apply_props(node, ctx, sink, &obj);
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
             // Lay out after rendering so `repeat` output counts.
-            let cols = resolve_assign_value(node, "columns", ctx).and_then(|v| parse_tracks(&v)).unwrap_or(Tracks::Count(2));
-            let rows = resolve_assign_value(node, "rows", ctx).and_then(|v| parse_tracks(&v));
-            obj.layout_grid(&cols, rows.as_ref());
+            after_children(node, ctx, &obj);
         }
         "scroll" => {
             // Schema 8.2: children as a column (or a row with
@@ -360,7 +742,7 @@ fn render_node(
                 Some("center") => ScrollSnap::Center,
                 _ => ScrollSnap::None,
             };
-            let obj = parent.new_layout();
+            let obj = layout(parent);
             obj.set_size(Size::Percent(100), Size::Content);
             // `grow` would override a `height` along a column.
             if find_simple(node, "height").is_none() && find_simple(node, "grow").is_none() {
@@ -377,24 +759,25 @@ fn render_node(
                 obj.set_flex_align(FlexAlign::Start, align);
             }
             render_item_list(&node.items, doc, ctx, slot, sink, &obj);
-            if find_simple(node, "align").map(str::trim) == Some("stretch") {
-                obj.stretch_children(!horizontal);
-            }
+            after_children(node, ctx, &obj);
         }
         "text" => {
             let text = resolve_text(node, "value", ctx).unwrap_or_default();
-            let obj = parent.new_label(&text);
+            let obj = nodes::made(parent, "label", 0, |p| p.new_label(&text), |o| o.set_label_text(&text));
             apply_props(node, ctx, sink, &obj);
             obj.fit_dots();
         }
         "button" => {
-            let obj = parent.new_button();
+            let obj = nodes::made(parent, "button", 0, |p| p.new_button(), |_| {});
+            // A component's root whose call has an `on_tap`: the call
+            // says where its call stands.
+            let call_taps = NODE_TAP.with(|t| t.get());
             // A failed call's default look, under the theme's
             // `button:failed`: a border in the theme's critical color.
             let critical = FAILED_BORDER.with(|c| c.get());
             crate::ui::with_state("failed", || obj.set_border(3, Some(critical)));
             let tap_call = apply_props(node, ctx, sink, &obj);
-            if !show_call_state(&obj, tap_call.as_ref()) {
+            {
                 // Shortcut: `button { label = "Save" }` renders a label
                 // child so the simplest button only takes one line. If
                 // the button also has child nodes, those render after
@@ -407,16 +790,16 @@ fn render_node(
                 let content = match label {
                     // `icon` and `label`: side by side, icon first.
                     Some(label) if !icon.is_empty() && !label.is_empty() => {
-                        let row = obj.new_plain_row(6);
+                        let row = nodes::made(&obj, "row", 0, |p| p.new_plain_row(6), |_| {});
                         if let Some(icon) = new_icon(&row, icon, None, ctx) {
                             tint_icon(&icon);
                         }
-                        let text = row.new_label(&label);
+                        let text = nodes::made(&row, "label", 0, |p| p.new_label(&label), |o| o.set_label_text(&label));
                         obj.fit_shortcut_label(&text);
                         Some(row)
                     }
                     Some(label) if icon.is_empty() => {
-                        let text = obj.new_label(&label);
+                        let text = nodes::made(&obj, "label", 0, |p| p.new_label(&label), |o| o.set_label_text(&label));
                         obj.fit_shortcut_label(&text);
                         Some(text)
                     }
@@ -431,6 +814,13 @@ fn render_node(
                 }
                 render_item_list(&node.items, doc, ctx, slot, sink, &obj);
             }
+            // Where its call stands, over the content (ADR 0024).
+            show_call_state(&obj, tap_call.as_ref(), !call_taps);
+            // Its label fitted again (a component's root: after its
+            // call's keys, which may make it busy).
+            if nodes::mode() == Mode::Update && !WIDGET_IS_ROOT.with(|r| r.get()) {
+                obj.refit_shortcut();
+            }
         }
         "icon" => {
             let name = resolve_text(node, "name", ctx).unwrap_or_default();
@@ -442,7 +832,7 @@ fn render_node(
             tint_icon(&icon);
         }
         "rect" => {
-            let obj = parent.new_container();
+            let obj = nodes::made(parent, "container", 0, |p| p.new_container(), |_| {});
             obj.set_enabled(false);
             obj.set_size(Size::Content, Size::Content);
             // A shape: no inner padding, which on a small one would
@@ -451,7 +841,7 @@ fn render_node(
             apply_props(node, ctx, sink, &obj);
         }
         "bar" => {
-            let obj = parent.new_bar();
+            let obj = nodes::made(parent, "bar", 0, |p| p.new_bar(), |_| {});
             // Schema 8.3: in the theme's `accent` on a faint `muted`
             // track; `color` / `track` (applied below) override.
             let (indicator, track) = gauge_colors(ctx);
@@ -463,17 +853,22 @@ fn render_node(
             let min = resolve_num(node, "min", ctx).unwrap_or(0.0) as i32;
             let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
             obj.set_bar_range(min, max);
-            if let Some(v) = resolve_num(node, "value", ctx) {
-                let to = (v as i32).clamp(min.min(max), max.max(min));
-                match crate::motion::gauge(node, to) {
-                    Some((from, ms)) => obj.animate_bar(from.clamp(min.min(max), max.max(min)), to, ms),
-                    None => obj.set_bar_value(to),
+            match resolve_num(node, "value", ctx) {
+                Some(v) => {
+                    let to = (v as i32).clamp(min.min(max), max.max(min));
+                    match crate::motion::gauge(node, to) {
+                        Some((from, ms)) => obj.animate_bar(from.clamp(min.min(max), max.max(min)), to, ms),
+                        None => obj.set_bar_value(to),
+                    }
                 }
+                // No value: as a new bar is (0, in its range).
+                None if nodes::mode() == Mode::Update => obj.set_bar_value(0.clamp(min.min(max), max.max(min))),
+                None => {}
             }
             apply_props(node, ctx, sink, &obj);
         }
         "arc" => {
-            let obj = parent.new_arc();
+            let obj = nodes::made(parent, "arc", 0, |p| p.new_arc(), |_| {});
             let (indicator, track) = gauge_colors(ctx);
             obj.set_arc_indicator(indicator.0, indicator.1);
             obj.set_arc_track(track.0, track.1);
@@ -486,12 +881,16 @@ fn render_node(
             let min = resolve_num(node, "min", ctx).unwrap_or(0.0) as i32;
             let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
             obj.set_arc_range(min, max);
-            if let Some(v) = resolve_num(node, "value", ctx) {
-                let to = (v as i32).clamp(min.min(max), max.max(min));
-                match crate::motion::gauge(node, to) {
-                    Some((from, ms)) => obj.animate_arc(from.clamp(min.min(max), max.max(min)), to, ms),
-                    None => obj.set_arc_value(to),
+            match resolve_num(node, "value", ctx) {
+                Some(v) => {
+                    let to = (v as i32).clamp(min.min(max), max.max(min));
+                    match crate::motion::gauge(node, to) {
+                        Some((from, ms)) => obj.animate_arc(from.clamp(min.min(max), max.max(min)), to, ms),
+                        None => obj.set_arc_value(to),
+                    }
                 }
+                None if nodes::mode() == Mode::Update => obj.unset_arc_value(),
+                None => {}
             }
             apply_props(node, ctx, sink, &obj);
         }
@@ -513,7 +912,7 @@ fn render_node(
                     .collect(),
                 _ => Vec::new(),
             };
-            let obj = parent.new_line(&points);
+            let obj = nodes::made(parent, "line", 0, |p| p.new_line(&points), |o| o.set_line_points(&points));
             let width = resolve_num(node, "thickness", ctx).unwrap_or(2.0) as i32;
             let rounded = resolve_assign_value(node, "rounded", ctx).is_some_and(|v| value_truthy(&v));
             let color = resolve_text(node, "color", ctx)
@@ -534,14 +933,19 @@ fn render_node(
             if src.is_empty() {
                 return;
             }
-            let Some(obj) = parent.new_image(src, fit) else { return };
+            let fit_sig = fit as u64;
+            let Some(obj) = nodes::made_opt(parent, "image", fit_sig, |p| p.new_image(src, fit), |o| {
+                o.set_image_path(src);
+            }) else {
+                return;
+            };
             if let Some((rgb, opa)) = resolve_text(node, "recolor", ctx).and_then(|c| color_of(&c, ctx)) {
                 obj.set_image_recolor(rgb, opa);
             }
             apply_props(node, ctx, sink, &obj);
         }
         "chart" => {
-            let obj = parent.new_chart();
+            let obj = nodes::made(parent, "chart", 0, |p| p.new_chart(), |o| o.chart_clear_series());
             // Schema 8.3: no white box; division lines in a faint
             // `muted`. `background` / `border` (applied below) win.
             let muted = color_of("muted", ctx).unwrap_or((0x757575, 255)).0;
@@ -550,21 +954,21 @@ fn render_node(
             apply_props(node, ctx, sink, &obj);
         }
         "spinner" => {
-            let obj = parent.new_spinner();
+            let obj = nodes::made(parent, "spinner", 0, |p| p.new_spinner(), |_| {});
             apply_props(node, ctx, sink, &obj);
         }
         "qr" => {
             let size = find_simple(node, "size")
                 .and_then(|v| v.trim().parse::<i32>().ok())
                 .unwrap_or(128);
-            let obj = parent.new_qrcode(size);
+            let obj = nodes::made(parent, "qr", size as u64, |p| p.new_qrcode(size), |_| {});
             if let Some(data) = resolve_assign_value(node, "data", ctx) {
                 obj.set_qrcode_data(&data.to_display_string());
             }
             apply_props(node, ctx, sink, &obj);
         }
         "toggle" => {
-            let obj = parent.new_toggle();
+            let obj = nodes::made(parent, "toggle", 0, |p| p.new_toggle(), |_| {});
             let value_on = resolve_assign_value(node, "value", ctx)
                 .map(|v| value_truthy(&v))
                 .unwrap_or(false);
@@ -575,12 +979,16 @@ fn render_node(
             }
         }
         "slider" => {
-            let obj = parent.new_slider();
+            let obj = nodes::made(parent, "slider", 0, |p| p.new_slider(), |_| {});
             let min = resolve_num(node, "min", ctx).unwrap_or(0.0) as i32;
             let max = resolve_num(node, "max", ctx).unwrap_or(100.0) as i32;
             obj.set_slider_range(min, max);
-            if let Some(v) = resolve_num(node, "value", ctx) {
-                obj.set_slider_value(v as i32);
+            // No value: where a new slider is, unless the user moved it.
+            let updating = nodes::mode() == Mode::Update && !obj.user_changed();
+            match resolve_num(node, "value", ctx) {
+                Some(v) => obj.set_slider_value(v as i32),
+                None if updating => obj.set_slider_value(0),
+                None => {}
             }
             apply_props(node, ctx, sink, &obj);
             if let Some(assigns) = bind_change_action(node, "on_change", ValueWidget::Slider, ctx, sink, &obj) {
@@ -597,9 +1005,9 @@ fn render_node(
                 .map(|v| value_truthy(&v))
                 .unwrap_or(false);
             let length = resolve_num(node, "length", ctx).unwrap_or(0.0) as u32;
-            let ta = parent.new_textarea(masked, length);
+            let ta = nodes::made(parent, "textarea", sig_of(&(masked, length)), |p| p.new_textarea(masked, length), |_| {});
             ta.register_input();
-            let kb = parent.new_number_keyboard();
+            let kb = nodes::made(parent, "keyboard", 0, |p| p.new_number_keyboard(), |_| {});
             kb.attach_keyboard_to(&ta);
             apply_props(node, ctx, sink, &ta);
             // The digits arrive as `value` / `event.value`.
@@ -626,20 +1034,34 @@ fn render_node(
             });
             let (obj, widget) = match find_simple(node, "style").map(str::trim) {
                 Some("roller") => {
-                    let obj = parent.new_roller(&options.join("\n"), 3);
-                    if let Some(i) = selected {
-                        obj.set_roller_selected(i as u32);
+                    let opts = options.join("\n");
+                    let obj = nodes::made(parent, "roller", 0, |p| p.new_roller(&opts, 3), |o| o.set_roller_options(&opts));
+                    match selected {
+                        Some(i) => obj.set_roller_selected(i as u32),
+                        // As a new one, unless the user turned it.
+                        None if nodes::mode() == Mode::Update && !obj.user_changed() => obj.set_roller_selected(0),
+                        None => {}
                     }
                     (obj, ValueWidget::Roller)
                 }
-                Some("buttons") => (parent.new_button_row(&options, selected), ValueWidget::Buttons),
+                Some("buttons") => {
+                    // Other options or choice: built again (phase 2).
+                    let sig = sig_of(&(&options, selected));
+                    (nodes::made(parent, "buttons", sig, |p| p.new_button_row(&options, selected), |_| {}), ValueWidget::Buttons)
+                }
                 _ => {
-                    let obj = parent.new_dropdown();
+                    let obj = nodes::made(parent, "dropdown", 0, |p| p.new_dropdown(), |_| {});
+                    let updating = nodes::mode() == Mode::Update;
                     if !options.is_empty() {
                         obj.set_dropdown_options(&options.join("\n"));
+                    } else if updating {
+                        // No options now: what a new dropdown lists.
+                        obj.set_dropdown_options(crate::ui::DROPDOWN_DEFAULT);
                     }
-                    if let Some(i) = selected {
-                        obj.set_dropdown_selected(i as u16);
+                    match selected {
+                        Some(i) => obj.set_dropdown_selected(i as u16),
+                        None if updating && !obj.user_changed() => obj.set_dropdown_selected(0),
+                        None => {}
                     }
                     (obj, ValueWidget::Dropdown)
                 }
@@ -649,24 +1071,8 @@ fn render_node(
                 obj.on_change_select_inline_set(widget, sink.clone(), assigns);
             }
         }
-        "slot" => {
-            // Expand the caller's child-items here, resolving them
-            // against the OUTER context (not the component's inner
-            // scope). If there's no enclosing component call, the
-            // slot renders nothing.
-            if let Some(s) = slot {
-                render_item_list(s.children, doc, s.outer_ctx, None, sink, parent);
-            }
-        }
         other => {
-            // Try to resolve as a user-defined component. If found,
-            // expand its body in place with each arg bound in a
-            // fresh scope.
-            if let Some(comp) = find_component(doc, other) {
-                expand_component(node, comp, doc, ctx, sink, parent);
-                return;
-            }
-            // Not a built-in widget and not a known component.
+            nodes::mark_broken("an unknown node");
             parent.new_label(&format!("[{other}: not implemented yet]"));
         }
     }
@@ -706,12 +1112,17 @@ fn new_icon<'ui>(parent: &Obj<'ui>, name: &str, size: Option<u16>, ctx: &Scope<'
     if !folder.is_empty() && folder != "builtin" && paneld_config::icons::is_file_name(name) {
         let path = format!("{folder}/{name}.png");
         if crate::ui::asset_exists(&path) {
-            let obj = parent.new_icon_image(&path, size.min(paneld_config::icons::MAX_SIZE))?;
+            let size = size.min(paneld_config::icons::MAX_SIZE);
+            let obj = nodes::made_opt(parent, "icon-image", sig_of(&(&path, size)), |p| p.new_icon_image(&path, size), |_| {})?;
             return Some((obj, true));
         }
     }
     if let Some(glyph) = paneld_config::icons::glyph(name) {
-        return Some((parent.new_icon_glyph(glyph, size), false));
+        // Another glyph of the same size is its text.
+        let obj = nodes::made(parent, "icon-glyph", u64::from(size), |p| p.new_icon_glyph(glyph, size), |o| {
+            o.set_label_text(&glyph.to_string())
+        });
+        return Some((obj, false));
     }
     UNKNOWN_ICONS.with(|u| {
         for line in note_unknown_icon(&mut u.borrow_mut(), name) {
@@ -776,12 +1187,55 @@ fn expand_component(
     sink: &Sender<UiEvent>,
     parent: &Obj<'_>,
 ) {
+    let mode = nodes::mode();
+    let is_root = ROOT_PENDING.with(|r| r.replace(false));
+    let forced = FORCE.with(|f| f.replace(false));
+    let block = call as *const Block as usize;
+    // The call's record, and whether its own keys (which act on the
+    // component's root) read something else now.
+    let (rec, force_root) = match mode {
+        Mode::Update => match nodes::visit(Kind::Call, block, forced) {
+            None => return,
+            Some(Visit::Skip) => {
+                if is_root {
+                    ROOT_REDONE.with(|r| r.set(false));
+                }
+                return;
+            }
+            Some(Visit::Look(i)) => {
+                let own = nodes::own_hit(i);
+                let changed = (own || forced) && nodes::fp_changed(i, call_fp(call, comp, outer_ctx));
+                (Some(i), forced || (own && (changed || nodes::call_hit(i))))
+            }
+        },
+        Mode::Build => {
+            let mut own = Vec::new();
+            call_deps(call, comp, &mut own);
+            (Some(nodes::open(Kind::Call, block, own, &call.kind.text, call.kind.span)), false)
+        }
+        Mode::Off | Mode::Scratch => (None, false),
+    };
+    let outer_frame = nodes::current_frame();
     let mut locals = Context::new();
+    // An `ago()` in an arg is timed with the call: its readers only
+    // see the text.
+    let ago_saved = crate::expr::take_ago_next();
+    // Build: each param's deps, bound in turn (a default reads the
+    // params before it).
+    let mut frames = Vec::new();
     for item in &comp.items {
         let Item::Param(p) = item else { continue };
+        let mut deps = Vec::new();
         let bound = if let Some((raw, span)) = find_raw(call, &p.name.text) {
+            if mode == Mode::Build {
+                let _outer = nodes::switch_frame(outer_frame);
+                raw_deps(raw, span, &mut deps);
+            }
             resolve_expr_value(raw, span, outer_ctx).unwrap_or(Value::Null)
         } else if let Some(default) = &p.default {
+            if mode == Mode::Build {
+                raw_deps(&default.text, default.span, &mut deps);
+            }
             // Schema 6: a default reads the params declared before it,
             // bound so far; `paneld check` refuses a later one, itself
             // and the caller's names.
@@ -789,8 +1243,18 @@ fn expand_component(
         } else {
             Value::Null
         };
+        if mode == Mode::Build {
+            deps.sort();
+            deps.dedup();
+            frames.push(nodes::push_frame(vec![(p.name.text.clone(), deps)]));
+        }
         locals.insert(p.name.text.clone(), typed_param(&p.ty.text, bound));
     }
+    let ago_due = crate::expr::take_ago_next();
+    if let (Mode::Build | Mode::Update, Some(i)) = (mode, rec) {
+        nodes::set_ago(i, ago_due);
+    }
+    crate::expr::restore_ago_next(min_opt(ago_saved, ago_due));
     let inner_ctx = outer_ctx.with(&locals);
     // Children of the call that aren't args become the slot's
     // content. The schema check already enforced "exactly one slot"
@@ -798,26 +1262,40 @@ fn expand_component(
     // only the UI nodes and `repeat`s of them: the args and handler
     // blocks (`on_hold vm_stop { ... }`, which belong to the call) are
     // skipped there.
-    let slot = SlotCtx { children: &call.items, outer_ctx };
+    let slot = SlotCtx { children: &call.items, outer_ctx, frame: outer_frame };
     let before = parent.child_count();
     // The call's `on_tap` wins over its root button's `action`.
     ROOT_TAP.with(|t| t.set(has_handler(call, "on_tap")));
+    ROOT_PENDING.with(|r| r.set(true));
+    ROOT_REDONE.with(|r| r.set(false));
+    FORCE.with(|f| f.set(force_root));
     crate::motion::push_scope((call.kind.span.file, call.kind.span.start));
     render_item_list(&comp.items, doc, &inner_ctx, Some(&slot), sink, parent);
     crate::motion::pop_scope();
     ROOT_TAP.with(|t| t.set(false));
+    ROOT_PENDING.with(|r| r.set(false));
+    FORCE.with(|f| f.set(false));
+    while let Some(f) = frames.pop() {
+        drop(f);
+    }
+    let redone = ROOT_REDONE.with(|r| r.replace(false));
     // The call's own `on_tap` / `on_hold` act on the component's root
     // object, with args evaluated in the caller's scope (`item`, ...).
     // So do its common properties (schema 7), over the component's
-    // own: everything on the call that is not one of its params.
-    if let Some(root) = parent.child(before) {
-        let tap_call = bind_handlers(call, outer_ctx, sink, &root);
+    // own: everything on the call that is not one of its params. When
+    // updating, only on a root set up again (it lost them).
+    let root = match mode {
+        Mode::Update => redone.then(|| ROOT_OBJ.with(|r| r.get())).filter(|r| !r.is_null()).map(Obj::from_raw),
+        _ => parent.child(before),
+    };
+    if let Some(root) = root {
+        let tap_call = bind_handlers(call, outer_ctx, sink, &root, false);
         let root_kind = comp.items.iter().find_map(|it| match it {
             Item::Block(b) => Some(b.kind.text.as_str()),
             _ => None,
         });
         if root_kind == Some("button") {
-            show_call_state(&root, tap_call.as_ref());
+            show_call_state(&root, tap_call.as_ref(), false);
         }
         let params: Vec<&str> = comp
             .items
@@ -840,10 +1318,6 @@ fn expand_component(
                 .cloned()
                 .collect()
         });
-        let root_kind = comp.items.iter().find_map(|it| match it {
-            Item::Block(b) => Some(b.kind.text.as_str()),
-            _ => None,
-        });
         let root_kind = root_kind.unwrap_or("");
         // The root already has its `*` and kind styles; the call adds
         // its classes only, so they do not undo the root's own props.
@@ -852,7 +1326,254 @@ fn expand_component(
         if root_kind == "text" {
             root.fit_dots();
         }
+        if root_kind == "button" && mode == Mode::Update {
+            root.refit_shortcut();
+        }
     }
+    if is_root {
+        ROOT_REDONE.with(|r| r.set(redone || mode != Mode::Update));
+    }
+    match (mode, rec) {
+        (Mode::Build, Some(i)) => nodes::close(i),
+        (Mode::Update, Some(i)) => nodes::leave(i),
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a node reads (ADR 0024): its dep keys, recorded when it is
+// built, and a hash of what its inputs evaluate to now, so an update
+// sets up again only a node whose inputs give something else.
+// ---------------------------------------------------------------------------
+
+/// The deps of raw value `raw` at `span` where the walk is.
+fn raw_deps(raw: &str, span: paneld_config::source::Span, out: &mut Vec<Dep>) {
+    match classify(raw) {
+        ValueShape::Literal(_) => {}
+        ValueShape::Expression(body) => {
+            let p = parse_fragment_cached(body, span.file, span.start + 2);
+            if let Some(e) = p.0.as_ref() {
+                nodes::expr_deps(parse_key(&p), e, out);
+            }
+        }
+        ValueShape::Interp(_) => {
+            let p = parse_interp_cached(raw, span.file, span.start);
+            for (i, e) in p.0.iter().enumerate() {
+                nodes::expr_deps(parse_key(&p).wrapping_add(i), e, out);
+            }
+        }
+    }
+}
+
+/// An action name as written (`on_tap = x`, `action = x`): whose call
+/// state a button shows.
+fn name_dep(raw: &str) -> Dep {
+    match classify(raw) {
+        ValueShape::Literal(t) => Dep::Call(Some(t.trim().to_string())),
+        _ => Dep::Call(None),
+    }
+}
+
+/// The deps of `items` (a node's, a style body's, a call's own keys):
+/// every value, and in handler blocks (and a chart's `series`) theirs.
+fn items_deps(items: &[Item], skip: &[&str], out: &mut Vec<Dep>) {
+    let mut handlers = false;
+    for item in items {
+        match item {
+            Item::Assign(a) => {
+                let AssignTarget::Simple { key } = &a.target else { continue };
+                if skip.contains(&key.text.as_str()) {
+                    continue;
+                }
+                raw_deps(&a.value.text, a.value.span, out);
+                if matches!(key.text.as_str(), "on_tap" | "on_hold" | "on_change" | "on_submit" | "action") {
+                    out.push(name_dep(&a.value.text));
+                    handlers = true;
+                }
+            }
+            Item::Block(b) if is_event_handler_block(&b.kind.text) => {
+                handlers = true;
+                match &b.name {
+                    Some(n) => out.push(Dep::Call(Some(n.text.clone()))),
+                    None if b.is_inline_action() => out.push(Dep::Call(Some(b.inline_action_name()))),
+                    None => {}
+                }
+                items_deps(&b.items, &[], out);
+            }
+            Item::Block(b) if matches!(b.kind.text.as_str(), "series" | "set") => items_deps(&b.items, &[], out),
+            _ => {}
+        }
+    }
+    // A handler's binding carries the names where it is drawn.
+    if handlers {
+        nodes::union(out, &nodes::all_local_deps());
+    }
+}
+
+/// The theme style bodies that apply to a node of `kind` with `items`
+/// (as [`apply_styles`] picks them), each with the kind it is applied as.
+fn style_bodies(kind: &str, items: &[Item], by_kind: bool, f: &mut dyn FnMut(&[Item])) {
+    let classes = class_names(items);
+    STYLES.with(|styles| {
+        let styles = styles.borrow();
+        if styles.is_empty() {
+            return;
+        }
+        let selectors: Vec<String> = ["*".to_string(), kind.to_string()]
+            .into_iter()
+            .filter(|_| by_kind)
+            .chain(classes.iter().map(|c| format!(".{c}")))
+            .collect();
+        for sel in &selectors {
+            if let Some(body) = styles.get(sel) {
+                f(body);
+            }
+            for state in ["pressed", "checked", "disabled", "focused", "hover", "running", "failed"] {
+                if let Some(body) = styles.get(&format!("{sel}:{state}")) {
+                    f(body);
+                }
+            }
+        }
+    });
+}
+
+/// What widget `node` itself reads (not its children): its keys, its
+/// handlers, its theme styles.
+fn node_deps(node: &Block, _ctx: &Scope<'_>, out: &mut Vec<Dep>) {
+    items_deps(&node.items, &[], out);
+    style_bodies(&node.kind.text, &node.items, true, &mut |body| items_deps(body, &[], out));
+    out.sort();
+    out.dedup();
+}
+
+/// The params of component `comp`.
+fn param_names(comp: &Block) -> Vec<&str> {
+    comp.items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Param(p) => Some(p.name.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What a component call's own keys read (they act on its root):
+/// everything on it that is not a param, its handlers, its classes'
+/// styles.
+fn call_deps(call: &Block, comp: &Block, out: &mut Vec<Dep>) {
+    let params = param_names(comp);
+    items_deps(&call.items, &params, out);
+    style_bodies("", &call.items, false, &mut |body| items_deps(body, &[], out));
+    out.sort();
+    out.dedup();
+}
+
+/// `page` reads the page's `title`, `nav` every nav page's.
+fn page_frame(doc: &Document, page: &Block) -> Vec<(String, Vec<Dep>)> {
+    let title = |b: &Block, out: &mut Vec<Dep>| {
+        if let Some((raw, span)) = find_raw(b, "title") {
+            raw_deps(raw, span, out);
+        }
+    };
+    let mut page_deps = Vec::new();
+    title(page, &mut page_deps);
+    let mut nav = Vec::new();
+    for item in &doc.items {
+        if let Item::Block(b) = item {
+            if b.kind.text == "page" && find_simple(b, "nav").is_some() {
+                title(b, &mut nav);
+            }
+        }
+    }
+    for d in [&mut page_deps, &mut nav] {
+        d.sort();
+        d.dedup();
+    }
+    vec![("page".into(), page_deps), ("nav".into(), nav)]
+}
+
+/// Hash `v` (numbers by their bits, maps in key order).
+fn hash_value(v: &Value, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match v {
+        Value::Null => 0u8.hash(h),
+        Value::Bool(b) => (1u8, b).hash(h),
+        Value::Int(n) => (2u8, n).hash(h),
+        Value::Double(d) => (3u8, d.to_bits()).hash(h),
+        Value::String(s) => (4u8, s).hash(h),
+        Value::List(l) => {
+            (5u8, l.len()).hash(h);
+            l.iter().for_each(|x| hash_value(x, h));
+        }
+        Value::Map(m) => {
+            (6u8, m.len()).hash(h);
+            for (k, x) in m {
+                k.hash(h);
+                hash_value(x, h);
+            }
+        }
+    }
+}
+
+/// What every value of `items` (and of their handler, `series` and
+/// `set` blocks) evaluates to in `ctx`, into `h`.
+fn hash_items(items: &[Item], skip: &[&str], ctx: &Scope<'_>, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    let mut handlers = false;
+    for item in items {
+        match item {
+            Item::Assign(a) => {
+                let AssignTarget::Simple { key } = &a.target else { continue };
+                if skip.contains(&key.text.as_str()) || matches!(classify(&a.value.text), ValueShape::Literal(_)) {
+                    continue;
+                }
+                key.text.hash(h);
+                match resolve_expr_value(&a.value.text, a.value.span, ctx) {
+                    Some(v) => hash_value(&v, h),
+                    None => 0xffu8.hash(h),
+                }
+                handlers |= matches!(key.text.as_str(), "on_tap" | "on_hold" | "on_change" | "on_submit" | "action");
+            }
+            Item::Block(b) if is_event_handler_block(&b.kind.text) => {
+                handlers = true;
+                hash_items(&b.items, &[], ctx, h);
+            }
+            Item::Block(b) if matches!(b.kind.text.as_str(), "series" | "set") => hash_items(&b.items, &[], ctx, h),
+            _ => {}
+        }
+    }
+    if handlers {
+        for (k, v) in ctx.visible() {
+            if !matches!(k, "sources" | "vars" | "alerts" | "theme" | "now") {
+                k.hash(h);
+                hash_value(v, h);
+            }
+        }
+    }
+}
+
+/// A hash of what widget `node`'s own inputs evaluate to now (an
+/// icon's: and the text color it takes from `parent`, which a theme
+/// PNG is tinted with when drawn).
+fn node_fp(node: &Block, ctx: &Scope<'_>, parent: &Obj<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if node.kind.text == "icon" {
+        parent.text_color().hash(&mut h);
+    }
+    hash_items(&node.items, &[], ctx, &mut h);
+    style_bodies(&node.kind.text, &node.items, true, &mut |body| hash_items(body, &[], ctx, &mut h));
+    h.finish()
+}
+
+/// The same for a component call's own keys, in the caller's scope.
+fn call_fp(call: &Block, comp: &Block, outer: &Scope<'_>) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let params = param_names(comp);
+    hash_items(&call.items, &params, outer, &mut h);
+    style_bodies("", &call.items, false, &mut |body| hash_items(body, &[], outer, &mut h));
+    h.finish()
 }
 
 /// Give a component arg its declared type. A literal arg (`warn = 70`)
@@ -1049,7 +1770,8 @@ fn apply_props(node: &Block, ctx: &Scope<'_>, sink: &Sender<UiEvent>, obj: &Obj<
     // Only one gets wired per tap: the first form found wins,
     // matching schema semantics (one action per handler).
     crate::perf::time(crate::perf::Slot::Props, || {
-        let tap_call = bind_handlers(node, ctx, sink, obj);
+        let call_taps = NODE_TAP.with(|t| t.replace(false));
+        let tap_call = bind_handlers(node, ctx, sink, obj, call_taps);
         apply_styles(&node.kind.text, &node.items, true, ctx, obj);
         apply_plain_props(&node.kind.text, &node.items, ctx, obj);
         apply_motion(node, ctx, obj);
@@ -1108,27 +1830,20 @@ pub struct CallState {
 thread_local! {
     /// The calls running or failed, as of the page being drawn.
     static CALL_STATES: std::cell::RefCell<Vec<CallState>> = Default::default();
-    /// The action calls the buttons on screen make (see [`shows_call`]).
-    static DRAWN_CALLS: std::cell::RefCell<Vec<(String, Vec<ActionArg>)>> = Default::default();
     /// A `:failed` button's default border color: the theme's
     /// `critical`, resolved once per page.
     static FAILED_BORDER: std::cell::Cell<(u32, u8)> = const { std::cell::Cell::new((0xf85149, 255)) };
     /// The component call being expanded has its own `on_tap`, which
     /// wins over its root button's `action`: taken by the root.
     static ROOT_TAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// That, for the widget being drawn (its `apply_props`).
+    static NODE_TAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Install the action calls running or failed now, before drawing a
 /// page: its buttons show them (`:running`, `:failed`).
 pub fn set_call_states(states: Vec<CallState>) {
     CALL_STATES.with(|s| *s.borrow_mut() = states);
-    DRAWN_CALLS.with(|d| d.borrow_mut().clear());
-}
-
-/// Whether a button on the page drawn last makes call `name(args)`,
-/// so a change in that call's state needs a redraw.
-pub fn shows_call(name: &str, args: &[ActionArg]) -> bool {
-    DRAWN_CALLS.with(|d| d.borrow().iter().any(|(n, a)| n == name && covers(args, a)))
 }
 
 /// `call` carries every arg in `button` with the same value.
@@ -1161,29 +1876,23 @@ fn call_state(name: &str, args: &[ActionArg]) -> Option<CallState> {
 
 /// Show on button `obj` where the call its tap makes stands: the
 /// `:running` / `:failed` state, and while it runs the call's `busy`
-/// text or a spinner in place of its content. Returns true when the
-/// content was replaced.
-fn show_call_state(obj: &Obj<'_>, tap_call: Option<&(String, Vec<ActionArg>)>) -> bool {
+/// text or a spinner over its content (ADR 0024: the content stays,
+/// hidden). `own`: the button's own tap (else its component call's,
+/// which only ever adds one).
+fn show_call_state(obj: &Obj<'_>, tap_call: Option<&(String, Vec<ActionArg>)>, own: bool) {
     let Some((name, args)) = tap_call else {
-        return false;
+        if own {
+            obj.show_busy(None);
+        }
+        return;
     };
-    DRAWN_CALLS.with(|d| d.borrow_mut().push((name.clone(), args.clone())));
     let call = call_state(name, args);
     let state = call.as_ref().map(|c| c.state);
     obj.set_run_state(state == Some(RunState::Running), state == Some(RunState::Failed));
-    let Some(CallState { state: RunState::Running, busy, .. }) = call else {
-        return false;
-    };
-    obj.clear_children();
-    match busy.filter(|t| !t.trim().is_empty()) {
-        Some(text) => {
-            obj.new_label(&text);
-        }
-        None => {
-            obj.new_busy_spinner();
-        }
+    match call {
+        Some(CallState { state: RunState::Running, busy, .. }) => obj.show_busy(Some(busy.filter(|t| !t.trim().is_empty()))),
+        _ => obj.show_busy(None),
     }
-    true
 }
 
 /// Install the active theme's styles: selector (`*`, `button`,
@@ -1194,6 +1903,9 @@ pub fn set_styles(styles: std::collections::BTreeMap<String, Vec<Item>>) {
     // A (re)loaded config: its expressions are parsed afresh.
     PARSED.with(|p| p.borrow_mut().clear());
     PARSED_INTERP.with(|p| p.borrow_mut().clear());
+    nodes::clear_reads();
+    // Other styles: every page is built afresh.
+    nodes::forget();
 }
 
 type ParseKey = (String, paneld_config::source::FileId, u32);
@@ -1318,13 +2030,12 @@ fn has_handler(node: &Block, handler: &str) -> bool {
 /// Wire `node`'s `on_tap` / `on_hold` handlers (block and `= name`
 /// forms) to `obj`. Action-call args are evaluated against `ctx` now.
 /// Returns the action call a tap makes, if any (name and args).
-fn bind_handlers(node: &Block, ctx: &Scope<'_>, sink: &Sender<UiEvent>, obj: &Obj<'_>) -> Option<(String, Vec<ActionArg>)> {
+/// `call_taps`: `node` is a component's root whose call has an `on_tap`.
+fn bind_handlers(node: &Block, ctx: &Scope<'_>, sink: &Sender<UiEvent>, obj: &Obj<'_>, call_taps: bool) -> Option<(String, Vec<ActionArg>)> {
     let mut tap_call = None;
     // A node with an `on_hold` gets short taps only for `on_tap`, so a
     // long press does not fire both.
     let has_hold = has_handler(node, "on_hold");
-    // Set for a component's root: its call has an `on_tap`.
-    let call_taps = ROOT_TAP.with(|t| t.replace(false));
     let tap = if has_hold { Trigger::ShortTap } else { Trigger::Tap };
     for (handler, trigger) in [("on_tap", tap), ("on_hold", Trigger::Hold)] {
         for item in &node.items {

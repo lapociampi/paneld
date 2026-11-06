@@ -40,6 +40,9 @@ impl Daemon {
             .arg(dir.join("p.conf"))
             .env("SDL_VIDEODRIVER", "dummy")
             .env("PANELD_SOCK", dir.join("ctl.sock"))
+            // ADR 0024: every update in place is checked against a
+            // fresh render (the daemon exits 3 when they differ).
+            .env("PANELD_VERIFY_UPDATES", "1")
             // LVGL's own log (printf): checked when the daemon is dropped.
             .stdout(std::fs::File::create(dir.join("lvgl.log")).unwrap())
             .stderr(std::fs::File::create(dir.join("log")).unwrap())
@@ -794,7 +797,8 @@ fn the_clock_redraws_only_pages_that_read_it_and_as_often_as_they_read() {
     assert!((unix - mine).abs() <= 2, "now.unix {unix}, the clock {mine}");
     assert_eq!(d.eval("ago(now.unix)"), "just now");
     assert_eq!(d.eval("size(now.iso_date) == 10 && size(now.time) == 5"), "true");
-    let renders = || status_num(&d, "renders");
+    // ADR 0024: a tick updates the page in place; a navigation builds it.
+    let renders = || status_num(&d, "renders") + status_num(&d, "updates");
     // A page without the clock: not redrawn as time passes, and the
     // loop sleeps its whole idle step.
     wait_idle(&d);
@@ -812,12 +816,13 @@ fn the_clock_redraws_only_pages_that_read_it_and_as_often_as_they_read() {
     } else {
         assert_eq!(after, before + 1, "a new minute redraws the page once");
     }
-    // Seconds: redrawn each second.
+    // Seconds: redrawn each second, in place.
     d.ok(&["goto", "seconds"]);
     std::thread::sleep(Duration::from_millis(200));
-    let before = renders();
+    let (before, built) = (renders(), status_num(&d, "renders"));
     std::thread::sleep(Duration::from_millis(3_000));
     let n = renders() - before;
     assert!((2..=4).contains(&n), "{n} redraws in 3 s of a seconds clock");
+    assert_eq!(status_num(&d, "renders"), built, "a tick built the page again");
     d.stop();
 }

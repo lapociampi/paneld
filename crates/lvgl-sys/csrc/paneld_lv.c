@@ -519,3 +519,272 @@ void lv_paneld_perf_attach(lv_display_t * disp)
     if(getenv("PANELD_PERF") == NULL) return;
     lv_display_add_event_cb(disp, perf_cb, LV_EVENT_ALL, NULL);
 }
+
+/* ---- In-place page updates (ADR 0024) ---------------------------- */
+
+#include "src/core/lv_obj_private.h"
+#include "src/core/lv_obj_style_private.h"
+#include "src/misc/lv_style_private.h"
+
+typedef struct {
+    uint32_t selector;
+    uint32_t n;
+    lv_style_prop_t * props;
+    lv_style_value_t * values;
+} paneld_saved_style_t;
+
+typedef struct {
+    uint32_t n;
+    paneld_saved_style_t * styles;
+} paneld_saved_t;
+
+/* The props and values of a local (never const) style. */
+static void paneld_style_parts(const lv_style_t * s, lv_style_prop_t ** props, lv_style_value_t ** values)
+{
+    *values = (lv_style_value_t *)s->values_and_props;
+    *props = (lv_style_prop_t *)((uint8_t *)s->values_and_props + s->prop_cnt * sizeof(lv_style_value_t));
+}
+
+void * lv_paneld_local_styles_save(const lv_obj_t * obj)
+{
+    uint32_t n = 0;
+    for(uint32_t i = 0; i < obj->style_cnt; i++) {
+        const lv_obj_style_t * os = &obj->styles[i];
+        if(os->is_local && os->style && os->style->prop_cnt > 0 && os->style->prop_cnt != 255) n++;
+    }
+    if(n == 0) return NULL;
+    paneld_saved_t * saved = lv_malloc_zeroed(sizeof(paneld_saved_t));
+    if(saved == NULL) return NULL;
+    saved->styles = lv_malloc_zeroed(n * sizeof(paneld_saved_style_t));
+    if(saved->styles == NULL) {
+        lv_free(saved);
+        return NULL;
+    }
+    for(uint32_t i = 0; i < obj->style_cnt; i++) {
+        const lv_obj_style_t * os = &obj->styles[i];
+        if(!(os->is_local && os->style && os->style->prop_cnt > 0 && os->style->prop_cnt != 255)) continue;
+        paneld_saved_style_t * d = &saved->styles[saved->n];
+        uint32_t cnt = os->style->prop_cnt;
+        lv_style_prop_t * props;
+        lv_style_value_t * values;
+        paneld_style_parts(os->style, &props, &values);
+        d->props = lv_malloc(cnt * sizeof(lv_style_prop_t));
+        d->values = lv_malloc(cnt * sizeof(lv_style_value_t));
+        if(d->props == NULL || d->values == NULL) {
+            lv_free(d->props);
+            lv_free(d->values);
+            continue;
+        }
+        lv_memcpy(d->props, props, cnt * sizeof(lv_style_prop_t));
+        lv_memcpy(d->values, values, cnt * sizeof(lv_style_value_t));
+        d->selector = os->selector;
+        d->n = cnt;
+        saved->n++;
+    }
+    return saved;
+}
+
+void lv_paneld_local_styles_restore(lv_obj_t * obj, const void * saved_p)
+{
+    const paneld_saved_t * saved = saved_p;
+    for(uint32_t i = 0; i < obj->style_cnt; i++) {
+        lv_obj_style_t * os = &obj->styles[i];
+        if(os->is_local && os->style && os->style->prop_cnt != 255) lv_style_reset((lv_style_t *)os->style);
+    }
+    if(saved == NULL) return;
+    for(uint32_t i = 0; i < saved->n; i++) {
+        const paneld_saved_style_t * d = &saved->styles[i];
+        for(uint32_t k = 0; k < d->n; k++) {
+            lv_obj_set_local_style_prop(obj, d->props[k], d->values[k], d->selector);
+        }
+    }
+}
+
+void lv_paneld_local_styles_free(void * saved_p)
+{
+    paneld_saved_t * saved = saved_p;
+    if(saved == NULL) return;
+    for(uint32_t i = 0; i < saved->n; i++) {
+        lv_free(saved->styles[i].props);
+        lv_free(saved->styles[i].values);
+    }
+    lv_free(saved->styles);
+    lv_free(saved);
+}
+
+bool lv_paneld_local_style_at(const lv_obj_t * obj, uint32_t i, uint32_t * selector, lv_style_prop_t * prop,
+                              lv_style_value_t * value)
+{
+    for(uint32_t s = 0; s < obj->style_cnt; s++) {
+        const lv_obj_style_t * os = &obj->styles[s];
+        if(!(os->is_local && os->style && os->style->prop_cnt != 255)) continue;
+        uint32_t cnt = os->style->prop_cnt;
+        if(i < cnt) {
+            lv_style_prop_t * props;
+            lv_style_value_t * values;
+            paneld_style_parts(os->style, &props, &values);
+            *selector = os->selector;
+            *prop = props[i];
+            *value = values[i];
+            return true;
+        }
+        i -= cnt;
+    }
+    return false;
+}
+
+uint32_t lv_paneld_obj_flags(const lv_obj_t * obj)
+{
+    uint32_t f = 0;
+    if(lv_obj_is_hidden(obj)) f |= LV_OBJ_FLAG_HIDDEN;
+    if(lv_obj_is_clickable(obj)) f |= LV_OBJ_FLAG_CLICKABLE;
+    if(lv_obj_is_checkable(obj)) f |= LV_OBJ_FLAG_CHECKABLE;
+    if(lv_obj_is_scrollable(obj)) f |= LV_OBJ_FLAG_SCROLLABLE;
+    return f;
+}
+
+void lv_paneld_set_state_raw(lv_obj_t * obj, lv_state_t state)
+{
+    obj->state = state;
+}
+
+void lv_paneld_state_settled(lv_obj_t * obj, lv_state_t prev)
+{
+    lv_obj_invalidate(obj);
+    lv_obj_refresh_style(obj, LV_PART_ANY, LV_STYLE_PROP_ANY);
+    lv_obj_send_event(obj, LV_EVENT_STATE_CHANGED, &prev);
+}
+
+/* Two values of `prop` alike: a color by its three bytes, a pointer
+ * whole, a number by its value (the rest of the union is padding). */
+static bool paneld_value_eq(lv_style_prop_t prop, lv_style_value_t a, lv_style_value_t b)
+{
+    switch(prop) {
+        case LV_STYLE_BG_COLOR:
+        case LV_STYLE_BG_GRAD_COLOR:
+        case LV_STYLE_BG_IMAGE_RECOLOR:
+        case LV_STYLE_BORDER_COLOR:
+        case LV_STYLE_OUTLINE_COLOR:
+        case LV_STYLE_SHADOW_COLOR:
+        case LV_STYLE_IMAGE_RECOLOR:
+        case LV_STYLE_LINE_COLOR:
+        case LV_STYLE_ARC_COLOR:
+        case LV_STYLE_TEXT_COLOR:
+        case LV_STYLE_TEXT_OUTLINE_STROKE_COLOR:
+        case LV_STYLE_RECOLOR:
+        case LV_STYLE_DROP_SHADOW_COLOR:
+            return a.color.red == b.color.red && a.color.green == b.color.green && a.color.blue == b.color.blue;
+        case LV_STYLE_TEXT_FONT:
+        case LV_STYLE_BG_GRAD:
+        case LV_STYLE_BG_IMAGE_SRC:
+        case LV_STYLE_ARC_IMAGE_SRC:
+        case LV_STYLE_TRANSITION:
+        case LV_STYLE_BITMAP_MASK_SRC:
+        case LV_STYLE_COLOR_FILTER_DSC:
+        case LV_STYLE_ANIM:
+        case LV_STYLE_GRID_COLUMN_DSC_ARRAY:
+        case LV_STYLE_GRID_ROW_DSC_ARRAY:
+            return a.ptr == b.ptr;
+        default:
+            return a.num == b.num;
+    }
+}
+
+static bool paneld_has_prop(const paneld_saved_t * s, uint32_t selector, lv_style_prop_t prop, lv_style_value_t v)
+{
+    for(uint32_t i = 0; s && i < s->n; i++) {
+        const paneld_saved_style_t * d = &s->styles[i];
+        if(d->selector != selector) continue;
+        for(uint32_t k = 0; k < d->n; k++) {
+            if(d->props[k] == prop) return paneld_value_eq(prop, d->values[k], v);
+        }
+    }
+    return false;
+}
+
+static uint32_t paneld_count(const paneld_saved_t * s)
+{
+    uint32_t n = 0;
+    for(uint32_t i = 0; s && i < s->n; i++) n += s->styles[i].n;
+    return n;
+}
+
+bool lv_paneld_local_styles_equal(const lv_obj_t * obj, const void * saved_p)
+{
+    const paneld_saved_t * saved = saved_p;
+    uint32_t n = 0;
+    for(uint32_t i = 0; i < obj->style_cnt; i++) {
+        const lv_obj_style_t * os = &obj->styles[i];
+        if(!(os->is_local && os->style && os->style->prop_cnt != 255)) continue;
+        lv_style_prop_t * props;
+        lv_style_value_t * values;
+        paneld_style_parts(os->style, &props, &values);
+        for(uint32_t k = 0; k < os->style->prop_cnt; k++) {
+            if(!paneld_has_prop(saved, os->selector, props[k], values[k])) return false;
+            n++;
+        }
+    }
+    return n == paneld_count(saved);
+}
+
+lv_event_code_t lv_paneld_event_dsc_code(const lv_event_dsc_t * dsc)
+{
+    return (lv_event_code_t)(dsc->filter & ~((uint32_t)LV_EVENT_PREPROCESS | (uint32_t)LV_EVENT_MARKED_DELETING));
+}
+
+#include "src/core/lv_obj_class_private.h"
+
+const char * lv_paneld_class_name(const lv_obj_t * obj)
+{
+    const lv_obj_class_t * c = lv_obj_get_class(obj);
+    return (c && c->name) ? c->name : "";
+}
+
+#include "src/widgets/arc/lv_arc_private.h"
+
+void lv_paneld_arc_unset(lv_obj_t * obj)
+{
+    lv_arc_t * arc = (lv_arc_t *)obj;
+    if(arc->value == INT16_MIN) return;
+    lv_obj_invalidate(obj);
+    arc->value = INT16_MIN;
+    arc->indic_angle_start = 135;
+    arc->indic_angle_end = 270;
+    lv_obj_invalidate(obj);
+}
+
+#include "src/misc/lv_anim_private.h"
+#include "src/core/lv_global.h"
+
+/* Never run: marks the animations lv_paneld_anim_delete_custom takes. */
+static void paneld_doomed(void * var, int32_t v)
+{
+    LV_UNUSED(var);
+    LV_UNUSED(v);
+}
+
+bool lv_paneld_anim_delete_custom(void * var, lv_anim_custom_exec_cb_t cb)
+{
+    bool any = false;
+    /* lv_anim_delete matches on `exec_cb` only: mark ours, then take
+     * them by that mark. */
+    for(lv_anim_t * x = lv_ll_get_head(&LV_GLOBAL_DEFAULT()->anim_state.anim_ll); x != NULL;
+        x = lv_ll_get_next(&LV_GLOBAL_DEFAULT()->anim_state.anim_ll, x)) {
+        if(x->var == var && x->custom_exec_cb == cb) {
+            x->exec_cb = paneld_doomed;
+            any = true;
+        }
+    }
+    if(any) lv_anim_delete(var, paneld_doomed);
+    return any;
+}
+
+uint32_t lv_paneld_anim_count(void * var, lv_anim_custom_exec_cb_t not_cb)
+{
+    uint32_t n = 0;
+    for(lv_anim_t * x = lv_ll_get_head(&LV_GLOBAL_DEFAULT()->anim_state.anim_ll); x != NULL;
+        x = lv_ll_get_next(&LV_GLOBAL_DEFAULT()->anim_state.anim_ll, x)) {
+        if(x->var == var && x->custom_exec_cb != not_cb && x->repeat_cnt == LV_ANIM_REPEAT_INFINITE) n++;
+    }
+    return n;
+}

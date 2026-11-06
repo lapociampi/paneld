@@ -73,6 +73,11 @@ enum ShotStep {
     Touch { x: i32, y: i32, press_ms: u32 },
     /// Run the UI this long without touching it.
     Wait(u32),
+    /// `--set name=value`: set a var as `paneld ctl set` does.
+    Set { var: String, value: String },
+    /// `--source name=value`: a new result of source `name` with this
+    /// `value` (a number, `true` / `false`, else text), as a poll gives.
+    Source { name: String, value: String },
 }
 
 /// `paneld shot`: render the config headless to a PNG.
@@ -88,6 +93,15 @@ struct ShotOpts {
     /// Touches and pauses, in order.
     taps: Vec<ShotStep>,
     settle_ms: u32,
+    /// After every step, compare the picture with one of the page built
+    /// afresh (ADR 0024): exit 3 if they differ.
+    verify: bool,
+    /// Then this many random changes (sources, vars, alerts, call
+    /// states, the clock), each checked against a fresh render.
+    fuzz: u32,
+    seed: u64,
+    /// Run no source commands (values come from `--source` / `--fuzz`).
+    no_sources: bool,
 }
 
 fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, String> {
@@ -99,6 +113,10 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
         rotation: 0,
         taps: Vec::new(),
         settle_ms: 300,
+        verify: false,
+        fuzz: 0,
+        seed: 1,
+        no_sources: false,
     };
     let mut i = 0;
     let val = |i: &mut usize, flag: &str| -> Result<String, String> {
@@ -147,6 +165,20 @@ fn parse_shot(args: &[String], config: Option<PathBuf>) -> Result<ShotOpts, Stri
             "--settle" => {
                 o.settle_ms = val(&mut i, a)?.parse().map_err(|_| "bad `--settle` ms")?;
             }
+            "--set" | "--source" => {
+                let v = val(&mut i, a)?;
+                let (k, value) = v.split_once('=').ok_or(format!("`{a}` is NAME=VALUE"))?;
+                let k = k.trim().trim_start_matches(if a == "--set" { "vars." } else { "sources." }).to_string();
+                o.taps.push(if a == "--set" {
+                    ShotStep::Set { var: k, value: value.to_string() }
+                } else {
+                    ShotStep::Source { name: k, value: value.to_string() }
+                });
+            }
+            "--verify" => o.verify = true,
+            "--no-sources" => o.no_sources = true,
+            "--fuzz" => o.fuzz = val(&mut i, a)?.parse().map_err(|_| "bad `--fuzz` count")?,
+            "--seed" => o.seed = val(&mut i, a)?.parse().map_err(|_| "bad `--seed`")?,
             s => return Err(format!("unexpected argument `{s}` to `shot`")),
         }
         i += 1;
@@ -244,10 +276,14 @@ Usage:
   paneld hash-pin                     Read a PIN on stdin, print its
                                       argon2 hash for security.pin
   paneld shot -o FILE.png [--page P] [--size WxH] [--settle MS]
-              [--rotation DEG] [--tap X,Y | --hold X,Y | --wait MS]...
+              [--rotation DEG] [--tap X,Y | --hold X,Y | --wait MS
+               | --set VAR=VALUE | --source NAME=VALUE]... [--verify]
+              [--fuzz N [--seed S]] [--no-sources]
                                       Render the config headless to a PNG,
                                       after the given steps (runs sources
-                                      and touched actions for real)
+                                      and touched actions for real);
+                                      --verify compares each step with a
+                                      page built afresh
 
 Flags:
   -c, --config PATH   Config file (default: {DEFAULT_CONFIG})
@@ -363,9 +399,10 @@ fn perf_on() -> bool {
 /// `paneld shot`.
 fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // Drain UI events: actions forward to the action worker,
-    // gotos update the current page, vars changes trigger a
-    // re-render (the worker already wrote the new values).
-    let mut dirty = std::mem::take(&mut live.redraw);
+    // gotos update the current page, vars changes update the page (the
+    // worker already wrote the new values). What changed is kept in
+    // `live.changes` (ADR 0024: typed change names), a navigation or
+    // anything that needs the page built afresh in `live.rebuild`.
     // Runs from before a reload: their completion, and their `then` /
     // `else`, which go through the new config's gates. (Their `set`
     // and `refresh` went to the old config's vars and sources.)
@@ -375,8 +412,10 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             Ok(paneld_ui::UiEvent::ActionDone { name, key, ok, result }) => {
                 live.running.remove(&key);
                 let args = live.calls.get(&key).map(|c| c.args.clone()).unwrap_or_default();
-                dirty |= call_done(live, &key, ok);
-                dirty |= action_done(live, screen, &name, &args, ok, result);
+                call_done(live, &key, ok);
+                if action_done(live, screen, &name, &args, ok, result) {
+                    live.rebuild = true;
+                }
             }
             Ok(paneld_ui::UiEvent::Chained { name, args }) => {
                 live.deferred.push_back(actions::Call::new(name, args));
@@ -470,7 +509,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                             live.pending = Some(Pending { call, stage: Stage::Notice });
                         }
                     }
-                    dirty = live.pending.is_none();
+                    end_dialog(live);
                 }
             }
             paneld_ui::UiEvent::AskReply { accept, value } => {
@@ -494,7 +533,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                         }
                         None => {}
                     }
-                    dirty = live.pending.is_none();
+                    end_dialog(live);
                 }
             }
             paneld_ui::UiEvent::ConfirmReply { accept } => {
@@ -504,11 +543,11 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                         dispatch(live, call);
                     }
                 }
-                dirty = true;
+                end_dialog(live);
             }
             paneld_ui::UiEvent::Goto { page } => {
                 if go_to(live, &page) {
-                    dirty = true;
+                    live.rebuild = true;
                 }
             }
             paneld_ui::UiEvent::Wake => live.touched = true,
@@ -516,9 +555,9 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                 live.running.remove(&key);
                 let args = live.calls.get(&key).map(|c| c.args.clone()).unwrap_or_default();
                 // Its buttons leave `:running`.
-                dirty |= call_done(live, &key, ok);
+                call_done(live, &key, ok);
                 if action_done(live, screen, &name, &args, ok, result) {
-                    dirty = true;
+                    live.rebuild = true;
                 }
             }
             paneld_ui::UiEvent::InlineSet { assigns } => {
@@ -535,7 +574,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                     &live.var_types,
                     &live.vars,
                 ) {
-                    dirty = true;
+                    note_vars(live);
                 }
             }
             paneld_ui::UiEvent::ChangeInlineSet { assigns, event_value } => {
@@ -563,12 +602,10 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
                     &live.var_types,
                     &live.vars,
                 ) {
-                    dirty = true;
+                    note_vars(live);
                 }
             }
-            paneld_ui::UiEvent::VarsChanged => {
-                dirty = true;
-            }
+            paneld_ui::UiEvent::VarsChanged => note_vars(live),
         }
     }
 
@@ -587,61 +624,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // ctx including the current `alerts` map for symmetry with
     // the render-side ctx.
     while let Ok(update) = live.source_rx.try_recv() {
-        // A run started: only `running` changed.
-        if update.began {
-            dirty |= visible::running_on_page(&update.name);
-            continue;
-        }
-        // A run that started before the value on screen was taken is
-        // stale (a slow refresh overtaken by a poll).
-        match live.source_started.get(&update.name) {
-            // Its run is over all the same: `running` may have changed.
-            Some(shown) if update.started < *shown => {
-                dirty |= visible::running_on_page(&update.name);
-                continue;
-            }
-            _ => {
-                live.source_started.insert(update.name.clone(), update.started);
-            }
-        }
-        let mut value = update.value;
-        if update.status {
-            // Only `ok` / `error` change: the rest of the last result
-            // (`value`, `at`, `history`, `exit`, ...) stays, and no
-            // event goes out.
-            let mut values = live.source_values.lock().unwrap();
-            if let (Some(paneld_ui::Value::Map(prev)), paneld_ui::Value::Map(m)) = (values.get(&update.name), &value) {
-                let mut merged = prev.clone();
-                for k in ["ok", "error"] {
-                    merged.insert(k.to_string(), m.get(k).cloned().unwrap_or(paneld_ui::Value::Null));
-                }
-                value = paneld_ui::Value::Map(merged);
-            }
-            values.insert(update.name.clone(), value);
-            dirty |= visible::on_page(&update.name);
-            continue;
-        }
-        let event_value = value.clone();
-        live.histories.record(&update.name, &mut value, std::time::SystemTime::now());
-        live.source_values
-            .lock()
-            .unwrap()
-            .insert(update.name.clone(), value);
-        let event_ctx = build_ctx(
-            &live.source_values,
-            &live.theme,
-            &live.vars,
-            Some(&live.alerts),
-        );
-        let _ = live.alerts.ingest_event(
-            &update.name,
-            &event_value,
-            &event_ctx,
-            std::time::SystemTime::now(),
-        );
-        // Only a page that reads the source changes (an alert it
-        // raises marks the frame dirty in the tick below).
-        dirty |= visible::on_page(&update.name);
+        source_update(live, update);
     }
 
     // Tick the alert engine against the latest sources + vars. A
@@ -656,16 +639,16 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     let now_instant = std::time::Instant::now();
     let now_wall = std::time::SystemTime::now();
     if live.alerts.tick(&alerts_ctx, now_instant, now_wall) {
-        dirty = true;
+        live.changes.alerts = true;
     }
     if live.reminders.tick(&mut live.alerts, &alerts_ctx, now_wall) {
-        dirty = true;
+        live.changes.alerts = true;
     }
     // Keep the state file (ADR 0014) in sync. `note` is cheap:
     // it only flags a pending write when the set actually
     // changed. `flush_if_due` writes at most once per 10s.
     if live.alerts.note_resolved(now_wall) {
-        dirty = true;
+        live.changes.alerts = true;
     }
     live.state.note(live.alerts.active_alerts(), live.reminders.dates(), live.alerts.history());
     live.state.flush_if_due(now_instant);
@@ -675,21 +658,27 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         live.toast_until = None;
     }
 
-    // A call dispatched in this pass, shown on the page: its buttons
-    // show `:running`.
-    dirty |= std::mem::take(&mut live.redraw);
     if screen_step(live) {
-        dirty = true;
+        live.rebuild = true;
     }
-    // A page that reads `now` (or `ago()`): redrawn when the minute
+    // A page that reads `now` (or `ago()`): updated when the minute
     // (or second) it shows is over. Wakes the loop then, not earlier;
     // none of this while asleep or on a page without the clock.
     if let Some(tick) = visible::clock_on_page() {
         let since_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        if live.clock_drawn != Some((tick, tick.key(since_epoch.as_secs() as i64))) {
-            dirty = true;
+        let secs = since_epoch.as_secs() as i64;
+        if live.clock_drawn != Some((tick, tick.key(secs))) {
+            match tick {
+                clock::Tick::Second => {
+                    live.changes.now_second = true;
+                    if live.minute_drawn != Some(clock::Tick::Minute.key(secs)) {
+                        live.changes.now_minute = true;
+                    }
+                }
+                clock::Tick::Minute => live.changes.now_minute = true,
+            }
         }
         // A little past the change, so the clock has moved when we look.
         paneld_ui::wake_within(tick.ms_to_next(since_epoch) + 2);
@@ -702,57 +691,123 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             .map_or(0, |d| d.as_millis() as i64);
         let due_ms = due.saturating_mul(1000);
         if now_ms >= due_ms {
-            dirty = true;
+            live.changes.ago = true;
         } else {
             paneld_ui::wake_within((due_ms - now_ms) as u64 + 2);
         }
     }
-    // Asleep: no redraws (ADR 0001, idle means asleep); render once
-    // on wake instead.
-    if dirty && live.screen.asleep() {
-        live.redraw = true;
-        dirty = false;
+    // Vars the action worker wrote (a `set`) count whatever told us.
+    note_vars(live);
+    let dirty = live.rebuild || !live.changes.is_empty();
+    // Asleep: no redraws (ADR 0001, idle means asleep); what changed
+    // is kept for the wake, which builds the page afresh.
+    if !dirty || live.screen.asleep() {
+        return;
     }
     // A page coming in is not redrawn under way: the change shows
     // when it is in (its end wakes the loop).
-    if dirty && paneld_ui::page_transition_running() {
-        live.redraw = true;
-        dirty = false;
+    if paneld_ui::page_transition_running() {
+        return;
     }
     // Nor while the user is in the middle of something on it (a finger
     // down, a slider or roller dragged, a dropdown open): a redraw would
     // drop the press or close the list. It follows as soon as that ends
     // (a release wakes the loop). A navigation goes ahead.
-    if dirty && live.current_page == live.rendered_page && paneld_ui::interacting() {
-        live.redraw = true;
-        dirty = false;
+    if live.current_page == live.rendered_page && paneld_ui::interacting() {
+        return;
     }
-
-    if dirty && live.pending.is_none() {
-        let perf_t0 = perf_on().then(std::time::Instant::now);
-        if perf_t0.is_some() {
-            paneld_ui::perf::take();
+    let perf_t0 = perf_on().then(std::time::Instant::now);
+    if perf_t0.is_some() {
+        paneld_ui::perf::take();
+    }
+    let lap = |t: &mut Option<std::time::Instant>| -> u128 {
+        t.map_or(0, |x| {
+            let now = std::time::Instant::now();
+            *t = Some(now);
+            (now - x).as_micros()
+        })
+    };
+    let mut perf_lap = perf_t0;
+    test_delay();
+    let drawn_at = clock::unix_now();
+    // The runs as the context has them: a run that started or ended
+    // since its source's message was read counts here, not later.
+    let running = sources::running_names();
+    for name in running.symmetric_difference(&live.last_running) {
+        live.changes.source(name, ["running"]);
+    }
+    let ctx = build_ctx_running(&live.source_values, &live.theme, &live.vars, Some(&live.alerts), &running);
+    live.last_running = running;
+    // What the page is updated from is this context: its vars are the
+    // ones to tell changes by (the action worker may have set one since
+    // the diff above).
+    if let Some(paneld_ui::Value::Map(vars)) = ctx.get("vars") {
+        diff_vars(live, vars.clone());
+    }
+    let perf_ctx = lap(&mut perf_lap);
+    paneld_ui::set_call_states(live.calls.values().cloned().collect());
+    let same_page = live.rendered_page == live.current_page;
+    // ADR 0024: a value change updates the page in place; a navigation,
+    // a wake, a theme switch, or what an update cannot do builds it.
+    let mut full = live.rebuild || !same_page || live.instant || live.release_fonts || !updates_on();
+    if !full {
+        let changes = std::mem::take(&mut live.changes);
+        let made_before = paneld_ui::nodes::made_count();
+        match paneld_ui::update_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, &changes) {
+            paneld_ui::Updated::Nothing => {
+                // Nothing on the page reads it: so says a fresh render too.
+                if verify_on() {
+                    if let Err(e) = paneld_ui::verify_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, screen) {
+                        eprintln!("paneld: verify: page `{}` left as it was for {} differs from a fresh render: {e}", live.current_page, changes.describe());
+                        std::process::exit(3);
+                    }
+                }
+            }
+            paneld_ui::Updated::Done { visited, reapplied, redrawn } => {
+                UPDATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(t0) = perf_t0 {
+                    let perf_walk = lap(&mut perf_lap);
+                    let perf_fine = paneld_ui::perf::take();
+                    eprintln!(
+                        "perf update page={} us={} ctx={} walk={} [{}] visited={visited} reapplied={reapplied} redrawn={redrawn} made={} changes={} at={}",
+                        live.current_page,
+                        t0.elapsed().as_micros(),
+                        perf_ctx,
+                        perf_walk,
+                        perf_fine,
+                        paneld_ui::nodes::made_count() - made_before,
+                        changes.describe(),
+                        paneld_ui::perf::mono_us(),
+                    );
+                }
+                if verify_on() {
+                    if let Err(e) = paneld_ui::verify_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx, screen) {
+                        eprintln!("paneld: verify: page `{}` updated for {} differs from a fresh render: {e}", live.current_page, changes.describe());
+                        std::process::exit(3);
+                    }
+                }
+            }
+            paneld_ui::Updated::Rebuild(why) => {
+                if perf_on() {
+                    eprintln!("perf rebuild page={} why=\"{why}\" changes={}", live.current_page, changes.describe());
+                }
+                full = true;
+                live.changes.merge(changes);
+            }
         }
-        let lap = |t: &mut Option<std::time::Instant>| -> u128 {
-            t.map_or(0, |x| {
-                let now = std::time::Instant::now();
-                *t = Some(now);
-                (now - x).as_micros()
-            })
-        };
-        let mut perf_lap = perf_t0;
-        let drawn_at = clock::unix_now();
-        let ctx = build_ctx(
-            &live.source_values,
-            &live.theme,
-            &live.vars,
-            Some(&live.alerts),
-        );
-        let perf_ctx = lap(&mut perf_lap);
+    }
+    // A dialog is up: the page under it is only updated in place; it is
+    // built afresh once the dialog is gone.
+    if full && live.pending.is_some() {
+        live.rebuild = true;
+        full = false;
+    }
+    if full {
+        live.rebuild = false;
+        live.changes = paneld_ui::Changes::default();
         // A poll landing mid-entry must not wipe digits the user
         // is typing into a keypad on the same page.
         let typed = paneld_ui::snapshot_inputs();
-        let same_page = live.rendered_page == live.current_page;
         // After a sleep everything is drawn as it is now, at once.
         let instant = std::mem::take(&mut live.instant);
         if instant {
@@ -780,9 +835,6 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
             screen.release_fonts();
         }
         let perf_clear = lap(&mut perf_lap);
-        paneld_ui::reset_action_bindings();
-        paneld_ui::set_call_states(live.calls.values().cloned().collect());
-        paneld_ui::take_ago_next();
         paneld_ui::render_page(
             &live.ui_doc,
             &live.current_page,
@@ -792,7 +844,6 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         );
         let perf_render = lap(&mut perf_lap);
         let perf_fine = if perf_t0.is_some() { paneld_ui::perf::take() } else { String::new() };
-        live.ago_due = min_due(paneld_ui::take_ago_next(), age_due(live));
         if same_page {
             paneld_ui::restore_inputs(&typed);
         }
@@ -823,8 +874,146 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
         live.rendered_page = live.current_page.clone();
         RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         visible::show(&live.current_page);
-        live.clock_drawn = visible::clock_on_page().map(|t| (t, t.key(drawn_at)));
     }
+    live.ago_due = min_due(paneld_ui::page_ago_due(), age_due(live));
+    live.clock_drawn = visible::clock_on_page().map(|t| (t, t.key(drawn_at)));
+    live.minute_drawn = Some(clock::Tick::Minute.key(drawn_at));
+}
+
+/// `PANELD_TEST_DELAY_MS`: a pause before the page's context is taken,
+/// so a test can make the action worker's `set` land in between (a race
+/// a busy machine hits now and then). Read once; unset, nothing.
+fn test_delay() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("PANELD_TEST_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// `PANELD_VERIFY_UPDATES` set at start: after each update in place,
+/// compare the page with a fresh render of it (ADR 0024); a difference
+/// is a bug, and the process ends (exit 3) saying where.
+fn verify_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PANELD_VERIFY_UPDATES").is_some_and(|v| v != "0"))
+}
+
+/// `PANELD_UPDATES=0` at start: every change builds the page afresh, as
+/// before ADR 0024 (to compare the two, docs/deploy.md Diagnostics).
+fn updates_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PANELD_UPDATES").is_none_or(|v| v != "0"))
+}
+
+/// A dialog stage ended: with no other dialog up, it goes; the page
+/// under it kept its bindings (and was updated in place meanwhile).
+fn end_dialog(live: &mut LiveState) {
+    if live.pending.is_none() {
+        paneld_ui::close_dialog();
+    }
+}
+
+/// The vars that changed since the page last saw them.
+fn note_vars(live: &mut LiveState) {
+    let now = live.vars.lock().unwrap().clone();
+    diff_vars(live, now);
+}
+
+/// The vars in `now` that differ from what the page last saw, as
+/// changes; `now` is what it sees from here on.
+fn diff_vars(live: &mut LiveState, now: std::collections::BTreeMap<String, paneld_ui::Value>) {
+    for (k, v) in &now {
+        if live.last_vars.get(k) != Some(v) {
+            live.changes.var(k);
+        }
+    }
+    for k in live.last_vars.keys() {
+        if !now.contains_key(k) {
+            live.changes.var(k);
+        }
+    }
+    live.last_vars = now;
+}
+
+/// The fields of a source's result that differ between `old` and
+/// `new` (`*`: all, when either is not a map). A new `at` moves `age`.
+fn changed_fields(old: Option<&paneld_ui::Value>, new: &paneld_ui::Value) -> Vec<String> {
+    use paneld_ui::Value;
+    match (old, new) {
+        (Some(Value::Map(a)), Value::Map(b)) => {
+            let mut out: Vec<String> = b.iter().filter(|(k, v)| a.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect();
+            out.extend(a.keys().filter(|k| !b.contains_key(*k)).cloned());
+            if out.iter().any(|k| k == "at") {
+                out.push("age".into());
+            }
+            out
+        }
+        _ => vec!["*".into()],
+    }
+}
+
+/// A source's new result (or its run starting, or its `ok` / `error`
+/// only): into the values the page reads, an event for the alerts that
+/// read its stream, and the change names for the page.
+fn source_update(live: &mut LiveState, update: sources::SourceUpdate) {
+    // A run started: only `running` changed.
+    if update.began {
+        live.changes.source(&update.name, ["running"]);
+        return;
+    }
+    // A run that started before the value on screen was taken is
+    // stale (a slow refresh overtaken by a poll).
+    match live.source_started.get(&update.name) {
+        // Its run is over all the same: `running` may have changed.
+        Some(shown) if update.started < *shown => {
+            live.changes.source(&update.name, ["running"]);
+            return;
+        }
+        _ => {
+            live.source_started.insert(update.name.clone(), update.started);
+        }
+    }
+    let mut value = update.value;
+    if update.status {
+        // Only `ok` / `error` change: the rest of the last result
+        // (`value`, `at`, `history`, `exit`, ...) stays, and no
+        // event goes out.
+        let mut values = live.source_values.lock().unwrap();
+        if let (Some(paneld_ui::Value::Map(prev)), paneld_ui::Value::Map(m)) = (values.get(&update.name), &value) {
+            let mut merged = prev.clone();
+            for k in ["ok", "error"] {
+                merged.insert(k.to_string(), m.get(k).cloned().unwrap_or(paneld_ui::Value::Null));
+            }
+            value = paneld_ui::Value::Map(merged);
+        }
+        let fields = changed_fields(values.get(&update.name), &value);
+        values.insert(update.name.clone(), value);
+        drop(values);
+        live.changes.source(&update.name, fields.into_iter().chain(["running".to_string()]));
+        return;
+    }
+    let event_value = value.clone();
+    live.histories.record(&update.name, &mut value, std::time::SystemTime::now());
+    {
+        let mut values = live.source_values.lock().unwrap();
+        // A same output: only `at`, `age` and `history` (and `running`).
+        let fields = changed_fields(values.get(&update.name), &value);
+        live.changes.source(&update.name, fields.into_iter().chain(["running".to_string()]));
+        values.insert(update.name.clone(), value);
+    }
+    let event_ctx = build_ctx(
+        &live.source_values,
+        &live.theme,
+        &live.vars,
+        Some(&live.alerts),
+    );
+    let _ = live.alerts.ingest_event(
+        &update.name,
+        &event_value,
+        &event_ctx,
+        std::time::SystemTime::now(),
+    );
 }
 
 /// Everything the main loop re-creates on a `reload`.
@@ -883,9 +1072,19 @@ struct LiveState {
     previous_page: Option<String>,
     /// When the current toast (top layer) is removed.
     toast_until: Option<std::time::Instant>,
-    /// Set by ctl requests that change what is shown; consumed by the
-    /// next `process`.
-    redraw: bool,
+    /// What changed since the page was drawn or updated (ADR 0024),
+    /// for the next `process`; kept while it cannot be shown (asleep,
+    /// a page transition, a finger down).
+    changes: paneld_ui::Changes,
+    /// The page must be built afresh (a navigation, a theme switch, a
+    /// wake, or what an update cannot do).
+    rebuild: bool,
+    /// The vars as the page last saw them, to tell which changed.
+    last_vars: std::collections::BTreeMap<String, paneld_ui::Value>,
+    /// The minute the page was drawn or updated in.
+    minute_drawn: Option<i64>,
+    /// The sources running as the page last saw them.
+    last_running: std::collections::BTreeSet<String>,
     /// Screen power and night hours (schema 12).
     screen: screen::Screen,
     /// The theme the night hours ask for (`None`: the config's).
@@ -1085,6 +1284,7 @@ fn setup_live_state(
                 source_tx.clone(),
             );
         }
+        None if NO_SOURCES.load(std::sync::atomic::Ordering::Relaxed) => {}
         None => {
             let mut values = sources::resolve_all(&doc, &command_ctx, &config_dir, app_defaults);
             let now = std::time::SystemTime::now();
@@ -1095,13 +1295,11 @@ fn setup_live_state(
         }
     }
     sources::fill_not_run(&doc, &mut source_values.lock().unwrap());
-    let sources_shutdown = sources::spawn_pollers(
-        &doc,
-        &command_ctx,
-        source_tx.clone(),
-        &config_dir,
-        app_defaults,
-    );
+    let sources_shutdown = if NO_SOURCES.load(std::sync::atomic::Ordering::Relaxed) {
+        sources::ShutdownHandle::idle()
+    } else {
+        sources::spawn_pollers(&doc, &command_ctx, source_tx.clone(), &config_dir, app_defaults)
+    };
     let action_table = actions::collect(&doc);
     let action_table_for_main = action_table.clone();
     let source_blocks = sources::collect_blocks(&doc);
@@ -1192,12 +1390,11 @@ fn setup_live_state(
     // No object points at a font now: free them, so fonts tried across
     // reloads do not fill the cache and an edited `.ttf` is read again.
     screen.release_fonts();
-    paneld_ui::reset_action_bindings();
     // A reload: what the old config drew is no guide to the new one.
     paneld_ui::motion::forget();
-    paneld_ui::take_ago_next();
     paneld_ui::render_page(&ui_doc, &current_page, &ctx, &event_tx, screen);
-    let ago_due = paneld_ui::take_ago_next();
+    let ago_due = paneld_ui::page_ago_due();
+    let last_vars = vars_shared.lock().unwrap().clone();
     RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     visible::show(&current_page);
     let clock_drawn = visible::clock_on_page().map(|t| (t, t.key(drawn_at)));
@@ -1232,7 +1429,11 @@ fn setup_live_state(
         stale_events: Vec::new(),
         previous_page: None,
         toast_until: None,
-        redraw: false,
+        changes: paneld_ui::Changes::default(),
+        rebuild: false,
+        last_vars,
+        minute_drawn: Some(clock::Tick::Minute.key(drawn_at)),
+        last_running: sources::running_names(),
         screen: screen_state,
         screen_theme: None,
         ctl_theme: None,
@@ -1408,7 +1609,7 @@ fn run_builtin(live: &mut LiveState, call: &actions::Call) -> Result<(), ctl::Ct
     if !found {
         return Err(ctl::CtlError::msg(format!("no active alert `{id}`")));
     }
-    live.redraw = true;
+    live.changes.alerts = true;
     Ok(())
 }
 
@@ -1472,7 +1673,7 @@ fn apply_active_theme(live: &mut LiveState) {
     live.ui_doc = themes::ui_doc(&live.doc, name.as_deref());
     install_visible(&live.doc, &live.ui_doc);
     visible::show(&live.current_page);
-    live.redraw = true;
+    live.rebuild = true;
     // Other components: nothing moves on the switch.
     paneld_ui::motion::forget();
     // The old theme's fonts go with the old screen, at the next redraw.
@@ -1548,14 +1749,10 @@ fn dispatch(live: &mut LiveState, call: actions::Call) {
         return;
     }
     live.running.insert(key.clone(), call.name.clone());
-    // A new run of the action clears its failed mark. Only a page
-    // with a button for it changes.
-    let mut shown = paneld_ui::shows_call(&call.name, &call.args);
-    live.calls.retain(|_, c| {
-        let cleared = c.name == call.name && c.state == paneld_ui::RunState::Failed;
-        shown |= cleared && paneld_ui::shows_call(&c.name, &c.args);
-        !cleared
-    });
+    // A new run of the action clears its failed mark. Only buttons
+    // for it change (ADR 0024: `call:<action>`).
+    live.calls.retain(|_, c| !(c.name == call.name && c.state == paneld_ui::RunState::Failed));
+    live.changes.call(&call.name);
     let busy = live.actions.get(&call.name).and_then(|def| {
         let b = def.busy.as_ref()?;
         Some(paneld_ui::interpolate(&b.raw, b.span.file, b.span.start, &call_ctx(live, def, &call.args)))
@@ -1569,23 +1766,20 @@ fn dispatch(live: &mut LiveState, call: actions::Call) {
             busy,
         },
     );
-    if shown {
-        live.redraw = true;
-    }
     let _ = live.action_tx.send(call);
 }
 
 /// A call finished: off its buttons when it succeeded, `:failed` on
-/// them until the action runs again when it did not. True when a
-/// button on screen shows it.
-fn call_done(live: &mut LiveState, key: &str, ok: bool) -> bool {
-    let shown = live.calls.get(key).is_some_and(|c| paneld_ui::shows_call(&c.name, &c.args));
+/// them until the action runs again when it did not.
+fn call_done(live: &mut LiveState, key: &str, ok: bool) {
+    if let Some(c) = live.calls.get(key) {
+        live.changes.call(&c.name);
+    }
     if ok {
         live.calls.remove(key);
     } else if let Some(c) = live.calls.get_mut(key) {
         c.state = paneld_ui::RunState::Failed;
     }
-    shown
 }
 
 /// The context an action's messages (`busy`, `done`, `failed`) read:
@@ -1727,10 +1921,10 @@ fn action_title(live: &LiveState, name: &str, args: &[paneld_ui::ActionArg]) -> 
 }
 
 /// A dialog over the page: the page stays on screen, under a backdrop
-/// (theme `dialog_backdrop`) that takes the taps. The page's bindings
-/// are dropped, so only the dialog's own act.
+/// (theme `dialog_backdrop`) that takes the taps. The page keeps its
+/// bindings (ADR 0024) and is updated under it; the dialog's own go
+/// with it ([`end_dialog`]).
 fn dialog_layer<'a>(screen: &paneld_ui::ui::Obj<'a>) -> paneld_ui::ui::Obj<'a> {
-    paneld_ui::reset_action_bindings();
     screen.new_dialog_layer()
 }
 
@@ -1969,6 +2163,7 @@ fn run_shot(o: ShotOpts) -> ExitCode {
         return ExitCode::from(70);
     }
     let screen = ui.screen();
+    NO_SOURCES.store(o.no_sources, std::sync::atomic::Ordering::Relaxed);
     // A snapshot must never touch the real alert state file.
     let scratch_state = std::env::temp_dir().join(format!("paneld-shot-{}.state", std::process::id()));
     let mut live = match setup_live_state(&o.config, &screen, Some(&scratch_state), None) {
@@ -1992,16 +2187,54 @@ fn run_shot(o: ShotOpts) -> ExitCode {
         live.instant = true;
     }
     settle(&mut live, o.settle_ms);
+    let mut verified = Ok(());
+    let mut check = |live: &mut LiveState, mem: &mut paneld_ui::MemDisplay| {
+        if o.verify && verified.is_ok() {
+            verified = verify_picture(&ui, mem, live, &screen);
+        }
+    };
+    check(&mut live, &mut mem);
     for step in &o.taps {
-        match *step {
+        match step {
             ShotStep::Touch { x, y, press_ms } => {
-                mem.set_pointer(x, y, true);
-                settle(&mut live, press_ms);
-                mem.set_pointer(x, y, false);
+                mem.set_pointer(*x, *y, true);
+                settle(&mut live, *press_ms);
+                mem.set_pointer(*x, *y, false);
                 settle(&mut live, o.settle_ms);
             }
-            ShotStep::Wait(ms) => settle(&mut live, ms),
+            ShotStep::Wait(ms) => settle(&mut live, *ms),
+            ShotStep::Set { var, value } => {
+                if let Err(e) = shot_set(&mut live, var, value) {
+                    eprintln!("paneld shot: --set {var}: {e}");
+                    return ExitCode::from(2);
+                }
+                settle(&mut live, o.settle_ms);
+            }
+            ShotStep::Source { name, value } => {
+                inject_source(&mut live, name, shot_value(value));
+                settle(&mut live, o.settle_ms);
+            }
         }
+        check(&mut live, &mut mem);
+    }
+    if o.fuzz > 0 {
+        let mut rng = o.seed.max(1);
+        let mut runs = Vec::new();
+        for _ in 0..o.fuzz {
+            // Up to three changes land in one pass.
+            for _ in 0..1 + next_rand(&mut rng) % 3 {
+                fuzz_step(&mut live, &mut rng, &mut runs);
+            }
+            settle(&mut live, 40);
+        }
+        drop(runs);
+        check(&mut live, &mut mem);
+    }
+    if let Err(e) = verified {
+        eprintln!("paneld shot: verify: {e}");
+        live.sources_shutdown.stop();
+        let _ = std::fs::remove_file(&scratch_state);
+        return ExitCode::from(3);
     }
 
     let (w, h) = mem.size();
@@ -2018,6 +2251,251 @@ fn run_shot(o: ShotOpts) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `--set var=value`: as `paneld ctl set` does.
+fn shot_set(live: &mut LiveState, var: &str, raw: &str) -> Result<(), String> {
+    let ty = live.var_types.get(var).cloned().ok_or_else(|| format!("no var `{var}`"))?;
+    let span = paneld_config::source::Span { file: paneld_config::source::FileId::default(), start: 0, end: 0 };
+    let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+    let value = paneld_ui::resolve_value(raw, span, &ctx).and_then(|v| vars::coerce(&ty, v)).ok_or_else(|| format!("`{raw}` does not fit ({ty})"))?;
+    live.vars.lock().unwrap().insert(var.to_string(), value);
+    note_vars(live);
+    Ok(())
+}
+
+/// A value written on the command line: a number, a bool, else text.
+fn shot_value(raw: &str) -> paneld_ui::Value {
+    use paneld_ui::Value;
+    let t = raw.trim();
+    if let Ok(n) = t.parse::<i64>() {
+        Value::Int(n)
+    } else if let Ok(d) = t.parse::<f64>() {
+        Value::Double(d)
+    } else if let Some(b) = paneld_config::value::parse_bool(t) {
+        Value::Bool(b)
+    } else {
+        Value::String(raw.to_string())
+    }
+}
+
+/// A new result of source `name` whose `value` is `value`, the rest as
+/// the last one: through the same path as a poll's.
+fn inject_source(live: &mut LiveState, name: &str, value: paneld_ui::Value) {
+    use paneld_ui::Value;
+    let mut map = match live.source_values.lock().unwrap().get(name) {
+        Some(Value::Map(m)) => m.clone(),
+        _ => Default::default(),
+    };
+    for k in ["history", "at", "age", "running"] {
+        map.remove(k);
+    }
+    map.insert("value".into(), value);
+    map.insert("ok".into(), Value::Bool(true));
+    map.insert("error".into(), Value::String(String::new()));
+    let update = sources::SourceUpdate { name: name.to_string(), value: Value::Map(map), status: false, started: std::time::Instant::now(), began: false };
+    source_update(live, update);
+}
+
+/// The next number of a small xorshift generator (`--fuzz`).
+fn next_rand(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// One random change (`paneld shot --fuzz`): a source's value, a var,
+/// an alert fired or resolved, an action call running, failed or done,
+/// or the clock.
+fn fuzz_step(live: &mut LiveState, rng: &mut u64, runs: &mut Vec<(String, sources::Run)>) {
+    use paneld_ui::Value;
+    let pick = |rng: &mut u64, n: usize| (next_rand(rng) as usize) % n.max(1);
+    let r = next_rand(rng);
+    let numbers = [0.0, 1.0, 5.0, 42.0, 50.0, 79.5, 80.0, 95.0, 100.0, -3.0];
+    let texts = ["", "ok", "a", "running", "stopped", "x y", "warning"];
+    match r % 7 {
+        6 => {
+            // A run of a source starts or ends: its `running`.
+            let names: Vec<String> = live.source_values.lock().unwrap().keys().cloned().collect();
+            if names.is_empty() {
+                return;
+            }
+            let name = names[pick(rng, names.len())].clone();
+            match runs.iter().position(|(n, _)| *n == name) {
+                Some(i) => drop(runs.remove(i)),
+                None => runs.push((name.clone(), sources::Run::start(&name, None))),
+            }
+            live.changes.source(&name, ["running"]);
+        }
+        0 | 1 => {
+            let names: Vec<String> = live.source_values.lock().unwrap().keys().cloned().collect();
+            if names.is_empty() {
+                return;
+            }
+            let name = names[pick(rng, names.len())].clone();
+            let old = match live.source_values.lock().unwrap().get(&name) {
+                Some(Value::Map(m)) => m.get("value").cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            let value = match (next_rand(rng) % 4, &old) {
+                // The same output again: only `at` and `history` change.
+                (0, v) => v.clone(),
+                (_, Value::Bool(b)) => Value::Bool(!b),
+                (_, Value::String(_)) => Value::String(texts[pick(rng, texts.len())].into()),
+                (_, Value::List(l)) if !l.is_empty() => {
+                    let mut l = l.clone();
+                    if next_rand(rng) % 2 == 0 {
+                        l.pop();
+                    } else {
+                        let first = l[0].clone();
+                        l.push(first);
+                    }
+                    Value::List(l)
+                }
+                (_, Value::List(_)) | (_, Value::Map(_)) => old.clone(),
+                _ => Value::Double(numbers[pick(rng, numbers.len())]),
+            };
+            inject_source(live, &name, value);
+        }
+        2 => {
+            let vars: Vec<(String, String)> = live.var_types.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            if vars.is_empty() {
+                return;
+            }
+            let (var, ty) = &vars[pick(rng, vars.len())];
+            let raw = match ty.as_str() {
+                "bool" => ["true", "false"][pick(rng, 2)].to_string(),
+                "int" => ["0", "1", "2", "7"][pick(rng, 4)].to_string(),
+                "number" => ["0", "0.5", "21", "75"][pick(rng, 4)].to_string(),
+                _ => {
+                    // A string var: one of the values it had, or another.
+                    let now = live.vars.lock().unwrap().get(var).map(|v| v.to_display_string()).unwrap_or_default();
+                    [now.as_str(), "a", "b", ""][pick(rng, 4)].to_string()
+                }
+            };
+            let quoted = if matches!(ty.as_str(), "bool" | "int" | "number") { raw } else { format!("\"{raw}\"") };
+            let _ = shot_set(live, var, &quoted);
+        }
+        3 => {
+            let id = format!("fuzz{}", pick(rng, 3));
+            let now = std::time::SystemTime::now();
+            if next_rand(rng) % 2 == 0 {
+                let severity = ["critical", "warning", "info"][pick(rng, 3)];
+                live.alerts.fire_external(&id, severity, &id, "fuzz", "", now);
+            } else {
+                live.alerts.resolve_external(&id);
+            }
+            live.changes.alerts = true;
+        }
+        4 => {
+            let names: Vec<String> = live.actions.keys().cloned().collect();
+            if names.is_empty() {
+                return;
+            }
+            let name = names[pick(rng, names.len())].clone();
+            // With an arg of its own when it takes one, as a button in a
+            // `repeat` calls it.
+            let args: Vec<paneld_ui::ActionArg> = live.actions[&name]
+                .params
+                .first()
+                .filter(|_| next_rand(rng) % 2 == 0)
+                .map(|p| {
+                    let value = [Value::Int(1), Value::String("a".into()), Value::String("b".into())][pick(rng, 3)].clone();
+                    vec![paneld_ui::ActionArg { name: p.name.clone(), value }]
+                })
+                .unwrap_or_default();
+            let key = actions::run_key(&name, &args);
+            match next_rand(rng) % 3 {
+                0 => {
+                    live.calls.insert(
+                        key,
+                        paneld_ui::CallState {
+                            name: name.clone(),
+                            args: args.clone(),
+                            state: paneld_ui::RunState::Running,
+                            busy: (next_rand(rng) % 2 == 0).then(|| "wait".to_string()),
+                        },
+                    );
+                }
+                1 => {
+                    live.calls.insert(
+                        key,
+                        paneld_ui::CallState { name: name.clone(), args: args.clone(), state: paneld_ui::RunState::Failed, busy: None },
+                    );
+                }
+                _ => {
+                    live.calls.remove(&key);
+                }
+            }
+            live.changes.call(&name);
+        }
+        _ => {
+            if next_rand(rng) % 2 == 0 {
+                live.changes.now_minute = true;
+            } else {
+                live.changes.now_second = true;
+            }
+            if next_rand(rng) % 3 == 0 {
+                live.changes.ago = true;
+            }
+        }
+    }
+}
+
+/// `paneld shot --verify`: the page as drawn now, and the same page
+/// built afresh on a scratch screen, pixel for pixel (animations at
+/// their end). Skipped while a dialog is up (the fresh page has none).
+fn verify_picture(ui: &paneld_ui::Ui, mem: &mut paneld_ui::MemDisplay, live: &LiveState, screen: &paneld_ui::ui::Obj<'_>) -> Result<(), String> {
+    let exists = live.ui_doc.items.iter().any(|it| {
+        matches!(it, paneld_config::parse::Item::Block(b) if b.kind.text == "page" && b.name.as_ref().is_some_and(|n| n.text == live.current_page))
+    });
+    if !exists || live.pending.is_some() || paneld_ui::page_transition_running() {
+        return Ok(());
+    }
+    // Let what moves (a value, a toggle's knob) arrive; what never
+    // holds still (a spinner, a scrolling label) is left out.
+    let run = |ms: u32| {
+        for _ in 0..ms / 20 {
+            ui.advance(20);
+        }
+    };
+    run(1500);
+    let mut shown = mem.rgb();
+    let mut restless = paneld_ui::restless_areas(screen);
+    let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
+    paneld_ui::set_call_states(live.calls.values().cloned().collect());
+    let fresh = paneld_ui::scratch_page(&live.ui_doc, &live.current_page, &ctx, &live.event_tx);
+    paneld_ui::show_screen(&fresh);
+    run(1500);
+    let mut built = mem.rgb();
+    restless.extend(paneld_ui::restless_areas(&fresh));
+    paneld_ui::show_screen(screen);
+    paneld_ui::delete_screen(fresh);
+    ui.advance(20);
+    let (w, h) = mem.size();
+    for (x1, y1, x2, y2) in restless {
+        for y in y1.max(0)..=y2.min(h as i32 - 1) {
+            for x in x1.max(0)..=x2.min(w as i32 - 1) {
+                let i = (y as usize * w as usize + x as usize) * 3;
+                shown[i..i + 3].fill(0);
+                built[i..i + 3].fill(0);
+            }
+        }
+    }
+    if shown == built {
+        return Ok(());
+    }
+    // Both pictures, to look at: next to the shot's own.
+    if let Some(dir) = std::env::var_os("PANELD_VERIFY_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::write(dir.join("updated.png"), png::encode_rgb(w, h, &shown));
+        let _ = std::fs::write(dir.join("fresh.png"), png::encode_rgb(w, h, &built));
+    }
+    let first = shown.iter().zip(&built).position(|(a, b)| a != b).unwrap_or(0) / 3;
+    Err(format!("page `{}`: the picture differs from a fresh render, first at {},{}", live.current_page, first % w as usize, first / w as usize))
 }
 
 /// `paneld hash-pin`: read one line (the PIN) from stdin and print
@@ -2124,7 +2602,7 @@ fn raise_display_problem(live: &mut LiveState) {
     if let Some(Some(problem)) = DISPLAY_PROBLEM.get() {
         let now = std::time::SystemTime::now();
         if live.alerts.fire_rule("paneld", "display", "warning", "Display config not used", problem, "", now) {
-            live.redraw = true;
+            live.changes.alerts = true;
         }
     }
 }
@@ -2209,7 +2687,7 @@ fn handle_request(
                 .and_then(|v| vars::coerce(&ty, v))
                 .ok_or_else(|| ctl::CtlError::msg(format!("`{raw}` does not fit var `{name}` ({ty})")))?;
             live.vars.lock().unwrap().insert(name, value.clone());
-            live.redraw = true;
+            note_vars(live);
             Ok(value)
         }
         "goto" => {
@@ -2222,7 +2700,7 @@ fn handle_request(
                 return Err(ctl::CtlError::msg(format!("no page `{page}`")));
             }
             if go_to(live, &page) {
-                live.redraw = true;
+                live.rebuild = true;
             }
             Ok(Value::String(live.current_page.clone()))
         }
@@ -2238,7 +2716,7 @@ fn handle_request(
             let text = req.opt_arg("text").unwrap_or_default();
             let link = req.opt_arg("link").unwrap_or_default();
             if live.alerts.fire_external(&id, &severity, &title, &text, &link, std::time::SystemTime::now()) {
-                live.redraw = true;
+                live.changes.alerts = true;
             }
             Ok(Value::String(format!("{}:{id}", alerts::CTL_RULE)))
         }
@@ -2266,7 +2744,7 @@ fn handle_request(
         "alert_resolve" => {
             let id = req.arg("id")?;
             if live.alerts.resolve_external(&id) {
-                live.redraw = true;
+                live.changes.alerts = true;
                 Ok(Value::String("resolved".into()))
             } else {
                 Err(ctl::CtlError::msg(format!("no active ctl alert `{id}`")))
@@ -2304,8 +2782,13 @@ fn handle_request(
             // loop's last sleep could be (1000 ms when nothing moves).
             m.insert("animations".to_string(), Value::Int(paneld_ui::running_animations() as i64));
             m.insert("idle_ms".to_string(), Value::Int(paneld_ui::idle_hint_ms() as i64));
-            // Full page renders since start: what the panel redrew.
+            // Full page renders since start: what the panel built, and
+            // the updates in place (ADR 0024).
             m.insert("renders".to_string(), Value::Int(RENDERS.load(std::sync::atomic::Ordering::Relaxed) as i64));
+            m.insert("updates".to_string(), Value::Int(UPDATES.load(std::sync::atomic::Ordering::Relaxed) as i64));
+            let (records, made) = paneld_ui::nodes::table_size();
+            m.insert("node_records".to_string(), Value::Int(records as i64));
+            m.insert("node_objects".to_string(), Value::Int(made as i64));
             // ADR 0024: LVGL objects on the screen and its top layer
             // (dialogs, toast), and the process's resident memory.
             let nodes = screen.descendant_count() + screen.top_layer().descendant_count();
@@ -2336,13 +2819,24 @@ fn build_ctx(
     vars: &std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
     alerts: Option<&alerts::Engine>,
 ) -> paneld_ui::Context {
+    build_ctx_running(source_values, theme, vars, alerts, &sources::running_names())
+}
+
+/// [`build_ctx`] with the sources running as of `running`.
+fn build_ctx_running(
+    source_values: &std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
+    theme: &std::collections::BTreeMap<String, paneld_ui::Value>,
+    vars: &std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, paneld_ui::Value>>>,
+    alerts: Option<&alerts::Engine>,
+    running: &std::collections::BTreeSet<String>,
+) -> paneld_ui::Context {
     // No `secrets` here: schema 16 allows them only in `run` and `env`,
     // and this context feeds pages, messages and alert texts (which
     // reach the screen and the state file). Command interpolation adds
     // them, see `with_secrets`.
     let mut ctx = paneld_ui::Context::new();
     let sources_snapshot = source_values.lock().unwrap().clone();
-    remotes::expose(&mut ctx, sources_snapshot);
+    remotes::expose(&mut ctx, sources_snapshot, running);
     ctx.insert("theme".into(), paneld_ui::Value::Map(theme.clone()));
     let snapshot = vars.lock().unwrap().clone();
     ctx.insert("vars".into(), paneld_ui::Value::Map(snapshot));
@@ -2390,6 +2884,11 @@ fn rss_kb() -> Option<i64> {
 
 /// Full page renders since start, for `ctl status` (`renders`).
 static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `paneld shot --no-sources`: no source command runs.
+static NO_SOURCES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Updates in place since start, for `ctl status` (`updates`).
+static UPDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {

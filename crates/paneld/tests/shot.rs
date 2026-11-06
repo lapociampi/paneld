@@ -85,9 +85,12 @@ fn shot(config: &Path, extra: &[&str]) -> Image {
         .arg("-o")
         .arg(&out)
         .args(extra)
+        // ADR 0024: every update in place is checked against a fresh
+        // render (exit 3 and the first difference when they differ).
+        .env("PANELD_VERIFY_UPDATES", "1")
         .output()
         .expect("run paneld shot");
-    assert!(run.status.success(), "paneld shot failed: {}", run.status);
+    assert!(run.status.success(), "paneld shot failed: {}\n{}", run.status, String::from_utf8_lossy(&run.stderr));
     // LVGL logs with printf, on stdout: an error there is a bug even
     // when the picture looks right.
     let log = String::from_utf8_lossy(&run.stdout);
@@ -1274,7 +1277,7 @@ fn qr_codes_are_freed_without_lvgl_errors() {
     for _ in 0..6 {
         args.extend(["--tap", "50,83", "--settle", "50"]);
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_paneld")).args(&args).output().expect("run paneld shot");
+    let out = Command::new(env!("CARGO_BIN_EXE_paneld")).args(&args).env("PANELD_VERIFY_UPDATES", "1").output().expect("run paneld shot");
     assert!(out.status.success());
     // LVGL logs with printf: on stdout.
     let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -2827,4 +2830,279 @@ fn a_var_set_after_a_component_call_reaches_its_params_and_body() {
     // After `k = 4` the last check (`vars.k == 3`) turns red; `live`
     // sees the new value through its param and directly.
     assert_eq!(scope_checks(&["515,99"]), (10, 1));
+}
+
+// ---- ADR 0024: pages updated in place ----
+
+/// `paneld shot` with `PANELD_PERF` (and verify): what it printed.
+fn shot_perf(config: &Path, extra: &[&str]) -> String {
+    let run = Command::new(env!("CARGO_BIN_EXE_paneld"))
+        .arg("shot")
+        .arg("-c")
+        .arg(config)
+        .arg("-o")
+        .arg(config.with_extension("png"))
+        .args(extra)
+        .env("PANELD_VERIFY_UPDATES", "1")
+        .env("PANELD_PERF", "1")
+        .output()
+        .expect("run paneld shot");
+    let err = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(run.status.success(), "paneld shot failed: {}\n{err}", run.status);
+    err
+}
+
+/// `name=value` fields of a perf line.
+fn field<'a>(line: &'a str, name: &str) -> &'a str {
+    line.split_whitespace().find_map(|w| w.strip_prefix(name).and_then(|r| r.strip_prefix('='))).unwrap_or("")
+}
+
+#[test]
+fn a_value_change_updates_only_what_shows_it() {
+    let d = tmp("in-place");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "source cpu { run = echo 1; poll = 1h }\n\
+         page home { column {\n\
+             text { value = CPU {{ sources.cpu.value }} }\n\
+             text { value = one }\n\
+             rect { width = 300; height = 100; background = #336699 }\n\
+             text { value = {{ ago(sources.cpu.at) }} }\n\
+         } }\n",
+    )
+    .unwrap();
+    // A second apart, so the same output is a new `at`.
+    let log = shot_perf(&conf, &["--no-sources", "--source", "cpu=42", "--wait", "1100", "--source", "cpu=42", "--wait", "1100", "--source", "cpu=50"]);
+    let lines: Vec<&str> = log.lines().filter(|l| !l.starts_with("perf event")).collect();
+    // Drawn once; every change after is an update, with no object made
+    // (every one kept), none built.
+    assert_eq!(lines.iter().filter(|l| l.starts_with("perf build")).count(), 0, "{log}");
+    let updates: Vec<&&str> = lines.iter().filter(|l| l.starts_with("perf update")).collect();
+    assert_eq!(updates.len(), 3, "{log}");
+    assert!(updates.iter().all(|l| field(l, "made") == "0"), "{log}");
+    // The same output again: only its `at` moved; its reader still
+    // reads `just now`, and no `value` reader is looked at.
+    assert!(!field(updates[1], "changes").contains("cpu.value") && field(updates[1], "changes").contains("cpu.at"), "{}", updates[1]);
+    assert_eq!(field(updates[1], "reapplied"), "0", "{}", updates[1]);
+    assert!(field(updates[2], "changes").contains("cpu.value"), "{}", updates[2]);
+    assert_eq!(field(updates[2], "reapplied"), "1", "{}", updates[2]);
+    // Each frame after an update redraws a line of text, not the page.
+    for u in &updates {
+        let at = lines.iter().position(|l| l == *u).unwrap();
+        let frame = lines[at..].iter().find(|l| l.starts_with("perf t=")).expect("a frame after the update");
+        let px: u64 = field(frame, "px").parse().unwrap();
+        assert!(px < 20_000, "{px} px redrawn for a label: {frame}");
+    }
+}
+
+#[test]
+fn the_page_takes_taps_after_a_dialog_closes() {
+    // The page's bindings are its objects': a dialog over it adds its
+    // own and takes them along when it goes (ADR 0024).
+    let d = tmp("after-dialog");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var a: bool = false\nvar b: bool = false\n\
+         page home {\n\
+             button { width = 200; height = 60; label = ask; on_tap { set { a = true }; confirm = Sure? } }\n\
+             button { width = 200; height = 60; label = b; on_tap { set { b = true } } }\n\
+             rect { width = 100; height = 40; background = {{ vars.a && vars.b ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    // Under the shell's title bar: `ask`, OK in the dialog, then `b`.
+    let img = shot(&conf, &["--tap", "100,95", "--settle", "200", "--tap", "463,282", "--settle", "200", "--tap", "100,160", "--settle", "200"]);
+    assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the page took no tap after the dialog");
+}
+
+#[test]
+fn a_grid_child_shown_again_takes_its_place_as_in_a_fresh_render() {
+    let d = tmp("grid-visible");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var show: bool = true\n\
+         page home { grid { columns = 2\n\
+             rect { width = 50; height = 50; background = #ff0000 }\n\
+             rect { width = 50; height = 50; background = #00ff00; visible = {{ vars.show }} }\n\
+             rect { width = 50; height = 50; background = #0000ff }\n\
+         } }\n",
+    )
+    .unwrap();
+    // `--verify` compares each step's picture with a fresh render.
+    let img = shot(&conf, &["--verify", "--set", "show=false"]);
+    let blue = bbox(&img, |p| close(p, [0, 0, 0xff], 16)).unwrap();
+    let red = bbox(&img, |p| close(p, [0xff, 0, 0], 16)).unwrap();
+    assert!(blue.1 < red.3, "the blue cell did not move up beside the red one");
+    shot(&conf, &["--verify", "--set", "show=false", "--set", "show=true"]);
+}
+
+#[test]
+fn a_running_button_and_its_end_look_as_a_fresh_render() {
+    let d = tmp("busy-verify");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "action slow { busy = wait; run = sleep 0.6 }\n\
+         action spin { run = sleep 0.6 }\n\
+         page home {\n\
+             button { width = 200; height = 60; label = go; on_tap = slow }\n\
+             button { width = 200; height = 60; icon = refresh; label = go; on_tap = spin }\n\
+         }\n",
+    )
+    .unwrap();
+    shot(&conf, &["--verify", "--tap", "100,95", "--tap", "100,160", "--settle", "100", "--wait", "1200"]);
+}
+
+/// The configs random changes are checked over: the shipped shell and
+/// alerts page, the examples, and the rack config when it is next to
+/// this repo (read only, nothing of it runs).
+fn fuzz_configs() -> Vec<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut out: Vec<PathBuf> = ["homelab", "smart-home", "system"].iter().map(|e| root.join("examples").join(e).join("paneld.conf")).collect();
+    let rack = root.join("../paneld-configs/paneld.conf");
+    if rack.is_file() {
+        out.push(rack);
+    }
+    out
+}
+
+/// The pages of `conf` (`page <name>` at the start of a line), and the
+/// shipped alerts page.
+fn pages_of(conf: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(conf).unwrap();
+    let mut pages: Vec<String> =
+        text.lines().filter_map(|l| l.strip_prefix("page ")).filter_map(|r| r.split_whitespace().next()).map(str::to_string).collect();
+    pages.push("alerts".into());
+    pages
+}
+
+#[test]
+fn random_changes_update_every_page_as_a_fresh_render_would_draw_it() {
+    // A minimal config: the shipped shell and alerts page.
+    let d = tmp("fuzz");
+    let lib = d.join("p.conf");
+    std::fs::write(&lib, "var x: int = 0\npage home { nav = 1; text { value = {{ vars.x }} } }\n").unwrap();
+    let mut configs = vec![lib];
+    configs.extend(fuzz_configs());
+    for conf in configs {
+        for page in pages_of(&conf) {
+            for seed in ["5", "17", "40"] {
+                let out = d.join(format!("fuzz-{page}-{seed}.png"));
+                let run = Command::new(env!("CARGO_BIN_EXE_paneld"))
+                    .arg("shot")
+                    .arg("-c")
+                    .arg(&conf)
+                    .arg("-o")
+                    .arg(&out)
+                    .args(["--no-sources", "--settle", "50", "--verify", "--page", &page, "--fuzz", "80", "--seed", seed])
+                    .env("PANELD_VERIFY_UPDATES", "1")
+                    .output()
+                    .expect("run paneld shot");
+                assert!(
+                    run.status.success(),
+                    "{} page {page} seed {seed}: {}\n{}",
+                    conf.display(),
+                    run.status,
+                    String::from_utf8_lossy(&run.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_spinner_shown_again_by_an_update_keeps_turning() {
+    // Review: setting a node up again deleted LVGL's own animations; the
+    // verify dump counts those that run for good (a spinner's turn).
+    let d = tmp("spin-again");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var show: bool = true\nvar c: int = 0\n\
+         page home { column {\n\
+             spinner { width = 60; height = 60; visible = {{ vars.show }} }\n\
+             text { value = {{ vars.c }} }\n\
+         } }\n",
+    )
+    .unwrap();
+    shot(&conf, &["--set", "show=false", "--set", "show=true", "--set", "c=2"]);
+}
+
+#[test]
+fn a_node_set_up_again_by_its_call_keeps_what_it_shows_in_step() {
+    // Review: a root set up again because its call's own keys changed
+    // kept the fingerprint from before, so a later change back to it
+    // was skipped and the old color stayed.
+    let d = tmp("fp-forced");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var a: int = 0\n\
+         component card {\n\
+             param p: int = 0\n\
+             rect { width = 100; height = 50; background = {{ p > 150 ? '#ff0000' : '#00ff00' }} }\n\
+         }\n\
+         page home { column {\n\
+             card { p = {{ vars.a }}; opacity = {{ vars.a > 100 ? 0.5 : 1 }} }\n\
+         } }\n",
+    )
+    .unwrap();
+    let img = shot(&conf, &["--set", "a=1", "--set", "a=50", "--set", "a=200", "--set", "a=120"]);
+    let green = |p: [u8; 3]| p[1] > 0x80 && p[0] < 0x80 && p[2] < 0x80;
+    let red = |p: [u8; 3]| p[0] > 0x80 && p[1] < 0x80 && p[2] < 0x80;
+    assert!(img.any(green) && !img.any(red), "the card stayed red at a = 120");
+}
+
+#[test]
+fn an_ago_in_a_component_arg_is_timed() {
+    // Review: an `ago()` evaluated in a component arg was never
+    // scheduled. Verify compares the page's `ago()` timing with a
+    // fresh render's after each update.
+    let d = tmp("ago-arg");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "source x { run = echo 1; poll = 1h }\n\
+         component age_of { param t: string = \"\"; text { value = {{ t }} } }\n\
+         page home { column { age_of { t = {{ ago(sources.x.at) }} } } }\n\
+         page two { title = {{ ago(sources.x.at) }}; column { text { value = x } } }\n",
+    )
+    .unwrap();
+    shot(&conf, &["--no-sources", "--source", "x=1", "--source", "x=2"]);
+    // In a page title (`page`, `nav`), the same.
+    shot(&conf, &["--no-sources", "--page", "two", "--source", "x=1", "--source", "x=2"]);
+}
+
+#[test]
+fn a_var_set_while_the_page_is_updated_is_shown() {
+    // Review: the vars were told apart before the page's context was
+    // taken; a `set` by the action worker in between was drawn without
+    // its change (the rect kept red; verify said so under load).
+    // `PANELD_TEST_DELAY_MS` holds the loop there long enough for it.
+    let d = tmp("var-race");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var on: bool = false\n\
+         page home {\n\
+             toggle { on_change { set { on = {{ event.value }} }; confirm = Sure? } }\n\
+             rect { width = 100; height = 40; background = {{ vars.on ? '#00ff00' : '#ff0000' }} }\n\
+         }\n",
+    )
+    .unwrap();
+    for _ in 0..3 {
+        let run = Command::new(env!("CARGO_BIN_EXE_paneld"))
+            .args(["shot", "-c", conf.to_str().unwrap(), "-o", d.join("p.png").to_str().unwrap()])
+            .args(["--tap", "38,77", "--tap", "463,282", "--settle", "200"])
+            .env("PANELD_VERIFY_UPDATES", "1")
+            .env("PANELD_TEST_DELAY_MS", "30")
+            .output()
+            .expect("run paneld shot");
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        let img = decode(&std::fs::read(d.join("p.png")).unwrap());
+        assert!(img.any(|p| close(p, [0, 0xff, 0], 16)), "the set was not drawn");
+    }
 }

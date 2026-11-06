@@ -188,22 +188,90 @@ enum ChangeKind {
     PinEntry,
 }
 
-/// Global registry of per-widget bindings. [`Obj::on_tap`] /
-/// [`Obj::on_tap_goto`] append a binding and use the returned index
-/// as the LVGL event user_data; the static trampoline reads that
-/// index when the event fires. The main loop calls
-/// [`reset_action_bindings`] before each re-render so freshly-
-/// cleared LVGL objects cannot fire against stale indices.
-fn bindings() -> &'static Mutex<Vec<Binding>> {
-    static B: OnceLock<Mutex<Vec<Binding>>> = OnceLock::new();
-    B.get_or_init(|| Mutex::new(Vec::new()))
+/// Per-widget bindings (ADR 0024: a binding belongs to its object). A
+/// registration takes a free slot and uses its index as the LVGL event
+/// user_data; the static trampolines read that index when the event
+/// fires. The slots of an object are freed when LVGL deletes it (and
+/// by [`Obj::unbind_all`] before it is bound again), so a page, a
+/// dialog or a scratch tree drops only its own.
+#[derive(Default)]
+struct Slab {
+    slots: Vec<Option<(usize, Binding)>>,
+    free: Vec<usize>,
 }
 
-/// Drop every registered action / goto binding. Call this on the UI
-/// thread AFTER [`Obj::clear_children`] on the screen.
-pub fn reset_action_bindings() {
-    bindings().lock().unwrap().clear();
-    INPUTS.with(|v| v.borrow_mut().clear());
+fn bindings() -> &'static Mutex<Slab> {
+    static B: OnceLock<Mutex<Slab>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(Slab::default()))
+}
+
+unsafe extern "C" fn free_bindings(e: *mut sys::lv_event_t) {
+    // SAFETY: registered for DELETE on the object whose slots go.
+    let obj = unsafe { sys::lv_event_get_target(e) } as usize;
+    free_slots(obj);
+}
+
+fn free_slots(obj: usize) {
+    let mut g = bindings().lock().unwrap_or_else(|e| e.into_inner());
+    let g = &mut *g;
+    for (i, s) in g.slots.iter_mut().enumerate() {
+        if s.as_ref().is_some_and(|(o, _)| *o == obj) {
+            *s = None;
+            g.free.push(i);
+        }
+    }
+}
+
+/// Register `binding` on `obj` for `code` through `cb`.
+fn bind(obj: *mut sys::lv_obj_t, binding: Binding, cb: unsafe extern "C" fn(*mut sys::lv_event_t), code: sys::lv_event_code_t) {
+    let idx = {
+        let mut g = bindings().lock().unwrap_or_else(|e| e.into_inner());
+        match g.free.pop() {
+            Some(i) => {
+                g.slots[i] = Some((obj as usize, binding));
+                i
+            }
+            None => {
+                g.slots.push(Some((obj as usize, binding)));
+                g.slots.len() - 1
+            }
+        }
+    };
+    unsafe {
+        if !has_event_cb(obj, free_bindings, sys::lv_event_code_t_LV_EVENT_DELETE) {
+            sys::lv_obj_add_event_cb(obj, Some(free_bindings), sys::lv_event_code_t_LV_EVENT_DELETE, std::ptr::null_mut());
+        }
+        sys::lv_obj_add_event_cb(obj, Some(cb), code, idx as *mut std::ffi::c_void);
+    }
+}
+
+fn binding_at(idx: usize) -> Option<Binding> {
+    let g = bindings().lock().unwrap_or_else(|e| e.into_inner());
+    g.slots.get(idx).and_then(|s| s.as_ref()).map(|(_, b)| b.clone())
+}
+
+/// Whether `obj` has `cb` registered for `code`.
+pub(crate) fn has_event_cb(obj: *mut sys::lv_obj_t, cb: unsafe extern "C" fn(*mut sys::lv_event_t), code: sys::lv_event_code_t) -> bool {
+    unsafe {
+        (0..sys::lv_obj_get_event_count(obj)).any(|i| {
+            let d = sys::lv_obj_get_event_dsc(obj, i);
+            !d.is_null() && sys::lv_event_dsc_get_cb(d).is_some_and(|f| f as usize == cb as usize) && event_dsc_code(d) == code
+        })
+    }
+}
+
+/// The code an event descriptor is registered for (filter bits off).
+unsafe fn event_dsc_code(d: *mut sys::lv_event_dsc_t) -> sys::lv_event_code_t {
+    unsafe { sys::lv_paneld_event_dsc_code(d) }
+}
+
+/// Close the dialog that is up, if any (its bindings go with it; the
+/// page under it kept its own).
+pub fn close_dialog() {
+    let d = DIALOG.with(|d| d.replace(std::ptr::null_mut()));
+    if !d.is_null() {
+        unsafe { sys::lv_obj_delete(d) };
+    }
 }
 
 /// Milliseconds since the last touch on the default display.
@@ -341,10 +409,7 @@ pub fn restore_inputs(texts: &[String]) {
 
 unsafe extern "C" fn on_tap_trampoline(e: *mut sys::lv_event_t) {
     let idx = unsafe { sys::lv_event_get_user_data(e) } as usize;
-    let bind = {
-        let guard = bindings().lock().unwrap();
-        guard.get(idx).cloned()
-    };
+    let bind = binding_at(idx);
     match bind {
         Some(Binding::Action { name, args, sink }) => {
             let _ = sink.send(UiEvent::Action { name, args });
@@ -378,10 +443,7 @@ pub fn set_ask_value(v: Option<EventValue>) {
 unsafe extern "C" fn on_change_trampoline(e: *mut sys::lv_event_t) {
     let idx = unsafe { sys::lv_event_get_user_data(e) } as usize;
     let target = unsafe { sys::lv_event_get_target(e) } as *mut sys::lv_obj_t;
-    let bind = {
-        let guard = bindings().lock().unwrap();
-        guard.get(idx).cloned()
-    };
+    let bind = binding_at(idx);
     match bind {
         Some(Binding::ChangeAction { kind, action, mut args, late, sink }) => {
             use crate::expr::Value;
@@ -496,22 +558,53 @@ pub(crate) fn grid_fr(x: i32) -> i32 {
 pub(crate) const GRID_CONTENT: i32 = LV_COORD_MAX_LOCAL - 101;
 
 thread_local! {
-    /// Grid track arrays of the current render. LVGL stores the
-    /// pointers, so they must outlive their grid objects; freed by
-    /// [`Obj::clear_children`] on the screen.
-    static LAYOUT_MEM: std::cell::RefCell<Vec<Box<[i32]>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// Chart series alphas: (chart, alpha of each series in the order
-    /// added, which is LVGL's series index). Cleared with the screen,
-    /// and per chart when one is created.
-    static CHART_ALPHA: std::cell::RefCell<Vec<(*mut sys::lv_obj_t, Vec<u8>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// Point arrays of the current render's `line`s; same lifetime.
-    static LINE_MEM: std::cell::RefCell<Vec<Box<[sys::lv_point_precise_t]>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// What LVGL points at but does not own, per object (grid track
+    /// arrays, line points, chart series alphas, gradients): freed with
+    /// the object (ADR 0024), or replaced when it is set again.
+    static OWNED: std::cell::RefCell<std::collections::HashMap<usize, Owned>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     /// Folder relative `image` paths are read from (the config's).
     static ASSET_DIR: std::cell::RefCell<std::path::PathBuf> =
         std::cell::RefCell::new(std::path::PathBuf::from("."));
+}
+
+/// A grid's column and row track arrays.
+type TrackArrays = (Box<[i32]>, Box<[i32]>);
+
+/// See [`OWNED`].
+#[derive(Default)]
+struct Owned {
+    tracks: Option<TrackArrays>,
+    line: Option<Box<[sys::lv_point_precise_t]>>,
+    /// Alpha of each chart series in the order added (LVGL's index).
+    chart_alpha: Vec<u8>,
+    grads: Vec<(sys::lv_style_selector_t, Box<sys::lv_grad_dsc_t>)>,
+    /// A button's busy overlay (its running call's `busy` text or a
+    /// spinner, last child), and the text it shows (`None`: spinner).
+    busy: Option<(*mut sys::lv_obj_t, Option<String>)>,
+    /// Hidden while its button's call runs (it shows again after).
+    busy_hidden: bool,
+    /// Placed in its grid's next free cell, not by its own `cell`.
+    grid_auto: bool,
+    /// A value widget the user changed since it was made.
+    user_changed: bool,
+    /// A QR code's data as set last.
+    qr: Option<String>,
+}
+
+unsafe extern "C" fn free_owned(e: *mut sys::lv_event_t) {
+    // SAFETY: registered for DELETE on the object whose memory goes;
+    // its styles go with it, so nothing points at it after.
+    let obj = unsafe { sys::lv_event_get_target(e) } as usize;
+    OWNED.with(|m| m.borrow_mut().remove(&obj));
+}
+
+/// `f` on what `obj` owns, made (and freed with it) on first use.
+fn owned<R>(obj: *mut sys::lv_obj_t, f: impl FnOnce(&mut Owned) -> R) -> R {
+    if !has_event_cb(obj, free_owned, sys::lv_event_code_t_LV_EVENT_DELETE) {
+        unsafe { sys::lv_obj_add_event_cb(obj, Some(free_owned), sys::lv_event_code_t_LV_EVENT_DELETE, std::ptr::null_mut()) };
+    }
+    OWNED.with(|m| f(m.borrow_mut().entry(obj as usize).or_default()))
 }
 
 /// Folder that a relative `image { src }` is read from: the config
@@ -1094,6 +1187,8 @@ impl Ui {
                 sys::lv_display_render_mode_t_LV_DISPLAY_RENDER_MODE_DIRECT,
             );
             sys::lv_display_set_default(display);
+            // `PANELD_PERF`: frame lines as on DRM (`px`: what was drawn).
+            sys::lv_paneld_perf_attach(display);
         }
         let indev = unsafe { sys::lv_indev_create() };
         assert!(!indev.is_null());
@@ -1600,7 +1695,18 @@ impl<'ui> Obj<'ui> {
                     sys::lv_text_flag_t_LV_TEXT_FLAG_NONE,
                 );
                 let parent = sys::lv_obj_get_parent(label);
-                let mut room = sys::lv_obj_get_content_width(btn);
+                // Hidden under a running call's overlay: fitted when it
+                // shows again (the button's size is the overlay's now).
+                let busy = |o: *mut sys::lv_obj_t| OWNED.with(|m| m.borrow().get(&(o as usize)).is_some_and(|o| o.busy_hidden));
+                if busy(label) || busy(parent) {
+                    return;
+                }
+                // A button as wide as its content is not narrower than
+                // the label: no room to fit to (it would only keep the
+                // size it had, as a spinner's while its call ran).
+                let content = sys::lv_obj_get_style_width(btn, main) == LV_SIZE_CONTENT_LOCAL
+                    && sys::lv_obj_get_style_flex_grow(btn, main) == 0;
+                let mut room = if content { i32::MAX / 4 } else { sys::lv_obj_get_content_width(btn) };
                 // Beside an icon (a theme's unknown one leaves none).
                 let icon = if parent == btn { std::ptr::null_mut() } else { sys::lv_obj_get_child(parent, 0) };
                 if !icon.is_null() && icon != label {
@@ -1611,7 +1717,11 @@ impl<'ui> Obj<'ui> {
                     }
                 }
                 let width = if size.x <= room { LV_SIZE_CONTENT_LOCAL } else { room.max(0) };
-                if sys::lv_obj_get_style_width(label, main) != width {
+                // Its own width, set or not (set up again by an update,
+                // it has none): the same after a fit either way.
+                let mut v = sys::lv_style_value_t::default();
+                let found = sys::lv_obj_get_local_style_prop(label, sys::_lv_style_id_t_LV_STYLE_WIDTH as sys::lv_style_prop_t, &mut v, 0);
+                if found != sys::lv_style_res_t_LV_STYLE_RES_FOUND || v.num != width {
                     sys::lv_obj_set_width(label, width);
                 }
             }
@@ -1630,8 +1740,15 @@ impl<'ui> Obj<'ui> {
         unsafe {
             sys::lv_label_set_long_mode(label.raw, sys::lv_label_long_mode_t_LV_LABEL_LONG_MODE_DOTS);
             sys::lv_label_set_max_lines(label.raw, 1);
-            sys::lv_obj_add_event_cb(self.raw, Some(fit), sys::lv_event_code_t_LV_EVENT_SIZE_CHANGED, label.raw.cast());
-            sys::lv_obj_add_event_cb(label.raw, Some(forget), sys::lv_event_code_t_LV_EVENT_DELETE, self.raw.cast());
+            // Set up again by an update: once is enough.
+            let bound = (0..sys::lv_obj_get_event_count(self.raw)).any(|i| {
+                let d = sys::lv_obj_get_event_dsc(self.raw, i);
+                sys::lv_event_dsc_get_cb(d).is_some_and(|f| f as usize == fit as unsafe extern "C" fn(*mut sys::lv_event_t) as usize) && sys::lv_event_dsc_get_user_data(d) == label.raw.cast()
+            });
+            if !bound {
+                sys::lv_obj_add_event_cb(self.raw, Some(fit), sys::lv_event_code_t_LV_EVENT_SIZE_CHANGED, label.raw.cast());
+                sys::lv_obj_add_event_cb(label.raw, Some(forget), sys::lv_event_code_t_LV_EVENT_DELETE, self.raw.cast());
+            }
         }
     }
 
@@ -1675,9 +1792,26 @@ impl<'ui> Obj<'ui> {
     pub fn new_chart(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_chart_create(self.raw) };
         assert!(!raw.is_null());
-        // A chart freed earlier may have had this address.
-        CHART_ALPHA.with(|m| m.borrow_mut().retain(|(c, _)| *c != raw));
         Obj { raw, _ui: PhantomData }
+    }
+
+    /// Remove every series (a chart set up again by an update adds its
+    /// series anew).
+    pub fn chart_clear_series(&self) {
+        unsafe {
+            loop {
+                let ser = sys::lv_chart_get_series_next(self.raw, std::ptr::null_mut());
+                if ser.is_null() {
+                    break;
+                }
+                sys::lv_chart_remove_series(self.raw, ser);
+            }
+        }
+        OWNED.with(|m| {
+            if let Some(o) = m.borrow_mut().get_mut(&(self.raw as usize)) {
+                o.chart_alpha.clear();
+            }
+        });
     }
 
     /// Kind, point count, value range of the primary y axis, and the
@@ -1776,7 +1910,9 @@ impl<'ui> Obj<'ui> {
                 }
             }
         }
-        unsafe { sys::lv_obj_add_event_cb(self.raw, Some(fill), sys::lv_event_code_t_LV_EVENT_DRAW_MAIN_END, std::ptr::null_mut()) };
+        if !has_event_cb(self.raw, fill, sys::lv_event_code_t_LV_EVENT_DRAW_MAIN_END) {
+            unsafe { sys::lv_obj_add_event_cb(self.raw, Some(fill), sys::lv_event_code_t_LV_EVENT_DRAW_MAIN_END, std::ptr::null_mut()) };
+        }
     }
 
     /// Add a series in `rgb` at `opa` (255 opaque). `None` values are
@@ -1816,20 +1952,11 @@ impl<'ui> Obj<'ui> {
             // Every series is recorded, opaque ones too, so the index
             // lines up; the hook goes on with the first translucent one.
             let raw = self.raw;
-            let hook = CHART_ALPHA.with(|m| {
-                let mut m = m.borrow_mut();
-                let at = match m.iter().position(|(c, _)| *c == raw) {
-                    Some(i) => i,
-                    None => {
-                        m.push((raw, Vec::new()));
-                        m.len() - 1
-                    }
-                };
-                let alphas = &mut m[at].1;
-                let had = alphas.iter().any(|&a| a < 255);
-                alphas.push(opa);
+            let hook = owned(raw, |o| {
+                let had = o.chart_alpha.iter().any(|&a| a < 255);
+                o.chart_alpha.push(opa);
                 opa < 255 && !had
-            });
+            }) && !has_event_cb(raw, series_opa, sys::lv_event_code_t_LV_EVENT_DRAW_TASK_ADDED);
             if hook {
                 sys::lv_obj_add_flag(raw, sys::lv_obj_flag_t_LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);
                 sys::lv_obj_add_event_cb(raw, Some(series_opa), sys::lv_event_code_t_LV_EVENT_DRAW_TASK_ADDED, std::ptr::null_mut());
@@ -1844,14 +1971,28 @@ impl<'ui> Obj<'ui> {
     pub fn new_line(&self, points: &[(i32, i32)]) -> Obj<'ui> {
         let raw = unsafe { sys::lv_line_create(self.raw) };
         assert!(!raw.is_null());
+        let obj = Obj { raw, _ui: PhantomData };
+        obj.set_line_points(points);
+        obj
+    }
+
+    /// A line's points: LVGL keeps the pointer, so the array lives with
+    /// the line (until replaced).
+    pub fn set_line_points(&self, points: &[(i32, i32)]) {
         let pts: Box<[sys::lv_point_precise_t]> =
             points.iter().map(|&(x, y)| sys::lv_point_precise_t { x, y }).collect();
+        let same = OWNED.with(|m| {
+            m.borrow().get(&(self.raw as usize)).and_then(|o| o.line.as_ref()).is_some_and(|l| {
+                l.len() == pts.len() && l.iter().zip(pts.iter()).all(|(a, b)| a.x == b.x && a.y == b.y)
+            })
+        });
+        if same {
+            return;
+        }
         let (ptr, len) = (pts.as_ptr(), pts.len() as u32);
-        // LVGL keeps the pointer: the array lives until the screen is
-        // cleared, like the grid tracks.
-        LINE_MEM.with(|m| m.borrow_mut().push(pts));
-        unsafe { sys::lv_line_set_points(raw, ptr, len) };
-        Obj { raw, _ui: PhantomData }
+        let old = owned(self.raw, |o| o.line.replace(pts));
+        unsafe { sys::lv_line_set_points(self.raw, ptr, len) };
+        drop(old);
     }
 
     /// Line width and rounded ends of a `line`, in `color` (rgb, alpha).
@@ -2055,6 +2196,7 @@ impl<'ui> Obj<'ui> {
     pub fn new_toggle(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_switch_create(self.raw) };
         assert!(!raw.is_null());
+        watch_user(raw);
         // Off: the track; on: the accent. The knob stays white.
         let c = input_colors();
         paint_bg(raw, c.track, 0);
@@ -2064,13 +2206,7 @@ impl<'ui> Obj<'ui> {
 
     /// Add or remove `LV_STATE_CHECKED` so the switch displays `on`.
     pub fn set_toggle_state(&self, on: bool) {
-        unsafe {
-            if on {
-                sys::lv_obj_add_state(self.raw, sys::lv_state_t_LV_STATE_CHECKED);
-            } else {
-                sys::lv_obj_remove_state(self.raw, sys::lv_state_t_LV_STATE_CHECKED);
-            }
-        }
+        set_state_bits(self.raw, sys::lv_state_t_LV_STATE_CHECKED as sys::lv_state_t, on);
     }
 
     /// A QR code widget (schema `qr`). Size is in pixels (square);
@@ -2084,6 +2220,10 @@ impl<'ui> Obj<'ui> {
 
     /// Encode `data` into the QR code. LVGL copies the bytes.
     pub fn set_qrcode_data(&self, data: &str) {
+        if owned(self.raw, |o| o.qr.as_deref() == Some(data)) {
+            return;
+        }
+        owned(self.raw, |o| o.qr = Some(data.to_string()));
         let c = CString::new(data).unwrap_or_else(|_| CString::new("").unwrap());
         unsafe { sys::lv_qrcode_set_data(self.raw, c.as_ptr()) };
         // `set_data` only stashes the string; `render` turns it into
@@ -2102,6 +2242,7 @@ impl<'ui> Obj<'ui> {
     pub fn new_dropdown(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_dropdown_create(self.raw) };
         assert!(!raw.is_null());
+        watch_user(raw);
         unsafe extern "C" fn open_close(e: *mut sys::lv_event_t) {
             // SAFETY: registered below on a dropdown for these codes.
             let (code, target) = unsafe { (sys::lv_event_get_code(e), sys::lv_event_get_target(e) as usize) };
@@ -2136,7 +2277,26 @@ impl<'ui> Obj<'ui> {
             Ok(c) => c,
             Err(_) => CString::new(options.replace('\0', "")).unwrap(),
         };
-        unsafe { sys::lv_dropdown_set_options(self.raw, c.as_ptr()) };
+        unsafe {
+            let now = sys::lv_dropdown_get_options(self.raw);
+            if !now.is_null() && std::ffi::CStr::from_ptr(now) == c.as_c_str() {
+                return;
+            }
+            sys::lv_dropdown_set_options(self.raw, c.as_ptr());
+        }
+    }
+
+    /// A roller's options (one per line), set again only when they
+    /// are others.
+    pub fn set_roller_options(&self, options: &str) {
+        let c = CString::new(options).unwrap_or_default();
+        unsafe {
+            let now = sys::lv_roller_get_options(self.raw);
+            if !now.is_null() && std::ffi::CStr::from_ptr(now) == c.as_c_str() {
+                return;
+            }
+            sys::lv_roller_set_options(self.raw, c.as_ptr(), sys::lv_roller_mode_t_LV_ROLLER_MODE_NORMAL);
+        }
     }
 
     /// A roller (`select { style = roller }`) showing `options`, one per
@@ -2144,6 +2304,7 @@ impl<'ui> Obj<'ui> {
     pub fn new_roller(&self, options: &str, rows: u32) -> Obj<'ui> {
         let raw = unsafe { sys::lv_roller_create(self.raw) };
         assert!(!raw.is_null());
+        watch_user(raw);
         let c = CString::new(options).unwrap_or_default();
         unsafe {
             sys::lv_roller_set_options(raw, c.as_ptr(), sys::lv_roller_mode_t_LV_ROLLER_MODE_NORMAL);
@@ -2245,7 +2406,16 @@ impl<'ui> Obj<'ui> {
     /// Remember this textarea as a page input whose typed text should
     /// survive a re-render of the same page (see [`snapshot_inputs`]).
     pub fn register_input(&self) {
+        unsafe extern "C" fn forget(e: *mut sys::lv_event_t) {
+            // SAFETY: registered for DELETE on the textarea going.
+            let ta = unsafe { sys::lv_event_get_target(e) } as *mut sys::lv_obj_t;
+            INPUTS.with(|v| v.borrow_mut().retain(|&t| t != ta));
+        }
+        if INPUTS.with(|v| v.borrow().contains(&self.raw)) {
+            return;
+        }
         INPUTS.with(|v| v.borrow_mut().push(self.raw));
+        unsafe { sys::lv_obj_add_event_cb(self.raw, Some(forget), sys::lv_event_code_t_LV_EVENT_DELETE, std::ptr::null_mut()) };
     }
 
     pub fn align_top_mid(&self, y: i32) {
@@ -2275,14 +2445,7 @@ impl<'ui> Obj<'ui> {
             ValueWidget::Buttons => (Binding::AskValue { kind: ChangeKind::Buttons }, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Keypad => (Binding::AskButton { accept: true, sink }, sys::lv_event_code_t_LV_EVENT_READY),
         };
-        let idx = {
-            let mut g = bindings().lock().unwrap();
-            g.push(binding);
-            g.len() - 1
-        };
-        unsafe {
-            sys::lv_obj_add_event_cb(self.raw, Some(on_change_trampoline), code, idx as *mut std::ffi::c_void);
-        }
+        bind(self.raw, binding, on_change_trampoline, code);
     }
 
     /// An ask dialog's footer button (OK / Cancel).
@@ -2291,14 +2454,7 @@ impl<'ui> Obj<'ui> {
         let raw = unsafe { sys::lv_msgbox_add_footer_button(self.raw, c.as_ptr()) };
         assert!(!raw.is_null());
         paint_footer_button(raw);
-        let idx = {
-            let mut g = bindings().lock().unwrap();
-            g.push(Binding::AskButton { accept, sink });
-            g.len() - 1
-        };
-        unsafe {
-            sys::lv_obj_add_event_cb(raw, Some(on_tap_trampoline), sys::lv_event_code_t_LV_EVENT_CLICKED, idx as *mut std::ffi::c_void);
-        }
+        bind(raw, Binding::AskButton { accept, sink }, on_tap_trampoline, sys::lv_event_code_t_LV_EVENT_CLICKED);
         Obj { raw, _ui: PhantomData }
     }
 
@@ -2317,14 +2473,7 @@ impl<'ui> Obj<'ui> {
             ValueWidget::Buttons => (ChangeKind::Buttons, sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED),
             ValueWidget::Keypad => (ChangeKind::Keypad, sys::lv_event_code_t_LV_EVENT_READY),
         };
-        let idx = {
-            let mut g = bindings().lock().unwrap();
-            g.push(Binding::ChangeAction { kind, action, args, late, sink });
-            g.len() - 1
-        };
-        unsafe {
-            sys::lv_obj_add_event_cb(self.raw, Some(on_change_trampoline), code, idx as *mut std::ffi::c_void);
-        }
+        bind(self.raw, Binding::ChangeAction { kind, action, args, late, sink }, on_change_trampoline, code);
     }
 
     /// A full-screen layer for a dialog, on top of what is drawn: it
@@ -2427,19 +2576,7 @@ impl<'ui> Obj<'ui> {
         assert!(!raw.is_null());
         paint_footer_button(raw);
         let btn = Obj { raw, _ui: PhantomData };
-        let idx = {
-            let mut g = bindings().lock().unwrap();
-            g.push(Binding::Confirm { accept, sink });
-            g.len() - 1
-        };
-        unsafe {
-            sys::lv_obj_add_event_cb(
-                raw,
-                Some(on_tap_trampoline),
-                sys::lv_event_code_t_LV_EVENT_CLICKED,
-                idx as *mut std::ffi::c_void,
-            );
-        }
+        bind(raw, Binding::Confirm { accept, sink }, on_tap_trampoline, sys::lv_event_code_t_LV_EVENT_CLICKED);
         btn
     }
 
@@ -2479,6 +2616,7 @@ impl<'ui> Obj<'ui> {
     pub fn new_slider(&self) -> Obj<'ui> {
         let raw = unsafe { sys::lv_slider_create(self.raw) };
         assert!(!raw.is_null());
+        watch_user(raw);
         let c = input_colors();
         paint_bg(raw, c.track, 0);
         paint_bg(raw, c.accent, PART_INDICATOR);
@@ -2713,6 +2851,7 @@ impl<'ui> Obj<'ui> {
                 if found == sys::lv_style_res_t_LV_STYLE_RES_FOUND && v.num != LV_SIZE_CONTENT_LOCAL {
                     continue;
                 }
+                touch(child);
                 if column {
                     sys::lv_obj_set_width(child, full);
                 } else {
@@ -2762,6 +2901,11 @@ impl<'ui> Obj<'ui> {
     /// `colspan` x `rowspan` cells, once its parent is laid out as a
     /// grid ([`Self::layout_grid`]).
     pub fn set_grid_cell(&self, col: u8, row: u8, colspan: u8, rowspan: u8) {
+        OWNED.with(|m| {
+            if let Some(o) = m.borrow_mut().get_mut(&(self.raw as usize)) {
+                o.grid_auto = false;
+            }
+        });
         unsafe {
             sys::lv_obj_set_style_grid_cell_column_pos(self.raw, col as i32, 0);
             sys::lv_obj_set_style_grid_cell_row_pos(self.raw, row as i32, 0);
@@ -3006,18 +3150,22 @@ impl<'ui> Obj<'ui> {
             sys::lv_grad_init_stops(g, colors.as_ptr(), opas.as_ptr(), std::ptr::null(), stops.len() as i32);
         }
         self.clear_background_paint();
-        let raw = Box::into_raw(grad);
-        unsafe extern "C" fn free_grad(e: *mut sys::lv_event_t) {
-            // SAFETY: registered below with the Box's pointer, freed
-            // once, when the object (and its styles) go.
-            unsafe { drop(Box::from_raw(sys::lv_event_get_user_data(e) as *mut sys::lv_grad_dsc_t)) };
-        }
+        let ptr: *const sys::lv_grad_dsc_t = &*grad;
+        let selector = sel();
+        // The style keeps the pointer: the gradient lives with the
+        // object, one per selector, the one before freed once replaced.
+        let old = owned(self.raw, |o| match o.grads.iter_mut().find(|(s, _)| *s == selector) {
+            Some(slot) => Some(std::mem::replace(&mut slot.1, grad)),
+            None => {
+                o.grads.push((selector, grad));
+                None
+            }
+        });
         unsafe {
-            // The style keeps the pointer: it lives as long as the object.
-            sys::lv_obj_add_event_cb(self.raw, Some(free_grad), sys::lv_event_code_t_LV_EVENT_DELETE, raw.cast());
-            sys::lv_obj_set_style_bg_grad(self.raw, raw, sel());
-            sys::lv_obj_set_style_bg_opa(self.raw, 255, sel());
+            sys::lv_obj_set_style_bg_grad(self.raw, ptr, selector);
+            sys::lv_obj_set_style_bg_opa(self.raw, 255, selector);
         }
+        drop(old);
     }
 
     /// An image background (schema 8.1): the PNG `path` (relative to
@@ -3048,7 +3196,7 @@ impl<'ui> Obj<'ui> {
             sys::lv_obj_set_style_bg_image_opa(self.raw, 255, selector);
         }
         bg_forget(self.raw, Some(selector));
-        let first = BG_OBJS.with(|o| !o.borrow().iter().any(|b| b.obj == self.raw));
+        let first = !has_event_cb(self.raw, bg_event, sys::lv_event_code_t_LV_EVENT_DELETE);
         BG_OBJS.with(|o| {
             o.borrow_mut().push(BgObj { obj: self.raw, selector, path: full, fit, buf: std::ptr::null_mut(), size: (0, 0) })
         });
@@ -3202,12 +3350,7 @@ impl<'ui> Obj<'ui> {
     /// re-render path when a source value changes.
     pub fn clear_children(&self) {
         unsafe { sys::lv_obj_clean(self.raw) };
-        // With the whole screen cleared no grid is left that could
-        // point at the track arrays.
         if self.raw == unsafe { sys::lv_screen_active() } {
-            LAYOUT_MEM.with(|m| m.borrow_mut().clear());
-            LINE_MEM.with(|m| m.borrow_mut().clear());
-            CHART_ALPHA.with(|m| m.borrow_mut().clear());
             // A page transition's objects went with the rest.
             if PAGE_TR.with(|p| p.borrow_mut().take()).is_some() {
                 unsafe { sys::lv_obj_set_scrollable(self.raw, true) };
@@ -3223,6 +3366,7 @@ impl<'ui> Obj<'ui> {
     /// cells row by row. Rows are added as the children need them.
     /// Call it after the children exist (so `repeat` output is counted).
     pub fn layout_grid(&self, cols: &Tracks, rows: Option<&Tracks>) {
+        touch(self.raw);
         // Bounded: `columns` / `rows` can come from a source.
         const MAX_COLS: usize = 64;
         const MAX_ROWS: usize = 1024;
@@ -3252,7 +3396,11 @@ impl<'ui> Obj<'ui> {
             }
         };
         let mut placed: Vec<(usize, usize, usize, usize)> = vec![(0, 0, 1, 1); shown.len()];
-        let explicit: Vec<Option<(i32, i32, i32, i32)>> = shown.iter().map(|&c| local_grid_cell(c)).collect();
+        // A cell this grid gave a child before (laid out again: a
+        // child's `visible` changed) is not one the child asked for.
+        let auto = |c: *mut sys::lv_obj_t| OWNED.with(|m| m.borrow().get(&(c as usize)).is_some_and(|o| o.grid_auto));
+        let explicit: Vec<Option<(i32, i32, i32, i32)>> =
+            shown.iter().map(|&c| if auto(c) { None } else { local_grid_cell(c) }).collect();
         for (i, cell) in explicit.iter().enumerate() {
             if let Some((c, r, cs, rs)) = *cell {
                 let c = (c.max(0) as usize).min(ncols - 1);
@@ -3289,20 +3437,20 @@ impl<'ui> Obj<'ui> {
         col_dsc.push(GRID_TEMPLATE_LAST);
         let mut row_dsc: Vec<i32> = row_tracks.iter().map(|t| t.lvgl()).collect();
         row_dsc.push(GRID_TEMPLATE_LAST);
-        // LVGL keeps these pointers, so they live in LAYOUT_MEM until
-        // the screen is cleared.
+        // LVGL keeps these pointers: they live with the grid, until it
+        // is laid out again.
         let col_dsc = col_dsc.into_boxed_slice();
         let row_dsc = row_dsc.into_boxed_slice();
         let (col_ptr, row_ptr) = (col_dsc.as_ptr(), row_dsc.as_ptr());
-        LAYOUT_MEM.with(|m| {
-            let mut m = m.borrow_mut();
-            m.push(col_dsc);
-            m.push(row_dsc);
-        });
+        let old = owned(self.raw, |o| o.tracks.replace((col_dsc, row_dsc)));
         unsafe {
             sys::lv_obj_set_layout(self.raw, sys::lv_layout_t_LV_LAYOUT_GRID);
             sys::lv_obj_set_grid_dsc_array(self.raw, col_ptr, row_ptr);
-            for (&child, &(c, r, cs, rs)) in shown.iter().zip(&placed) {
+            for (i, (&child, &(c, r, cs, rs))) in shown.iter().zip(&placed).enumerate() {
+                touch(child);
+                if explicit[i].is_none() {
+                    owned(child, |o| o.grid_auto = true);
+                }
                 let y_align = local_self_align(child).unwrap_or(SelfAlign::Stretch).grid();
                 sys::lv_obj_set_grid_cell(
                     child,
@@ -3315,6 +3463,7 @@ impl<'ui> Obj<'ui> {
                 );
             }
         }
+        drop(old);
     }
 
     /// Mark this object clickable (plain `obj` and `label` need this;
@@ -3325,7 +3474,17 @@ impl<'ui> Obj<'ui> {
 
     /// Hide / show the object.
     pub fn set_hidden(&self, hidden: bool) {
-        unsafe { sys::lv_obj_set_hidden(self.raw, hidden) };
+        unsafe {
+            if sys::lv_obj_is_hidden(self.raw) != hidden {
+                sys::lv_obj_set_hidden(self.raw, hidden);
+            }
+        }
+        // Hidden by its own `visible` now, not by a running button.
+        OWNED.with(|m| {
+            if let Some(o) = m.borrow_mut().get_mut(&(self.raw as usize)) {
+                o.busy_hidden = false;
+            }
+        });
     }
 
     /// Enable / disable click handling.
@@ -3337,16 +3496,14 @@ impl<'ui> Obj<'ui> {
     /// is in LVGL's disabled state, so a theme's `:disabled` style shows.
     pub fn set_disabled(&self, disabled: bool) {
         self.set_enabled(!disabled);
-        unsafe { sys::lv_obj_set_state(self.raw, sys::lv_state_t_LV_STATE_DISABLED as _, disabled) };
+        set_state_bits(self.raw, sys::lv_state_t_LV_STATE_DISABLED as sys::lv_state_t, disabled);
     }
 
     /// Put a button in its `:running` or `:failed` state (its action
     /// call runs, or its last run failed).
     pub fn set_run_state(&self, running: bool, failed: bool) {
-        unsafe {
-            sys::lv_obj_set_state(self.raw, sys::lv_state_t_LV_STATE_USER_1 as _, running);
-            sys::lv_obj_set_state(self.raw, sys::lv_state_t_LV_STATE_USER_2 as _, failed);
-        }
+        set_state_bits(self.raw, sys::lv_state_t_LV_STATE_USER_1 as sys::lv_state_t, running);
+        set_state_bits(self.raw, sys::lv_state_t_LV_STATE_USER_2 as sys::lv_state_t, failed);
     }
 
     /// A spinner in place of a running button's content: as tall as
@@ -3500,35 +3657,11 @@ impl<'ui> Obj<'ui> {
         sink: Sender<UiEvent>,
         event_code: sys::lv_event_code_t,
     ) {
-        let idx = {
-            let mut g = bindings().lock().unwrap();
-            g.push(Binding::Change { kind, assigns, sink });
-            g.len() - 1
-        };
-        unsafe {
-            sys::lv_obj_add_event_cb(
-                self.raw,
-                Some(on_change_trampoline),
-                event_code,
-                idx as *mut std::ffi::c_void,
-            );
-        }
+        bind(self.raw, Binding::Change { kind, assigns, sink }, on_change_trampoline, event_code);
     }
 
     fn register_binding(&self, trigger: Trigger, binding: Binding) {
-        let idx = {
-            let mut g = bindings().lock().unwrap();
-            g.push(binding);
-            g.len() - 1
-        };
-        unsafe {
-            sys::lv_obj_add_event_cb(
-                self.raw,
-                Some(on_tap_trampoline),
-                trigger.code(),
-                idx as *mut std::ffi::c_void,
-            );
-        }
+        bind(self.raw, binding, on_tap_trampoline, trigger.code());
     }
 }
 
@@ -3814,13 +3947,7 @@ thread_local! {
 
 /// The alpha of `chart`'s series number `idx` (255 when unknown).
 fn series_alpha(chart: *mut sys::lv_obj_t, idx: u32) -> u8 {
-    CHART_ALPHA.with(|m| {
-        m.borrow()
-            .iter()
-            .find(|(c, _)| *c == chart)
-            .and_then(|(_, a)| a.get(idx as usize).copied())
-            .unwrap_or(255)
-    })
+    OWNED.with(|m| m.borrow().get(&(chart as usize)).and_then(|o| o.chart_alpha.get(idx as usize).copied()).unwrap_or(255))
 }
 
 /// `opa` scaled by `alpha` (both 0..=255).
@@ -4209,7 +4336,9 @@ enum Tween {
     Chart { series: Vec<SeriesTween> },
     /// A node coming in: opacity from 0 to `opa`; with `slide`, also
     /// moved down from one own height above.
-    Enter { opa: u8, slide: bool, from: f64 },
+    /// `local`: the node had an opacity of its own (else it ends with
+    /// none, as a node drawn without an entrance).
+    Enter { opa: u8, slide: bool, from: f64, local: bool },
     /// The page transition (see [`run_page_transition`]).
     Page { slide: bool, dir: i32, width: i32 },
 }
@@ -4217,6 +4346,33 @@ enum Tween {
 struct Tw {
     obj: *mut sys::lv_obj_t,
     tween: Tween,
+}
+
+/// Where an object's running tweens go, for comparing trees: a value
+/// is compared at its target, an entrance not at all.
+#[derive(Clone, Debug)]
+pub(crate) enum TweenTo {
+    Value(i32),
+    Chart(Vec<Vec<Option<i32>>>),
+    Enter,
+}
+
+thread_local! {
+    static TWEENS: std::cell::RefCell<Vec<(usize, usize, TweenTo)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn tween_to(tw: &Tween) -> Option<TweenTo> {
+    Some(match tw {
+        Tween::Bar { to, .. } | Tween::Arc { to, .. } => TweenTo::Value(*to),
+        Tween::Chart { series } => TweenTo::Chart(series.iter().map(|(_, t)| t.clone()).collect()),
+        Tween::Enter { .. } => TweenTo::Enter,
+        Tween::Page { .. } => return None,
+    })
+}
+
+/// The targets of the tweens running on `obj`.
+pub(crate) fn tweens_of(obj: *mut sys::lv_obj_t) -> Vec<TweenTo> {
+    TWEENS.with(|t| t.borrow().iter().filter(|(o, _, _)| *o == obj as usize).map(|(_, _, w)| w.clone()).collect())
 }
 
 thread_local! {
@@ -4266,13 +4422,22 @@ fn apply_tween(tw: &Tw, step: i32) {
                 }
                 sys::lv_chart_refresh(tw.obj);
             }
-            Tween::Enter { opa, slide, from } => {
+            Tween::Enter { opa, slide, from, local } => {
                 // A rebuild mid-way carries on from where it was.
                 let e = from + (1.0 - from) * e;
-                sys::lv_obj_set_style_opa(tw.obj, (*opa as f64 * e).round() as sys::lv_opa_t, 0);
+                if e >= 1.0 && !*local {
+                    // In: as a node drawn without an entrance.
+                    sys::lv_obj_remove_local_style_prop(tw.obj, sys::_lv_style_id_t_LV_STYLE_OPA as sys::lv_style_prop_t, 0);
+                } else {
+                    sys::lv_obj_set_style_opa(tw.obj, (*opa as f64 * e).round() as sys::lv_opa_t, 0);
+                }
                 if *slide {
-                    let pct = -((1.0 - e) * 100.0).round() as i16;
-                    sys::lv_obj_set_style_translate_y(tw.obj, Size::Percent(pct).to_lvgl(), 0);
+                    if e >= 1.0 {
+                        sys::lv_obj_remove_local_style_prop(tw.obj, sys::_lv_style_id_t_LV_STYLE_TRANSLATE_Y as sys::lv_style_prop_t, 0);
+                    } else {
+                        let pct = -((1.0 - e) * 100.0).round() as i16;
+                        sys::lv_obj_set_style_translate_y(tw.obj, Size::Percent(pct).to_lvgl(), 0);
+                    }
                 }
             }
             Tween::Page { slide, dir, width } => {
@@ -4310,6 +4475,8 @@ unsafe extern "C" fn tween_exec(a: *mut sys::lv_anim_t, v: i32) {
 unsafe extern "C" fn tween_deleted(a: *mut sys::lv_anim_t) {
     // SAFETY: as in `tween_exec`; this is the last call for this anim.
     let tw = unsafe { Box::from_raw(sys::lv_anim_get_user_data(a) as *mut Tw) };
+    let id = &*tw as *const Tw as usize;
+    TWEENS.with(|t| t.borrow_mut().retain(|(_, i, _)| *i != id));
     if FINISHING.with(|f| f.get()) && !matches!(tw.tween, Tween::Page { .. }) {
         apply_tween(&tw, TWEEN_END);
     }
@@ -4337,7 +4504,11 @@ unsafe extern "C" fn page_tween_completed(_a: *mut sys::lv_anim_t) {
 fn start_tween(var: *mut sys::lv_obj_t, tw: Tw, ms: u32, completed: sys::lv_anim_completed_cb_t) -> bool {
     let start = tween_start(matches!(tw.tween, Tween::Page { .. }), ms);
     apply_tween(&tw, start);
+    let target = tween_to(&tw.tween).map(|w| (tw.obj as usize, w));
     let boxed = Box::into_raw(Box::new(tw));
+    if let Some((obj, w)) = target {
+        TWEENS.with(|t| t.borrow_mut().push((obj, boxed as usize, w)));
+    }
     unsafe {
         let mut a: sys::lv_anim_t = std::mem::zeroed();
         sys::lv_anim_init(&mut a);
@@ -4353,6 +4524,7 @@ fn start_tween(var: *mut sys::lv_obj_t, tw: Tw, ms: u32, completed: sys::lv_anim
         // which LVGL would otherwise take for one replacing the other.
         sys::lv_anim_set_early_apply(&mut a, false);
         if sys::lv_anim_start(&a).is_null() {
+            TWEENS.with(|t| t.borrow_mut().retain(|(_, i, _)| *i != boxed as usize));
             let tw = Box::from_raw(boxed);
             if !matches!(tw.tween, Tween::Page { .. }) {
                 apply_tween(&tw, TWEEN_END);
@@ -4386,8 +4558,13 @@ impl<'ui> Obj<'ui> {
     /// `from` (0 out, 1 in, eased).
     pub fn animate_enter(&self, slide: bool, from: f64, ms: u32) {
         let opa = unsafe { sys::lv_obj_get_style_opa(self.raw, 0) };
+        let local = unsafe {
+            let mut v = sys::lv_style_value_t::default();
+            sys::lv_obj_get_local_style_prop(self.raw, sys::_lv_style_id_t_LV_STYLE_OPA as sys::lv_style_prop_t, &mut v, 0)
+                == sys::lv_style_res_t_LV_STYLE_RES_FOUND
+        };
         let from = from.clamp(0.0, 1.0);
-        start_tween(self.raw, Tw { obj: self.raw, tween: Tween::Enter { opa, slide, from } }, ms, None);
+        start_tween(self.raw, Tw { obj: self.raw, tween: Tween::Enter { opa, slide, from, local } }, ms, None);
     }
 
     /// Animate this node's state changes (`:pressed` and back: scale,
@@ -4542,6 +4719,680 @@ pub fn interacting() -> bool {
 /// Animations running now (LVGL's, the style transitions included).
 pub fn running_animations() -> u32 {
     unsafe { sys::lv_anim_count_running() as u32 }
+}
+
+// ---------------------------------------------------------------------------
+// In-place updates (ADR 0024): what a node looked like when it was made,
+// so an update can set its properties again from there, and a dump of an
+// object tree to compare an updated page with a fresh render.
+// ---------------------------------------------------------------------------
+
+/// The states a page sets on a node (a toggle's value, `enabled`, a
+/// button's call state); the rest (pressed, focused, scrolled) is the
+/// user's and stays.
+const MANAGED_STATES: sys::lv_state_t = (sys::lv_state_t_LV_STATE_CHECKED
+    | sys::lv_state_t_LV_STATE_DISABLED
+    | sys::lv_state_t_LV_STATE_USER_1
+    | sys::lv_state_t_LV_STATE_USER_2) as sys::lv_state_t;
+
+/// A node as it was made, before the page set its properties. Its
+/// `visible` is not kept: a node with a `visible` sets it every time,
+/// one without never does.
+pub(crate) struct Pristine {
+    styles: *mut std::ffi::c_void,
+    clickable: bool,
+    state: sys::lv_state_t,
+    /// A label's long mode and line count.
+    label: Option<(sys::lv_label_long_mode_t, i32)>,
+}
+
+impl Drop for Pristine {
+    fn drop(&mut self) {
+        // SAFETY: made by lv_paneld_local_styles_save, freed once.
+        unsafe { sys::lv_paneld_local_styles_free(self.styles) };
+    }
+}
+
+/// What an object looked like before an update set it up again: it is
+/// restyled at the end only if it now looks otherwise.
+struct Before {
+    obj: *mut sys::lv_obj_t,
+    styles: *mut std::ffi::c_void,
+    state: sys::lv_state_t,
+}
+
+impl Drop for Before {
+    fn drop(&mut self) {
+        // SAFETY: as for `Pristine`.
+        unsafe { sys::lv_paneld_local_styles_free(self.styles) };
+    }
+}
+
+thread_local! {
+    /// An update is under way ([`begin_update`]): style refreshes are
+    /// off and states are set raw, so a node set up again the same
+    /// way costs no redraw.
+    static UPDATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TOUCHED: std::cell::RefCell<Vec<Before>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Start an update of a page in place: nothing is restyled until
+/// [`end_update`].
+pub(crate) fn begin_update() {
+    UPDATING.with(|u| u.set(true));
+    unsafe { sys::lv_obj_enable_style_refresh(false) };
+}
+
+/// Note `obj`'s looks before an update changes it (once per update).
+pub(crate) fn touch(obj: *mut sys::lv_obj_t) {
+    if !UPDATING.with(|u| u.get()) {
+        return;
+    }
+    TOUCHED.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.iter().any(|b| b.obj == obj) {
+            return;
+        }
+        let (styles, state) = unsafe { (sys::lv_paneld_local_styles_save(obj), sys::lv_obj_get_state(obj)) };
+        t.push(Before { obj, styles, state });
+    });
+}
+
+/// End an update: restyle (and so redraw) the objects that look
+/// otherwise now. Returns how many did.
+pub(crate) fn end_update() -> usize {
+    UPDATING.with(|u| u.set(false));
+    unsafe { sys::lv_obj_enable_style_refresh(true) };
+    let touched = TOUCHED.with(|t| std::mem::take(&mut *t.borrow_mut()));
+    let mut changed = 0;
+    for b in &touched {
+        unsafe {
+            let state = sys::lv_obj_get_state(b.obj);
+            if state != b.state {
+                sys::lv_paneld_state_settled(b.obj, b.state);
+                changed += 1;
+            } else if !sys::lv_paneld_local_styles_equal(b.obj, b.styles) {
+                sys::lv_obj_refresh_style(b.obj, sys::lv_part_t_LV_PART_ANY as sys::lv_part_t, sys::_lv_style_id_t_LV_STYLE_PROP_ANY as sys::lv_style_prop_t);
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
+/// Set (or clear) `bits` of `obj`'s state: raw during an update.
+fn set_state_bits(obj: *mut sys::lv_obj_t, bits: sys::lv_state_t, on: bool) {
+    unsafe {
+        if UPDATING.with(|u| u.get()) {
+            let now = sys::lv_obj_get_state(obj);
+            let want = if on { now | bits } else { now & !bits };
+            if want != now {
+                sys::lv_paneld_set_state_raw(obj, want);
+            }
+        } else {
+            sys::lv_obj_set_state(obj, bits, on);
+        }
+    }
+}
+
+impl<'ui> Obj<'ui> {
+    /// An object handle from a pointer the node table keeps: the
+    /// object is alive (records go with the page they describe).
+    pub(crate) fn from_raw(raw: *mut sys::lv_obj_t) -> Obj<'ui> {
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// A screen of the display's size that is never shown: what a
+    /// fresh render to compare with is drawn on.
+    pub(crate) fn new_scratch_screen() -> Obj<'ui> {
+        let raw = unsafe { sys::lv_obj_create(std::ptr::null_mut()) };
+        assert!(!raw.is_null());
+        Obj { raw, _ui: PhantomData }
+    }
+
+    /// Delete this object and what is under it.
+    pub(crate) fn delete(self) {
+        unsafe { sys::lv_obj_delete(self.raw) };
+    }
+
+    /// Lay out the screen this object is on now.
+    pub(crate) fn update_layout(&self) {
+        unsafe { sys::lv_obj_update_layout(self.raw) };
+    }
+
+    /// Show this screen (`paneld shot --verify` draws a fresh render).
+    pub(crate) fn load_screen(&self) {
+        unsafe { sys::lv_screen_load(self.raw) };
+    }
+
+    pub(crate) fn pristine(&self) -> Pristine {
+        unsafe {
+            let label = if self.class_name() == "label" {
+                Some((sys::lv_label_get_long_mode(self.raw), sys::lv_label_get_max_lines(self.raw)))
+            } else {
+                None
+            };
+            Pristine {
+                styles: sys::lv_paneld_local_styles_save(self.raw),
+                clickable: sys::lv_obj_is_clickable(self.raw),
+                state: sys::lv_obj_get_state(self.raw) & MANAGED_STATES,
+                label,
+            }
+        }
+    }
+
+    /// Put this node back as it was made (styles, clickable, the states
+    /// a page sets, its taps and image backgrounds), so its properties
+    /// can be set again as a fresh render sets them. Within an update
+    /// ([`begin_update`]): nothing is restyled until it ends.
+    pub(crate) fn restore(&self, p: &Pristine) {
+        touch(self.raw);
+        unsafe {
+            sys::lv_paneld_local_styles_restore(self.raw, p.styles);
+            if sys::lv_obj_is_clickable(self.raw) != p.clickable {
+                sys::lv_obj_set_clickable(self.raw, p.clickable);
+            }
+            let state = sys::lv_obj_get_state(self.raw);
+            let want = (state & !MANAGED_STATES) | p.state;
+            if want != state {
+                sys::lv_paneld_set_state_raw(self.raw, want);
+            }
+            if let Some((mode, lines)) = p.label {
+                if sys::lv_label_get_long_mode(self.raw) != mode {
+                    sys::lv_label_set_long_mode(self.raw, mode);
+                }
+                if sys::lv_label_get_max_lines(self.raw) != lines {
+                    sys::lv_label_set_max_lines(self.raw, lines);
+                }
+            }
+            // A value or entrance moving: the update says where it goes.
+            // Only motion's own tweens: a spinner keeps turning, a
+            // cursor blinking, a toggle's knob moving.
+            sys::lv_paneld_anim_delete_custom(self.raw.cast(), Some(tween_exec));
+        }
+        self.unbind_all();
+        bg_forget(self.raw, None);
+        OWNED.with(|m| {
+            if let Some(o) = m.borrow_mut().get_mut(&(self.raw as usize)) {
+                o.grid_auto = false;
+            }
+        });
+    }
+
+    /// A button's call state shown (ADR 0024, one model for a fresh
+    /// render and an update): while `busy` is `Some`, its content is
+    /// hidden and the call's `busy` text (else a spinner) is its last
+    /// child; with `None` the overlay goes and the content shows again.
+    pub(crate) fn show_busy(&self, busy: Option<Option<String>>) {
+        let current = OWNED.with(|m| m.borrow().get(&(self.raw as usize)).and_then(|o| o.busy.clone()));
+        let mut overlay = None;
+        if let Some((ov, text)) = current {
+            if busy.as_ref() == Some(&text) {
+                overlay = Some(ov);
+            } else {
+                owned(self.raw, |o| o.busy = None);
+                unsafe { sys::lv_obj_delete(ov) };
+            }
+        }
+        if let (Some(text), None) = (&busy, overlay) {
+            // A new object is styled as it is made, an update or not.
+            let updating = UPDATING.with(|u| u.get());
+            unsafe { sys::lv_obj_enable_style_refresh(true) };
+            let ov = match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                Some(t) => self.new_label(t).raw,
+                None => self.new_busy_spinner().raw,
+            };
+            if updating {
+                unsafe { sys::lv_obj_enable_style_refresh(false) };
+            }
+            crate::nodes::count_made(1);
+            owned(self.raw, |o| o.busy = Some((ov, text.clone())));
+            overlay = Some(ov);
+        }
+        unsafe {
+            for i in 0..sys::lv_obj_get_child_count(self.raw) {
+                let child = sys::lv_obj_get_child(self.raw, i as i32);
+                if Some(child) == overlay {
+                    continue;
+                }
+                let marked = OWNED.with(|m| m.borrow().get(&(child as usize)).is_some_and(|o| o.busy_hidden));
+                if busy.is_some() {
+                    if !sys::lv_obj_is_hidden(child) {
+                        sys::lv_obj_set_hidden(child, true);
+                        owned(child, |o| o.busy_hidden = true);
+                    }
+                } else if marked {
+                    sys::lv_obj_set_hidden(child, false);
+                    owned(child, |o| o.busy_hidden = false);
+                    // Its shortcut label is fitted again, now shown.
+                    sys::lv_obj_send_event(self.raw, sys::lv_event_code_t_LV_EVENT_SIZE_CHANGED, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+
+    /// The user changed this value widget (a toggle, slider, select)
+    /// since it was made.
+    pub(crate) fn user_changed(&self) -> bool {
+        OWNED.with(|m| m.borrow().get(&(self.raw as usize)).is_some_and(|o| o.user_changed))
+    }
+
+    /// An arc with no value, as made.
+    pub(crate) fn unset_arc_value(&self) {
+        unsafe { sys::lv_paneld_arc_unset(self.raw) };
+    }
+
+    /// [`Self::show_busy`] again as it stands (a child of a running
+    /// button was set up again).
+    pub(crate) fn reassert_busy(&self) {
+        let busy = OWNED.with(|m| m.borrow().get(&(self.raw as usize)).and_then(|o| o.busy.as_ref().map(|(_, t)| t.clone())));
+        if busy.is_some() {
+            self.show_busy(busy);
+        }
+    }
+
+    /// Drop this object's taps and change handlers (they are bound
+    /// again with what they read now).
+    pub(crate) fn unbind_all(&self) {
+        unsafe {
+            while sys::lv_obj_remove_event_cb(self.raw, Some(on_tap_trampoline)) != 0 {}
+            while sys::lv_obj_remove_event_cb(self.raw, Some(on_change_trampoline)) != 0 {}
+        }
+        free_slots(self.raw as usize);
+    }
+
+    /// A label's text, set only when it is another (setting it
+    /// redraws the label).
+    pub fn set_label_text(&self, text: &str) {
+        let c = CString::new(text).unwrap_or_else(|_| CString::new("<nul>").unwrap());
+        unsafe {
+            let now = sys::lv_label_get_text(self.raw);
+            if !now.is_null() && std::ffi::CStr::from_ptr(now) == c.as_c_str() {
+                return;
+            }
+            sys::lv_label_set_text(self.raw, c.as_ptr());
+        }
+    }
+
+    /// An image's source, set again only when it is another.
+    pub(crate) fn set_image_path(&self, path: &str) -> bool {
+        let full = match paneld_config::assets::root_of(path) {
+            Some(_) => match asset_path(path, "image") {
+                Some(p) => p,
+                None => return false,
+            },
+            None => ASSET_DIR.with(|d| d.borrow().join(path)),
+        };
+        let Ok(src) = CString::new(format!("A:{}", full.display())) else { return false };
+        unsafe {
+            let now = sys::lv_image_get_src(self.raw);
+            if !now.is_null()
+                && sys::lv_image_src_get_type(now) == sys::lv_image_src_t_LV_IMAGE_SRC_FILE
+                && std::ffi::CStr::from_ptr(now.cast()) == src.as_c_str()
+            {
+                return true;
+            }
+            sys::lv_image_set_src(self.raw, src.as_ptr().cast());
+        }
+        true
+    }
+
+    /// The name of this object's LVGL class (`label`, `bar`, ...).
+    pub(crate) fn class_name(&self) -> String {
+        let c = unsafe { sys::lv_paneld_class_name(self.raw) };
+        if c.is_null() {
+            return String::new();
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(c) }.to_string_lossy();
+        name.strip_prefix("lv_").unwrap_or(&name).to_string()
+    }
+
+    /// Ask a button to fit its shortcut label again (its text changed;
+    /// its size may not have).
+    pub(crate) fn refit_shortcut(&self) {
+        unsafe { sys::lv_obj_send_event(self.raw, sys::lv_event_code_t_LV_EVENT_SIZE_CHANGED, std::ptr::null_mut()) };
+    }
+
+}
+
+/// What a new dropdown lists (LVGL's own placeholder options).
+pub(crate) const DROPDOWN_DEFAULT: &str = "Option 1\nOption 2\nOption 3";
+
+/// Note that the user changed a value widget ([`Obj::user_changed`]).
+fn watch_user(obj: *mut sys::lv_obj_t) {
+    unsafe extern "C" fn changed(e: *mut sys::lv_event_t) {
+        // SAFETY: registered on the widget for VALUE_CHANGED, which
+        // only the user's input sends (setters do not).
+        let obj = unsafe { sys::lv_event_get_target(e) } as *mut sys::lv_obj_t;
+        owned(obj, |o| o.user_changed = true);
+    }
+    unsafe { sys::lv_obj_add_event_cb(obj, Some(changed), sys::lv_event_code_t_LV_EVENT_VALUE_CHANGED, std::ptr::null_mut()) };
+}
+
+/// Colors stored in a style value: only their three bytes count.
+const COLOR_PROPS: &[u32] = &[
+    sys::_lv_style_id_t_LV_STYLE_BG_GRAD_COLOR,
+    sys::_lv_style_id_t_LV_STYLE_BG_IMAGE_RECOLOR,
+    sys::_lv_style_id_t_LV_STYLE_BORDER_COLOR,
+    sys::_lv_style_id_t_LV_STYLE_OUTLINE_COLOR,
+    sys::_lv_style_id_t_LV_STYLE_BG_COLOR,
+    sys::_lv_style_id_t_LV_STYLE_SHADOW_COLOR,
+    sys::_lv_style_id_t_LV_STYLE_IMAGE_RECOLOR,
+    sys::_lv_style_id_t_LV_STYLE_LINE_COLOR,
+    sys::_lv_style_id_t_LV_STYLE_ARC_COLOR,
+    sys::_lv_style_id_t_LV_STYLE_TEXT_COLOR,
+    sys::_lv_style_id_t_LV_STYLE_TEXT_OUTLINE_STROKE_COLOR,
+    sys::_lv_style_id_t_LV_STYLE_RECOLOR,
+    sys::_lv_style_id_t_LV_STYLE_DROP_SHADOW_COLOR,
+];
+
+/// The areas (x1, y1, x2, y2) under `root` that never hold still: a
+/// spinner, a scrolling label. `paneld shot --verify` leaves them out.
+pub fn restless_areas(root: &Obj<'_>) -> Vec<(i32, i32, i32, i32)> {
+    fn walk(obj: *mut sys::lv_obj_t, out: &mut Vec<(i32, i32, i32, i32)>) {
+        let o = Obj::from_raw(obj);
+        let class = o.class_name();
+        unsafe {
+            let restless = class == "spinner"
+                || (class == "label"
+                    && matches!(
+                        sys::lv_label_get_long_mode(obj),
+                        sys::lv_label_long_mode_t_LV_LABEL_LONG_MODE_SCROLL | sys::lv_label_long_mode_t_LV_LABEL_LONG_MODE_SCROLL_CIRCULAR
+                    ));
+            if restless {
+                let mut c: sys::lv_area_t = std::mem::zeroed();
+                sys::lv_obj_get_coords(obj, &mut c);
+                out.push((c.x1, c.y1, c.x2, c.y2));
+            }
+            for i in 0..sys::lv_obj_get_child_count(obj) {
+                walk(sys::lv_obj_get_child(obj, i as i32), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root.raw, &mut out);
+    out
+}
+
+/// One object of a tree dump (ADR 0024, "Correctness guard").
+struct Line {
+    obj: *mut sys::lv_obj_t,
+    /// Depth, class, child count, flags, states.
+    head: String,
+    /// Where it is in its parent after layout; `None` while it (or
+    /// what it is in) comes in.
+    at: Option<String>,
+    /// Its local style properties, `selector:prop=value`, sorted.
+    styles: Vec<(u32, String)>,
+    /// Text, values, points, source, options, bindings, animations
+    /// that run for good, event callbacks.
+    rest: String,
+    /// A value the user can change (a toggle's position, a slider's
+    /// value, a select's choice), when the user has not changed it.
+    user: Option<String>,
+    entering: bool,
+}
+
+/// Compare the object trees under `live` (a page updated in place) and
+/// `fresh` (the same page built afresh): what a fresh render and an
+/// updated page must agree on. Left out: scroll offsets, pressed /
+/// focused states, a keypad's typed text, what a running animation is
+/// in the middle of (a value is taken at its target; an entrance and
+/// what is under it are not placed or faded). The roots' own styles
+/// are left out (a page transition leaves its marks on the holder).
+/// `Err` describes the first object that differs.
+pub(crate) fn compare_trees(live: &Obj<'_>, fresh: &Obj<'_>) -> Result<(), String> {
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    dump_obj(live.raw, 0, true, false, &mut a);
+    dump_obj(fresh.raw, 0, true, false, &mut b);
+    let show = |l: &Line| {
+        let styles: Vec<&str> = l.styles.iter().map(|(_, s)| s.as_str()).collect();
+        format!("{} at={} [{}]{} user={}", l.head, l.at.as_deref().unwrap_or("-"), styles.join(" "), l.rest, l.user.as_deref().unwrap_or("-"))
+    };
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        let moving = x.entering || y.entering;
+        let styles = |l: &Line| -> Vec<String> {
+            l.styles
+                .iter()
+                .filter(|(p, _)| !(moving && (*p == sys::_lv_style_id_t_LV_STYLE_OPA || *p == sys::_lv_style_id_t_LV_STYLE_TRANSLATE_Y)))
+                .map(|(_, s)| s.clone())
+                .collect()
+        };
+        let at_differs = matches!((&x.at, &y.at), (Some(p), Some(q)) if p != q);
+        let user_differs = matches!((&x.user, &y.user), (Some(p), Some(q)) if p != q);
+        if x.head != y.head || x.rest != y.rest || at_differs || user_differs || styles(x) != styles(y) {
+            return Err(format!("object {i} differs:\n  updated: {}\n  fresh:   {}", show(x), show(y)))
+                .map_err(|e| format!("{e}\n  {}", crate::nodes::describe_obj(x.obj)));
+        }
+    }
+    if a.len() != b.len() {
+        let i = a.len().min(b.len());
+        let extra = a.get(i).or(b.get(i)).map(show).unwrap_or_default();
+        return Err(format!("{} objects updated, {} fresh; first extra: {extra}", a.len(), b.len()));
+    }
+    Ok(())
+}
+
+fn dump_obj(obj: *mut sys::lv_obj_t, depth: usize, root: bool, moving: bool, out: &mut Vec<Line>) {
+    use std::fmt::Write;
+    let o = Obj::from_raw(obj);
+    let class = o.class_name();
+    let tweens = tweens_of(obj);
+    let entering = tweens.iter().any(|t| matches!(t, TweenTo::Enter));
+    // Where a hidden object would be is not drawn: not compared.
+    let hidden = unsafe { sys::lv_obj_is_hidden(obj) };
+    let moving = moving || entering || hidden;
+    let mut head = String::new();
+    let mut rest = String::new();
+    let mut at = None;
+    let mut user = None;
+    let mut styles: Vec<(u32, String)> = Vec::new();
+    unsafe {
+        let n = sys::lv_obj_get_child_count(obj);
+        let _ = write!(head, "{depth} {class} n={n}");
+        let flags = [
+            ("hidden", sys::lv_obj_flag_t_LV_OBJ_FLAG_HIDDEN),
+            ("click", sys::lv_obj_flag_t_LV_OBJ_FLAG_CLICKABLE),
+            ("scroll", sys::lv_obj_flag_t_LV_OBJ_FLAG_SCROLLABLE),
+        ];
+        let bits = sys::lv_paneld_obj_flags(obj);
+        for (name, f) in flags {
+            if bits & f != 0 {
+                let _ = write!(head, " {name}");
+            }
+        }
+        // A toggle's position is compared apart (`user`): the user may
+        // have changed it, which an update keeps until what it shows
+        // changes.
+        let user_bits = if class == "switch" { sys::lv_state_t_LV_STATE_CHECKED as sys::lv_state_t } else { 0 };
+        let _ = write!(head, " st={:x}", sys::lv_obj_get_state(obj) & MANAGED_STATES & !user_bits);
+        if !moving {
+            let mut c: sys::lv_area_t = std::mem::zeroed();
+            sys::lv_obj_get_coords(obj, &mut c);
+            let parent = sys::lv_obj_get_parent(obj);
+            let (px, py) = if parent.is_null() {
+                (0, 0)
+            } else {
+                let mut p: sys::lv_area_t = std::mem::zeroed();
+                sys::lv_obj_get_coords(parent, &mut p);
+                (p.x1 - sys::lv_obj_get_scroll_x(parent), p.y1 - sys::lv_obj_get_scroll_y(parent))
+            };
+            at = Some(format!("{},{} {}x{}", c.x1 - px, c.y1 - py, c.x2 - c.x1 + 1, c.y2 - c.y1 + 1));
+        }
+        if !root {
+            let mut i = 0;
+            loop {
+                let (mut sel, mut prop, mut v) = (0u32, 0 as sys::lv_style_prop_t, sys::lv_style_value_t::default());
+                if !sys::lv_paneld_local_style_at(obj, i, &mut sel, &mut prop, &mut v) {
+                    break;
+                }
+                i += 1;
+                let p = u32::from(prop);
+                // Taken with the image: its buffer is the cache's.
+                if p == sys::_lv_style_id_t_LV_STYLE_BG_IMAGE_SRC {
+                    continue;
+                }
+                let value = if p == sys::_lv_style_id_t_LV_STYLE_BG_GRAD && !v.ptr.is_null() {
+                    // Each tree has its own: compare what it holds.
+                    let g = &*(v.ptr as *const sys::lv_grad_dsc_t);
+                    let bytes = std::slice::from_raw_parts((g as *const sys::lv_grad_dsc_t).cast::<u8>(), std::mem::size_of::<sys::lv_grad_dsc_t>());
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    std::hash::Hash::hash(bytes, &mut h);
+                    format!("grad:{:x}", std::hash::Hasher::finish(&h))
+                } else if p == sys::_lv_style_id_t_LV_STYLE_GRID_COLUMN_DSC_ARRAY || p == sys::_lv_style_id_t_LV_STYLE_GRID_ROW_DSC_ARRAY {
+                    // Arrays of their own: compare the tracks.
+                    let mut tracks = Vec::new();
+                    let mut q = v.ptr as *const i32;
+                    while !q.is_null() && *q != GRID_TEMPLATE_LAST && tracks.len() < 2048 {
+                        tracks.push(*q);
+                        q = q.add(1);
+                    }
+                    format!("{tracks:?}")
+                } else if COLOR_PROPS.contains(&p) {
+                    format!("#{:02x}{:02x}{:02x}", v.color.red, v.color.green, v.color.blue)
+                } else {
+                    format!("{}", v.num)
+                };
+                styles.push((p, format!("{sel:x}:{p}={value}")));
+            }
+            styles.sort();
+        }
+        let value = tweens.iter().find_map(|t| match t {
+            TweenTo::Value(v) => Some(*v),
+            _ => None,
+        });
+        let parent = sys::lv_obj_get_parent(obj);
+        let in_textarea = !parent.is_null() && Obj::from_raw(parent).class_name() == "textarea";
+        match class.as_str() {
+            "label" if !in_textarea => {
+                let t = sys::lv_label_get_text(obj);
+                if !t.is_null() {
+                    let _ = write!(rest, " text={:?}", std::ffi::CStr::from_ptr(t).to_string_lossy());
+                }
+                let _ = write!(rest, " long={} lines={}", sys::lv_label_get_long_mode(obj), sys::lv_label_get_max_lines(obj));
+            }
+            "bar" => {
+                let v = value.unwrap_or_else(|| sys::lv_bar_get_value(obj));
+                let _ = write!(rest, " v={v} {}..{}", sys::lv_bar_get_min_value(obj), sys::lv_bar_get_max_value(obj));
+            }
+            "slider" => {
+                let _ = write!(rest, " {}..{}", sys::lv_slider_get_min_value(obj), sys::lv_slider_get_max_value(obj));
+                user = Some(sys::lv_slider_get_value(obj).to_string());
+            }
+            "switch" => user = Some((sys::lv_obj_get_state(obj) & sys::lv_state_t_LV_STATE_CHECKED as sys::lv_state_t != 0).to_string()),
+            "arc" => {
+                let v = value.unwrap_or_else(|| sys::lv_arc_get_value(obj));
+                let _ = write!(
+                    rest,
+                    " v={v} {}..{} a={}..{}",
+                    sys::lv_arc_get_min_value(obj),
+                    sys::lv_arc_get_max_value(obj),
+                    sys::lv_arc_get_bg_angle_start(obj),
+                    sys::lv_arc_get_bg_angle_end(obj)
+                );
+            }
+            "chart" => {
+                let target = tweens.iter().find_map(|t| match t {
+                    TweenTo::Chart(c) => Some(c.clone()),
+                    _ => None,
+                });
+                let count = sys::lv_chart_get_point_count(obj);
+                let _ = write!(rest, " type={} points={count}", sys::lv_chart_get_type(obj));
+                let mut ser = sys::lv_chart_get_series_next(obj, std::ptr::null_mut());
+                let mut k = 0;
+                while !ser.is_null() {
+                    let pts: Vec<i32> = match target.as_ref().and_then(|t| t.get(k)) {
+                        Some(t) => t.iter().map(|p| p.unwrap_or(sys::LV_CHART_POINT_NONE as i32)).collect(),
+                        None => {
+                            let y = sys::lv_chart_get_series_y_array(obj, ser);
+                            if y.is_null() {
+                                Vec::new()
+                            } else {
+                                std::slice::from_raw_parts(y, count as usize).to_vec()
+                            }
+                        }
+                    };
+                    let c = sys::lv_chart_get_series_color(obj, ser);
+                    let _ = write!(rest, " s{k}=#{:02x}{:02x}{:02x}:{pts:?}", c.red, c.green, c.blue);
+                    ser = sys::lv_chart_get_series_next(obj, ser);
+                    k += 1;
+                }
+            }
+            "dropdown" => {
+                let opts = sys::lv_dropdown_get_options(obj);
+                let opts = if opts.is_null() { String::new() } else { std::ffi::CStr::from_ptr(opts).to_string_lossy().into_owned() };
+                let _ = write!(rest, " opts={opts:?}");
+                user = Some(sys::lv_dropdown_get_selected(obj).to_string());
+            }
+            "roller" => {
+                let opts = sys::lv_roller_get_options(obj);
+                let opts = if opts.is_null() { String::new() } else { std::ffi::CStr::from_ptr(opts).to_string_lossy().into_owned() };
+                let _ = write!(rest, " opts={opts:?}");
+                user = Some(sys::lv_roller_get_selected(obj).to_string());
+            }
+            "image" => {
+                let src = sys::lv_image_get_src(obj);
+                if !src.is_null() && sys::lv_image_src_get_type(src) == sys::lv_image_src_t_LV_IMAGE_SRC_FILE {
+                    let _ = write!(rest, " src={:?}", std::ffi::CStr::from_ptr(src.cast()).to_string_lossy());
+                } else {
+                    let _ = write!(rest, " src={}", !src.is_null());
+                }
+            }
+            "line" => {
+                let _ = write!(rest, " pts={:?}", OWNED.with(|m| m.borrow().get(&(obj as usize)).and_then(|o| o.line.as_ref().map(|l| l.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>()))));
+            }
+            _ => {}
+        }
+        let mut binds: Vec<String> = {
+            let g = bindings().lock().unwrap_or_else(|e| e.into_inner());
+            g.slots.iter().flatten().filter(|(o, _)| *o == obj as usize).map(|(_, b)| describe(b)).collect()
+        };
+        binds.sort();
+        if !binds.is_empty() {
+            let _ = write!(rest, " on={binds:?}");
+        }
+        // Animations that run for good (a spinner's turn), not motion's.
+        let anims = sys::lv_paneld_anim_count(obj.cast(), Some(tween_exec));
+        if anims > 0 {
+            let _ = write!(rest, " anims={anims}");
+        }
+        // Event callbacks, but those that only free what goes with it.
+        let events = (0..sys::lv_obj_get_event_count(obj))
+            .filter(|&i| {
+                let d = sys::lv_obj_get_event_dsc(obj, i);
+                !d.is_null() && event_dsc_code(d) != sys::lv_event_code_t_LV_EVENT_DELETE
+            })
+            .count();
+        let _ = write!(rest, " ev={events}");
+        if Obj::from_raw(obj).user_changed() {
+            user = None;
+        }
+        out.push(Line { obj, head, at, styles, rest, user, entering: moving });
+        // A roller's label is where the user scrolled it.
+        if class == "roller" {
+            return;
+        }
+        for i in 0..n {
+            dump_obj(sys::lv_obj_get_child(obj, i as i32), depth + 1, false, moving, out);
+        }
+    }
+}
+
+/// What a binding does, without its queue.
+fn describe(b: &Binding) -> String {
+    let args = |a: &[ActionArg]| a.iter().map(|x| format!("{}={:?}", x.name, x.value)).collect::<Vec<_>>().join(",");
+    let sets = |a: &[InlineSetItem]| a.iter().map(|x| format!("{}={}[{}]", x.key, x.value_raw, args(&x.locals))).collect::<Vec<_>>().join(",");
+    match b {
+        Binding::Action { name, args: a, .. } => format!("action {name}({})", args(a)),
+        Binding::Goto { page, .. } => format!("goto {page}"),
+        Binding::InlineSet { assigns, .. } => format!("set {}", sets(assigns)),
+        Binding::Change { kind, assigns, .. } => format!("change {kind:?} {}", sets(assigns)),
+        Binding::Confirm { accept, .. } => format!("confirm {accept}"),
+        Binding::AskValue { kind } => format!("ask {kind:?}"),
+        Binding::AskButton { accept, .. } => format!("ask-button {accept}"),
+        Binding::ChangeAction { kind, action, args: a, late, .. } => format!("change {kind:?} {action}({}) late {}", args(a), sets(late)),
+    }
 }
 
 #[cfg(test)]

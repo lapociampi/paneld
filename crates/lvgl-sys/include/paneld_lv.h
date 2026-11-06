@@ -60,4 +60,59 @@ void lv_paneld_perf_attach(lv_display_t * disp);
 /* CLOCK_MONOTONIC in us, the clock of the frame lines' `t`. */
 uint64_t lv_paneld_mono_us(void);
 
+/* In-place page updates (ADR 0024). */
+
+/* A copy of `obj`'s local styles, every selector, to put back later
+ * with lv_paneld_local_styles_restore (what the object looked like
+ * when it was made, before a page set its properties). NULL when it
+ * has none. Free with lv_paneld_local_styles_free. */
+void * lv_paneld_local_styles_save(const lv_obj_t * obj);
+
+/* Make `obj`'s local styles exactly `saved` (NULL: none) again. No
+ * style refresh of its own: the caller refreshes once when done. */
+void lv_paneld_local_styles_restore(lv_obj_t * obj, const void * saved);
+
+void lv_paneld_local_styles_free(void * saved);
+
+/* The `i`th local style property of `obj` (in style order, then
+ * property order): its selector, property and value. false past the
+ * last one. For comparing two trees. */
+bool lv_paneld_local_style_at(const lv_obj_t * obj, uint32_t i, uint32_t * selector, lv_style_prop_t * prop,
+                              lv_style_value_t * value);
+
+/* `obj`'s hidden, clickable, checkable and scrollable flags, as the
+ * bits of lv_obj_flag_t. */
+uint32_t lv_paneld_obj_flags(const lv_obj_t * obj);
+
+/* Set `obj`'s state bits as they are, with no restyle, transition or
+ * event (an update setting a node up again; see
+ * lv_paneld_state_settled). */
+void lv_paneld_set_state_raw(lv_obj_t * obj, lv_state_t state);
+
+/* `obj`'s state was set raw and differs from `prev`: restyle it for
+ * the new state at once (no transition) and tell it. */
+void lv_paneld_state_settled(lv_obj_t * obj, lv_state_t prev);
+
+/* Delete the animations of `var` run by `cb` (custom exec): paneld's
+ * own tweens, leaving a widget's own (a spinner's turn) alone. */
+bool lv_paneld_anim_delete_custom(void * var, lv_anim_custom_exec_cb_t cb);
+
+/* How many animations that run for good (a spinner's turn, a
+ * scrolling label) `var` has, those run by `not_cb` left out. */
+uint32_t lv_paneld_anim_count(void * var, lv_anim_custom_exec_cb_t not_cb);
+
+/* An arc's value as before any was set (its indicator where a new
+ * arc has it): an update of an arc whose `value` gives none. */
+void lv_paneld_arc_unset(lv_obj_t * obj);
+
+/* `obj`'s local styles are exactly `saved` (from
+ * lv_paneld_local_styles_save), in any order. */
+bool lv_paneld_local_styles_equal(const lv_obj_t * obj, const void * saved);
+
+/* The name of `obj`'s class ("label", "bar", ...), "" if unnamed. */
+const char * lv_paneld_class_name(const lv_obj_t * obj);
+
+/* The event code an event descriptor is for, without the flag bits. */
+lv_event_code_t lv_paneld_event_dsc_code(const lv_event_dsc_t * dsc);
+
 #endif

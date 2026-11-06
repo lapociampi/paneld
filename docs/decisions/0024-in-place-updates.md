@@ -8,7 +8,7 @@ series: paneld
 order: 31
 ---
 
-- Status: Proposed. Changes the rendering of [ADR 0003](0003-ui-model.md) ("every update rebuilds the page") and the "rebuilt whole" basis of [ADR 0023](0023-motion.md); keeps [ADR 0004](0004-cel.md) and [ADR 0010](0010-threads.md) (all LVGL work stays on the UI thread).
+- Status: Accepted; Phase 0 and Phase 1 done (results below). Changes the rendering of [ADR 0003](0003-ui-model.md) ("every update rebuilds the page") and the "rebuilt whole" basis of [ADR 0023](0023-motion.md); keeps [ADR 0004](0004-cel.md) and [ADR 0010](0010-threads.md) (all LVGL work stays on the UI thread).
 - Date: 2026-11-06
 
 ## Context
@@ -237,11 +237,53 @@ Done: the read analysis (which names and paths an expression reads) is `paneld_c
 
 The gain is larger than `clone` alone: dropping the copies was not timed. RSS on the Pi after the same run: 6.6 -> 6.5 MB; a rack page is ~50 LVGL objects (`nodes` 52 on `home` with the shell).
 
+### Phase 1 results
+
+Done: `crates/paneld-ui/src/nodes.rs` (node table, dep keys, change set, the update walk) and the render code it walks with; typed change names at every redraw site of `main.rs` (`paneld_ui::Changes`); `PANELD_VERIFY_UPDATES` on in every test; `paneld shot --verify`, `--set`, `--source`, `--fuzz`, `--no-sources`; `ctl status` `updates`, `node_records`, `node_objects`; `PANELD_UPDATES=0` builds on every change, as before (to compare).
+
+What updates in place, and what still builds the page:
+
+| In place | Built afresh |
+| --- | --- |
+| Every key of the phase 1 rows, `visible` with a grid placing its children again, handler entries, button call states (overlay model), component args, `page` / `nav` titles | Navigation (phase 3), wake, theme switch, reload |
+| A `repeat` whose item keys are the same (its items walked in place) | A `repeat` whose items changed (phase 2) |
+| Under a dialog: the page updates, the dialog stays | A node that made other objects (button shortcut shape, icon glyph <-> PNG or size, select `style = buttons` options, keypad `masked` / `length`) |
+
+Deviations from section 1, kept simpler with the same guarantee:
+
+| Point | As built |
+| --- | --- |
+| Unit of an update | The node, not each key: a node whose deps changed is set up again from what it was made as (its local styles, clickable, managed states, as saved when made) by the same render code as a fresh build, so every layer of the cascade, the button `background` / `color` coupling and component call keys come out as in a fresh render. A node whose inputs hash as before (output cutoff) is not touched; one set up again is restyled (redrawn) only if its styles or states now differ (states are set raw during the walk, compared at its end) |
+| `RenderPass` | A thread-local mode instead (build, update, scratch): a scratch render (verify) records nothing, moves nothing, leaves `ago()` timing, drawn calls and the top layer alone |
+| Dep keys | Mapped in `nodes.rs` from `paneld_config::reads` through frames for component params, `repeat` bindings and `page` / `nav`; a node with a handler reads every local (its binding carries them) |
+| `ago()` due | Per record: a node reading `ago`, a component call whose args do, and the page for its titles; the page's due is their soonest |
+| Touch | As before: the whole update waits for the release |
+| Fingerprints | Taken lazily: a node's first update after a build sets it up again (no cost added to a build); taken again whenever a node is set up again, forced by its component call's keys too |
+| Setting up again | Ends only motion's own tweens on the node; a widget's own animations (a spinner's turn, a cursor's blink) go on. A value that gives nothing (a bar's, an arc's, a slider's, a select's choice, a dropdown's options) is put back as a new widget has it, unless the user changed it |
+| Change names and the context | Vars and `running` are told apart from the same snapshot the update's context is built from (the action worker can `set` a var, a poller start a run, between reading the queues and building it) |
+| Another shape found mid-walk | Its objects are made off the page (deleted after the walk), so a page under a dialog, built again only when it closes, shows no extras meanwhile |
+| A theme PNG icon | Reads what its ancestors read, and its fingerprint holds the text color it is tinted with |
+
+Verify (after every update, and after a change nothing on the page reads) compares the object trees per node (class, children, flags, states, place after layout, local styles, text, values at their target, chart points, image source, binding entries, animations that run for good, event callbacks other than those freeing memory on delete), and when the page's `ago()` texts are next drawn. What the user can change (a select's choice, a slider's value, a toggle's position) is compared while the user has not changed it since the widget was made; an update keeps a user's change until what the widget shows changes. Left out besides the ADR's list: a roller's label, where a hidden object would be. `shot --verify` compares pixels once motion has ended, without spinners and scrolling text. Two render fixes came out of it: a content-sized button no longer fits its label to the size it had while its call ran, and an entrance ends without leaving an opacity of its own.
+
+Coverage: every `shot.rs` and `daemon.rs` test with verify on; new tests for a value change (no object made, a label's area redrawn, a same-output poll touches no value reader), a page taking taps after a dialog closes, a grid child shown again, running buttons and their end, a spinner shown again, a root set up again by its call, `ago()` in a component arg and a page title; `--fuzz --verify` (1-3 changes per pass: source values, `running`, vars, alerts, call states with args and `busy`, the clock) with three seeds over the shipped shell and alerts page, every page of the three examples and of the rack config (when next to the repo).
+
+Measured, `perf update` against `perf build same=true` (`PANELD_UPDATES=0`), medians:
+
+| Where | Built (before) | Updated (after) | Frame after |
+| --- | --- | --- | --- |
+| x86, homelab `overview`, source values | 1.1 ms | 0.06-0.1 ms | |
+| x86, smart-home `home`, var sets | 0.96 ms | 0.07 ms | |
+| x86, system `overview`, polls | 0.62 ms | 0.12-0.19 ms | |
+| Pi, rack `home`, polls | 8-14 ms, then a 13-21 ms frame (384000 px) | 1.3 ms (1.0-2.3; the first after start 17 ms) | 1.6-3.3 ms (56000 px) |
+
+RSS on the Pi after 90 s on `home`: 5.7 MB (`node_records` 38, `node_objects` 45, 48 LVGL objects).
+
 ## What stays a full rebuild
 
 - Reload (every key may mean another node; motion `forget`), theme switch (tokens, styles, fonts, components), a display size change.
 - A page drawn the first time or evicted from the cache.
-- In Phase 1 only: a change hitting a rebuild row, a `repeat` source, or a handler entry that cannot be rewritten.
+- In Phase 1 only: a change hitting a rebuild row, or a `repeat` whose items changed.
 - Errors: a config error keeps the last good config (and its trees); a node that fails to build shows its error text as today and rebuilds whenever its bindings change.
 
 ## Risks
