@@ -14,9 +14,9 @@ paneld is one native process: Rust and [LVGL](https://lvgl.io), drawing straight
 
 | | |
 | --- | --- |
-| Binary | one static file, about 3.1 MB (fonts and icons included) |
-| Memory | about 5.5 MB resident (RSS), with six live sources polling |
-| CPU | about 0.4% of one core, averaged over 10 minutes of normal running |
+| Binary | one static file, about 3.5 MB (fonts and icons included) |
+| Memory | about 5.8 MB resident (RSS), with six live sources polling and recent pages kept |
+| CPU | about 0.2% of one core, averaged over 10 minutes of normal running |
 | Start | the screen is open about 0.1 s after launch |
 | Drawing | a full 800x480 redraw in about 7 ms; page transitions at about 30 frames per second |
 | Touch | visible feedback within about 5 ms of a touch reaching paneld |
