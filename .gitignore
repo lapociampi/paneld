@@ -14,3 +14,4 @@ editors/vscode/node_modules
 .idea
 *.swp
 *.swo
+/dist

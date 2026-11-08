@@ -1,0 +1,7 @@
+Font Awesome Free 5 glyphs, part of LVGL's built-in Montserrat bitmap
+fonts (the symbol icons). Fonts under the SIL Open Font License 1.1,
+whose full text follows (also in the OFL-*.txt files beside this one).
+https://fontawesome.com/license/free
+
+Copyright (c) Fonticons, Inc. (https://fontawesome.com)
+
