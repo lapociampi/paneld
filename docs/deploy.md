@@ -2,7 +2,7 @@
 title: "Deploy"
 description: "Cross-compile paneld for an arm64 Linux board and run it as a systemd service."
 date: 2026-10-30
-updated: 2026-11-06
+updated: 2026-11-08
 tags: [paneld, deploy, pi, systemd]
 series: paneld
 order: 7
@@ -62,6 +62,27 @@ scripts/build-static.sh --check aarch64-unknown-linux-musl
 scripts/build-static.sh --check x86_64-unknown-linux-musl
 ```
 
+## Releases
+
+Each release on GitHub carries the static binaries, so a board needs no build toolchain: `paneld-vX.Y.Z-aarch64-linux-musl.tar.gz` (Raspberry Pi 3, 4 and 5 on a 64-bit OS, other arm64 boards) and `paneld-vX.Y.Z-x86_64-linux-musl.tar.gz` (PCs, mini PCs), plus `SHA256SUMS`. An archive holds the binary, `paneld.service`, `INSTALL.md` (the steps below, short), `LICENSE` and the licenses of everything built into the binary in `licenses/`.
+
+```
+# Next to the downloaded archive and SHA256SUMS:
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf paneld-vX.Y.Z-aarch64-linux-musl.tar.gz
+cd paneld-vX.Y.Z-aarch64-linux-musl
+```
+
+`uname -m` on the board says which archive: `aarch64` or `x86_64`; a 32-bit OS (`armv7l`) has no release build. Then install as below, copying the unpacked `paneld` and `paneld.service` to the device instead of the built ones (or follow `INSTALL.md` on the device).
+
+Making a release (`.github/workflows/release.yml`, run by hand):
+
+1. On `main`, set `version` in `Cargo.toml` and run `cargo check` so `Cargo.lock` follows (the workflow builds with `--locked`); commit both.
+2. Push, then start it: Actions, `release`, Run workflow, or `gh workflow run release.yml -f version=X.Y.Z`. `draft` and `prerelease` are optional; with `draft`, the tag is made when you publish the draft on the releases page.
+3. It checks that the version is `X.Y.Z` (or `X.Y.Z-pre`), matches `Cargo.toml` and has no tag yet; runs the tests, clippy and `paneld check` on the examples; builds both targets with `scripts/build-static.sh --check` (the allocator check above); packs them with `scripts/package-release.sh`; then creates tag `vX.Y.Z` on the tested commit and the release, with notes from the commit messages since the last tag. Nothing is published unless every step passes.
+
+`scripts/package-release.sh VERSION TARGET [OUT_DIR]` packs a local build the same way (after `scripts/build-static.sh --check TARGET`; needs `jq` and GNU tar), into `dist/` by default. A run that fails while uploading can leave a draft release behind; delete it on the releases page before running again.
+
 ## Install on the device
 
 ```
@@ -72,10 +93,11 @@ scp packaging/paneld.service pi@panel:/tmp/paneld.service
 # On the device:
 sudo install -m 0755 /tmp/paneld /usr/local/bin/paneld
 sudo install -m 0644 /tmp/paneld.service /etc/systemd/system/paneld.service
-sudo useradd --system --no-create-home --groups video,input paneld
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups video,input paneld
 sudo install -d -m 0750 -o paneld -g paneld /etc/paneld /var/lib/paneld
 sudo cp paneld.conf /etc/paneld/paneld.conf
 
+sudo -u paneld paneld check -c /etc/paneld/paneld.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now paneld
 ```

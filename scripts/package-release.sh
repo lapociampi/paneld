@@ -48,10 +48,13 @@ install -m 0755 "$bin" "$dir/paneld"
 cp packaging/paneld.service LICENSE "$dir/"
 sed "s/VERSION/$version/g; s/TARGET/$target/" packaging/INSTALL.md > "$dir/INSTALL.md"
 
-# C code: LVGL with its QR code generator, and libdrm, whose MIT terms
+# C code: LVGL with the libraries it builds in (QR code generator,
+# LodePNG, stb_truetype for TinyTTF), and libdrm, whose MIT terms
 # are in its source headers (the files with other holders included).
 cp vendor/lvgl/LICENCE.txt "$lic/lvgl.txt"
 cp vendor/lvgl/src/libs/qrcode/LICENSE.txt "$lic/qrcodegen.txt"
+cp vendor/lvgl/src/libs/lodepng/LICENSE.txt "$lic/lodepng.txt"
+cp vendor/lvgl/src/libs/tiny_ttf/LICENSE.txt "$lic/stb_truetype.txt"
 notice() {
     printf 'From %s:\n\n' "${1#vendor/libdrm/}"
     sed -n '/^ \* Copyright/,/^ \*\//p' "$1" | sed 's/^ \*\/$//; s/^ \* \{0,1\}//'

@@ -98,7 +98,9 @@ cargo run --release -- shot -c examples/smart-home/paneld.conf --page lights -o 
 
 ## Run it on a Raspberry Pi
 
-paneld cross-compiles to one static binary with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) (the toolchain setup is in [Deploy](docs/deploy.md)); nothing is installed on the Pi but the binary, a systemd unit and your config:
+paneld is one static binary: nothing is installed on the Pi but the binary, a systemd unit and your config. Each [release](https://github.com/lapociampi/paneld/releases) has it ready for arm64 (Raspberry Pi 3, 4 and 5 on a 64-bit OS) and x86_64, with the unit and short install steps in the archive.
+
+To build it yourself, it cross-compiles with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) (the toolchain setup is in [Deploy](docs/deploy.md)):
 
 ```
 scripts/build-static.sh aarch64-unknown-linux-musl
@@ -134,4 +136,4 @@ paneld is in daily use. The config schema is at v1 and may still change before a
 
 paneld is licensed under the [MIT license](LICENSE).
 
-It bundles [LVGL](https://github.com/lvgl/lvgl) (MIT), [libdrm](https://gitlab.freedesktop.org/mesa/drm) (MIT) and five font families under the [SIL Open Font License](crates/paneld-ui/fonts/): Roboto, Open Sans, Noto Sans, Montserrat and Inter, cut down to Latin-1 (see [their README](crates/paneld-ui/fonts/README.md)).
+It bundles [LVGL](https://github.com/lvgl/lvgl) (MIT) with its QR code generator (MIT), LodePNG (zlib), stb_truetype (MIT) and the Font Awesome icons in its built-in fonts (OFL), [libdrm](https://gitlab.freedesktop.org/mesa/drm) (MIT), musl, the Rust standard library and a few Rust crates (MIT, Apache-2.0, BSD-3-Clause; the release archives carry every license in `licenses/`), and five font families under the [SIL Open Font License](crates/paneld-ui/fonts/): Roboto, Open Sans, Noto Sans, Montserrat and Inter, cut down to Latin-1 (see [their README](crates/paneld-ui/fonts/README.md)).

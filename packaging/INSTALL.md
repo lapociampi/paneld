@@ -35,5 +35,5 @@ the PIN and secrets, and the rest of the setup are in the docs:
     https://github.com/lapociampi/paneld/blob/vVERSION/docs/deploy.md
 
 paneld is MIT licensed (LICENSE). The licenses of what is built into
-it (LVGL, libdrm, the fonts, musl, the Rust standard library and
-crates) are in licenses/.
+it (LVGL and its QR code, PNG and TrueType libraries, libdrm, the
+fonts, musl, the Rust standard library and crates) are in licenses/.
