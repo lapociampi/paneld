@@ -75,11 +75,14 @@ cd paneld-vX.Y.Z-aarch64-linux-musl
 
 `uname -m` on the board says which archive: `aarch64` or `x86_64`; a 32-bit OS (`armv7l`) has no release build. Then install as below, copying the unpacked `paneld` and `paneld.service` to the device instead of the built ones (or follow `INSTALL.md` on the device).
 
-Making a release (`.github/workflows/release.yml`, run by hand):
+Making a release takes one run of `.github/workflows/release.yml`: Actions, `release`, Run workflow, or `gh workflow run release.yml -f bump=patch` (`patch`, `minor` or `major`; `draft` and `prerelease` are optional; with `draft`, the tag is made when you publish the draft on the releases page). It runs from `main` and:
 
-1. On `main`, set `version` in `Cargo.toml` and run `cargo check` so `Cargo.lock` follows (the workflow builds with `--locked`); commit both.
-2. Push, then start it: Actions, `release`, Run workflow, or `gh workflow run release.yml -f version=X.Y.Z`. `draft` and `prerelease` are optional; with `draft`, the tag is made when you publish the draft on the releases page.
-3. It checks that the version is `X.Y.Z` (or `X.Y.Z-pre`), matches `Cargo.toml` and has no tag yet; runs the tests, clippy and `paneld check` on the examples; builds both targets with `scripts/build-static.sh --check` (the allocator check above); packs them with `scripts/package-release.sh`; then creates tag `vX.Y.Z` on the tested commit and the release, with notes from the commit messages since the last tag. Nothing is published unless every step passes.
+1. Raises that part of `version` in `Cargo.toml` (0.1.0 becomes 0.1.1, 0.2.0 or 1.0.0), updates `Cargo.lock` to match and pushes the two as one commit, `release vX.Y.Z`, on `main`. It stops first if tag `vX.Y.Z` exists, and pushes nothing if `main` moved meanwhile.
+2. Runs `.github/workflows/release-executor.yml` on that commit: checks that the version is `X.Y.Z` (or `X.Y.Z-pre`), matches `Cargo.toml` and has no tag yet; runs the tests, clippy and `paneld check` on the examples; builds both targets with `scripts/build-static.sh --check` (the allocator check above); packs them with `scripts/package-release.sh`; then creates tag `vX.Y.Z` on that commit and the release, with notes from the commit messages since the last tag. Nothing is published unless every step passes.
+
+`release` refuses to bump a version that was never released: the first release, or the bump of a run whose executor failed. Release that version with `release executor` by hand (`gh workflow run release-executor.yml -f version=X.Y.Z`, for the version already in `Cargo.toml` on `main`; `-f sha=...` picks a commit). After a failed run, fix the cause and use "Re-run failed jobs" on it: that releases the bump commit it pushed. "Re-run all jobs", or a new `release` run, would bump once more. Run one release at a time.
+
+The bump is pushed with the workflow's own token, so a protected `main` refuses it unless a ruleset lets GitHub Actions bypass it (or the push uses a deploy key).
 
 `scripts/package-release.sh VERSION TARGET [OUT_DIR]` packs a local build the same way (after `scripts/build-static.sh --check TARGET`; needs `jq` and GNU tar), into `dist/` by default. A run that fails while uploading can leave a draft release behind; delete it on the releases page before running again.
 
