@@ -128,7 +128,10 @@
 #define LV_SDL_BACKEND          LV_SDL_BACKEND_SW
 #define LV_SDL_RENDER_MODE      LV_DISPLAY_RENDER_MODE_DIRECT
 #define LV_SDL_BUF_COUNT        1
-#define LV_SDL_ACCELERATED      1
+/* LVGL draws in software; SDL only shows the frame. A software
+ * renderer also works under SDL2's headless `dummy` driver (tests, CI),
+ * which has no accelerated one. */
+#define LV_SDL_ACCELERATED      0
 #define LV_SDL_FULLSCREEN       0
 #define LV_SDL_DIRECT_EXIT      1
 
