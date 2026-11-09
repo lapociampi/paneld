@@ -74,8 +74,8 @@ cp crates/paneld-ui/fonts/OFL-*.txt "$lic/"
 # target's binary, with the license files the crate ships.
 cp packaging/licenses/musl.txt packaging/licenses/rust-std.txt "$lic/"
 meta=$stage/metadata.json
-cargo metadata --format-version 1 --filter-platform "$target" > "$meta"
-cargo tree -p paneld --target "$target" --no-default-features --features device -e normal \
+cargo metadata --color never --format-version 1 --filter-platform "$target" > "$meta"
+cargo tree --color never -p paneld --target "$target" --no-default-features --features device -e normal \
     --prefix none --format '{p}' | sed 's/ (\*)$//; / (\//d' | sort -u | while read -r crate ver; do
     ver=${ver#v}
     src=$(jq -r --arg n "$crate" --arg v "$ver" '.packages[] | select(.name == $n and .version == $v) | .manifest_path' "$meta")
