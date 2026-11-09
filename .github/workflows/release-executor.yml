@@ -181,9 +181,10 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          ls *.tar.gz
-          [ "$(ls *.tar.gz | wc -l)" = 2 ] || { echo "::error::expected 2 archives"; exit 1; }
-          sha256sum *.tar.gz > SHA256SUMS
+          set -- ./paneld-*.tar.gz
+          [ $# = 2 ] && [ -f "$1" ] || { echo "::error::expected 2 archives, got: $*"; exit 1; }
+          # Names without ./ in the file, as sha256sum -c expects them.
+          sha256sum -- "${@#./}" > SHA256SUMS
           cat SHA256SUMS
 
       - name: Release notes
