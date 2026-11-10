@@ -418,7 +418,7 @@ screen {
 | `theme` | theme name | Active theme; default: the config's first `theme`, else the shipped `light`. `paneld ctl theme` overrides it until reset or restart |
 | `idle` | duration | Turn off after no touch |
 | `brightness` | 0..100 | Passed to `dim` as `level` |
-| `fps` | 1..60 | Default `30`. Frames a second while something changes on screen (a frame every `1000 / fps` ms, rounded); animations step at the same rate. Nothing is drawn while nothing changes, at any rate. Applied at start, on reload and when the night hours start or end |
+| `fps` | 1..60 | Default `30`. Frames a second while something changes on screen (a frame every `1000 / fps` ms, rounded); animations step at the same rate. Nothing is drawn while nothing changes, at any rate. What a touch or a change shows can wait up to one frame (`1000 / fps` ms); on the device a touch is still read as it arrives, at any rate (the SDL mouse on a desktop is read every 33 ms, whatever `fps` is). Applied at start, on reload and when the night hours start or end; `ctl status` reports `fps`, `refresh_ms` and `anim_ms`. Why: [ADR 0025](decisions/0025-frame-rate.md) |
 | `on`, `off`, `dim` | command | Backlight control |
 | `wake_on` | severities | Default `[critical]` |
 | `first_tap` | `wake`, `act` | Default `wake`: the tap that wakes the screen does nothing else |

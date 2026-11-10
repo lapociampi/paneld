@@ -2,7 +2,7 @@
 title: "Decisions"
 description: "The design decisions behind paneld, one record each."
 date: 2026-10-29
-updated: 2026-11-06
+updated: 2026-11-10
 tags: [paneld, adr]
 series: paneld
 order: 7
@@ -34,3 +34,4 @@ order: 7
 | [0022](0022-backgrounds-shadows.md) | Backgrounds are a color, a gradient or a fitted image; shadows are capped |
 | [0023](0023-motion.md) | Motion runs once, from what was shown, and never while asleep |
 | [0024](0024-in-place-updates.md) | Pages update in place; recent pages are kept (phases 1 to 3 done) |
+| [0025](0025-frame-rate.md) | The screen sets its frame rate |

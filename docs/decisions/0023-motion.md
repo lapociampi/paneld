@@ -2,7 +2,7 @@
 title: "ADR 0023: Motion runs once, from what was shown, and never while asleep"
 description: "The theme's motion levels and tokens, how values animate from what was shown when a page is drawn again, and how animations end so the panel sleeps again."
 date: 2026-11-05
-updated: 2026-11-06
+updated: 2026-11-10
 tags: [paneld, adr, themes, rendering]
 series: paneld
 order: 30
@@ -31,7 +31,7 @@ The docs promised page transitions, tap feedback, animated values and an alert b
 | Reload, theme switch | The next render starts afresh: values at their new value, no entrance, since a remembered place (file and offset) may now be another node; the render after compares against it as usual |
 | Charts | Point by point; a series whose points moved left by k (a `history` gaining points) is shifted first, the new points start at the last one, so the line does not wobble |
 | Easing | Ease-out cubic, computed in Rust both in the animation and when reading the value shown, so a rebuild mid-way does not jump |
-| Page transitions | Only when the page changes (`same_page` false); a value change redraws in place. The new page is drawn in a holder over the old one; `fade` animates its opacity, `slide` both holders' `translate_x`. It starts one lead in (33 ms, at most a quarter of the duration) and runs from there over the whole duration, so the first frame (drawn once the new page is laid out, some 15-25 ms later) already shows the new page partly in, and the transition still takes its duration on the clock. A transparent blocker on top takes taps until the end, then the old page and the blocker are deleted. The frame after the end is drawn at once, not a refresh period later A redraw asked for meanwhile waits for the end, which wakes the loop. If LVGL cannot start the animation, the new page is in at once |
+| Page transitions | Only when the page changes (`same_page` false); a value change redraws in place. The new page is drawn in a holder over the old one; `fade` animates its opacity, `slide` both holders' `translate_x`. It starts one lead in (one refresh period, 33 ms at the default 30 fps, [ADR 0025](0025-frame-rate.md); at most a quarter of the duration) and runs from there over the whole duration, so the first frame (drawn once the new page is laid out, some 15-25 ms later at 30 fps) already shows the new page partly in, and the transition still takes its duration on the clock. A transparent blocker on top takes taps until the end, then the old page and the blocker are deleted. The frame after the end is drawn at once, not a refresh period later. A redraw asked for meanwhile waits for the end, which wakes the loop. If LVGL cannot start the animation, the new page is in at once |
 | Tap feedback | Local `transition` styles on buttons and nodes with `on_tap` / `on_hold` for the pressed state and back (scale, opacity, colors, border). The LVGL default theme's own transitions are off (`LV_THEME_DEFAULT_TRANSITION_TIME 0`), so `none` means none. `scale` pivots about the node's middle |
 | Sleep | Going to sleep ends every animation at its end value (`finish_motion`) before the cover goes up; the render on waking is instant (no values, entrances or transition move). While asleep nothing is rendered at all |
 | One-shot | Every animation is a one-shot `lv_anim` with its data freed in its `deleted_cb`; LVGL pauses its animation timer when the list is empty, so the pump's hint goes back to the idle step |

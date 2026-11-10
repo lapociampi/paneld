@@ -160,6 +160,15 @@ Details: [ADR 0023](decisions/0023-motion.md).
 
 The Pi 3B+ is about 4 to 6 times slower per frame on this kind of drawing (10 times on gradients and shadows, see above), so a fade costs about 16 to 30 ms of a 33 ms frame there: it fits, with little to spare. On x86 the daemon used 0.5% of a core idle, 10% during a value animation, 13% during a page fade, and 0.5% again from the end of each.
 
+**Frame rate:** `screen:fps` (default 30, [Schema](schema.md) 12) spaces the frames of every animation; `motion` decides which animations run at all (spinners and scrolling text always do). Details: [ADR 0025](decisions/0025-frame-rate.md).
+
+| Device | Setting |
+| --- | --- |
+| Weakest | `motion = none`: no transitions, value animations or tap feedback (`reduced` drops only slides), the biggest saving; spinners and scrolling text still step at `fps` |
+| Some animation, less CPU | a lower `fps`, e.g. 15-20: the same animations in fewer, coarser steps |
+| Fast (a desktop, a faster board) | `fps = 60` for smoother motion |
+| Any, at night | a low `night { fps = ... }`: animations are coarser and a tap's feedback can lag up to one frame (`1000 / fps` ms), which matters little when nobody watches |
+
 ## Switching
 
 - One theme is active (`screen:theme`). A night theme takes over in the screen's night hours (`screen { night { theme = dim } }`), with its tokens, styles and components.
