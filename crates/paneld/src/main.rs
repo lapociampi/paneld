@@ -1881,6 +1881,9 @@ fn screen_step(live: &mut LiveState) -> bool {
             screen::Effect::Dim(level) => {
                 screen_command(&live.screen, live.screen.cfg.dim.clone(), Some(level));
             }
+            // The display's refresh and the animations from the next
+            // frame on; nothing is redrawn for it.
+            screen::Effect::Fps(fps) => paneld_ui::set_fps(fps),
             screen::Effect::Theme(name) => {
                 live.screen_theme = name;
                 // A theme chosen over ctl stays until `theme --reset`.
@@ -3378,6 +3381,13 @@ fn handle_request(
             // loop's last sleep could be (1000 ms when nothing moves).
             m.insert("animations".to_string(), Value::Int(paneld_ui::running_animations() as i64));
             m.insert("idle_ms".to_string(), Value::Int(paneld_ui::idle_hint_ms() as i64));
+            // The frame rate in force (schema 12 `fps`, the night's at
+            // night) and the periods LVGL's refresh and animation
+            // timers run at.
+            m.insert("fps".to_string(), Value::Int(paneld_ui::fps() as i64));
+            let (refresh, anim) = paneld_ui::timer_periods();
+            m.insert("refresh_ms".to_string(), Value::Int(refresh as i64));
+            m.insert("anim_ms".to_string(), Value::Int(anim as i64));
             // Full page renders since start: what the panel built, and
             // the updates in place (ADR 0024).
             m.insert("renders".to_string(), Value::Int(RENDERS.load(std::sync::atomic::Ordering::Relaxed) as i64));

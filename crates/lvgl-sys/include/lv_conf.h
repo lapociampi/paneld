@@ -51,7 +51,9 @@
  * Timing and DPI
  * --------------------------------------------------------------------- */
 
-/* 30 FPS refresh target (~33 ms); the Pi draws in software. */
+/* 30 FPS refresh target (~33 ms); the Pi draws in software. The
+ * default only: `screen:fps` (schema 12) sets the display refresh and
+ * animation timers at run time (paneld_ui::set_fps). */
 #define LV_DEF_REFR_PERIOD      33
 #define LV_DPI_DEF              130
 

@@ -888,6 +888,52 @@ fn wait_status(d: &Daemon, field: &str, want: i64) {
     }
 }
 
+/// `fps`, and the periods of the refresh and animation timers.
+fn rate(d: &Daemon) -> (i64, i64, i64) {
+    (status_num(d, "fps"), status_num(d, "refresh_ms"), status_num(d, "anim_ms"))
+}
+
+#[test]
+fn the_frame_rate_is_set_at_start_on_reload_and_by_the_night_hours() {
+    let dir = tmp("fps");
+    let page = "theme t { value_transition = 600ms }\nvar v: int = 10\n\
+                page home { bar { width = 200; value = {{ vars.v }} } }\n";
+    let d = Daemon::start(&dir, &format!("screen {{ fps = 10 }}\n{page}"));
+    wait_status(&d, "fps", 10);
+    assert_eq!(rate(&d), (10, 100, 100));
+    // Idle is asleep at 10 fps too; an animation steps a frame at a
+    // time and ends.
+    wait_idle(&d);
+    d.ok(&["set", "vars.v=90"]);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(status_num(&d, "animations") >= 1, "the bar did not animate");
+    assert!(status_num(&d, "idle_ms") <= 100, "no frames while animating");
+    wait_idle(&d);
+    // A reload sets the new rate live.
+    write_conf(&dir, &format!("screen {{ fps = 25 }}\n{page}"));
+    d.ok(&["reload"]);
+    wait_status(&d, "fps", 25);
+    assert_eq!(rate(&d), (25, 40, 40));
+    // Night hours around now: the night's rate.
+    let h = local_hour();
+    let (from, to) = ((h + 23) % 24, (h + 2) % 24);
+    write_conf(&dir, &format!("screen {{ fps = 25; night {{ from = {from:02}:00; to = {to:02}:00; fps = 5 }} }}\n{page}"));
+    d.ok(&["reload"]);
+    wait_status(&d, "fps", 5);
+    assert_eq!(rate(&d), (5, 200, 200));
+    wait_idle(&d);
+    // A rate the check refuses keeps the last good config's.
+    write_conf(&dir, &format!("screen {{ fps = 0 }}\n{page}"));
+    let why = d.refused(&["reload"]);
+    assert!(why.contains("p.conf:3:16") && why.contains("from 1 to 60"), "{why}");
+    assert_eq!(rate(&d), (5, 200, 200));
+    // No `fps`: back to the default 30 fps, LVGL's 33 ms.
+    write_conf(&dir, page);
+    d.ok(&["reload"]);
+    wait_status(&d, "fps", 30);
+    assert_eq!(rate(&d), (30, 33, 33));
+}
+
 #[test]
 fn a_page_left_is_kept_and_shown_again_with_what_changed_meanwhile() {
     // ADR 0024 page cache (on by default, 3 pages). Verify is on: a

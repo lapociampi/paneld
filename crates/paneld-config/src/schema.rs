@@ -260,6 +260,12 @@ const NIGHT_BLOCK: &BlockSchema = &BlockSchema {
             required: false,
             expr_ok: false,
         },
+        KeyRule {
+            name: "fps",
+            ty: ExpectedType::IntIn(1, 60),
+            required: false,
+            expr_ok: false,
+        },
     ],
     nested: &[],
     body_mode: BodyMode::Keyed,
@@ -475,6 +481,12 @@ const SCREEN_SCHEMA: &BlockSchema = &BlockSchema {
         KeyRule {
             name: "brightness",
             ty: ExpectedType::Int,
+            required: false,
+            expr_ok: false,
+        },
+        KeyRule {
+            name: "fps",
+            ty: ExpectedType::IntIn(1, 60),
             required: false,
             expr_ok: false,
         },
@@ -4972,6 +4984,29 @@ screen { idle = 2m }
             "theme dim { }\nscreen { idle = 2m; night { from = 22:00; to = 07:00; theme = dim } }\n",
         );
         assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn screen_fps_in_range_passes() {
+        for src in [
+            "screen { fps = 1 }\n",
+            "screen { fps = 60; night { from = 22:00; to = 07:00; fps = 10 } }\n",
+            "screen:fps = 24\n",
+        ] {
+            assert!(check_text(src).is_empty(), "{src}: {:?}", check_text(src));
+        }
+    }
+
+    #[test]
+    fn screen_fps_out_of_range_says_where() {
+        let diags = check_text("screen {\n    fps = 0\n}\n");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].ends_with("root.conf:2:11: expected an integer from 1 to 60, got `0`"), "{diags:?}");
+        let diags = check_text("screen { night { from = 22:00; to = 07:00; fps = 61 } }\n");
+        assert_msg(&diags, "root.conf:1:50:");
+        assert_msg(&diags, "expected an integer from 1 to 60, got `61`");
+        assert_msg(&check_text("screen:fps = fast\n"), "expected an integer from 1 to 60, got `fast`");
+        assert_msg(&check_text("screen { fps = 2.5 }\n"), "expected an integer from 1 to 60");
     }
 
     #[test]

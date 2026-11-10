@@ -1,7 +1,8 @@
 //! Screen power and night hours (schema 12): sleep after `idle`
 //! without a touch, wake on a touch or on a new alert of a `wake_on`
-//! severity, `on` / `off` / `dim` backlight commands, and `night { }`
-//! hours that switch theme, idle and brightness.
+//! severity, `on` / `off` / `dim` backlight commands, the frame rate
+//! (`fps`), and `night { }` hours that switch theme, idle, brightness
+//! and frame rate.
 //!
 //! [`Screen::step`] is pure (time and inputs in, [`Effect`]s out) so
 //! the rules are tested without LVGL; `main.rs` applies the effects.
@@ -21,6 +22,7 @@ pub struct Night {
     pub theme: Option<String>,
     pub idle: Option<Duration>,
     pub brightness: Option<u8>,
+    pub fps: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +30,8 @@ pub struct Config {
     pub theme: Option<String>,
     pub idle: Option<Duration>,
     pub brightness: u8,
+    /// Frames a second, 1..=60 (default 30).
+    pub fps: u32,
     pub on: Option<String>,
     pub off: Option<String>,
     pub dim: Option<String>,
@@ -43,6 +47,7 @@ impl Default for Config {
             theme: None,
             idle: None,
             brightness: 100,
+            fps: 30,
             on: None,
             off: None,
             dim: None,
@@ -68,6 +73,7 @@ impl Config {
                 "theme" => c.theme = Some(raw.to_string()),
                 "idle" => c.idle = paneld_config::value::parse_duration(raw),
                 "brightness" => c.brightness = parse_level(raw).unwrap_or(c.brightness),
+                "fps" => c.fps = parse_fps(raw).unwrap_or(c.fps),
                 "on" => c.on = Some(raw.to_string()),
                 "off" => c.off = Some(raw.to_string()),
                 "dim" => c.dim = Some(raw.to_string()),
@@ -94,6 +100,7 @@ impl Config {
                         "theme" => night.theme = Some(raw.to_string()),
                         "idle" => night.idle = paneld_config::value::parse_duration(raw),
                         "brightness" => night.brightness = parse_level(raw),
+                        "fps" => night.fps = parse_fps(raw),
                         _ => {}
                     }
                 }
@@ -121,6 +128,11 @@ fn parse_level(raw: &str) -> Option<u8> {
     raw.trim().parse::<u32>().ok().map(|v| v.min(100) as u8)
 }
 
+/// `fps`: 1..=60; anything else (the check refuses it) is ignored.
+fn parse_fps(raw: &str) -> Option<u32> {
+    raw.trim().parse::<u32>().ok().filter(|v| (1..=60).contains(v))
+}
+
 /// What the main loop must do after a [`Screen::step`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
@@ -133,6 +145,8 @@ pub enum Effect {
     Dim(u8),
     /// Switch to this theme (`None` = the config's normal one).
     Theme(Option<String>),
+    /// Draw at this many frames a second.
+    Fps(u32),
 }
 
 /// Inputs to one [`Screen::step`].
@@ -150,9 +164,11 @@ pub struct Screen {
     pub cfg: Config,
     zone: Zone,
     asleep: bool,
-    /// Night state and level last applied; `None` before the first step.
+    /// Night state, level and frame rate last applied; `None` before
+    /// the first step.
     night: Option<bool>,
     level: Option<u8>,
+    fps: Option<u32>,
     /// Shown alert ids when the screen went to sleep.
     seen: BTreeSet<String>,
     /// Where `on` / `off` / `dim` run (the config folder).
@@ -161,7 +177,7 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(cfg: Config, zone: Zone, cwd: PathBuf) -> Self {
-        Self { cfg, zone, asleep: false, night: None, level: None, seen: BTreeSet::new(), cwd }
+        Self { cfg, zone, asleep: false, night: None, level: None, fps: None, seen: BTreeSet::new(), cwd }
     }
 
     pub fn asleep(&self) -> bool {
@@ -174,6 +190,7 @@ impl Screen {
         self.asleep = old.asleep;
         self.seen = old.seen.clone();
         self.level = old.level;
+        self.fps = old.fps;
         // `night` stays `None` so the new config's theme and level are
         // applied on the first step.
     }
@@ -199,6 +216,7 @@ impl Screen {
         let idle = n.and_then(|n| n.idle).or(self.cfg.idle);
         let level = n.and_then(|n| n.brightness).unwrap_or(self.cfg.brightness);
         let theme = n.and_then(|n| n.theme.clone());
+        let fps = n.and_then(|n| n.fps).unwrap_or(self.cfg.fps);
 
         if self.night != Some(night) {
             let first = self.night.is_none();
@@ -208,6 +226,13 @@ impl Screen {
             if !first || night {
                 out.push(Effect::Theme(theme));
             }
+        }
+
+        // Asleep too: a paused refresh costs nothing at any rate, and
+        // the wake draws at the right one.
+        if self.fps != Some(fps) {
+            self.fps = Some(fps);
+            out.push(Effect::Fps(fps));
         }
 
         if self.asleep {
@@ -282,12 +307,61 @@ mod tests {
         let n = c.night.unwrap();
         assert_eq!((n.from, n.to), (22 * 3600, 7 * 3600));
         assert_eq!(n.brightness, Some(20));
+        // No `fps`: 30, and the night keeps it.
+        assert_eq!((c.fps, n.fps), (30, None));
+    }
+
+    #[test]
+    fn fps_and_a_night_fps_are_read() {
+        let c = Config::from_doc(&doc("screen { fps = 12; night { from = 22:00; to = 07:00; fps = 4 } }\n"));
+        assert_eq!((c.fps, c.night.unwrap().fps), (12, Some(4)));
+        // Options: last one wins, as everywhere.
+        let mut d = doc("screen { fps = 12 }\nscreen:fps = 20\n");
+        paneld_config::apply_overrides(&mut d);
+        assert_eq!(Config::from_doc(&d).fps, 20);
+    }
+
+    #[test]
+    fn the_frame_rate_is_set_once_and_switched_by_the_night_hours() {
+        let mut s = screen(
+            "screen { idle = 10m; fps = 20\n\
+             night { from = 22:00; to = 07:00; fps = 5 } }\n",
+        );
+        assert_eq!(step(&mut s, at(21, 0), 0, false, &[]), vec![Effect::Fps(20), Effect::Dim(100)]);
+        assert_eq!(step(&mut s, at(21, 30), 0, false, &[]), vec![]);
+        assert_eq!(
+            step(&mut s, at(22, 0), 0, false, &[]),
+            vec![Effect::Theme(None), Effect::Fps(5)]
+        );
+        // Asleep at night, the morning still switches it back.
+        assert_eq!(step(&mut s, at(23, 0), 600, false, &[]), vec![Effect::Sleep { absorb: true }]);
+        assert_eq!(step(&mut s, at(7, 0), 30_000, false, &[]), vec![Effect::Theme(None), Effect::Fps(20)]);
+        // A night without `fps` keeps the day's.
+        let mut s = screen("screen { fps = 15; night { from = 22:00; to = 07:00; brightness = 5 } }\n");
+        assert!(step(&mut s, at(21, 0), 0, false, &[]).contains(&Effect::Fps(15)));
+        assert!(!step(&mut s, at(22, 0), 0, false, &[]).iter().any(|e| matches!(e, Effect::Fps(_))));
+    }
+
+    #[test]
+    fn a_reload_sets_the_new_frame_rate_only_when_it_changed() {
+        let mut old = screen("screen { fps = 20 }\n");
+        step(&mut old, at(12, 0), 0, false, &[]);
+        let mut same = screen("screen { fps = 20; brightness = 100 }\n");
+        same.carry_from(&old);
+        assert!(!step(&mut same, at(12, 0), 0, false, &[]).iter().any(|e| matches!(e, Effect::Fps(_))));
+        let mut new = screen("screen { fps = 10 }\n");
+        new.carry_from(&old);
+        assert!(step(&mut new, at(12, 0), 0, false, &[]).contains(&Effect::Fps(10)));
+        // Removed: back to 30.
+        let mut gone = screen("page p { }\n");
+        gone.carry_from(&new);
+        assert!(step(&mut gone, at(12, 0), 0, false, &[]).contains(&Effect::Fps(30)));
     }
 
     #[test]
     fn sleeps_after_idle_and_wakes_on_touch() {
         let mut s = screen("screen { idle = 60s; brightness = 70 }\n");
-        assert_eq!(step(&mut s, at(12, 0), 0, false, &[]), vec![Effect::Dim(70)]);
+        assert_eq!(step(&mut s, at(12, 0), 0, false, &[]), vec![Effect::Fps(30), Effect::Dim(70)]);
         assert_eq!(step(&mut s, at(12, 0), 59, false, &[]), vec![]);
         assert_eq!(step(&mut s, at(12, 1), 60, false, &[]), vec![Effect::Sleep { absorb: true }]);
         assert!(s.asleep());
@@ -323,7 +397,7 @@ mod tests {
             "screen { idle = 10m; brightness = 90\n\
              night { from = 22:00; to = 07:00; theme = dim; idle = 30s; brightness = 20 } }\n",
         );
-        assert_eq!(step(&mut s, at(21, 59), 0, false, &[]), vec![Effect::Dim(90)]);
+        assert_eq!(step(&mut s, at(21, 59), 0, false, &[]), vec![Effect::Fps(30), Effect::Dim(90)]);
         assert_eq!(
             step(&mut s, at(22, 0), 0, false, &[]),
             vec![Effect::Theme(Some("dim".into())), Effect::Dim(20)]

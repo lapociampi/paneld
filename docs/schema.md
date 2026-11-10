@@ -2,7 +2,7 @@
 title: "Schema"
 description: "Every item, category, building block and property the config can hold."
 date: 2026-10-29
-updated: 2026-11-06
+updated: 2026-11-10
 tags: [paneld, config, reference]
 series: paneld
 order: 4
@@ -405,10 +405,11 @@ screen {
     theme      = dark
     idle       = 2m
     brightness = 80
+    fps        = 30
     on         = sh -c 'echo 0 > /sys/class/backlight/*/bl_power'
     off        = sh -c 'echo 1 > /sys/class/backlight/*/bl_power'
     dim        = sh -c 'echo "$$1" > /sys/class/backlight/*/brightness' sh {{ level }}
-    night { from = 22:00; to = 07:00; theme = dim; idle = 30s; brightness = 20 }
+    night { from = 22:00; to = 07:00; theme = dim; idle = 30s; brightness = 20; fps = 10 }
 }
 ```
 
@@ -417,10 +418,11 @@ screen {
 | `theme` | theme name | Active theme; default: the config's first `theme`, else the shipped `light`. `paneld ctl theme` overrides it until reset or restart |
 | `idle` | duration | Turn off after no touch |
 | `brightness` | 0..100 | Passed to `dim` as `level` |
+| `fps` | 1..60 | Default `30`. Frames a second while something changes on screen (a frame every `1000 / fps` ms, rounded); animations step at the same rate. Nothing is drawn while nothing changes, at any rate. Applied at start, on reload and when the night hours start or end |
 | `on`, `off`, `dim` | command | Backlight control |
 | `wake_on` | severities | Default `[critical]` |
 | `first_tap` | `wake`, `act` | Default `wake`: the tap that wakes the screen does nothing else |
-| `night { }` | `from`, `to`, `theme`, `idle`, `brightness` | |
+| `night { }` | `from`, `to`, `theme`, `idle`, `brightness`, `fps` | Each replaces the key of the same name during the night hours |
 
 ## 13. Display
 

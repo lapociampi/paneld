@@ -52,6 +52,9 @@ void lv_paneld_areas_add(lv_area_t * list, int32_t * n, int32_t max, const lv_ar
  * panel's idle wake rate on a desktop). */
 uint32_t lv_paneld_timers_idle_ms(lv_timer_t * const * skip, uint32_t n_skip, uint32_t cap);
 
+/* A timer's period in ms (`fps`, schema 12; LVGL has no getter). */
+uint32_t lv_paneld_timer_period(const lv_timer_t * t);
+
 /* With PANELD_PERF set in the environment, print one line of timings
  * (us) per drawn frame to stderr; nothing is attached otherwise. Call
  * after lv_paneld_drm_shadow / lv_paneld_set_rotation. */

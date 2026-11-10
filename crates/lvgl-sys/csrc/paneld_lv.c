@@ -442,6 +442,11 @@ uint32_t lv_paneld_timers_idle_ms(lv_timer_t * const * skip, uint32_t n_skip, ui
     return idle;
 }
 
+uint32_t lv_paneld_timer_period(const lv_timer_t * t)
+{
+    return t->period;
+}
+
 /* PANELD_PERF (docs/deploy.md, Diagnostics): one stderr line per drawn
  * frame, times in us: gap (ms since the last frame start), pre
  * (layout and LVGL's buffer sync), render (drawing and the flush,

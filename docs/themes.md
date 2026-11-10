@@ -2,7 +2,7 @@
 title: "Themes"
 description: "What a theme is and what it can change, layout included."
 date: 2026-10-29
-updated: 2026-11-06
+updated: 2026-11-10
 tags: [paneld, themes, ui]
 series: paneld
 order: 5
@@ -142,7 +142,7 @@ Details: [ADR 0023](decisions/0023-motion.md).
 
 | Token (default) | What moves | Lowest level |
 | --- | --- | --- |
-| `page_transition` (`fade 120ms`) | Going to another page (a `goto`, the navigation, `ctl goto`): `fade` brings the new page in over the old one; `slide` moves the old one out to the left and the new one in from the right (from the left going `back` or to an earlier `nav` page). It starts one frame (33 ms, at most a quarter of it) in, so the first frame already shows the new page, and lasts the whole duration. Taps wait until it is in. A value change on the same page never moves the page | `fade`: `reduced`, `slide`: `full` |
+| `page_transition` (`fade 120ms`) | Going to another page (a `goto`, the navigation, `ctl goto`): `fade` brings the new page in over the old one; `slide` moves the old one out to the left and the new one in from the right (from the left going `back` or to an earlier `nav` page). It starts one frame (33 ms at the default `screen:fps`, at most a quarter of it) in, so the first frame already shows the new page, and lasts the whole duration. Taps wait until it is in. A value change on the same page never moves the page | `fade`: `reduced`, `slide`: `full` |
 | `value_transition` (`300ms`) | `arc`, `bar` and `chart` values, eased from the value shown ([Schema](schema.md) 8.3) | `reduced` |
 | `tap_transition` (`50ms`) | A press: what a `:pressed` style changes (`scale`, `opacity`, colors, border) moves there and back, on buttons and nodes with `on_tap` / `on_hold` | `reduced` |
 | `banner_transition` (`fade 200ms`) | The shipped shell's alert banner coming in (its `enter`, [Schema](schema.md) 8.1); any node can have an `enter` | `fade`: `reduced`, `slide`: `full` |

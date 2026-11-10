@@ -2506,6 +2506,46 @@ fn value_changes_move_from_the_last_value_and_end_on_the_new_one() {
     assert_eq!(mid, end, "motion = none still animates");
 }
 
+#[test]
+fn at_ten_fps_frames_come_a_tenth_of_a_second_apart_and_values_still_move() {
+    let at30 = motion_conf("fps-30", "value_transition = 1000ms");
+    let at10 = motion_conf("fps-10", "value_transition = 1000ms");
+    let conf = std::fs::read_to_string(&at10).unwrap();
+    std::fs::write(&at10, format!("screen {{ fps = 10 }}\n{conf}")).unwrap();
+    let tap = ["--tap", "100,95", "--settle", "20"];
+    // The same picture before, under way, and at the end.
+    let before = gauges(&shot(&at10, &["--settle", "50"]));
+    assert_eq!(before, gauges(&shot(&at30, &["--settle", "50"])));
+    let mid = gauges(&shot(&at10, &[&tap[..], &["--wait", "200"]].concat()));
+    let end = gauges(&shot(&at10, &[&tap[..], &["--wait", "1300"]].concat()));
+    assert_eq!(end, gauges(&shot(&at30, &[&tap[..], &["--wait", "1300"]].concat())));
+    for i in 0..3 {
+        let (b, m, e) = (before[i], mid[i], end[i]);
+        assert!(m > b + (e - b) / 5 && m + (e - b) / 10 < e, "gauge {i} mid-way at 10 fps: {b} < {m} < {e}");
+    }
+    // The frames the animation drew: on the virtual clock, about one
+    // per 100 ms at 10 fps (one per 40 ms at 30: two 20 ms steps), and
+    // the frame lines' real clock (a 20 ms sleep a step) says the same.
+    let frames = |conf: &Path| -> Vec<u64> {
+        shot_perf(conf, &[&tap[..], &["--wait", "1300"]].concat())
+            .lines()
+            .filter(|l| l.starts_with("perf t="))
+            .map(|l| field(l, "gap").parse().unwrap())
+            .collect()
+    };
+    let (slow, fast) = (frames(&at10), frames(&at30));
+    assert!((8..=18).contains(&slow.len()), "{} frames at 10 fps: {slow:?}", slow.len());
+    assert!(fast.len() > slow.len() * 2, "{} frames at 30 fps, {} at 10", fast.len(), slow.len());
+    let median = |v: &[u64]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v[v.len() / 2]
+    };
+    // Gaps are wall-clock time: only the lower bound is safe on a busy
+    // machine; the frame counts above already show the 30 fps rate.
+    assert!(median(&slow) >= 95, "frame gaps at 10 fps: {slow:?}");
+}
+
 /// Two pages: green on the left of `home` with a button to `two`,
 /// blue on the right of `two`.
 fn pages_conf(label: &str, tokens: &str) -> PathBuf {

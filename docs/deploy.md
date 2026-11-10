@@ -2,7 +2,7 @@
 title: "Deploy"
 description: "Cross-compile paneld for an arm64 Linux board and run it as a systemd service."
 date: 2026-10-30
-updated: 2026-11-08
+updated: 2026-11-10
 tags: [paneld, deploy, pi, systemd]
 series: paneld
 order: 7
@@ -202,12 +202,12 @@ remote_kind linux {
   | Field | Meaning |
   | --- | --- |
   | `t` | Frame start, `CLOCK_MONOTONIC` |
-  | `gap` | Milliseconds since the last frame started; about 33 while something animates (30 fps) |
+  | `gap` | Milliseconds since the last frame started; about one refresh period while something animates (33 at the default 30 fps, 100 at `screen:fps = 10`) |
   | `pre` | Layout and LVGL's buffer sync before drawing; large on the first frame of a new page |
   | `render` | Drawing, plus the flush: the wait for the last page flip and the copy of the changed areas into the panel buffer |
   | `post` | After drawing, until the frame ends |
   | `wait` | LVGL's own flush waits; about 0 on DRM, since the flip wait is inside `render` |
-  | `total` | Whole frame; well under 33000 for a smooth animation |
+  | `total` | Whole frame; well under the refresh period (33000 at 30 fps) for a smooth animation |
   | `px` | Pixels redrawn (384000 is all of 800x480) |
 
   And one line per page rebuild, `perf build page=<page> same=<true: a value change, false: navigation> us=<time to build it> ctx= clear= render= [parse= eval= clone= props= font=] tr= at=`: building the context, clearing the old page, rendering the new one (inside it, as `us/count`: parsing `{{ }}` bodies, evaluating them, copying a component call's own properties onto its root (component params and `repeat` items open a scope over the context, nothing is copied: [ADR 0024](decisions/0024-in-place-updates.md)), applying node and style properties (includes their evaluation), setting fonts), starting the transition; `at` is the end, on the frame lines' clock. One `perf event at=` line per UI event (a tap) taken from the queue.

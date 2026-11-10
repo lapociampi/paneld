@@ -1407,6 +1407,68 @@ pub fn wake_within(ms: u64) {
     WAKE_WITHIN_MS.fetch_min(ms.min(u32::MAX as u64) as u32, Ordering::Relaxed);
 }
 
+/// Frames a second (schema 12 `fps`), set by [`set_fps`]; 30 until
+/// then, the build's LV_DEF_REFR_PERIOD.
+static FPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(30);
+
+/// The refresh period of `fps` frames a second, in ms (1..=60, rounded).
+pub fn period_ms(fps: u32) -> u32 {
+    let fps = fps.clamp(1, 60);
+    (1000 + fps / 2) / fps
+}
+
+/// The frame rate in force.
+pub fn fps() -> u32 {
+    FPS.load(Ordering::Relaxed)
+}
+
+/// The refresh period in force, in ms: how often a display draws and
+/// animations step while something changes.
+pub fn refresh_period_ms() -> u32 {
+    period_ms(fps())
+}
+
+/// Draw at `fps` frames a second (clamped to 1..=60): the period of
+/// every display's refresh timer and of the animation timer. Only the
+/// period changes; a timer paused because nothing changes stays
+/// paused, so an idle screen wakes no more often at any rate.
+pub fn set_fps(fps: u32) {
+    let fps = fps.clamp(1, 60);
+    FPS.store(fps, Ordering::Relaxed);
+    let period = period_ms(fps);
+    // SAFETY: LVGL's own displays and timers, on the UI thread (the
+    // only one that calls into LVGL).
+    unsafe {
+        let mut d = sys::lv_display_get_next(std::ptr::null_mut());
+        while !d.is_null() {
+            let t = sys::lv_display_get_refr_timer(d);
+            if !t.is_null() {
+                sys::lv_timer_set_period(t, period);
+            }
+            d = sys::lv_display_get_next(d);
+        }
+        let a = sys::lv_anim_get_timer();
+        if !a.is_null() {
+            sys::lv_timer_set_period(a, period);
+        }
+    }
+}
+
+/// The period of the default display's refresh timer and of the
+/// animation timer, as LVGL has them (`ctl status`).
+pub fn timer_periods() -> (u32, u32) {
+    // SAFETY: reads LVGL's timers on the UI thread.
+    unsafe {
+        let d = sys::lv_display_get_default();
+        let t = if d.is_null() { std::ptr::null_mut() } else { sys::lv_display_get_refr_timer(d) };
+        let a = sys::lv_anim_get_timer();
+        (
+            if t.is_null() { 0 } else { sys::lv_paneld_timer_period(t) },
+            if a.is_null() { 0 } else { sys::lv_paneld_timer_period(a) },
+        )
+    }
+}
+
 /// One iteration of the LVGL tick loop. See [`Ui::pump`].
 pub struct Pump<'ui> {
     last: Instant,
@@ -4427,21 +4489,19 @@ pub(crate) fn mono_us() -> u64 {
 /// The steps of a tween's progress (0 start, `TWEEN_END` done).
 const TWEEN_END: i32 = 1024;
 
-/// How far into a page transition its first frame shows it: about one
-/// refresh period (LV_DEF_REFR_PERIOD), at most a quarter of it.
-const PAGE_LEAD_MS: u32 = 33;
-
 /// Where a tween of `ms` starts, in steps: a page transition one lead
-/// in, so the first frame drawn (some 15-25 ms after the start, once
-/// the new page is laid out) already shows the new page instead of a
-/// frame of the old one alone; anything else at 0. The animation then
-/// runs from there to `TWEEN_END` over the whole `ms`, so the
-/// transition still takes `ms` on the clock.
-fn tween_start(page: bool, ms: u32) -> i32 {
+/// in, so the first frame drawn (some 15-25 ms after the start at 30
+/// fps, once the new page is laid out) already shows the new page
+/// instead of a frame of the old one alone; anything else at 0. The
+/// lead is one refresh period (`frame`, [`refresh_period_ms`]), at
+/// most a quarter of `ms`. The animation then runs from there to
+/// `TWEEN_END` over the whole `ms`, so the transition still takes `ms`
+/// on the clock.
+fn tween_start(page: bool, ms: u32, frame: u32) -> i32 {
     if !page || ms == 0 {
         return 0;
     }
-    let lead = PAGE_LEAD_MS.min(ms / 4);
+    let lead = frame.min(ms / 4);
     (TWEEN_END as i64 * lead as i64 / ms as i64) as i32
 }
 
@@ -4632,7 +4692,7 @@ unsafe extern "C" fn page_tween_completed(_a: *mut sys::lv_anim_t) {
 /// Run `tween` on `var` over `ms`, applying its start now. false: LVGL
 /// could not start it (out of memory); its end is applied instead.
 fn start_tween(var: *mut sys::lv_obj_t, tw: Tw, ms: u32, completed: sys::lv_anim_completed_cb_t) -> bool {
-    let start = tween_start(matches!(tw.tween, Tween::Page { .. }), ms);
+    let start = tween_start(matches!(tw.tween, Tween::Page { .. }), ms, refresh_period_ms());
     apply_tween(&tw, start);
     let target = tween_to(&tw.tween).map(|w| (tw.obj as usize, w));
     let boxed = Box::into_raw(Box::new(tw));
@@ -5955,11 +6015,26 @@ mod tests {
 
     #[test]
     fn only_a_page_tween_starts_one_lead_in() {
-        assert_eq!(tween_start(false, 120), 0);
-        assert_eq!(tween_start(true, 0), 0);
+        assert_eq!(tween_start(false, 120, 33), 0);
+        assert_eq!(tween_start(true, 0, 33), 0);
         // 30 of 120 ms (a quarter at most), 33 of 300 ms.
-        assert_eq!(tween_start(true, 120), TWEEN_END / 4);
-        assert_eq!(tween_start(true, 300), TWEEN_END * 33 / 300);
+        assert_eq!(tween_start(true, 120, 33), TWEEN_END / 4);
+        assert_eq!(tween_start(true, 300, 33), TWEEN_END * 33 / 300);
+        // At 10 fps the lead is a 100 ms frame.
+        assert_eq!(tween_start(true, 1000, period_ms(10)), TWEEN_END * 100 / 1000);
+        assert_eq!(tween_start(true, 300, period_ms(10)), TWEEN_END * 75 / 300);
+    }
+
+    #[test]
+    fn the_refresh_period_is_the_rounded_frame_time() {
+        // The default is the build's period.
+        assert_eq!(period_ms(30), sys::LV_DEF_REFR_PERIOD);
+        assert_eq!(period_ms(10), 100);
+        assert_eq!(period_ms(60), 17);
+        assert_eq!(period_ms(1), 1000);
+        // Out of range is clamped (the schema refuses it before).
+        assert_eq!(period_ms(0), 1000);
+        assert_eq!(period_ms(500), 17);
     }
 
     #[test]
