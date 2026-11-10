@@ -2217,39 +2217,44 @@ impl<'ui> Obj<'ui> {
     /// The color is the inherited text color unless set on the result.
     pub fn new_icon_glyph(&self, glyph: char, size: u16) -> Obj<'ui> {
         let sizes = paneld_config::icons::FONT_SIZES;
-        let largest = *sizes.last().unwrap_or(&32);
         let font_px = *sizes.iter().min_by_key(|s| (i32::from(**s) - i32::from(size)).abs()).unwrap_or(&16);
         let mut buf = [0u8; 4];
         let text = glyph.encode_utf8(&mut buf);
-        if size <= largest {
+        let Some((w, h, scale)) = glyph_box(glyph, size) else {
             let label = self.new_label(text);
             label.set_font_size(font_px);
             return label;
-        }
-        let size = size.min(paneld_config::icons::MAX_SIZE);
-        let font: *const sys::lv_font_t = unsafe { &sys::lv_font_montserrat_32 };
-        // The glyph's own box at 32 px, then scaled by size / 32.
-        let (w, h) = unsafe {
-            (
-                i32::from(sys::lv_font_get_glyph_width(font, glyph as u32, 0)),
-                sys::lv_font_get_line_height(font),
-            )
         };
-        let scale = i32::from(size) * 256 / i32::from(largest);
         // No style of its own (inherits the text color) and no clicks
         // (a tap goes to the enclosing button).
         let boxed = self.new_container();
         unsafe { sys::lv_obj_remove_style_all(boxed.raw) };
         boxed.set_enabled(false);
-        boxed.set_size(Size::Px(w * scale / 256), Size::Px(h * scale / 256));
+        boxed.set_size(Size::Px(w), Size::Px(h));
         let label = boxed.new_label(text);
-        label.set_font_size(largest);
+        label.set_font_size(*sizes.last().unwrap_or(&32));
         unsafe {
             sys::lv_obj_set_style_transform_scale(label.raw, scale, 0);
             sys::lv_obj_set_style_transform_pivot_x(label.raw, 0, 0);
             sys::lv_obj_set_style_transform_pivot_y(label.raw, 0, 0);
         }
         boxed
+    }
+
+    /// Show `glyph` on an icon [`Obj::new_icon_glyph`] made at the same
+    /// `size` (an update in place): the label's text, or for a scaled
+    /// glyph the text of the label in its box and the box's size. The
+    /// box is a plain object, never set as a label.
+    pub(crate) fn set_icon_glyph(&self, glyph: char, size: u16) {
+        let text = glyph.to_string();
+        let Some((w, h, _)) = glyph_box(glyph, size) else {
+            self.set_label_text(&text);
+            return;
+        };
+        self.set_size(Size::Px(w), Size::Px(h));
+        if let Some(label) = self.child(0).filter(|l| l.class_name() == "label") {
+            label.set_label_text(&text);
+        }
     }
 
     /// An image's own opacity, 255 opaque.
@@ -5055,6 +5060,22 @@ const MANAGED_STATES: sys::lv_state_t = (sys::lv_state_t_LV_STATE_CHECKED
     | sys::lv_state_t_LV_STATE_DISABLED
     | sys::lv_state_t_LV_STATE_USER_1
     | sys::lv_state_t_LV_STATE_USER_2) as sys::lv_state_t;
+
+/// A built-in icon above the largest font: the size of the box it is
+/// drawn in and the label's scale (256 = 1x); `None` at or below it
+/// (a plain label).
+fn glyph_box(glyph: char, size: u16) -> Option<(i32, i32, i32)> {
+    let largest = paneld_config::icons::FONT_SIZES.last().copied().unwrap_or(32);
+    if size <= largest {
+        return None;
+    }
+    let size = size.min(paneld_config::icons::MAX_SIZE);
+    let font: *const sys::lv_font_t = unsafe { &sys::lv_font_montserrat_32 };
+    // The glyph's own box at 32 px, then scaled by size / 32.
+    let (w, h) = unsafe { (i32::from(sys::lv_font_get_glyph_width(font, glyph as u32, 0)), sys::lv_font_get_line_height(font)) };
+    let scale = i32::from(size) * 256 / i32::from(largest);
+    Some((w * scale / 256, h * scale / 256, scale))
+}
 
 /// A node as it was made, before the page set its properties. Its
 /// `visible` is not kept: a node with a `visible` sets it every time,

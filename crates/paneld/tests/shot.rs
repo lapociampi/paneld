@@ -2980,6 +2980,32 @@ fn a_grid_child_shown_again_takes_its_place_as_in_a_fresh_render() {
 }
 
 #[test]
+fn a_scaled_icon_updated_in_place_keeps_its_box() {
+    // Above the largest icon font (32 px) a glyph is a label scaled in
+    // a plain box: setting it up again set the box's text as if it were
+    // the label, writing past the object (a crash after a few updates).
+    let d = tmp("big-icon");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var on: bool = false\n\
+         page home { column {\n\
+             column { visible = {{ !vars.on }}; icon { name = wifi; size = 48 } }\n\
+             icon { name = {{ vars.on ? 'close' : 'wifi' }}; size = 64 }\n\
+         } }\n",
+    )
+    .unwrap();
+    // Each step is drawn in place and compared with a fresh render
+    // (another glyph in the same box takes its own width).
+    let mut args = vec!["--verify"];
+    for _ in 0..5 {
+        args.extend(["--set", "on=true", "--set", "on=false"]);
+    }
+    shot(&conf, &args);
+    shot(&conf, &["--verify", "--set", "on=true"]);
+}
+
+#[test]
 fn a_running_button_and_its_end_look_as_a_fresh_render() {
     let d = tmp("busy-verify");
     let conf = d.join("p.conf");

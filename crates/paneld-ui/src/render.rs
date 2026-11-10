@@ -1424,10 +1424,9 @@ fn new_icon<'ui>(parent: &Obj<'ui>, name: &str, size: Option<u16>, ctx: &Scope<'
         }
     }
     if let Some(glyph) = paneld_config::icons::glyph(name) {
-        // Another glyph of the same size is its text.
-        let obj = nodes::made(parent, "icon-glyph", u64::from(size), |p| p.new_icon_glyph(glyph, size), |o| {
-            o.set_label_text(&glyph.to_string())
-        });
+        // Another glyph of the same size is its text (above the largest
+        // font, the text of the label in its box).
+        let obj = nodes::made(parent, "icon-glyph", u64::from(size), |p| p.new_icon_glyph(glyph, size), |o| o.set_icon_glyph(glyph, size));
         return Some((obj, false));
     }
     UNKNOWN_ICONS.with(|u| {
