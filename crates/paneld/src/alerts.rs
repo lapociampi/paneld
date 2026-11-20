@@ -733,16 +733,21 @@ impl Engine {
         self.source_last.contains_key(name)
     }
 
-    /// Whether a rule names `word`, a field of a source: `age`, which
-    /// follows the clock, or `running`, which follows the runs. Its
-    /// context must then be built again as that moves.
-    pub fn reads(&self, word: &str) -> bool {
+    /// Whether a rule reads `field` of a source: `age`, which follows
+    /// the clock, or `running`, which follows the runs. Its context
+    /// must then be built again as that moves.
+    pub fn reads(&self, field: &str) -> bool {
         self.rules.iter().any(|r| {
-            [r.when_raw.as_deref(), r.id_raw.as_deref(), r.state_raw.as_deref()]
+            [(r.when_raw.as_deref(), r.when_span), (r.id_raw.as_deref(), r.id_span), (r.state_raw.as_deref(), r.state_span)]
                 .into_iter()
-                .flatten()
-                .chain([r.severity_raw.as_str(), r.title_raw.as_str(), r.text_raw.as_str(), r.link_raw.as_str()])
-                .any(|raw| mentions(raw, word))
+                .filter_map(|(raw, span)| Some((raw?, span)))
+                .chain([
+                    (r.severity_raw.as_str(), r.severity_span),
+                    (r.title_raw.as_str(), r.title_span),
+                    (r.text_raw.as_str(), r.text_span),
+                    (r.link_raw.as_str(), r.link_span),
+                ])
+                .any(|(raw, span)| reads_field(raw, span, field))
         })
     }
 
@@ -856,12 +861,25 @@ fn resolve_string(
     Some(paneld_ui::interpolate(raw, span.file, span.start, ctx))
 }
 
-/// Whether `raw` has the word `word` (`sources.x.age`, `['age']`): an
-/// expression can only read a source's field by naming it.
-pub fn mentions(raw: &str, word: &str) -> bool {
-    let part = |c: char| c.is_alphanumeric() || c == '_';
-    raw.match_indices(word).any(|(i, _)| {
-        !raw[..i].chars().next_back().is_some_and(part) && !raw[i + word.len()..].chars().next().is_some_and(part)
+/// Whether the `{{ }}` expressions of `raw` read `field` of a source:
+/// by name (`sources.x.age`, `pve.status.vms.age`, `self.status.m.age`
+/// in a remote kind), or with a source map that holds it: `sources` or
+/// a source whole or by a computed name, a remote or its `status`
+/// whole. A field of a value (`pve.vms.exists(v, v.running)`) is not.
+pub fn reads_field(raw: &str, span: paneld_config::source::Span, field: &str) -> bool {
+    let value = paneld_config::parse::RawValue { text: raw.to_string(), span };
+    paneld_config::reads::value_reads(&value).iter().any(|r| {
+        let step = |i: usize| r.path.get(i).map(|s| s.name.as_str());
+        match r.root.as_str() {
+            "vars" | "theme" | "alerts" | "now" | "event" => false,
+            "sources" => step(1).is_none_or(|f| f == field),
+            // A remote's members: their source maps are under `status`.
+            _ => match step(0) {
+                None => true,
+                Some("status") => step(2).is_none_or(|f| f == field),
+                Some(_) => false,
+            },
+        }
     })
 }
 
@@ -1034,14 +1052,23 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_a_field_is_found_by_the_word() {
-        assert!(mentions("{{ sources.x.age > 300 }}", "age"));
-        assert!(mentions("{{ sources['x']['age'] > 300 }}", "age"));
-        assert!(mentions("age", "age"));
-        assert!(mentions("{{ sources.x.running }}", "running"));
-        assert!(!mentions("{{ sources.storage.value.usage > 90 }}", "age"));
-        assert!(!mentions("{{ sources.x.page_age }}", "age"));
-        assert!(!mentions("Pi under-voltage or throttling", "age"));
+    fn a_source_field_is_read_by_name_or_with_its_map() {
+        let span = paneld_config::source::Span::new(paneld_config::source::FileId::default(), 0, 0);
+        let reads = |raw: &str, f: &str| reads_field(raw, span, f);
+        assert!(reads("{{ sources.x.age > 300 }}", "age"));
+        assert!(reads("{{ sources['x']['age'] > 300 }}", "age"));
+        assert!(reads("{{ sources.x.running }}", "running"));
+        assert!(reads("{{ self.status.vms.age > 60 }}", "age"));
+        // A map that holds it, whole or by a computed name.
+        assert!(reads("{{ string(sources.x) }}", "age"));
+        assert!(reads("{{ sources[vars.s].value > 1 }}", "age"));
+        assert!(reads("{{ pve.status.vms }}", "age"));
+        // Other fields, values, and plain text are not.
+        assert!(!reads("{{ sources.x.value.age > 3 }}", "age"));
+        assert!(!reads("{{ sources.storage.value.usage > 90 }}", "age"));
+        assert!(!reads("{{ pve.status.vms.ok && pve.vms.exists(v, !v.running) }}", "running"));
+        assert!(!reads("Check the offline age key still opens", "age"));
+        assert!(!reads("{{ vars.age > 1 }}", "age"));
     }
 
     #[test]

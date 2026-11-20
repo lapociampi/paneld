@@ -103,10 +103,10 @@ impl Book {
         Self { list, zone, dates }
     }
 
-    /// Whether a reminder's text names `word` (see
+    /// Whether a reminder's text reads `field` of a source (see
     /// [`alerts::Engine::reads`]).
-    pub fn reads(&self, word: &str) -> bool {
-        self.list.iter().any(|r| [&r.title, &r.text, &r.link].into_iter().any(|(raw, _)| alerts::mentions(raw, word)))
+    pub fn reads(&self, field: &str) -> bool {
+        self.list.iter().any(|r| [&r.title, &r.text, &r.link].into_iter().any(|(raw, span)| alerts::reads_field(raw, *span, field)))
     }
 
     /// First seen and last done, for the state file.

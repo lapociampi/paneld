@@ -354,7 +354,7 @@ alert pi_hot {
 | `title`, `text`, `link` | string expr | `link` can be shown as a QR code |
 | `action` | action call | Optional button on the alert ("Restart") |
 
-A rule sees a source's `age` move with the clock, and its `running` with the runs, when it reads them by name (`sources.x.age`, `sources.x.running`), as a page does; a source map passed whole shows them as of its last change.
+A rule sees a source's `age` move with the clock and its `running` with the runs (`sources.x.age`, `sources.x.running`, or the source passed whole).
 
 `alerts { }` category: `history = 30d`, `snooze = [1d, 1w]`, `source_down = 2m` (after this long a failing source used by an alert raises `source_down:<name>`, [ADR 0013](decisions/0013-command-runner.md)).
 
