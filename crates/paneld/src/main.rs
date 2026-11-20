@@ -675,19 +675,26 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
 
     // Tick the alert engine against the latest sources + vars. A
     // transition (fire or resolve) marks the frame dirty so the
-    // header badge and overview reflect it right away.
-    let alerts_ctx = build_ctx(
-        &live.source_values,
-        &live.theme,
-        &live.vars,
-        None,
-    );
+    // header badge and overview reflect it right away. The context is
+    // built again only when a source or a var changed: this runs on
+    // every pass of the loop, asleep too, and a copy of every source's
+    // data each time cost more than the rest of an idle panel. `now`
+    // is set fresh each pass, so time-based rules see the clock. A
+    // source's `age` is set as the context is built: a rule that reads
+    // it gets a new one each pass, as before.
+    let inputs = vars::inputs();
+    if live.alerts_read_age || live.alerts_ctx.as_ref().is_none_or(|(at, _)| *at != inputs) {
+        let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, None);
+        ALERT_CTX_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        live.alerts_ctx = Some((inputs, ctx));
+    }
+    let (_, alerts_ctx) = live.alerts_ctx.as_mut().expect("built above");
+    clock::insert(alerts_ctx);
     let now_instant = std::time::Instant::now();
     let now_wall = std::time::SystemTime::now();
-    if live.alerts.tick(&alerts_ctx, now_instant, now_wall) {
-        note_alerts(live);
-    }
-    if live.reminders.tick(&mut live.alerts, &alerts_ctx, now_wall) {
+    let fired = live.alerts.tick(alerts_ctx, now_instant, now_wall);
+    let reminded = live.reminders.tick(&mut live.alerts, alerts_ctx, now_wall);
+    if fired || reminded {
         note_alerts(live);
     }
     // Keep the state file (ADR 0014) in sync. `note` is cheap:
@@ -1172,6 +1179,8 @@ fn changed_fields(old: Option<&paneld_ui::Value>, new: &paneld_ui::Value) -> Vec
 /// only): into the values the page reads, an event for the alerts that
 /// read its stream, and the change names for the page.
 fn source_update(live: &mut LiveState, update: sources::SourceUpdate) {
+    // Every update changes the context: a value, `ok`, or `running`.
+    vars::inputs_changed();
     // A run started: only `running` changed.
     if update.began {
         live.changes.source(&update.name, ["running"]);
@@ -1289,6 +1298,12 @@ struct LiveState {
     /// for the next `process`; kept while it cannot be shown (asleep,
     /// a page transition).
     changes: paneld_ui::Changes,
+    /// The context the alert tick evaluates against, with the
+    /// [`vars::inputs`] it was built at: built again when that moves.
+    alerts_ctx: Option<(u64, paneld_ui::Context)>,
+    /// A rule or a reminder reads a source's `age`, which is set as a
+    /// context is built: the alert tick then builds one each pass.
+    alerts_read_age: bool,
     /// Changes an update made while the user touched the page, with
     /// what they hold (or a change of structure) left for the release:
     /// run again then.
@@ -1632,6 +1647,7 @@ fn setup_live_state(
 
     let screen_state =
         screen::Screen::new(screen::Config::from_doc(&doc), tz::Zone::local(), config_dir.clone());
+    let alerts_read_age = alerts_engine.reads_age() || reminder_book.reads_age();
     Ok(LiveState {
         doc,
         ui_doc,
@@ -1661,6 +1677,8 @@ fn setup_live_state(
         previous_page: None,
         toast_until: None,
         changes: paneld_ui::Changes::default(),
+        alerts_ctx: None,
+        alerts_read_age,
         held: paneld_ui::Changes::default(),
         rebuild: false,
         last_vars,
@@ -1908,6 +1926,8 @@ fn active_theme(live: &LiveState) -> Option<&str> {
 fn apply_active_theme(live: &mut LiveState) {
     let name = active_theme(live).map(str::to_string);
     live.theme = themes::resolve_with(&live.doc, name.as_deref());
+    // `theme` is in the alert tick's context too.
+    live.alerts_ctx = None;
     apply_theme_ui(&live.doc, &live.theme, name.as_deref());
     live.ui_doc = themes::ui_doc(&live.doc, name.as_deref());
     install_visible(&live.doc, &live.ui_doc);
@@ -2639,6 +2659,7 @@ fn shot_set(live: &mut LiveState, var: &str, raw: &str) -> Result<(), String> {
     let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, Some(&live.alerts));
     let value = paneld_ui::resolve_value(raw, span, &ctx).and_then(|v| vars::coerce(&ty, v)).ok_or_else(|| format!("`{raw}` does not fit ({ty})"))?;
     live.vars.lock().unwrap().insert(var.to_string(), value);
+    vars::inputs_changed();
     note_vars(live);
     Ok(())
 }
@@ -3286,6 +3307,7 @@ fn handle_request(
                 .and_then(|v| vars::coerce(&ty, v))
                 .ok_or_else(|| ctl::CtlError::msg(format!("`{raw}` does not fit var `{name}` ({ty})")))?;
             live.vars.lock().unwrap().insert(name, value.clone());
+            vars::inputs_changed();
             note_vars(live);
             Ok(value)
         }
@@ -3392,6 +3414,9 @@ fn handle_request(
             // the updates in place (ADR 0024).
             m.insert("renders".to_string(), Value::Int(RENDERS.load(std::sync::atomic::Ordering::Relaxed) as i64));
             m.insert("updates".to_string(), Value::Int(UPDATES.load(std::sync::atomic::Ordering::Relaxed) as i64));
+            // Contexts the alert tick built: one per change of a
+            // source or a var, none while nothing changes.
+            m.insert("alert_ctx_builds".to_string(), Value::Int(ALERT_CTX_BUILDS.load(std::sync::atomic::Ordering::Relaxed) as i64));
             let (records, made) = paneld_ui::nodes::table_size();
             m.insert("node_records".to_string(), Value::Int(records as i64));
             m.insert("node_objects".to_string(), Value::Int(made as i64));
@@ -3495,6 +3520,9 @@ fn rss_kb() -> Option<i64> {
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Contexts the alert tick built since start, for `ctl status`
+/// (`alert_ctx_builds`).
+static ALERT_CTX_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Full page renders since start, for `ctl status` (`renders`).
 static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// `paneld shot --no-sources`: no source command runs.

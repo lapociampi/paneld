@@ -1127,3 +1127,41 @@ fn a_page_shown_from_the_cache_at_a_wake_moves_its_next_value() {
     assert!(status_num(&d, "animations") >= 1, "the value jumped");
     d.stop();
 }
+
+#[test]
+fn the_alert_check_builds_its_context_only_when_a_source_or_var_changes() {
+    let dir = tmp("alert-ctx");
+    let d = Daemon::start(
+        &dir,
+        "var v: int = 1\n\
+         source s {\n    poll  = 1h\n    run   = echo 5\n    parse = number\n}\n\
+         alert big {\n    when     = {{ sources.s.value + vars.v > 100 }}\n    severity = warning\n    title    = Big\n}\n\
+         page home { text { value = {{ vars.v }} } }\n",
+    );
+    d.wait_for("sources.s.value", "5");
+    wait_idle(&d);
+    // Idle passes of the loop (about one a second) reuse the context:
+    // nothing changed.
+    let before = status_num(&d, "alert_ctx_builds");
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(status_num(&d, "alert_ctx_builds"), before, "idle passes built the alert context again");
+    // A var changes: the next pass builds it again and the rule sees it.
+    d.ok(&["set", "vars.v=200"]);
+    d.wait_for("alerts.count", "1");
+    assert!(status_num(&d, "alert_ctx_builds") > before);
+}
+
+#[test]
+fn a_rule_on_a_source_age_fires_as_the_clock_moves() {
+    let dir = tmp("alert-age");
+    // The source runs once (an hour's poll): only its `age` moves, with
+    // the clock, and the rule must see it move.
+    let d = Daemon::start(
+        &dir,
+        "source s {\n    poll  = 1h\n    run   = echo 5\n    parse = number\n}\n\
+         alert stale {\n    when     = {{ sources.s.age >= 3 }}\n    severity = warning\n    title    = Stale\n}\n\
+         page home { text { value = Hi } }\n",
+    );
+    d.wait_for("sources.s.value", "5");
+    d.wait_for("alerts.count", "1");
+}

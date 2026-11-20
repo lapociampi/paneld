@@ -853,6 +853,7 @@ fn apply_set(
             match guard.get(&a.key) {
                 Some(old) if std::mem::discriminant(old) == std::mem::discriminant(&coerced) || matches!(old, Value::Null) => {
                     guard.insert(a.key.clone(), coerced);
+                    vars::inputs_changed();
                 }
                 _ => {
                     eprintln!("paneld: action `{action_name}`: `set {}`: the var changed with a reload; not set", a.key);
@@ -906,6 +907,7 @@ pub fn apply_inline_set(
             continue;
         };
         vars.lock().unwrap().insert(a.key.clone(), coerced);
+        vars::inputs_changed();
         changed = true;
     }
     changed

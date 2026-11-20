@@ -7,10 +7,26 @@
 //! `set` is visible on the next render tick.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use paneld_config::parse::{Document, Item, VarDecl};
 use paneld_config::value::{parse_bool, parse_int, parse_number};
 use paneld_ui::Value;
+
+/// Moves on every write to the vars or the source values, from any
+/// thread: the alert tick keeps the context it evaluates against until
+/// it moves, instead of copying every source's data each pass.
+static INPUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Note a write to the vars or the source values.
+pub fn inputs_changed() {
+    INPUTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Where [`inputs_changed`] is at.
+pub fn inputs() -> u64 {
+    INPUTS.load(Ordering::Relaxed)
+}
 
 /// All `var` declarations in the document, in source order.
 pub fn collect(doc: &Document) -> Vec<&VarDecl> {

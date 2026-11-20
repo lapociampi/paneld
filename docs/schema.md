@@ -2,7 +2,7 @@
 title: "Schema"
 description: "Every item, category, building block and property the config can hold."
 date: 2026-10-29
-updated: 2026-11-10
+updated: 2026-11-20
 tags: [paneld, config, reference]
 series: paneld
 order: 4
@@ -353,6 +353,8 @@ alert pi_hot {
 | `severity` | `critical`, `warning`, `info`, expr | |
 | `title`, `text`, `link` | string expr | `link` can be shown as a QR code |
 | `action` | action call | Optional button on the alert ("Restart") |
+
+A rule sees a source's `age` move with the clock when it reads it by name (`sources.x.age`), as a page does; a source map passed whole shows the `age` of its last change.
 
 `alerts { }` category: `history = 30d`, `snooze = [1d, 1w]`, `source_down = 2m` (after this long a failing source used by an alert raises `source_down:<name>`, [ADR 0013](decisions/0013-command-runner.md)).
 
