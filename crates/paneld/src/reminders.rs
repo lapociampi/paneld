@@ -103,10 +103,10 @@ impl Book {
         Self { list, zone, dates }
     }
 
-    /// Whether a reminder's text reads a source's `age` (see
-    /// [`alerts::Engine::reads_age`]).
-    pub fn reads_age(&self) -> bool {
-        self.list.iter().any(|r| [&r.title, &r.text, &r.link].into_iter().any(|(raw, _)| alerts::mentions_age(raw)))
+    /// Whether a reminder's text names `word` (see
+    /// [`alerts::Engine::reads`]).
+    pub fn reads(&self, word: &str) -> bool {
+        self.list.iter().any(|r| [&r.title, &r.text, &r.link].into_iter().any(|(raw, _)| alerts::mentions(raw, word)))
     }
 
     /// First seen and last done, for the state file.

@@ -682,7 +682,7 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
     // is set fresh each pass, so time-based rules see the clock. A
     // source's `age` is set as the context is built: a rule that reads
     // it gets a new one each pass, as before.
-    let inputs = vars::inputs();
+    let inputs = (vars::inputs(), if live.alerts_read_running { vars::runs() } else { 0 });
     if live.alerts_read_age || live.alerts_ctx.as_ref().is_none_or(|(at, _)| *at != inputs) {
         let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, None);
         ALERT_CTX_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1179,9 +1179,7 @@ fn changed_fields(old: Option<&paneld_ui::Value>, new: &paneld_ui::Value) -> Vec
 /// only): into the values the page reads, an event for the alerts that
 /// read its stream, and the change names for the page.
 fn source_update(live: &mut LiveState, update: sources::SourceUpdate) {
-    // Every update changes the context: a value, `ok`, or `running`.
-    vars::inputs_changed();
-    // A run started: only `running` changed.
+    // A run started: only `running` changed (the run counts it).
     if update.began {
         live.changes.source(&update.name, ["running"]);
         return;
@@ -1198,6 +1196,8 @@ fn source_update(live: &mut LiveState, update: sources::SourceUpdate) {
             live.source_started.insert(update.name.clone(), update.started);
         }
     }
+    // A value or `ok` changes below.
+    vars::inputs_changed();
     let mut value = update.value;
     if update.status {
         // Only `ok` / `error` change: the rest of the last result
@@ -1217,7 +1217,8 @@ fn source_update(live: &mut LiveState, update: sources::SourceUpdate) {
         live.changes.source(&update.name, fields.into_iter().chain(["running".to_string()]));
         return;
     }
-    let event_value = value.clone();
+    // The event a `from` rule sees: the value before its history.
+    let event_value = live.alerts.listens_to(&update.name).then(|| value.clone());
     live.histories.record(&update.name, &mut value, std::time::SystemTime::now());
     {
         let mut values = live.source_values.lock().unwrap();
@@ -1226,13 +1227,16 @@ fn source_update(live: &mut LiveState, update: sources::SourceUpdate) {
         live.changes.source(&update.name, fields.into_iter().chain(["running".to_string()]));
         values.insert(update.name.clone(), value);
     }
+    // An `alert { from = <this source> }` fired or resolved by it. Its
+    // context is a copy of every source's data: only for a source such
+    // a rule listens to.
+    let Some(event_value) = event_value else { return };
     let event_ctx = build_ctx(
         &live.source_values,
         &live.theme,
         &live.vars,
         Some(&live.alerts),
     );
-    // An `alert { from = <this source> }` fired or resolved by it.
     if live.alerts.ingest_event(&update.name, &event_value, &event_ctx, std::time::SystemTime::now()) {
         note_alerts(live);
     }
@@ -1299,11 +1303,15 @@ struct LiveState {
     /// a page transition).
     changes: paneld_ui::Changes,
     /// The context the alert tick evaluates against, with the
-    /// [`vars::inputs`] it was built at: built again when that moves.
-    alerts_ctx: Option<(u64, paneld_ui::Context)>,
+    /// [`vars::inputs`] (and [`vars::runs`], when a rule reads
+    /// `running`) it was built at: built again when they move.
+    alerts_ctx: Option<((u64, u64), paneld_ui::Context)>,
     /// A rule or a reminder reads a source's `age`, which is set as a
     /// context is built: the alert tick then builds one each pass.
     alerts_read_age: bool,
+    /// A rule or a reminder names `running`: a run starting or ending
+    /// then builds the alert tick's context again too.
+    alerts_read_running: bool,
     /// Changes an update made while the user touched the page, with
     /// what they hold (or a change of structure) left for the release:
     /// run again then.
@@ -1647,7 +1655,8 @@ fn setup_live_state(
 
     let screen_state =
         screen::Screen::new(screen::Config::from_doc(&doc), tz::Zone::local(), config_dir.clone());
-    let alerts_read_age = alerts_engine.reads_age() || reminder_book.reads_age();
+    let alerts_read_age = alerts_engine.reads("age") || reminder_book.reads("age");
+    let alerts_read_running = alerts_engine.reads("running") || reminder_book.reads("running");
     Ok(LiveState {
         doc,
         ui_doc,
@@ -1679,6 +1688,7 @@ fn setup_live_state(
         changes: paneld_ui::Changes::default(),
         alerts_ctx: None,
         alerts_read_age,
+        alerts_read_running,
         held: paneld_ui::Changes::default(),
         rebuild: false,
         last_vars,

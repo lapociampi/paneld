@@ -63,8 +63,8 @@ impl Run {
     /// redrawn (the end comes with the run's own update).
     pub fn start(name: &str, tx: Option<&Sender<SourceUpdate>>) -> Run {
         *RUNNING.lock().unwrap_or_else(|e| e.into_inner()).entry(name.to_string()).or_default() += 1;
-        // `running` is in every context: the alert tick's must follow.
-        crate::vars::inputs_changed();
+        // `running` is in every context: the alert tick's follows it.
+        crate::vars::runs_changed();
         if let Some(tx) = tx {
             let _ = tx.send(SourceUpdate { name: name.to_string(), value: Value::Null, status: false, started: Instant::now(), began: true });
         }
@@ -81,7 +81,7 @@ impl Drop for Run {
                 r.remove(&self.0);
             }
         }
-        crate::vars::inputs_changed();
+        crate::vars::runs_changed();
     }
 }
 

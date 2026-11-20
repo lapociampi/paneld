@@ -727,15 +727,22 @@ impl Engine {
         changed
     }
 
-    /// Whether a rule reads a source's `age`, which follows the clock:
-    /// its context must then be built each tick, not kept.
-    pub fn reads_age(&self) -> bool {
+    /// Whether an event-mode rule (`from = <name>`) listens to source
+    /// `name`: [`Engine::ingest_event`] does nothing for the others.
+    pub fn listens_to(&self, name: &str) -> bool {
+        self.source_last.contains_key(name)
+    }
+
+    /// Whether a rule names `word`, a field of a source: `age`, which
+    /// follows the clock, or `running`, which follows the runs. Its
+    /// context must then be built again as that moves.
+    pub fn reads(&self, word: &str) -> bool {
         self.rules.iter().any(|r| {
             [r.when_raw.as_deref(), r.id_raw.as_deref(), r.state_raw.as_deref()]
                 .into_iter()
                 .flatten()
                 .chain([r.severity_raw.as_str(), r.title_raw.as_str(), r.text_raw.as_str(), r.link_raw.as_str()])
-                .any(mentions_age)
+                .any(|raw| mentions(raw, word))
         })
     }
 
@@ -849,12 +856,12 @@ fn resolve_string(
     Some(paneld_ui::interpolate(raw, span.file, span.start, ctx))
 }
 
-/// Whether `raw` has the word `age` (`sources.x.age`, `['age']`): an
-/// expression can only read a source's `age` by naming it.
-pub fn mentions_age(raw: &str) -> bool {
-    let word = |c: char| c.is_alphanumeric() || c == '_';
-    raw.match_indices("age").any(|(i, _)| {
-        !raw[..i].chars().next_back().is_some_and(word) && !raw[i + 3..].chars().next().is_some_and(word)
+/// Whether `raw` has the word `word` (`sources.x.age`, `['age']`): an
+/// expression can only read a source's field by naming it.
+pub fn mentions(raw: &str, word: &str) -> bool {
+    let part = |c: char| c.is_alphanumeric() || c == '_';
+    raw.match_indices(word).any(|(i, _)| {
+        !raw[..i].chars().next_back().is_some_and(part) && !raw[i + word.len()..].chars().next().is_some_and(part)
     })
 }
 
@@ -1027,13 +1034,14 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_age_is_found_by_the_word() {
-        assert!(mentions_age("{{ sources.x.age > 300 }}"));
-        assert!(mentions_age("{{ sources['x']['age'] > 300 }}"));
-        assert!(mentions_age("age"));
-        assert!(!mentions_age("{{ sources.storage.value.usage > 90 }}"));
-        assert!(!mentions_age("{{ sources.x.page_age }}"));
-        assert!(!mentions_age("Pi under-voltage or throttling"));
+    fn a_read_of_a_field_is_found_by_the_word() {
+        assert!(mentions("{{ sources.x.age > 300 }}", "age"));
+        assert!(mentions("{{ sources['x']['age'] > 300 }}", "age"));
+        assert!(mentions("age", "age"));
+        assert!(mentions("{{ sources.x.running }}", "running"));
+        assert!(!mentions("{{ sources.storage.value.usage > 90 }}", "age"));
+        assert!(!mentions("{{ sources.x.page_age }}", "age"));
+        assert!(!mentions("Pi under-voltage or throttling", "age"));
     }
 
     #[test]

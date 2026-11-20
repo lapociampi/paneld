@@ -28,6 +28,20 @@ pub fn inputs() -> u64 {
     INPUTS.load(Ordering::Relaxed)
 }
 
+/// Moves when a source run starts or ends: only `running` changed,
+/// which a context needs again only if something reads it.
+static RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Note a source run starting or ending.
+pub fn runs_changed() {
+    RUNS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Where [`runs_changed`] is at.
+pub fn runs() -> u64 {
+    RUNS.load(Ordering::Relaxed)
+}
+
 /// All `var` declarations in the document, in source order.
 pub fn collect(doc: &Document) -> Vec<&VarDecl> {
     let mut out = Vec::new();

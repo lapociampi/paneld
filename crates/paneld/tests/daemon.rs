@@ -1165,3 +1165,19 @@ fn a_rule_on_a_source_age_fires_as_the_clock_moves() {
     d.wait_for("sources.s.value", "5");
     d.wait_for("alerts.count", "1");
 }
+
+#[test]
+fn a_rule_on_a_source_running_follows_its_runs() {
+    let dir = tmp("alert-running");
+    // A run takes 2s, every 3s: while it is under way only `running`
+    // moves, and the rule must see it.
+    let d = Daemon::start(
+        &dir,
+        "source s {\n    poll  = 3s\n    run   = sh -c 'sleep 2; echo 5'\n    parse = number\n}\n\
+         alert busy {\n    when     = {{ sources.s.running }}\n    severity = info\n    title    = Busy\n}\n\
+         page home { text { value = Hi } }\n",
+    );
+    d.wait_for("alerts.count", "1");
+    d.wait_for("sources.s.value", "5");
+    d.wait_for("alerts.count", "0");
+}
