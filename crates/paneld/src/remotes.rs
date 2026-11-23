@@ -81,7 +81,7 @@ pub fn expose(ctx: &mut Context, mut sources: BTreeMap<String, Value>, running: 
     // The clock the page reads (`now`, held still by `shot --verify`).
     crate::sources::add_live_fields(&mut sources, crate::clock::unix_now(), running);
     let remotes = current();
-    for (name, root) in remotes.roots(&sources) {
+    for (name, root) in remotes.roots(&mut sources) {
         ctx.insert(name, root);
     }
     let plain = sources.into_iter().filter(|(k, _)| !k.contains('.')).collect();
@@ -400,44 +400,51 @@ impl Remotes {
 
     /// Each instance as an expression root: its members' values by
     /// name, `ok`, `error` and `status` (schema 17). `sources` holds
-    /// the lowered values under their dotted names.
-    pub fn roots(&self, sources: &BTreeMap<String, Value>) -> Vec<(String, Value)> {
-        self.by_name
-            .iter()
-            .map(|(name, remote)| {
-                let mut m = BTreeMap::new();
-                let mut status = BTreeMap::new();
-                let (mut any_result, mut error) = (false, None);
-                for (member, b) in cr_members(&remote.kind) {
-                    if b.kind.text != "value" {
-                        continue;
-                    }
-                    let full = sources.get(&format!("{name}.{member}")).cloned().unwrap_or(Value::Null);
-                    let field = |k: &str| match &full {
-                        Value::Map(f) => f.get(k).cloned(),
-                        _ => None,
-                    };
-                    let ok = matches!(field("ok"), Some(Value::Bool(true)));
-                    // Ran and failed, as opposed to not run yet.
-                    let ran = field("at").is_some()
-                        || matches!(field("error"), Some(Value::String(e)) if e != "not run yet");
-                    any_result |= ok;
-                    if ran && !ok && error.is_none() {
-                        error = Some(match field("error") {
-                            Some(Value::String(e)) if !e.is_empty() => format!("{member}: {e}"),
-                            _ => format!("{member} failed"),
-                        });
-                    }
-                    m.insert(member.to_string(), field("value").unwrap_or(Value::Null));
-                    status.insert(member.to_string(), full);
-                }
-                m.insert("ok".into(), Value::Bool(any_result && error.is_none()));
-                m.insert("error".into(), Value::String(error.unwrap_or_default()));
-                m.insert("status".into(), Value::Map(status));
-                (name.clone(), Value::Map(m))
-            })
-            .collect()
+    /// the lowered values under their dotted names; the members' are
+    /// taken out of it.
+    pub fn roots(&self, sources: &mut BTreeMap<String, Value>) -> Vec<(String, Value)> {
+        self.by_name.iter().map(|(name, remote)| (name.clone(), root_value(name, remote, sources))).collect()
     }
+}
+
+/// Instance `name` as an expression root (see [`Remotes::roots`]), from
+/// `sources` holding at least its members; `None` for no such remote.
+pub fn root(name: &str, mut sources: BTreeMap<String, Value>) -> Option<Value> {
+    let remotes = current();
+    remotes.by_name.get(name).map(|remote| root_value(name, remote, &mut sources))
+}
+
+fn root_value(name: &str, remote: &Remote, sources: &mut BTreeMap<String, Value>) -> Value {
+    let mut m = BTreeMap::new();
+    let mut status = BTreeMap::new();
+    let (mut any_result, mut error) = (false, None);
+    for (member, b) in cr_members(&remote.kind) {
+        if b.kind.text != "value" {
+            continue;
+        }
+        let full = sources.remove(&format!("{name}.{member}")).unwrap_or(Value::Null);
+        let field = |k: &str| match &full {
+            Value::Map(f) => f.get(k).cloned(),
+            _ => None,
+        };
+        let ok = matches!(field("ok"), Some(Value::Bool(true)));
+        // Ran and failed, as opposed to not run yet.
+        let ran = field("at").is_some()
+            || matches!(field("error"), Some(Value::String(e)) if e != "not run yet");
+        any_result |= ok;
+        if ran && !ok && error.is_none() {
+            error = Some(match field("error") {
+                Some(Value::String(e)) if !e.is_empty() => format!("{member}: {e}"),
+                _ => format!("{member} failed"),
+            });
+        }
+        m.insert(member.to_string(), field("value").unwrap_or(Value::Null));
+        status.insert(member.to_string(), full);
+    }
+    m.insert("ok".into(), Value::Bool(any_result && error.is_none()));
+    m.insert("error".into(), Value::String(error.unwrap_or_default()));
+    m.insert("status".into(), Value::Map(status));
+    Value::Map(m)
 }
 
 fn cr_members(kind: &Block) -> impl Iterator<Item = (&str, &Block)> {
@@ -738,7 +745,7 @@ mod tests {
         let r = Remotes::from_doc(&d, Path::new("/s/state"));
         let ok = |v: i64| Value::Map(BTreeMap::from([("value".into(), Value::Int(v)), ("ok".into(), Value::Bool(true)), ("at".into(), Value::Int(1))]));
         let mut sources = BTreeMap::from([("r1.a".to_string(), ok(5))]);
-        let root = |s: &BTreeMap<String, Value>| match r.roots(s).remove(0).1 {
+        let root = |s: &BTreeMap<String, Value>| match r.roots(&mut s.clone()).remove(0).1 {
             Value::Map(m) => m,
             _ => panic!(),
         };

@@ -145,7 +145,10 @@ impl Drop for Daemon {
         if std::fs::symlink_metadata(&self.dir).is_ok_and(|m| m.file_type().is_symlink()) {
             let _ = std::fs::remove_file(&self.dir);
         }
+        // So is a verify failure (exit 3), even after the last check.
+        let ours = std::fs::read_to_string(self.dir.join("log")).unwrap_or_default();
         if !std::thread::panicking() {
+            assert!(!ours.contains("paneld: verify:"), "verify failed:\n{ours}");
             assert!(!log.contains("[Error]"), "LVGL logged an error:\n{log}");
         }
     }
@@ -1129,7 +1132,7 @@ fn a_page_shown_from_the_cache_at_a_wake_moves_its_next_value() {
 }
 
 #[test]
-fn the_alert_check_builds_its_context_only_when_a_source_or_var_changes() {
+fn the_alert_check_keeps_its_context_while_nothing_changes() {
     let dir = tmp("alert-ctx");
     let d = Daemon::start(
         &dir,
@@ -1142,13 +1145,15 @@ fn the_alert_check_builds_its_context_only_when_a_source_or_var_changes() {
     wait_idle(&d);
     // Idle passes of the loop (about one a second) reuse the context:
     // nothing changed.
-    let before = status_num(&d, "alert_ctx_builds");
+    let (builds, patches) = (status_num(&d, "alert_ctx_builds"), status_num(&d, "alert_ctx_patches"));
     std::thread::sleep(Duration::from_millis(2500));
-    assert_eq!(status_num(&d, "alert_ctx_builds"), before, "idle passes built the alert context again");
-    // A var changes: the next pass builds it again and the rule sees it.
+    assert_eq!(status_num(&d, "alert_ctx_builds"), builds, "idle passes built the alert context again");
+    assert_eq!(status_num(&d, "alert_ctx_patches"), patches, "idle passes patched the alert context");
+    // A var changes: the next pass patches it in and the rule sees it.
     d.ok(&["set", "vars.v=200"]);
     d.wait_for("alerts.count", "1");
-    assert!(status_num(&d, "alert_ctx_builds") > before);
+    assert!(status_num(&d, "alert_ctx_patches") > patches);
+    assert_eq!(status_num(&d, "alert_ctx_builds"), builds);
 }
 
 #[test]
@@ -1180,4 +1185,41 @@ fn a_rule_on_a_source_running_follows_its_runs() {
     d.wait_for("alerts.count", "1");
     d.wait_for("sources.s.value", "5");
     d.wait_for("alerts.count", "0");
+}
+
+#[test]
+fn the_kept_alert_context_takes_each_new_value_of_a_source_and_a_remote_member() {
+    let dir = tmp("alert-patch");
+    // Each run counts up in a file: the rules fire only once the
+    // values that came after the first build reach 3. The runs from
+    // the second argument on fail: status-only updates
+    // (`ok`, `error`) that the root's `ok` and `error` follow. Every
+    // patch is checked against a whole build (PANELD_VERIFY_UPDATES).
+    std::fs::write(
+        dir.join("count.sh"),
+        "n=$(( $(cat \"$1\" 2>/dev/null || echo 0) + 1 ))\necho $n > \"$1\"\n[ -n \"$2\" ] && [ $n -ge \"$2\" ] && exit 1\necho $n\n",
+    )
+    .unwrap();
+    let d = Daemon::start(
+        &dir,
+        "var v: int = 1\n\
+         source s {\n    poll  = 1s\n    run   = sh count.sh s.count\n    parse = number\n}\n\
+         remote_kind box {\n    param file: string\n    param stop: int\n    via = local\n    value n { poll = 1s; run = sh count.sh {{ file }} {{ stop }}; parse = number }\n}\n\
+         remote b: box { file = b.count; stop = 1000 }\n\
+         remote b2: box { file = b2.count; stop = 3 }\n\
+         alert plain {\n    when     = {{ sources.s.value >= 3 }}\n    severity = warning\n    title    = Plain\n}\n\
+         alert member {\n    when     = {{ b.n >= 3 && vars.v == 1 }}\n    severity = warning\n    title    = Member\n}\n\
+         page home { text { value = Hi } }\n",
+    );
+    d.wait_for("alerts.count", "2");
+    let builds = status_num(&d, "alert_ctx_builds");
+    assert!(status_num(&d, "alert_ctx_patches") > 0, "no patch: {}", d.log());
+    // `b2` shares the prefix `b`: each root follows its own member.
+    d.wait_for("b2.ok", "false");
+    assert_eq!(d.eval("b.ok && b2.error != ''"), "true");
+    // A var: the next patch copies the vars again.
+    d.ok(&["set", "vars.v=2"]);
+    d.wait_for("alerts.count", "1");
+    // All of it by patches: no whole build since the first.
+    assert_eq!(status_num(&d, "alert_ctx_builds"), builds);
 }

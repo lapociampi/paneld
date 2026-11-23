@@ -675,18 +675,31 @@ fn process(live: &mut LiveState, screen: &paneld_ui::ui::Obj<'_>) {
 
     // Tick the alert engine against the latest sources + vars. A
     // transition (fire or resolve) marks the frame dirty so the
-    // header badge and overview reflect it right away. The context is
-    // built again only when a source or a var changed: this runs on
+    // header badge and overview reflect it right away. This runs on
     // every pass of the loop, asleep too, and a copy of every source's
-    // data each time cost more than the rest of an idle panel. `now`
-    // is set fresh each pass, so time-based rules see the clock. A
-    // source's `age` is set as the context is built: a rule that reads
-    // it gets a new one each pass, as before.
+    // data each time cost more than the rest of an idle panel: the
+    // context is kept, and what changed since is patched into it (the
+    // vars, and each source written, alone). `now` is set fresh each
+    // pass, so time-based rules see the clock. A source's `age` is set
+    // as the context is built: a rule that reads it gets a new one each
+    // pass, as before; one that reads `running` gets a new one as runs
+    // start and end.
     let inputs = (vars::inputs(), if live.alerts_read_running { vars::runs() } else { 0 });
-    if live.alerts_read_age || live.alerts_ctx.as_ref().is_none_or(|(at, _)| *at != inputs) {
+    let runs_moved = live.alerts_ctx.as_ref().is_some_and(|((_, runs), _)| *runs != inputs.1);
+    if live.alerts_read_age || runs_moved || live.alerts_ctx.is_none() {
         let ctx = build_ctx(&live.source_values, &live.theme, &live.vars, None);
         ALERT_CTX_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         live.alerts_ctx = Some((inputs, ctx));
+        live.alerts_dirty.clear();
+    } else if live.alerts_ctx.as_ref().is_some_and(|(at, _)| *at != inputs) {
+        patch_alerts_ctx(live);
+        ALERT_CTX_PATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some((at, _)) = live.alerts_ctx.as_mut() {
+            *at = inputs;
+        }
+        if verify_on() {
+            verify_alerts_ctx(live, inputs.0);
+        }
     }
     let (_, alerts_ctx) = live.alerts_ctx.as_mut().expect("built above");
     clock::insert(alerts_ctx);
@@ -1198,6 +1211,7 @@ fn source_update(live: &mut LiveState, update: sources::SourceUpdate) {
     }
     // A value or `ok` changes below.
     vars::inputs_changed();
+    live.alerts_dirty.insert(update.name.clone());
     let mut value = update.value;
     if update.status {
         // Only `ok` / `error` change: the rest of the last result
@@ -1304,8 +1318,12 @@ struct LiveState {
     changes: paneld_ui::Changes,
     /// The context the alert tick evaluates against, with the
     /// [`vars::inputs`] (and [`vars::runs`], when a rule reads
-    /// `running`) it was built at: built again when they move.
+    /// `running`) it is up to date with: patched when the inputs move,
+    /// built again when the runs do.
     alerts_ctx: Option<((u64, u64), paneld_ui::Context)>,
+    /// The sources written since the alert tick's context was brought
+    /// up to date: patched into it, alone, at the next pass.
+    alerts_dirty: std::collections::BTreeSet<String>,
     /// A rule or a reminder reads a source's `age`, which is set as a
     /// context is built: the alert tick then builds one each pass.
     alerts_read_age: bool,
@@ -1687,6 +1705,7 @@ fn setup_live_state(
         toast_until: None,
         changes: paneld_ui::Changes::default(),
         alerts_ctx: None,
+        alerts_dirty: Default::default(),
         alerts_read_age,
         alerts_read_running,
         held: paneld_ui::Changes::default(),
@@ -3424,9 +3443,11 @@ fn handle_request(
             // the updates in place (ADR 0024).
             m.insert("renders".to_string(), Value::Int(RENDERS.load(std::sync::atomic::Ordering::Relaxed) as i64));
             m.insert("updates".to_string(), Value::Int(UPDATES.load(std::sync::atomic::Ordering::Relaxed) as i64));
-            // Contexts the alert tick built: one per change of a
-            // source or a var, none while nothing changes.
+            // Contexts the alert tick built whole (at start, or each
+            // pass for a rule on `age`), and the times it patched what
+            // changed into the one it keeps.
             m.insert("alert_ctx_builds".to_string(), Value::Int(ALERT_CTX_BUILDS.load(std::sync::atomic::Ordering::Relaxed) as i64));
+            m.insert("alert_ctx_patches".to_string(), Value::Int(ALERT_CTX_PATCHES.load(std::sync::atomic::Ordering::Relaxed) as i64));
             let (records, made) = paneld_ui::nodes::table_size();
             m.insert("node_records".to_string(), Value::Int(records as i64));
             m.insert("node_objects".to_string(), Value::Int(made as i64));
@@ -3457,6 +3478,102 @@ fn with_secrets(
 ) -> paneld_ui::Context {
     ctx.insert("secrets".into(), paneld_ui::Value::Map(secrets.clone()));
     ctx
+}
+
+/// Bring the alert tick's kept context up to date: the vars, copied
+/// whole (they are small, and the action worker writes them too), and
+/// each source written since, alone (a remote member: its instance's
+/// root), instead of a copy of every source's data.
+fn patch_alerts_ctx(live: &mut LiveState) {
+    use paneld_ui::Value;
+    let dirty = std::mem::take(&mut live.alerts_dirty);
+    let Some((_, ctx)) = live.alerts_ctx.as_mut() else { return };
+    ctx.insert("vars".into(), Value::Map(live.vars.lock().unwrap().clone()));
+    if dirty.is_empty() {
+        return;
+    }
+    let running = sources::running_names();
+    let now = clock::unix_now();
+    let values = live.source_values.lock().unwrap();
+    let mut roots = std::collections::BTreeSet::new();
+    for name in dirty {
+        if let Some((root, _)) = name.split_once('.') {
+            roots.insert(root.to_string());
+            continue;
+        }
+        let mut one: std::collections::BTreeMap<String, Value> = values.get(&name).map(|v| (name.clone(), v.clone())).into_iter().collect();
+        sources::add_live_fields(&mut one, now, &running);
+        if let (Some(v), Some(Value::Map(plain))) = (one.remove(&name), ctx.get_mut("sources")) {
+            plain.insert(name, v);
+        }
+    }
+    for root in roots {
+        let prefix = format!("{root}.");
+        let mut members: std::collections::BTreeMap<String, Value> = values
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        sources::add_live_fields(&mut members, now, &running);
+        if let Some(v) = remotes::root(&root, members) {
+            ctx.insert(root, v);
+        }
+    }
+}
+
+/// `PANELD_VERIFY_UPDATES`: the patched alert context must be what a
+/// whole build gives, but for `now` and the source fields that follow
+/// the clock and the runs (`age`, `running`), kept as they were built;
+/// a difference is a bug, and the process ends (exit 3). Skipped when
+/// a var was written since the patch (`inputs`): the build would see
+/// it and the patch not yet.
+fn verify_alerts_ctx(live: &LiveState, inputs: u64) {
+    use paneld_ui::Value;
+    // Out of a source's map, or of every member's in a root's `status`.
+    fn strip(sources: Option<&mut Value>) {
+        if let Some(Value::Map(m)) = sources {
+            for v in m.values_mut() {
+                if let Value::Map(f) = v {
+                    f.remove("age");
+                    f.remove("running");
+                }
+            }
+        }
+    }
+    let Some((_, kept)) = live.alerts_ctx.as_ref() else { return };
+    let mut fresh = build_ctx(&live.source_values, &live.theme, &live.vars, None);
+    if vars::inputs() != inputs {
+        return;
+    }
+    let mut kept = kept.clone();
+    for ctx in [&mut kept, &mut fresh] {
+        ctx.remove("now");
+        strip(ctx.get_mut("sources"));
+        for (root, v) in ctx.iter_mut() {
+            if !matches!(root.as_str(), "sources" | "vars" | "theme" | "alerts") {
+                if let Value::Map(m) = v {
+                    strip(m.get_mut("status"));
+                }
+            }
+        }
+    }
+    if kept != fresh {
+        // Where: a source, a root, or `vars`.
+        let mut at = Vec::new();
+        for k in kept.keys().chain(fresh.keys()) {
+            match (kept.get(k), fresh.get(k)) {
+                (Some(Value::Map(a)), Some(Value::Map(b))) if a != b && k == "sources" => {
+                    at.extend(a.keys().chain(b.keys()).filter(|n| a.get(*n) != b.get(*n)).map(|n| format!("sources.{n}")));
+                }
+                (a, b) if a != b => at.push(k.clone()),
+                _ => {}
+            }
+        }
+        at.sort();
+        at.dedup();
+        eprintln!("paneld: verify: the patched alert context differs from a whole build at {}", at.join(", "));
+        std::process::exit(3);
+    }
 }
 
 fn build_ctx(
@@ -3533,6 +3650,9 @@ fn rss_kb() -> Option<i64> {
 /// Contexts the alert tick built since start, for `ctl status`
 /// (`alert_ctx_builds`).
 static ALERT_CTX_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Patches of the alert tick's kept context since start, for `ctl
+/// status` (`alert_ctx_patches`).
+static ALERT_CTX_PATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Full page renders since start, for `ctl status` (`renders`).
 static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// `paneld shot --no-sources`: no source command runs.
