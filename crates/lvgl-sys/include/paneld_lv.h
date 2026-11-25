@@ -83,6 +83,13 @@ void lv_paneld_local_styles_free(void * saved);
 bool lv_paneld_local_style_at(const lv_obj_t * obj, uint32_t i, uint32_t * selector, lv_style_prop_t * prop,
                               lv_style_value_t * value);
 
+/* Leave the text color (and opacity) out of the theme's styles on
+ * `obj`'s main part, so it inherits its parent's as a label does: a
+ * layout block passes on its parent's text color, also when that
+ * changes later. The theme's style is swapped for a copy without
+ * them, made once per style. */
+void lv_paneld_inherit_text_color(lv_obj_t * obj);
+
 /* `obj`'s hidden, clickable, checkable and scrollable flags, as the
  * bits of lv_obj_flag_t. */
 uint32_t lv_paneld_obj_flags(const lv_obj_t * obj);

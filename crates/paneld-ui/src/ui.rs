@@ -1743,11 +1743,9 @@ impl<'ui> Obj<'ui> {
             sys::lv_obj_set_style_border_width(obj.raw, 0, 0);
             // LVGL's theme gives every container its own text color;
             // a layout block passes on its parent's instead (a dark
-            // theme's light text).
-            let color = sys::lv_obj_get_style_text_color(self.raw, 0);
-            let opa = sys::lv_obj_get_style_text_opa(self.raw, 0);
-            sys::lv_obj_set_style_text_color(obj.raw, color, 0);
-            sys::lv_obj_set_style_text_opa(obj.raw, opa, 0);
+            // theme's light text), also when that changes later (a
+            // button's on its background, updated in place).
+            sys::lv_paneld_inherit_text_color(obj.raw);
             // Only a `scroll` scrolls ([`Self::set_scroll`]); what
             // overflows another layout block is clipped, with no
             // scrollbar inside a card.
@@ -1801,8 +1799,21 @@ impl<'ui> Obj<'ui> {
                 let parent = sys::lv_obj_get_parent(label);
                 // Hidden under a running call's overlay: fitted when it
                 // shows again (the button's size is the overlay's now).
+                // Until then as made, as a fresh render of the running
+                // button leaves it.
                 let busy = |o: *mut sys::lv_obj_t| OWNED.with(|m| m.borrow().get(&(o as usize)).is_some_and(|o| o.busy_hidden));
                 if busy(label) || busy(parent) {
+                    let width = sys::_lv_style_id_t_LV_STYLE_WIDTH as sys::lv_style_prop_t;
+                    let mut v = sys::lv_style_value_t::default();
+                    let fitted = sys::lv_obj_get_local_style_prop(label, width, &mut v, 0) == sys::lv_style_res_t_LV_STYLE_RES_FOUND;
+                    let shortened = !busy(label) && sys::lv_obj_is_hidden(label);
+                    if fitted || shortened {
+                        touch(label);
+                        sys::lv_obj_remove_local_style_prop(label, width, 0);
+                        if shortened {
+                            sys::lv_obj_set_hidden(label, false);
+                        }
+                    }
                     return;
                 }
                 // A button as wide as its content is not narrower than
@@ -1820,13 +1831,22 @@ impl<'ui> Obj<'ui> {
                         sys::lv_obj_set_hidden(label, hide);
                     }
                 }
-                let width = if size.x <= room { LV_SIZE_CONTENT_LOCAL } else { room.max(0) };
                 // Its own width, set or not (set up again by an update,
-                // it has none): the same after a fit either way.
+                // it has none): the same after a fit either way. One
+                // that fits has none, as made (a label is as wide as
+                // its text), so it is the same as one never fitted (a
+                // button hidden since a fresh render made it).
+                let prop = sys::_lv_style_id_t_LV_STYLE_WIDTH as sys::lv_style_prop_t;
                 let mut v = sys::lv_style_value_t::default();
-                let found = sys::lv_obj_get_local_style_prop(label, sys::_lv_style_id_t_LV_STYLE_WIDTH as sys::lv_style_prop_t, &mut v, 0);
-                if found != sys::lv_style_res_t_LV_STYLE_RES_FOUND || v.num != width {
-                    sys::lv_obj_set_width(label, width);
+                let found = sys::lv_obj_get_local_style_prop(label, prop, &mut v, 0) == sys::lv_style_res_t_LV_STYLE_RES_FOUND;
+                if size.x <= room {
+                    if found {
+                        touch(label);
+                        sys::lv_obj_remove_local_style_prop(label, prop, 0);
+                    }
+                } else if !found || v.num != room.max(0) {
+                    touch(label);
+                    sys::lv_obj_set_width(label, room.max(0));
                 }
             }
         }
@@ -3707,24 +3727,16 @@ impl<'ui> Obj<'ui> {
     /// the button's text and in its color (as styled now, so in its
     /// `:running` state), centered, over a faint track.
     pub fn new_busy_spinner(&self) -> Obj<'ui> {
-        let main = sys::lv_part_t_LV_PART_MAIN as sys::lv_part_t;
-        let (color, size) = unsafe {
-            let font = sys::lv_obj_get_style_text_font(self.raw, main);
-            let size = if font.is_null() { 24 } else { (*font).line_height };
-            (sys::lv_obj_get_style_text_color(self.raw, main), size)
-        };
         let raw = unsafe { sys::lv_spinner_create(self.raw) };
         assert!(!raw.is_null());
         let indicator = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
         unsafe {
-            sys::lv_obj_set_size(raw, size, size);
             sys::lv_obj_center(raw);
             sys::lv_obj_set_style_arc_width(raw, 3, 0);
             sys::lv_obj_set_style_arc_width(raw, 3, indicator);
-            sys::lv_obj_set_style_arc_color(raw, color, 0);
             sys::lv_obj_set_style_arc_opa(raw, sys::_lv_opacity_level_t_LV_OPA_30 as sys::lv_opa_t, 0);
-            sys::lv_obj_set_style_arc_color(raw, color, indicator);
         }
+        fit_busy_spinner(raw);
         Obj { raw, _ui: PhantomData }
     }
 
@@ -5491,6 +5503,10 @@ impl<'ui> Obj<'ui> {
         if let Some((ov, text)) = current {
             if busy.as_ref() == Some(&text) {
                 overlay = Some(ov);
+                if text.is_none() {
+                    touch(ov);
+                    fit_busy_spinner(ov);
+                }
             } else {
                 owned(self.raw, |o| o.busy = None);
                 unsafe { sys::lv_obj_delete(ov) };
@@ -5512,6 +5528,7 @@ impl<'ui> Obj<'ui> {
             overlay = Some(ov);
         }
         unsafe {
+            let mut hid = false;
             for i in 0..sys::lv_obj_get_child_count(self.raw) {
                 let child = sys::lv_obj_get_child(self.raw, i as i32);
                 if Some(child) == overlay {
@@ -5522,6 +5539,7 @@ impl<'ui> Obj<'ui> {
                     if !sys::lv_obj_is_hidden(child) {
                         sys::lv_obj_set_hidden(child, true);
                         owned(child, |o| o.busy_hidden = true);
+                        hid = true;
                     }
                 } else if marked {
                     sys::lv_obj_set_hidden(child, false);
@@ -5529,6 +5547,10 @@ impl<'ui> Obj<'ui> {
                     // Its shortcut label is fitted again, now shown.
                     sys::lv_obj_send_event(self.raw, sys::lv_event_code_t_LV_EVENT_SIZE_CHANGED, std::ptr::null_mut());
                 }
+            }
+            if hid {
+                // And put as made while hidden.
+                sys::lv_obj_send_event(self.raw, sys::lv_event_code_t_LV_EVENT_SIZE_CHANGED, std::ptr::null_mut());
             }
         }
     }
@@ -5615,6 +5637,23 @@ impl<'ui> Obj<'ui> {
         unsafe { sys::lv_obj_send_event(self.raw, sys::lv_event_code_t_LV_EVENT_SIZE_CHANGED, std::ptr::null_mut()) };
     }
 
+}
+
+/// A busy spinner in its button's text color, a line of its font
+/// high: as made, and again on a running button set up again (its
+/// background, so its text color, may have changed).
+fn fit_busy_spinner(spinner: *mut sys::lv_obj_t) {
+    let main = sys::lv_part_t_LV_PART_MAIN as sys::lv_part_t;
+    let indicator = sys::lv_part_t_LV_PART_INDICATOR as sys::lv_style_selector_t;
+    unsafe {
+        let btn = sys::lv_obj_get_parent(spinner);
+        let font = sys::lv_obj_get_style_text_font(btn, main);
+        let size = if font.is_null() { 24 } else { (*font).line_height };
+        let color = sys::lv_obj_get_style_text_color(btn, main);
+        sys::lv_obj_set_size(spinner, size, size);
+        sys::lv_obj_set_style_arc_color(spinner, color, 0);
+        sys::lv_obj_set_style_arc_color(spinner, color, indicator);
+    }
 }
 
 /// A keypad's keys in a parent as tall as its content: four rows.

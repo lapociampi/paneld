@@ -3022,6 +3022,52 @@ fn a_running_button_and_its_end_look_as_a_fresh_render() {
     shot(&conf, &["--verify", "--tap", "100,95", "--tap", "100,160", "--settle", "100", "--wait", "1200"]);
 }
 
+#[test]
+fn a_buttons_text_color_follows_its_background_when_updated_in_place() {
+    // A button's text reads on its solid `background` (white on dark,
+    // black on light), else it is the button's own; a layout block in
+    // it passes that on. Updated in place from dark to light, to a
+    // gradient and back, the row kept the color it had when made.
+    let d = tmp("button-on-color");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var k: int = 0\n\
+         page home {\n\
+             button { width = 200; height = 60\n\
+                 background = {{ vars.k == 1 ? '#ffeb3b' : vars.k == 2 ? 'linear 90 #ff0000 #0000ff' : '#202020' }}\n\
+                 row { column { text { value = go } } }\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut args = vec!["--verify"];
+    for k in ["k=1", "k=2", "k=0", "k=2", "k=1", "k=0"] {
+        args.extend(["--set", k]);
+    }
+    shot(&conf, &args);
+}
+
+#[test]
+fn a_running_buttons_spinner_follows_its_text_color_when_updated_in_place() {
+    // The spinner over a running button is drawn in its text color;
+    // the button's background changing while it runs changes that.
+    let d = tmp("busy-on-color");
+    let conf = d.join("p.conf");
+    std::fs::write(
+        &conf,
+        "var k: int = 0\n\
+         action spin { run = sleep 3 }\n\
+         page home {\n\
+             button { width = 200; height = 60; icon = refresh; label = go; on_tap = spin\n\
+                 background = {{ vars.k == 1 ? '#ffeb3b' : vars.k == 2 ? 'linear 90 #ff0000 #0000ff' : '#202020' }}\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    shot(&conf, &["--verify", "--settle", "50", "--tap", "100,95", "--set", "k=1", "--set", "k=2", "--set", "k=0", "--wait", "3500"]);
+}
+
 /// The configs random changes are checked over: the shipped shell and
 /// alerts page, the examples, and the config in `PANELD_FUZZ_CONFIG`
 /// when it is set (read only, nothing of it runs).

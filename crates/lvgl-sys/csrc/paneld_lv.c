@@ -638,6 +638,50 @@ bool lv_paneld_local_style_at(const lv_obj_t * obj, uint32_t i, uint32_t * selec
     return false;
 }
 
+void lv_paneld_inherit_text_color(lv_obj_t * obj)
+{
+    /* One copy per theme style met, kept for the program's life (so
+     * are the theme's own styles). */
+    static struct {
+        const lv_style_t * from;
+        lv_style_t * to;
+    } copies[4];
+    static uint32_t n_copies;
+    for(uint32_t i = 0; i < obj->style_cnt; i++) {
+        const lv_obj_style_t * os = &obj->styles[i];
+        if(!os->is_theme || os->selector != 0 || os->style == NULL || os->style->prop_cnt == 255) continue;
+        lv_style_value_t v;
+        if(lv_style_get_prop(os->style, LV_STYLE_TEXT_COLOR, &v) != LV_STYLE_RES_FOUND
+           && lv_style_get_prop(os->style, LV_STYLE_TEXT_OPA, &v) != LV_STYLE_RES_FOUND) continue;
+        const lv_style_t * from = os->style;
+        lv_style_t * to = NULL;
+        for(uint32_t k = 0; k < n_copies; k++) {
+            if(copies[k].from == from) to = copies[k].to;
+        }
+        if(to == NULL) {
+            if(n_copies == sizeof(copies) / sizeof(copies[0])) return;
+            to = lv_malloc_zeroed(sizeof(lv_style_t));
+            if(to == NULL) return;
+            lv_style_init(to);
+            lv_style_prop_t * props;
+            lv_style_value_t * values;
+            paneld_style_parts(from, &props, &values);
+            for(uint32_t k = 0; k < from->prop_cnt; k++) {
+                if(props[k] == LV_STYLE_TEXT_COLOR || props[k] == LV_STYLE_TEXT_OPA) continue;
+                lv_style_set_prop(to, props[k], values[k]);
+            }
+            copies[n_copies].from = from;
+            copies[n_copies].to = to;
+            n_copies++;
+        }
+        lv_obj_replace_style(obj, from, to, 0);
+        /* Still the theme's (replacing clears the mark). */
+        for(uint32_t k = 0; k < obj->style_cnt; k++) {
+            if(obj->styles[k].style == to) obj->styles[k].is_theme = 1;
+        }
+    }
+}
+
 uint32_t lv_paneld_obj_flags(const lv_obj_t * obj)
 {
     uint32_t f = 0;
