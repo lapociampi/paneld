@@ -62,13 +62,14 @@ page home {
 
 ## Examples
 
-Three complete configs live in [`examples/`](examples/). Each brings its own theme and demo data, so it runs on any Linux machine as is, and says next to every source what a real setup would run instead.
+Four complete configs live in [`examples/`](examples/). Each brings its own theme and demo data, so it runs on any Linux machine as is, and says next to every source what a real setup would run instead.
 
 | | |
 | --- | --- |
 | [**Homelab rack**](examples/homelab/): services at a glance, VMs you start and stop behind a PIN, storage pools, a latency chart, alerts. Its theme replaces the frame with a side bar. | ![Homelab overview](docs/images/homelab-overview.png) |
 | [**Smart home**](examples/smart-home/): clock and weather, scenes, lights, a thermostat and the day's solar power, on a warm light theme. Comes with a `remote_kind` for Home Assistant's REST API. | ![Smart home](docs/images/smart-home-home.png) |
 | [**System monitor**](examples/system/): the machine paneld runs on, from `/proc`: gauges, charts with history, top processes. Real data, nothing to set up. | ![System monitor](docs/images/system-overview.png) |
+| [**Stream deck**](examples/stream-deck/): a control surface beside a streaming PC: OBS scenes, go live and record, a mixer, music and macro keys, with glows, gradients and animations drawn natively, no browser. OBS over its WebSocket, the PC over `ssh`. | ![Stream deck](docs/images/stream-deck-live.png) |
 
 More screenshots are in the [examples README](examples/README.md).
 

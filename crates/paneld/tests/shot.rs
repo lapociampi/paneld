@@ -3073,7 +3073,7 @@ fn a_running_buttons_spinner_follows_its_text_color_when_updated_in_place() {
 /// when it is set (read only, nothing of it runs).
 fn fuzz_configs() -> Vec<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut out: Vec<PathBuf> = ["homelab", "smart-home", "system"].iter().map(|e| root.join("examples").join(e).join("paneld.conf")).collect();
+    let mut out: Vec<PathBuf> = ["homelab", "smart-home", "system", "stream-deck"].iter().map(|e| root.join("examples").join(e).join("paneld.conf")).collect();
     if let Some(extra) = std::env::var_os("PANELD_FUZZ_CONFIG").map(PathBuf::from).filter(|p| p.is_file()) {
         out.push(extra);
     }
