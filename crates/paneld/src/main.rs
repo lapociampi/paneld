@@ -3110,7 +3110,7 @@ fn verify_picture(ui: &paneld_ui::Ui, mem: &mut paneld_ui::MemDisplay, live: &Li
             let _ = std::fs::write(std::path::PathBuf::from(dir).join(name), png::encode_rgb(w, h, px));
         }
     };
-    if partial != shown {
+    if !alike(&partial, &shown) {
         dump("partial.png", &partial);
         dump("updated.png", &shown);
         let (n, bbox) = differ(&partial, &shown, w as usize);
@@ -3119,22 +3119,32 @@ fn verify_picture(ui: &paneld_ui::Ui, mem: &mut paneld_ui::MemDisplay, live: &Li
             live.current_page, bbox.0, bbox.1, bbox.2, bbox.3
         ));
     }
-    if shown == built {
+    if alike(&shown, &built) {
         return Ok(());
     }
     // Both pictures, to look at: next to the shot's own.
     dump("updated.png", &shown);
     dump("fresh.png", &built);
-    let first = shown.iter().zip(&built).position(|(a, b)| a != b).unwrap_or(0) / 3;
+    let first = shown.iter().zip(&built).position(|(a, b)| a.abs_diff(*b) > 1).unwrap_or(0) / 3;
     Err(format!("page `{}`: the picture differs from a fresh render, first at {},{}", live.current_page, first % w as usize, first / w as usize))
 }
 
-/// How many pixels of two RGB8 pictures `w` wide differ, and the box
-/// (x1, y1, x2, y2) holding them.
+/// Two RGB8 pictures alike: no channel more than 1 apart. LVGL's
+/// shadow cache keys a blurred corner by blur and radius only, while a
+/// short box's corner also depends on its height: a shadow can come
+/// out 1 step off depending on what was drawn before it, which is not
+/// a redraw the page missed.
+fn alike(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(p, q)| p.abs_diff(*q) <= 1)
+}
+
+/// How many pixels of two RGB8 pictures `w` wide differ (by more than
+/// 1 in a channel, see [`alike`]), and the box (x1, y1, x2, y2)
+/// holding them.
 fn differ(a: &[u8], b: &[u8], w: usize) -> (usize, (usize, usize, usize, usize)) {
     let (mut n, mut bbox) = (0, (usize::MAX, usize::MAX, 0, 0));
     for (i, (p, q)) in a.chunks(3).zip(b.chunks(3)).enumerate() {
-        if p != q {
+        if p.iter().zip(q).any(|(x, y)| x.abs_diff(*y) > 1) {
             let (x, y) = (i % w, i / w);
             n += 1;
             bbox = (bbox.0.min(x), bbox.1.min(y), bbox.2.max(x), bbox.3.max(y));
